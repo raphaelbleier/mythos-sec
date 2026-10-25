@@ -7,8 +7,10 @@ from mythos.scan import browser
 
 
 @pytest.mark.skipif(not browser.available(), reason="playwright not installed")
-def test_dom_xss_detected(vulnapp):
-    f = browser.check_dom_xss(vulnapp + "/dom")
+@pytest.mark.parametrize("path", ["/dom", "/dom_write", "/dom_query"])
+def test_dom_xss_detected(vulnapp, path):
+    # three sink classes: innerHTML-via-hash, document.write, query-source innerHTML
+    f = browser.check_dom_xss(vulnapp + path)
     assert f and f[0].kind == "dom-xss" and f[0].confidence == "certain"
 
 

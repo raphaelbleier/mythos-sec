@@ -102,6 +102,24 @@ def dom():
     </script></body></html>"""
 
 
+@app.route("/dom_write")
+def dom_write():
+    # VULN: DOM XSS via document.write sink reading location.hash
+    return """<html><head><title>DOMW</title></head><body>
+    <script>document.write(decodeURIComponent(location.hash.slice(1)));</script>
+    </body></html>"""
+
+
+@app.route("/dom_query")
+def dom_query():
+    # VULN: DOM XSS via innerHTML sink reading a QUERY parameter (location.search)
+    return """<html><head><title>DOMQ</title></head><body><div id="o"></div>
+    <script>
+      var p=new URLSearchParams(location.search);
+      document.getElementById('o').innerHTML = p.get('q') || '';
+    </script></body></html>"""
+
+
 @app.route("/static/app.js")
 def appjs():
     js = ('fetch("/api/data?token=1");const u="/profile?id=1";'

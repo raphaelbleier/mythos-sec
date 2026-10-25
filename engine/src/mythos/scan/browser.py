@@ -25,37 +25,49 @@ def available() -> bool:
         return False
 
 
-def check_dom_xss(url: str, *, param: str | None = None, timeout_ms: int = 8000) -> list[Finding]:
+def check_dom_xss(url: str, *, param: str | None = None, timeout_ms: int = 8000,
+                  query_params: list[str] | None = None) -> list[Finding]:
     """Render ``url`` and detect DOM XSS by observing payload execution.
 
-    Tries the URL hash (the classic DOM-XSS source) and, if ``param`` is given,
-    that query parameter. Execution is confirmed when our injected script sets a
-    window flag or fires a dialog — proof the sink executed, not just reflected.
+    Drives payloads through two source classes — the URL hash (``location.hash``)
+    and query parameters (``location.search``) — across several sink shapes
+    (innerHTML, document.write). Execution is confirmed when the injected script
+    sets a window flag: proof the sink executed, not merely reflected.
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
         return []
+    from urllib.parse import quote
 
     token = "mxdom" + uuid.uuid4().hex[:8]
-    # payload sets a window flag when executed via a DOM sink
-    payloads = [
-        f"#<img src=x onerror=\"window.{token}=1\">",
-        f"#<svg/onload=\"window.{token}=1\">",
-    ]
+    inner = [f"<img src=x onerror=\"window.{token}=1\">",
+             f"<svg/onload=\"window.{token}=1\">"]
+    # build candidate full URLs: hash source, then query source on likely params
+    candidates = [url + "#" + p for p in inner]
+    qparams = list(query_params or [])
+    if param:
+        qparams.append(param)
+    qparams += ["q", "search", "name", "input", "data", "msg"]
+    sep = "&" if "?" in url else "?"
+    for qp in dict.fromkeys(qparams):
+        for p in inner:
+            candidates.append(f"{url}{sep}{qp}={quote(p)}")
+
     findings: list[Finding] = []
+    executed_payload = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
             page = browser.new_page()
-            executed_payload = None
-            for frag in payloads:
+            for cand in candidates:
                 try:
-                    page.goto(url + frag, wait_until="load", timeout=timeout_ms)
-                    page.wait_for_timeout(500)
+                    page.goto(cand, wait_until="load", timeout=timeout_ms)
+                    page.wait_for_timeout(400)
                     if page.evaluate(f"() => window.{token} === 1"):
-                        executed_payload = frag
+                        executed_payload = cand
                         break
+                    page.evaluate(f"() => {{ try{{ delete window.{token} }}catch(e){{}} }}")
                 except Exception:
                     continue
             browser.close()
@@ -75,7 +87,7 @@ def check_dom_xss(url: str, *, param: str | None = None, timeout_ms: int = 8000)
             remediation="Avoid dangerous DOM sinks (innerHTML, document.write); use "
                         "textContent / safe APIs; deploy Trusted Types and a strict CSP.",
             cvss="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
-            evidence=Evidence(request=f"GET {url}{executed_payload}",
+            evidence=Evidence(request=f"GET {executed_payload}",
                               matched=f"window.{token} set by injected sink",
                               note="headless Chromium execution"),
             confidence="certain"))
