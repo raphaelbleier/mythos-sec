@@ -56,6 +56,24 @@ _Caveat: 100% on a self-authored ground-truth app validates the pipeline, not
 real-world recall. The contribution is the method and the safety model; the
 next run measures recall on Juice Shop / DVWA / crAPI._
 
+**Full toolbox, live run (standard mode, all tools enabled):** against the same
+running target the engine plus the Kali tool belt produced 32 findings that
+merged and deduplicated across five sources, showing the tools augment rather
+than duplicate the engine:
+
+| Source                 | Findings | Role                                                    |
+| ---------------------- | -------- | ------------------------------------------------------- |
+| mythos-engine (native) | 19       | breadth across all classes                              |
+| nikto                  | 6        | server misconfigurations                                |
+| nuclei                 | 3        | templated `.env` exposure (laravel/codeigniter/generic) |
+| dalfox                 | 3        | confirmed reflected XSS                                 |
+| sqlmap                 | 1        | confirmed critical SQLi                                 |
+
+3 critical, 11 high, 5 medium, 11 low, 2 info; 4 findings reached `confirmed`
+closure (dalfox XSS ×2, sqlmap SQLi, JWT weak secret). The pure-Python engine
+also mapped 97 endpoints on live OWASP Juice Shop, confirming the crawler works
+on a real Angular SPA.
+
 ## Contribution
 
 Mythos is the intersection of the four frameworks' strengths plus two things

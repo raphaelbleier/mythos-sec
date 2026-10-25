@@ -1,0 +1,39 @@
+{
+  "target": "http://mythos-vulnapp:5000 (lab)",
+  "mode": "standard",
+  "tools_available": [
+    "subfinder",
+    "httpx",
+    "katana",
+    "nuclei",
+    "ffuf",
+    "dalfox",
+    "sqlmap",
+    "nikto",
+    "whatweb",
+    "nmap"
+  ],
+  "total_findings": 32,
+  "severity": {
+    "info": 2,
+    "low": 11,
+    "medium": 5,
+    "high": 11,
+    "critical": 3
+  },
+  "by_source": {
+    "mythos-engine": 19,
+    "sqlmap": 1,
+    "nuclei": 3,
+    "dalfox": 3,
+    "nikto": 6
+  },
+  "confirmed": 4,
+  "coverage": {
+    "endpoints": 31,
+    "cells": 682,
+    "tested": 143,
+    "findings": 29,
+    "coverage_pct": 21.0
+  }
+}
