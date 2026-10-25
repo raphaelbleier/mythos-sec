@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 mythos = "mythos.cli:main"
+mythos-agent = "mythos_agent.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

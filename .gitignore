@@ -19,3 +19,4 @@ nuclei-output/
 
 # OS
 .DS_Store
+.venv-agent/

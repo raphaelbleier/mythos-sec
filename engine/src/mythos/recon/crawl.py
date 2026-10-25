@@ -15,6 +15,14 @@ from urllib.parse import urljoin, urlparse, parse_qs, urldefrag, urlunparse
 
 from bs4 import BeautifulSoup
 
+
+def _soup(html: str) -> BeautifulSoup:
+    # prefer lxml (fast) but fall back to the stdlib parser when lxml is absent
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
 from ..http_client import HttpClient, ScopeViolation, BudgetExceeded
 
 # endpoints referenced from JS, two complementary patterns. Both optionally
@@ -129,7 +137,7 @@ def crawl(client: HttpClient, seed: str, *, max_pages: int = 150,
         if "html" not in ctype:
             continue
 
-        soup = BeautifulSoup(resp.text or "", "lxml")
+        soup = _soup(resp.text or "")
         # links
         for a in soup.find_all("a", href=True):
             nxt = urljoin(url, a["href"])
