@@ -270,6 +270,19 @@ def api_jsonlogin():
         con.close()
 
 
+@app.route("/item/<thing>")
+def item(thing):
+    # VULN: SQLi via a PATH segment (REST-style path parameter injection)
+    con = _db()
+    try:
+        con.execute(f"SELECT name FROM users WHERE name = '{thing}'")
+        return {"ok": True, "thing": thing}
+    except sqlite3.Error as e:
+        return Response(f"sqlite3.OperationalError: {e}", status=500)
+    finally:
+        con.close()
+
+
 @app.route("/api/debug")
 def api_debug():
     # VULN: excessive data exposure — dumps every user's credentials unauth

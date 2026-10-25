@@ -32,5 +32,12 @@
     "note": "built into the toolbox image as root (no host Chrome/sudo needed); engine runs it on HTML pages when available, falls back to HTTP checks otherwise"
   },
   "exploiter_subagent": "CONFIRMED the /user?id= SQLi via sqlmap (boolean/error/time/UNION, SQLite 3.46.1), non-destructive, run as a subagent",
-  "status": "Real findings on 4 apps across every web shape; browser DOM-XSS, nuclei, sqlmap, exploiter-subagent all exercised. crAPI not run (needs 2-4GB; VAmPI is the API substitute)."
+  "status": "5 real apps engaged: Juice Shop, DVWA, VAmPI, crAPI, vulnapp. Browser DOM-XSS, nuclei, sqlmap, exploiter-subagent all exercised.",
+  "crapi": {
+    "target": "OWASP crAPI (identity service, authenticated via JWT)",
+    "status": "RAN \u2014 core subset (identity+postgres+mongo+mailhog+gateway) fits in this 3.7GB VM with ~2.2GB headroom; earlier 'cannot fit' claim was WRONG and is corrected",
+    "flow": "signup -> login -> JWT bearer -> authenticated engagement (5th real app)",
+    "findings": "reachable surface scanned; missing security headers. crAPI exposes no springdoc spec here (404) so deep path-BOLA/mass-assignment auto-discovery is limited; those need a spec or multi-account business-logic testing (a limit shared by all scanners)."
+  },
+  "injection_coverage": "query + HTML form + JSON body + path parameter (all implemented and unit-tested)"
 }

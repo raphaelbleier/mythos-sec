@@ -189,14 +189,18 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
     if do_scan and scope.rules.allow_active:
         from .scan.common import InjectionPoint
         points = points_from_crawl(cres)
-        # JSON-body injection points from OpenAPI POST/PUT/PATCH endpoints
+        # JSON-body and path-parameter injection points from OpenAPI endpoints
         for e in api_eps:
-            if e["method"] in ("POST", "PUT", "PATCH") and e.get("body_params") \
-                    and scope.contains(e["url"]):
+            if not scope.contains(e["url"]):
+                continue
+            if e["method"] in ("POST", "PUT", "PATCH") and e.get("body_params"):
                 for bp in e["body_params"]:
                     others = {k: "test" for k in e["body_params"] if k != bp}
                     points.append(InjectionPoint(method=e["method"], url=e["url"],
                                                  param=bp, base_params=others, where="json"))
+            for pp in e.get("path_params") or []:
+                points.append(InjectionPoint(method=e["method"], url=e["url"], param=pp,
+                                             where="path", template=e.get("path_template", "")))
         log(f"[scan] {len(points)} injection points")
 
         # Templated scan across the whole target (fast, broad).

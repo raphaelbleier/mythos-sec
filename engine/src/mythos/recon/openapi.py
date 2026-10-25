@@ -17,6 +17,8 @@ from ..http_client import HttpClient
 SPEC_PATHS = [
     "/openapi.json", "/swagger.json", "/api-docs", "/v2/api-docs",
     "/v3/api-docs", "/swagger/v1/swagger.json", "/openapi", "/api/openapi.json",
+    # springdoc under a service base path (e.g. crAPI identity)
+    "/identity/v3/api-docs", "/identity/api-docs", "/api/v3/api-docs",
 ]
 _TEMPLATE = re.compile(r"\{[^}]+\}")
 
@@ -82,8 +84,15 @@ def parse_spec(spec: dict, base: str) -> list[dict]:
             params = list(path_level_params) + (op.get("parameters") or [])
             qp = sorted({pm["name"] for pm in params
                          if isinstance(pm, dict) and pm.get("in") == "query" and pm.get("name")})
+            pp = sorted({pm["name"] for pm in params
+                         if isinstance(pm, dict) and pm.get("in") == "path" and pm.get("name")})
+            # also catch {templates} present in the path but not declared as params
+            pp = sorted(set(pp) | {m.strip("{}") for m in _TEMPLATE.findall(path)})
+            tmpl = urljoin(origin, (base_path + "/" + path.lstrip("/")).replace("//", "/")
+                           if base_path else path)
             out.append({"url": full, "method": method.upper(),
-                        "query_params": qp, "body_params": _body_params(op)})
+                        "query_params": qp, "body_params": _body_params(op),
+                        "path_params": pp, "path_template": tmpl})
     return out
 
 

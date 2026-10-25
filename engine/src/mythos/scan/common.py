@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
 
 from ..http_client import HttpClient
 from ..recon.crawl import CrawlResult
@@ -17,10 +17,18 @@ class InjectionPoint:
     url: str                 # base url (query stripped for the injected param)
     param: str
     base_params: dict[str, str] = field(default_factory=dict)  # other params held constant
-    where: str = "query"     # query | body
+    where: str = "query"     # query | body | json | path
+    template: str = ""       # for where=="path": full URL with {param} placeholders
 
     def build(self, value: str) -> tuple[str, dict]:
         """Return (url, kwargs) for a request with ``param`` set to ``value``."""
+        if self.where == "path":
+            # substitute the payload into the named path segment; fill any other
+            # path templates with a benign placeholder
+            url = self.template.replace("{" + self.param + "}",
+                                        quote(str(value), safe=""))
+            url = re.sub(r"\{[^}]+\}", "1", url)
+            return url, {}
         params = dict(self.base_params)
         params[self.param] = value
         if self.where == "query":
