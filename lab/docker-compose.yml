@@ -35,3 +35,14 @@ services:
     ports:
       - "127.0.0.1:4280:80"
     networks: [mythos-lab]
+
+  # Lightweight vulnerable REST API (IDOR/BOLA, SQLi, JWT, mass assignment).
+  # Stands in for crAPI on memory-constrained hosts (single small container).
+  vampi:
+    image: erev0s/vampi:latest
+    container_name: mythos-vampi
+    environment:
+      - vulnerable=1
+    ports:
+      - "127.0.0.1:5002:5000"
+    networks: [mythos-lab]

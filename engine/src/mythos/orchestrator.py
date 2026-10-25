@@ -229,18 +229,20 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         # isolated: a parser error or crash in one never aborts the engagement.
         param_urls = [e.url for e in cres.endpoints.values()
                       if "?" in e.url or e.params]
+        dmax = int(os.environ.get("MYTHOS_DALFOX_MAX", "6"))
+        smax = int(os.environ.get("MYTHOS_SQLMAP_MAX", "3"))
         if external.have("dalfox"):
             log("[scan] dalfox XSS on parameterized endpoints")
-            for url in param_urls[:12]:
+            for url in param_urls[:dmax]:
                 if scope.contains(url):
                     _safe(res.store,
-                          lambda u=url: external.dalfox(_with_params(u, cres), timeout=90))
+                          lambda u=url: external.dalfox(_with_params(u, cres), timeout=60))
         if external.have("sqlmap") and scope.rules.allow_exploit:
             log("[scan] sqlmap on parameterized endpoints")
-            for url in param_urls[:6]:
+            for url in param_urls[:smax]:
                 if scope.contains(url):
                     _safe(res.store,
-                          lambda u=url: external.sqlmap(_with_params(u, cres), timeout=180))
+                          lambda u=url: external.sqlmap(_with_params(u, cres), timeout=120))
         if external.have("nikto"):
             log("[scan] nikto server scan")
             _safe(res.store, lambda: external.nikto(target))
