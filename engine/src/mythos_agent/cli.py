@@ -30,6 +30,8 @@ def main(argv=None) -> int:
                     "(Burp/Caido/ZAP), e.g. http://127.0.0.1:8080")
     ap.add_argument("--objective", default="",
                     help="explicit goal, e.g. 'capture the flag (flag{...})' for CTF/benchmark")
+    ap.add_argument("--swarm", action="store_true",
+                    help="multi-agent: spawn parallel role sub-agents (recon/injection/api_auth)")
     ap.add_argument("--workdir")
     args = ap.parse_args(argv)
 
@@ -40,15 +42,26 @@ def main(argv=None) -> int:
         host = urlparse(args.target).hostname or args.target
         scope = Scope.from_dict({"target": args.target, "in_scope": [host]})
 
-    res = run_agent(args.target, scope, backend_name=args.backend, model=args.model,
-                    max_steps=args.max_steps, proxy=args.proxy, objective=args.objective,
-                    workdir=Path(args.workdir) if args.workdir else None,
-                    log=lambda *a: print(*a, file=sys.stderr))
+    wd = Path(args.workdir) if args.workdir else None
+    logf = lambda *a: print(*a, file=sys.stderr)
+    if args.swarm:
+        from .orchestrator import run_orchestrated
+        res = run_orchestrated(args.target, scope, backend_name=args.backend,
+                               model=args.model, max_steps=args.max_steps,
+                               proxy=args.proxy, workdir=wd, log=logf)
+    else:
+        res = run_agent(args.target, scope, backend_name=args.backend, model=args.model,
+                        max_steps=args.max_steps, proxy=args.proxy, objective=args.objective,
+                        workdir=wd, log=logf)
     c = res.store.counts()
-    print(f"\n=== Mythos agent done: {res.steps} steps, "
-          f"{len(res.store)} findings "
+    mode = "swarm" if args.swarm else f"{getattr(res, 'steps', '?')} steps"
+    print(f"\n=== Mythos agent done ({mode}): {len(res.store)} findings "
           f"(crit={c['critical']} high={c['high']} med={c['medium']} low={c['low']}) ===")
-    print(res.summary[:800])
+    if args.swarm:
+        for role, info in getattr(res, "per_role", {}).items():
+            print(f"  {role}: {info['findings']} findings ({info['steps']} steps)")
+    else:
+        print(getattr(res, "summary", "")[:800])
     return 0
 
 

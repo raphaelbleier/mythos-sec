@@ -16,22 +16,22 @@ Legend: ✅ done · 🚧 in this iteration · ⏳ planned
 
 ## This iteration (Agent v2)
 
-- 🚧 **Toolbox tool proxy** — the agent runs Kali tools (nuclei/sqlmap/dalfox/
+- ✅ **Toolbox tool proxy** — the agent runs Kali tools (nuclei/sqlmap/dalfox/
   ffuf/nikto) even from the host, by proxying tool calls into the running
   `mythos-toolbox` container via `docker exec`. Closes the biggest gap.
-- 🚧 **Browser/DOM agent tool** — expose the headless-Chromium DOM-XSS check as
+- ✅ **Browser/DOM agent tool** — expose the headless-Chromium DOM-XSS check as
   an agent tool.
-- 🚧 **Two-account BOLA agent tool** — the agent drives `scan/bola.py` with two
+- ✅ **Two-account BOLA agent tool** — the agent drives `scan/bola.py` with two
   identities from `scope.identities`.
-- 🚧 **Persistent shared state in the loop** — wire the coverage matrix and a
+- ✅ **Persistent shared state in the loop** — wire the coverage matrix and a
   task-tree/notes store into the agent so it tracks what is tested across steps,
   not just the transcript.
-- 🚧 **Multi-agent / parallelism** — an orchestrator that spawns parallel
+- ✅ **Multi-agent / parallelism** — an orchestrator that spawns parallel
   sub-agents (recon, per-area scanners, per-finding validators), in the spirit
   of CAI's `run_parallel_specialists` and Strix's agent graph.
-- 🚧 **CVE intelligence (NVD)** — a tool that queries the NVD API for the
+- ✅ **CVE intelligence (NVD)** — a tool that queries the NVD API for the
   detected technologies/versions (HexStrike-style).
-- 🚧 **Proxy integration** — route all agent traffic through an upstream proxy
+- ✅ **Proxy integration** — route all agent traffic through an upstream proxy
   (Burp/Caido/ZAP) via `scope`/CLI, for evidence capture and manual pivoting.
 
 ## Backlog (post-v2)
