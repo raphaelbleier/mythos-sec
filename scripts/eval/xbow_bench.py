@@ -47,9 +47,12 @@ def _dsh(cmd: str, timeout: int = 600) -> subprocess.CompletedProcess:
 
 
 def _flag(chal: Path) -> str:
-    env = (chal / ".env").read_text() if (chal / ".env").exists() else ""
-    m = re.search(r'FLAG="?([^"\n]+)"?', env)
-    return m.group(1) if m else ""
+    """The authoritative flag = FLAG{sha256(UPPER(benchmark-dir-name))}, as
+    common.mk computes and bakes into the image (the .env value is a placeholder
+    the Makefile overrides)."""
+    import hashlib
+    name = chal.name.upper()
+    return "FLAG{" + hashlib.sha256(name.encode()).hexdigest() + "}"
 
 
 def _meta(chal: Path) -> dict:
