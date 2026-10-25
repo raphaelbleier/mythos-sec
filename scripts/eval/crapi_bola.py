@@ -42,17 +42,24 @@ def signup_login(name: str) -> tuple[str, str]:
 
 
 def mail_vehicle(email: str) -> tuple[str, str]:
-    """Return (vin, pincode) from the user's welcome email in MailHog."""
-    for _ in range(8):
+    """Return (vin, pincode) from the user's vehicle email in MailHog.
+
+    crAPI sends an HTML email (VIN wrapped in <font> tags, quoted-printable
+    encoded). Decode QP, strip tags, then extract.
+    """
+    import quopri
+    for _ in range(10):
         time.sleep(2)
         msgs = requests.get(f"{MAIL}/api/v2/messages", timeout=15).json()
         for m in msgs.get("items", []):
             to = ",".join(m["Content"]["Headers"].get("To", []))
             if email not in to:
                 continue
-            body = m["Content"]["Body"]
-            vin = re.search(r"VIN[:\s]+([A-Z0-9]{11,17})", body, re.I)
-            pin = re.search(r"[Pp]in\s*[Cc]ode[:\s]+(\d{4,8})", body)
+            raw = m.get("Raw", {}).get("Data", "") or m["Content"]["Body"]
+            txt = quopri.decodestring(raw.encode("utf-8", "replace")).decode("utf-8", "replace")
+            txt = re.sub(r"<[^>]+>", " ", txt)
+            vin = re.search(r"VIN:\s*([A-HJ-NPR-Z0-9]{8,17})", txt)
+            pin = re.search(r"Pincode:\s*([0-9]{3,8})", txt)
             if vin and pin:
                 return vin.group(1), pin.group(1)
     return "", ""
