@@ -17,13 +17,14 @@ from bs4 import BeautifulSoup
 
 from ..http_client import HttpClient, ScopeViolation, BudgetExceeded
 
-# endpoints referenced from JS. Two forms, both common in SPAs:
-#   root-relative:  "/api/x", fetch("/y?a=1")
-#   bare relative:  'rest/products/search', "api/Users"  (Angular/axios style)
-# the char class stops at ?, " or '
-_JS_ENDPOINT = re.compile(
-    r"""["'](/[a-zA-Z0-9_\-./]{2,120}"""
-    r"""|(?:api|rest|graphql|v[0-9]+)/[a-zA-Z0-9_\-./]{1,120})""")
+# endpoints referenced from JS, two complementary patterns:
+#   quoted root-relative paths:  "/api/x", fetch("/y?a=1")
+_JS_ENDPOINT = re.compile(r"""["'](/[a-zA-Z0-9_\-./]{2,120})""")
+#   api/rest/graphql/vN paths ANYWHERE (even in template literals like
+#   `${base}/rest/products/search`): the prefix is specific enough to be safe.
+#   A non-word lookbehind avoids matching mid-identifier.
+_JS_API = re.compile(
+    r"(?<![A-Za-z0-9_])(/?(?:api|rest|graphql|v[0-9]+)/[a-zA-Z0-9_\-./]{1,120})")
 _SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
              ".woff2", ".ttf", ".eot", ".css", ".pdf", ".zip", ".mp4", ".webp")
 # never follow these during authenticated crawls: they destroy the session
@@ -168,7 +169,10 @@ def _extract_form(result: CrawlResult, page_url: str, form) -> None:
 def _mine_js(result: CrawlResult, seed_host: str, base: str, body: str,
              queue: deque, depth: int) -> None:
     origin = f"{urlparse(base).scheme}://{urlparse(base).netloc}"
-    for m in set(_JS_ENDPOINT.findall(body or "")):
+    body = body or ""
+    matches = set(_JS_ENDPOINT.findall(body)) | set(_JS_API.findall(body))
+    for m in matches:
+        m = m.rstrip(".")  # trailing dot from minified concatenation
         if m.startswith("//") or any(m.lower().endswith(e) for e in _SKIP_EXT):
             continue
         # bare relative api/rest paths resolve against the site root, not the
