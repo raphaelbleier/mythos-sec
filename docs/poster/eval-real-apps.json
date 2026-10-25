@@ -27,10 +27,15 @@
   },
   "juiceshop": {
     "target": "OWASP Juice Shop (SPA)",
-    "endpoints_crawled": 124,
-    "result": "autonomous engagement detects critical SQL injection at /rest/products/search?q= (SQLITE_ERROR) end-to-end, plus BOLA on /api/Challenges",
-    "chain": "crawl -> JS/template-literal mining -> query-param capture -> native SQLi check",
-    "note": "full nuclei pass OOMs on this 3.7GB VM; run gentle (low rps, nuclei skipped) here"
+    "endpoints_crawled": 107,
+    "engagement": "full engagement WITH nuclei completed (lean mode + scoped templates)",
+    "findings": {
+      "critical": "SQLi /rest/products/search?q=",
+      "high": "data exposure /rest/memories",
+      "medium": "nuclei: exposed Prometheus /metrics",
+      "low": "missing headers x2"
+    },
+    "note": "nuclei runs on a 3.7GB host when template set is scoped (MYTHOS_NUCLEI_TAGS) and the engine runs lean (MYTHOS_LEAN); full unscoped nuclei + sqlmap/dalfox together still needs more RAM"
   },
   "vampi": {
     "target": "VAmPI (vulnerable REST API)",

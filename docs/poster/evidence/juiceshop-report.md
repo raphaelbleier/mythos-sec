@@ -7,16 +7,16 @@ _Generated 2026-10-25 by mythos-sec. For authorized testing only._
 | Severity | Count |
 |---|---|
 | Critical | 1 |
-| High | 0 |
+| High | 1 |
 | Medium | 1 |
 | Low | 2 |
 | Info | 0 |
-| **Total** | **4** |
+| **Total** | **5** |
 
 **Server:** n/a  
 **Technologies:** jQuery  
 
-**Tools available:** subfinder, httpx, katana, ffuf, whatweb, nmap
+**Tools available:** nuclei, ffuf, whatweb, nmap
 
 ## Findings
 
@@ -54,38 +54,74 @@ tml>
 
 ---
 
-### 2. 🟡 Potential IDOR / Broken Object Level Authorization
+### 2. 🟠 Sensitive data exposure in API response
 
-- **Severity:** Medium (`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N`)
-- **Asset:** http://mythos-juiceshop:3000/api/Challenges
-- **Parameter:** `id`
-- **Confidence:** tentative
+- **Severity:** High (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`)
+- **Asset:** http://mythos-juiceshop:3000/rest/memories
+- **Confidence:** firm
 - **Source:** mythos-engine
 
-Changing 'id' from 1 to 2 returns a different object while unauthenticated. If these objects belong to different users, this is an authorization flaw.
-
-**Payload / Steps to reproduce:**
-
-```
-id=1 vs 2
-```
+The endpoint returns JSON containing sensitive fields (password) to the caller.
 
 **Evidence:**
 
 ```http
-GET http://mythos-juiceshop:3000/api/Challenges [query:id] (id=1 then 2)
+GET http://mythos-juiceshop:3000/rest/memories
 ---
-len(1)=954 vs len(2)=714
-[matched] distinct objects for sequential ids
+{"status":"success","data":[{"UserId":13,"id":1,"caption":"😼 #zatschi #whoneedsfourlegs","imagePath":"assets/public/images/uploads/😼-#zatschi-#whoneedsfourlegs-1572600969477.jpg","createdAt":"2026-10-25T17:03:53.024Z","updatedAt":"2026-10-25T17:03:53.024Z","User":{"id":13,"username":"","email":"bjoern@owasp.org","password":"***","role":"deluxe","deluxeToken":"efe2f1599e2d93440d5243a1ffaf5a413b70cf
+[matched] 10 sensitive field(s): password
 ```
 
-**Impact:** An attacker can read or modify other users' objects by changing an id.
+**Impact:** Credentials, tokens or secrets are disclosed, enabling account takeover or lateral movement.
 
-**Remediation:** Enforce per-object authorization on every request; scope queries to the authenticated principal; use unguessable identifiers.
+**Remediation:** Never return secret fields in API responses; scope data to the authenticated principal; remove debug/dump endpoints from production.
 
 ---
 
-### 3. 🔵 Missing Content-Security-Policy
+### 3. 🟡 Prometheus Metrics - Detect
+
+- **Severity:** Medium
+- **Asset:** http://mythos-juiceshop:3000/metrics
+- **Confidence:** firm
+- **Source:** nuclei
+
+Prometheus metrics page was detected.
+
+**Evidence:**
+
+```http
+GET /metrics HTTP/1.1
+Host: mythos-juiceshop:3000
+User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15
+Accept: */*
+Accept-Language: en
+Accept-Encoding: gzip
+---
+HTTP/1.1 200 OK
+Content-Length: 23902
+Connection: keep-alive
+Content-Type: text/plain; version=0.0.4; charset=utf-8
+Date: Sun, 25 Oct 2026 17:07:36 GMT
+Keep-Alive: timeout=5
+
+# HELP file_uploads_count Total number of successful file uploads grouped by file type.
+# TYPE file_uploads_count counter
+
+# HELP file_upload_errors Total number of failed file uploads grouped by file type.
+# TYPE file_upload_errors counter
+
+# HELP juiceshop_startup_duration_seconds Duration juiceshop required to perform a certain task during startup
+# TYPE juiceshop_startup_duration_seconds gauge
+juiceshop_startup_duration_seconds{task="validateConfig",app="juiceshop"} 0.051608263
+juiceshop_startup_duration_seconds{task="cleanupFtpFolder",app="juiceshop"} 0.067643355
+juiceshop_startup_duration_seconds{task="va
+```
+
+**References:** https://github.com/prometheus/prometheus, https://hackerone.com/reports/1026196
+
+---
+
+### 4. 🔵 Missing Content-Security-Policy
 
 - **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-juiceshop:3000
@@ -110,7 +146,7 @@ GET http://mythos-juiceshop:3000
 
 ---
 
-### 4. 🔵 Missing HTTP Strict-Transport-Security
+### 5. 🔵 Missing HTTP Strict-Transport-Security
 
 - **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-juiceshop:3000
