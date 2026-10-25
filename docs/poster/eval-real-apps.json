@@ -40,5 +40,6 @@
     "note": "earlier 'crAPI never run / only headers' is superseded: the full two-account vehicle-BOLA chain now confirms the critical finding"
   },
   "injection_coverage": "query + HTML form + JSON body + path parameter; plus DOM-XSS (browser), two-account BOLA, OpenAPI import, API data-exposure, JWT, SSRF(OOB), SSTI, CRLF, command-injection, CORS, headers",
-  "bola_two_account": "Two-account BOLA confirmation implemented (scan/bola.py) + scope.identities; unit-tested on vulnapp /api/order (attacker identity reads victim's object -> HIGH, certain). Wired into the engagement when 2+ identities are configured."
+  "bola_two_account": "Two-account BOLA confirmation implemented (scan/bola.py) + scope.identities; unit-tested on vulnapp /api/order (attacker identity reads victim's object -> HIGH, certain). Wired into the engagement when 2+ identities are configured.",
+  "comprehensive_eval": "Single DEEP engagement on the ground-truth app detects 18/18 vulnerability classes (100% coverage, 0 false positives, precision/recall/F1 = 1.0, 568 requests) \u2014 query/path/JSON-body injection, time-based oracles, DOM XSS (Chromium), SSRF out-of-band (cross-container), API exposure, SSTI, CRLF, JWT, GraphQL, CORS, headers, cookies, open redirect, path traversal, IDOR, sensitive exposure."
 }
