@@ -54,8 +54,9 @@ class AgentResult:
 
 def run_agent(target: str, scope: Scope, *, backend_name: str = "claude-cli",
               model: str = "claude-opus-4-8", max_steps: int = 25,
+              proxy: str | None = None,
               workdir: Path | None = None, log=print) -> AgentResult:
-    client = HttpClient(scope=scope)
+    client = HttpClient(scope=scope, proxy=proxy)
     state = AgentState(target=target, client=client)
     tools = registry()
     backend = get_backend(backend_name, model)

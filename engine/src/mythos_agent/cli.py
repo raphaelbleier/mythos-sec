@@ -22,8 +22,12 @@ def main(argv=None) -> int:
     ap.add_argument("--scope", help="scope.yaml (else single-host from target)")
     ap.add_argument("--model", default="claude-opus-4-8")
     ap.add_argument("--backend", default="claude-cli",
-                    choices=["claude-cli", "anthropic", "auto"])
+                    choices=["claude-cli", "litellm", "anthropic", "auto"],
+                    help="claude-cli = no API key (Claude Code auth); litellm = any "
+                         "provider via its key or local Ollama")
     ap.add_argument("--max-steps", type=int, default=25, dest="max_steps")
+    ap.add_argument("--proxy", help="route all agent HTTP via an upstream proxy "
+                    "(Burp/Caido/ZAP), e.g. http://127.0.0.1:8080")
     ap.add_argument("--workdir")
     args = ap.parse_args(argv)
 
@@ -35,7 +39,7 @@ def main(argv=None) -> int:
         scope = Scope.from_dict({"target": args.target, "in_scope": [host]})
 
     res = run_agent(args.target, scope, backend_name=args.backend, model=args.model,
-                    max_steps=args.max_steps,
+                    max_steps=args.max_steps, proxy=args.proxy,
                     workdir=Path(args.workdir) if args.workdir else None,
                     log=lambda *a: print(*a, file=sys.stderr))
     c = res.store.counts()

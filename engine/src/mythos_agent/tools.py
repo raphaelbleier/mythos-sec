@@ -161,6 +161,47 @@ def _scan_all(st: AgentState, args: dict) -> str:
                        "findings": new[:40]})[:3500]
 
 
+def _browser_dom_xss(st: AgentState, args: dict) -> str:
+    from mythos.scan import browser
+    if not browser.available():
+        return "browser (playwright/chromium) not available in this environment"
+    try:
+        finds = browser.check_dom_xss(args["url"], param=args.get("param"))
+    except Exception as e:
+        return f"browser error: {e}"
+    for f in finds:
+        st.store.add(f)
+    return json.dumps([{"kind": f.kind, "severity": f.severity.value,
+                        "payload": f.payload[:60]} for f in finds]) or "no DOM XSS"
+
+
+def _bola(st: AgentState, args: dict) -> str:
+    """Two-account BOLA: attacker identity reads the victim's object_url."""
+    from mythos.scan.bola import check_bola
+    import dataclasses as _dc
+    idents = st.client.scope.identities
+    if not idents:
+        return "no second identity configured (set scope.identities with 2 users)"
+    atk_scope = _dc.replace(st.client.scope, auth=idents[0])
+    attacker = HttpClient(scope=atk_scope, proxy=st.client.proxy)
+    try:
+        finds = check_bola(st.client, attacker, args["object_url"],
+                           attacker_own_url=args.get("attacker_own_url"))
+    except Exception as e:
+        return f"bola error: {e}"
+    for f in finds:
+        st.store.add(f)
+    return json.dumps([{"kind": f.kind, "severity": f.severity.value} for f in finds]) \
+        or "no BOLA (attacker denied or same object)"
+
+
+def _cve_lookup(st: AgentState, args: dict) -> str:
+    from mythos.intel import nvd
+    res = nvd.search(args.get("product", ""), args.get("version", ""),
+                     limit=int(args.get("limit", 6)))
+    return json.dumps(res)[:2500]
+
+
 def _run_tool(st: AgentState, args: dict) -> str:
     tool = args.get("tool", "")
     url = args.get("url") or st.target
@@ -207,6 +248,9 @@ def registry() -> dict[str, Tool]:
              + ", ".join(_PARAM_CHECKS), _check),
         Tool("passive_checks", "Run header/cookie/CORS/API-exposure checks on a URL. args: {url?}", _passive),
         Tool("scan_all", "Exhaustive sweep: run every native vuln check on ALL crawled injection points + passive checks. Call once after crawl for breadth, then reason about depth. args: {}", _scan_all),
-        Tool("run_tool", "Run a Kali tool and parse findings. args: {tool(nuclei|dalfox|sqlmap|nikto), url?}", _run_tool),
+        Tool("run_tool", "Run a Kali tool (local or via the toolbox container) and parse findings. args: {tool(nuclei|dalfox|sqlmap|nikto), url?}", _run_tool),
+        Tool("browser_dom_xss", "Headless-Chromium DOM-XSS check on a URL (query + hash sinks). args: {url, param?}", _browser_dom_xss),
+        Tool("bola", "Two-account BOLA: confirm the attacker identity can read the victim's object. Needs scope.identities. args: {object_url, attacker_own_url?}", _bola),
+        Tool("cve_lookup", "Look up known CVEs for a product/version via NVD. args: {product, version?, limit?}", _cve_lookup),
         Tool("record_finding", "Record a confirmed finding. args: {title, severity, kind, url, param?, description?, evidence?}", _record),
     ]}

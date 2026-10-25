@@ -70,14 +70,48 @@ class AnthropicBackend:
         return "".join(b.get("text", "") for b in data.get("content", []))
 
 
+class LiteLLMBackend:
+    """Any provider via LiteLLM (like Strix): OpenAI, Anthropic, Gemini, Azure,
+    local Ollama/vLLM, etc. Model string selects the provider, e.g.
+    'gpt-4o', 'anthropic/claude-opus-4-8', 'ollama/llama3', 'gemini/gemini-2.5-pro'.
+    Needs `pip install litellm` and that provider's key in the environment
+    (none for local Ollama). Lets anyone plug in their own provider."""
+    name = "litellm"
+
+    def __init__(self, model: str, timeout: int = 180):
+        self.model = model
+        self.timeout = timeout
+        try:
+            import litellm  # noqa: F401
+        except Exception as exc:
+            raise LLMError("litellm not installed (pip install litellm)") from exc
+
+    def complete(self, system: str, prompt: str) -> str:
+        import litellm
+        try:
+            resp = litellm.completion(
+                model=self.model, timeout=self.timeout, max_tokens=2048,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}])
+        except Exception as exc:
+            raise LLMError(f"litellm error: {exc}") from exc
+        return resp["choices"][0]["message"]["content"] or ""
+
+
 def get_backend(name: str, model: str):
+    # Default: claude CLI (no API key, uses Claude Code auth).
     if name in ("claude-cli", "cli", "auto"):
         try:
             return ClaudeCLIBackend(model=model)
         except LLMError:
             if name == "auto":
-                return AnthropicBackend(model=model)
+                try:
+                    return LiteLLMBackend(model=model)
+                except LLMError:
+                    return AnthropicBackend(model=model)
             raise
+    if name in ("litellm", "any"):
+        return LiteLLMBackend(model=model)
     if name in ("anthropic", "api"):
         return AnthropicBackend(model=model)
     raise LLMError(f"unknown backend {name!r}")

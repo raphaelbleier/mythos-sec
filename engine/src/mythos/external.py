@@ -36,17 +36,70 @@ _SEV = {
 }
 
 
+import functools
+
+# tools we know the Mythos toolbox image ships (for the docker-exec proxy)
+_TOOLBOX_TOOLS = {
+    "nmap", "nuclei", "ffuf", "gobuster", "wfuzz", "dirb", "dirsearch", "sqlmap",
+    "nikto", "whatweb", "subfinder", "katana", "dnsx", "naabu", "dalfox", "amass",
+    "httpx", "arjun", "jwt_tool", "interactsh-client", "gau", "gospider",
+    "waybackurls", "qsreplace", "wafw00f", "commix", "feroxbuster", "masscan",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _toolbox_container() -> str | None:
+    """Name of a running Mythos toolbox container usable for `docker exec`,
+    or None. Lets the host agent run Kali tools without installing them."""
+    import os
+    import subprocess
+    if os.environ.get("MYTHOS_NO_TOOLBOX_PROXY"):
+        return None
+    name = os.environ.get("MYTHOS_TOOLBOX", "mythos-toolbox")
+    if os.environ.get("MYTHOS_IN_TOOLBOX"):
+        return None  # already inside it; tools are local
+    for prefix in ([], ["sg", "docker", "-c"]):
+        try:
+            cmd = prefix + ([f"docker ps --format '{{{{.Names}}}}'"] if prefix
+                            else ["docker", "ps", "--format", "{{.Names}}"])
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if out.returncode == 0 and name in out.stdout.split():
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def _docker_exec_prefix(container: str) -> list[str] | None:
+    """How to invoke `docker exec` here (direct, or via the docker group)."""
+    import subprocess
+    try:
+        if subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode == 0:
+            return ["docker", "exec", container]
+    except Exception:
+        pass
+    try:
+        if subprocess.run(["sg", "docker", "-c", "docker info"],
+                          capture_output=True, timeout=10).returncode == 0:
+            return ["__sg__", container]  # sentinel: wrap via sg in _run
+    except Exception:
+        pass
+    return None
+
+
 def have(tool: str) -> bool:
     # MYTHOS_NO_EXTERNAL forces the pure-Python path even inside the toolbox.
-    # MYTHOS_SKIP_TOOLS=nuclei,amass disables only named tools (e.g. drop the
-    # memory-heavy nuclei on constrained hosts while keeping katana/arjun/dalfox).
+    # MYTHOS_SKIP_TOOLS=nuclei,amass disables only named tools.
     import os
     if os.environ.get("MYTHOS_NO_EXTERNAL"):
         return False
     skip = {t.strip() for t in os.environ.get("MYTHOS_SKIP_TOOLS", "").split(",") if t.strip()}
     if tool in skip:
         return False
-    return shutil.which(tool) is not None
+    if shutil.which(tool) is not None:
+        return True
+    # available via the toolbox container?
+    return tool in _TOOLBOX_TOOLS and _toolbox_container() is not None
 
 
 def available_tools() -> dict[str, bool]:
@@ -70,10 +123,25 @@ def _run(cmd: list[str], timeout: int = 900, input_text: str | None = None,
         if hit and (time.time() - hit[0]) < _CACHE_TTL:
             return hit[1]
 
+    # Toolbox proxy: if the tool isn't local, run it inside the toolbox container.
+    exec_cmd = cmd
+    if shutil.which(cmd[0]) is None:
+        container = _toolbox_container()
+        if container:
+            import shlex
+            prefix = _docker_exec_prefix(container)
+            if prefix and prefix[0] == "__sg__":
+                inner = ("docker exec -i " + container + " "
+                         + " ".join(shlex.quote(c) for c in cmd))
+                exec_cmd = ["sg", "docker", "-c", inner]
+            elif prefix:
+                exec_cmd = prefix[:2] + ["-i", container] + cmd  # docker exec -i <c> ...
+            # else: no docker access -> fall through, will FileNotFound -> ""
+
     out = ""
     for attempt in range(max(1, retries) + 1):
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
+            proc = subprocess.run(exec_cmd, capture_output=True, text=True,
                                   timeout=timeout, input=input_text)
             out = proc.stdout or ""
             if out.strip() or proc.returncode == 0:
@@ -149,14 +217,12 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
            extra: list[str] | None = None) -> list[Finding]:
     if not have("nuclei"):
         return []
-    with tempfile.NamedTemporaryFile("r", suffix=".jsonl", delete=False) as tf:
-        out_path = tf.name
-    # bounded concurrency + rate limit keep nuclei's memory/footprint in check.
-    # MYTHOS_NUCLEI_TAGS / MYTHOS_NUCLEI_CONC let memory-constrained hosts scope
+    # stdout-based (no -o file) so it works identically locally or via the
+    # toolbox docker-exec proxy. MYTHOS_NUCLEI_TAGS / MYTHOS_NUCLEI_CONC scope
     # the template set (loading all ~9k templates is the memory cost).
     import os
     conc = os.environ.get("MYTHOS_NUCLEI_CONC", "15")
-    cmd = ["nuclei", "-u", url, "-jsonl", "-o", out_path, "-silent",
+    cmd = ["nuclei", "-u", url, "-jsonl", "-silent",
            "-severity", severity, "-no-color", "-c", conc, "-rl", "150",
            "-timeout", "8", "-retries", "1"]
     tags = os.environ.get("MYTHOS_NUCLEI_TAGS")
@@ -164,9 +230,12 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
         cmd += ["-tags", tags]
     if extra:
         cmd += extra
-    _run(cmd, timeout=timeout)
+    out = _run(cmd, timeout=timeout)
     findings: list[Finding] = []
-    for line in Path(out_path).read_text(errors="replace").splitlines() if Path(out_path).exists() else []:
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
@@ -187,7 +256,6 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
                 matched=str(ev.get("extracted-results") or ev.get("matcher-name") or ""),
                 note=f"nuclei template {ev.get('template-id','')}"),
             source="nuclei", confidence="firm"))
-    Path(out_path).unlink(missing_ok=True)
     return findings
 
 
