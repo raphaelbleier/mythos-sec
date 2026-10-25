@@ -1,45 +1,58 @@
 {
   "target": "https://ginandjuice.shop",
-  "steps": 13,
-  "summary": "Target https://ginandjuice.shop (PortSwigger demo). Fingerprint: 200, title 'Gin & Juice Shop', session+AWSALB cookies. Mapped 7 param endpoints via crawl: /catalog (category,searchTerm), /catalog/product (productId), /blog/ (back,search), /blog/post (postId), /v8/issues/detail (id), /api/webview-tag, /script. Discover: /admin/ 403, /login 200. Active checks (reflected-xss, sqli, blind-sqli, open-redirect) on searchTerm/category/productId/postId/back all returned no confirmation via check tool; nuclei unavailable. CONFIRMED/RECORDED: cookie-flags (low) \u2014 session/AWSALB cookies missing Secure/H",
-  "actions": [
+  "model": "claude-opus-4-8",
+  "backend": "claude-cli (no API key)",
+  "steps": 12,
+  "tools_used": [
     "fingerprint",
     "crawl",
-    "passive_checks",
-    "check",
-    "check",
+    "scan_all",
+    "record_finding",
     "check",
     "check",
     "run_tool",
-    "check",
-    "check",
     "record_finding",
-    "discover"
+    "check",
+    "check",
+    "passive_checks"
   ],
+  "headline": "autonomously found HIGH reflected XSS on /login (username) via crawl->scan_all->reason",
   "findings": [
     {
-      "kind": "cookie-flags",
-      "severity": "low"
+      "kind": "reflected-xss",
+      "severity": "high",
+      "url": "https://ginandjuice.shop/login",
+      "param": "username"
     },
     {
       "kind": "cookie-flags",
-      "severity": "low"
+      "severity": "low",
+      "url": "https://ginandjuice.shop",
+      "param": "AWSALB"
     },
     {
       "kind": "cookie-flags",
-      "severity": "low"
+      "severity": "low",
+      "url": "https://ginandjuice.shop",
+      "param": "AWSALBCORS"
     },
     {
       "kind": "missing-security-header",
-      "severity": "low"
+      "severity": "low",
+      "url": "https://ginandjuice.shop",
+      "param": "content-security-policy"
     },
     {
       "kind": "missing-security-header",
-      "severity": "low"
+      "severity": "low",
+      "url": "https://ginandjuice.shop",
+      "param": "strict-transport-security"
     },
     {
       "kind": "missing-security-header",
-      "severity": "info"
+      "severity": "info",
+      "url": "https://ginandjuice.shop",
+      "param": "x-content-type-options"
     }
   ]
 }
