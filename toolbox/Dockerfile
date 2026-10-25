@@ -81,6 +81,13 @@ RUN if [ "$INSTALL_METASPLOIT" = "true" ]; then \
 # nuclei templates (best-effort; needs network at build time)
 RUN nuclei -update-templates 2>/dev/null || true
 
+# --- headless browser for DOM-XSS / SPA testing (built as root, no sudo) ---
+RUN pip3 install --break-system-packages --no-cache-dir playwright \
+    && (playwright install --with-deps chromium \
+        || (apt-get update && apt-get install -y --no-install-recommends chromium \
+            && rm -rf /var/lib/apt/lists/*) \
+        || echo "browser install best-effort")
+
 # --- Mythos engine ------------------------------------------------------
 WORKDIR /opt/mythos-engine
 COPY engine/ /opt/mythos-engine/

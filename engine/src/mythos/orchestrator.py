@@ -238,6 +238,15 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
             if i % 25 == 0:
                 log(f"[scan] checked {i}/{len(points)} points")
 
+        # Browser-driven DOM XSS on HTML pages (headless Chromium), when the
+        # browser is available and not explicitly skipped. Bounded.
+        from .scan import browser as browser_mod
+        if browser_mod.available() and not os.environ.get("MYTHOS_NO_BROWSER"):
+            log("[scan] browser DOM-XSS checks")
+            html_pages = [u for u in (cres.pages[:8] or [target]) if scope.contains(u)]
+            for u in html_pages:
+                _safe(res.store, lambda u=u: browser_mod.check_dom_xss(u))
+
         # GraphQL introspection on graphql-looking endpoints
         for ep in cres.endpoints.values():
             if "graphql" in ep.url.lower() and scope.contains(ep.url):

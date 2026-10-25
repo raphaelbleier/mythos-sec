@@ -87,6 +87,18 @@ def index():
     </body></html>"""
 
 
+@app.route("/dom")
+def dom():
+    # VULN: DOM-based XSS — client-side sink writes location.hash into innerHTML.
+    # The server response is benign; only a real browser executing the JS triggers it.
+    return """<html><head><title>DOM</title></head><body>
+    <div id="out"></div>
+    <script>
+      document.getElementById('out').innerHTML =
+          decodeURIComponent(location.hash.slice(1));
+    </script></body></html>"""
+
+
 @app.route("/static/app.js")
 def appjs():
     js = ('fetch("/api/data?token=1");const u="/profile?id=1";'
