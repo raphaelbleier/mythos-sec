@@ -218,7 +218,8 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
 
         oast = None
         try:
-            oast = OastListener(public_host=_oast_host()).__enter__()
+            # bind all interfaces so a target in another container can call back
+            oast = OastListener(host="0.0.0.0", public_host=_oast_host()).__enter__()
             log(f"[scan] OAST listener on :{oast.port}")
         except Exception:
             oast = None
@@ -247,7 +248,7 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         from .scan import browser as browser_mod
         if browser_mod.available() and not os.environ.get("MYTHOS_NO_BROWSER"):
             log("[scan] browser DOM-XSS checks")
-            html_pages = [u for u in (cres.pages[:8] or [target]) if scope.contains(u)]
+            html_pages = [u for u in (cres.pages[:20] or [target]) if scope.contains(u)]
             for u in html_pages:
                 _safe(res.store, lambda u=u: browser_mod.check_dom_xss(u))
 

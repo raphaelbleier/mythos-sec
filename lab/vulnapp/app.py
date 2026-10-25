@@ -82,6 +82,9 @@ def index():
     <a href="/log?msg=hi">log</a>
     <a href="/fetch?url=http://localhost/">fetch</a>
     <a href="/api/account?id=1">account</a>
+    <a href="/api/debug">debug</a>
+    <a href="/dom">dom</a>
+    <a href="/item/readme">item</a>
     <form action="/search" method="get"><input name="q"><input type="submit"></form>
     <script src="/static/app.js"></script>
     </body></html>"""
@@ -154,6 +157,21 @@ def api_data():
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
+
+
+@app.route("/openapi.json")
+def openapi():
+    # advertises the API surface so the engine builds query/path/body injection points
+    return {
+        "openapi": "3.0.0",
+        "paths": {
+            "/api/jsonlogin": {"post": {"requestBody": {"content": {"application/json": {
+                "schema": {"properties": {"username": {}, "password": {}}}}}}}},
+            "/item/{thing}": {"get": {"parameters": [{"name": "thing", "in": "path"}]}},
+            "/search": {"get": {"parameters": [{"name": "q", "in": "query"}]}},
+            "/user": {"get": {"parameters": [{"name": "id", "in": "query"}]}},
+        },
+    }
 
 
 @app.route("/.env")

@@ -8,7 +8,10 @@
     { "kind": "ssrf", "path": "/fetch", "param": "url" },
     { "kind": "graphql-introspection", "path": "/graphql", "param": "" },
     { "kind": "jwt-weak-secret", "path": "/api/login", "param": "" },
-    { "kind": "idor", "path": "/api/account", "param": "id" }
+    { "kind": "idor", "path": "/api/account", "param": "id" },
+    { "kind": "dom-xss", "path": "/dom", "param": "" },
+    { "kind": "sqli", "path": "/item", "param": "thing" },
+    { "kind": "sqli", "path": "/api/jsonlogin", "param": "username" }
   ],
   "must_not_flag": []
 }
