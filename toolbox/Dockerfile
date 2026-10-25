@@ -23,15 +23,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv pipx golang-go seclists wordlists \
     && rm -rf /var/lib/apt/lists/*
 
-# --- recon / discovery / scanning (best-effort apt) --------------------
-RUN apt-get update && \
-    (apt-get install -y --no-install-recommends \
-        nuclei subfinder katana dnsx naabu dalfox amass masscan \
-        feroxbuster wafw00f commix dotdotpwn xsser sslscan testssl.sh \
-        wpscan hydra john hashcat gau whatweb nbtscan enum4linux \
-        gospider hakrawler assetfinder httpx-toolkit \
-     || echo "some apt tools unavailable in this snapshot") \
+# --- recon / scanning: proven-good group (one atomic install) ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nuclei subfinder katana dnsx naabu dalfox amass masscan feroxbuster \
     && rm -rf /var/lib/apt/lists/*
+
+# --- extras: per-package so one missing name never kills the rest ------
+RUN apt-get update && for p in \
+        wafw00f commix dotdotpwn xsser sslscan testssl.sh wpscan \
+        hydra john hashcat nbtscan enum4linux hakrawler httpx-toolkit; do \
+      apt-get install -y --no-install-recommends "$p" || echo "skip apt:$p"; \
+    done && rm -rf /var/lib/apt/lists/*
 
 # ProjectDiscovery httpx binary (kali's package name varies; ensure `httpx`)
 RUN set -e; \
@@ -47,15 +49,17 @@ RUN for pkg in \
         github.com/tomnomnom/anew@latest \
         github.com/tomnomnom/qsreplace@latest \
         github.com/tomnomnom/gf@latest \
-        github.com/s0md3v/uro@latest \
+        github.com/lc/gau/v2/cmd/gau@latest \
+        github.com/jaeles-project/gospider@latest \
+        github.com/tomnomnom/assetfinder@latest \
         github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest ; do \
       GOBIN=/usr/local/bin go install "$pkg" 2>/dev/null || echo "skip $pkg"; \
     done; rm -rf /root/go/pkg || true
 
-# --- Python belt (best-effort) -----------------------------------------
-RUN pipx install arjun 2>/dev/null || pip3 install --break-system-packages arjun 2>/dev/null || true; \
-    pip3 install --break-system-packages --no-cache-dir \
-        semgrep graphw00f paramspider 2>/dev/null || true
+# --- Python belt (best-effort, each independent) -----------------------
+RUN for pkg in arjun wafw00f semgrep graphw00f paramspider; do \
+      pip3 install --break-system-packages --no-cache-dir "$pkg" || echo "skip pip:$pkg"; \
+    done
 
 # --- git-clone tools (jwt_tool) ----------------------------------------
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool 2>/dev/null && \
