@@ -22,8 +22,10 @@ digraph mythos {
   subgraph cluster_agents {
     label="sub-agents (model: inherit)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
     planner [label="planner"];
-    browser [label="browser\nPlaywright MCP\nDOM-XSS · auth flows"];
+    browser [label="browser\nPlaywright + Chromium\nDOM-XSS · auth flows"];
   }
+
+  know [label="knowledge base\nper-class playbooks\nCVE triage · chaining", fillcolor="#eafff0", color="#1faa59"];
 
   shim    [label="scripts/mythos\n(docker exec shim)", fillcolor="#fff7e6", color="#e0a800"];
   toolbox [label="mythos-toolbox (Kali, Docker)\nnuclei · sqlmap · dalfox · ffuf · katana\nsubfinder · httpx · commix · interactsh · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
@@ -32,6 +34,7 @@ digraph mythos {
   out     [label="engagements/<dir>\nrecon · scan · findings · report.md", fillcolor="#f3f1ff", color="#6d5efc"];
 
   user -> cc;
+  know -> cc [label="informs", style=dashed];
   cc -> planner [label="delegates", style=dashed];
   cc -> setup; cc -> recon; cc -> scan; cc -> exploit; cc -> report;
   cc -> browser [style=dashed];
