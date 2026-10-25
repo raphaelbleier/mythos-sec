@@ -243,6 +243,21 @@ def api_account():
     return ACCOUNTS.get(aid, {"error": "not found"})
 
 
+@app.route("/api/jsonlogin", methods=["POST"])
+def api_jsonlogin():
+    # VULN: SQLi via a JSON request-body field (API-style injection)
+    data = request.get_json(silent=True) or {}
+    u = data.get("username", "")
+    con = _db()
+    try:
+        con.execute(f"SELECT name FROM users WHERE name = '{u}'")
+        return {"ok": True}
+    except sqlite3.Error as e:
+        return Response(f"sqlite3.OperationalError: {e}", status=500)
+    finally:
+        con.close()
+
+
 @app.route("/api/debug")
 def api_debug():
     # VULN: excessive data exposure — dumps every user's credentials unauth

@@ -75,6 +75,7 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
     res.tools_used = external.available_tools()
     host = urlparse(target).hostname or target
     scope = client.scope
+    api_eps: list[dict] = []   # OpenAPI endpoints (carry method + body params)
 
     # ---- RECON ---------------------------------------------------------
     if do_recon:
@@ -186,7 +187,16 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
 
     # ---- SCAN ----------------------------------------------------------
     if do_scan and scope.rules.allow_active:
+        from .scan.common import InjectionPoint
         points = points_from_crawl(cres)
+        # JSON-body injection points from OpenAPI POST/PUT/PATCH endpoints
+        for e in api_eps:
+            if e["method"] in ("POST", "PUT", "PATCH") and e.get("body_params") \
+                    and scope.contains(e["url"]):
+                for bp in e["body_params"]:
+                    others = {k: "test" for k in e["body_params"] if k != bp}
+                    points.append(InjectionPoint(method=e["method"], url=e["url"],
+                                                 param=bp, base_params=others, where="json"))
         log(f"[scan] {len(points)} injection points")
 
         # Templated scan across the whole target (fast, broad).

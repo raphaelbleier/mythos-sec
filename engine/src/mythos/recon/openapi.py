@@ -44,8 +44,26 @@ def fetch_spec(client: HttpClient, target: str) -> dict | None:
     return None
 
 
+def _body_params(op: dict) -> list[str]:
+    """Extract JSON request-body property names (OpenAPI3 requestBody or
+    Swagger2 in:body parameter schema)."""
+    names: set[str] = set()
+    # OpenAPI 3: requestBody.content[*].schema.properties
+    rb = op.get("requestBody")
+    if isinstance(rb, dict):
+        for media in (rb.get("content") or {}).values():
+            schema = (media or {}).get("schema") or {}
+            names.update((schema.get("properties") or {}).keys())
+    # Swagger 2: parameters with in:body -> schema.properties
+    for pm in op.get("parameters") or []:
+        if isinstance(pm, dict) and pm.get("in") == "body":
+            schema = pm.get("schema") or {}
+            names.update((schema.get("properties") or {}).keys())
+    return sorted(n for n in names if isinstance(n, str))
+
+
 def parse_spec(spec: dict, base: str) -> list[dict]:
-    """Return [{url, method, query_params}] from an OpenAPI/Swagger spec."""
+    """Return [{url, method, query_params, body_params}] from a spec."""
     origin = _origin(base)
     base_path = (spec.get("basePath") or "").rstrip("/")  # swagger 2
     out: list[dict] = []
@@ -59,12 +77,13 @@ def parse_spec(spec: dict, base: str) -> list[dict]:
         for method, op in methods.items():
             if method.lower() not in ("get", "post", "put", "delete", "patch"):
                 continue
-            params = list(path_level_params)
-            if isinstance(op, dict):
-                params += op.get("parameters") or []
+            if not isinstance(op, dict):
+                op = {}
+            params = list(path_level_params) + (op.get("parameters") or [])
             qp = sorted({pm["name"] for pm in params
                          if isinstance(pm, dict) and pm.get("in") == "query" and pm.get("name")})
-            out.append({"url": full, "method": method.upper(), "query_params": qp})
+            out.append({"url": full, "method": method.upper(),
+                        "query_params": qp, "body_params": _body_params(op)})
     return out
 
 

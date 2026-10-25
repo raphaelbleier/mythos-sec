@@ -28,6 +28,8 @@ class InjectionPoint:
             query = urlencode(params, doseq=True)
             url = urlunparse(parsed._replace(query=query))
             return url, {}
+        if self.where == "json":
+            return self.url, {"json": params}
         return self.url, {"data": params}
 
     def label(self) -> str:

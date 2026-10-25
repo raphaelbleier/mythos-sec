@@ -36,3 +36,20 @@ def test_api_sensitive_response_flagged(client, vulnapp):
 def test_api_check_ignores_clean_json(client, vulnapp):
     f = check_sensitive_api_response(client, vulnapp + "/api/data")
     assert f == []
+
+
+def test_body_params_parsed_from_openapi():
+    spec = {"paths": {"/users/v1/login": {"post": {"requestBody": {"content": {
+        "application/json": {"schema": {"properties": {"username": {}, "password": {}}}}}}}}}}
+    eps = parse_spec(spec, "http://t")
+    login = [e for e in eps if e["url"].endswith("/users/v1/login")][0]
+    assert set(login["body_params"]) == {"username", "password"}
+
+
+def test_json_body_sqli(client, vulnapp):
+    from mythos.scan.common import InjectionPoint
+    from mythos.scan.quick import check_sqli
+    pt = InjectionPoint(method="POST", url=vulnapp + "/api/jsonlogin",
+                        param="username", where="json")
+    f = check_sqli(client, pt)
+    assert f and f[0].kind == "sqli" and f[0].severity.value == "critical"

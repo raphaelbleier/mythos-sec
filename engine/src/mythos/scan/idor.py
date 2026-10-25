@@ -21,8 +21,15 @@ _ID_PARAM = re.compile(r"(^id$|_id$|uid|user|account|acct|order|invoice|doc|"
 _TOKEN_PARAM = re.compile(r"(token|csrf|nonce|xsrf|captcha|_wpnonce|authenticity)", re.I)
 
 
+# auth/registration endpoints are not object references
+_AUTH_PATH = re.compile(r"(register|signup|sign-up|login|signin|sign-in|logout|"
+                        r"create|auth|token|session)", re.I)
+
+
 def check_idor(client: HttpClient, point: InjectionPoint) -> list[Finding]:
     if _TOKEN_PARAM.search(point.param):
+        return []
+    if _AUTH_PATH.search(point.url):
         return []
     if not _ID_PARAM.search(point.param):
         return []
