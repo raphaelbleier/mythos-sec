@@ -54,7 +54,7 @@ class AgentResult:
 
 def run_agent(target: str, scope: Scope, *, backend_name: str = "claude-cli",
               model: str = "claude-opus-4-8", max_steps: int = 25,
-              proxy: str | None = None,
+              proxy: str | None = None, objective: str = "",
               workdir: Path | None = None, log=print) -> AgentResult:
     client = HttpClient(scope=scope, proxy=proxy)
     state = AgentState(target=target, client=client)
@@ -69,7 +69,8 @@ def run_agent(target: str, scope: Scope, *, backend_name: str = "claude-cli",
     step = 0
     while step < max_steps:
         step += 1
-        prompt = render_prompt(target, scope_desc, tools, transcript, step, max_steps)
+        prompt = render_prompt(target, scope_desc, tools, transcript, step, max_steps,
+                               objective=objective)
         try:
             reply = backend.complete(SYSTEM, prompt)
         except Exception as e:

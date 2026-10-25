@@ -27,8 +27,11 @@ Do not wrap the JSON in markdown. Output only the JSON object.
 
 
 def render_prompt(target: str, scope_desc: str, tools: dict, transcript: list[dict],
-                  step: int, max_steps: int) -> str:
-    lines = [f"Engagement target: {target}", f"Scope: {scope_desc}", ""]
+                  step: int, max_steps: int, objective: str = "") -> str:
+    lines = [f"Engagement target: {target}", f"Scope: {scope_desc}"]
+    if objective:
+        lines.append(f"OBJECTIVE: {objective}")
+    lines.append("")
     lines.append("Available tools:")
     for t in tools.values():
         lines.append(f"- {t.name}: {t.description}")

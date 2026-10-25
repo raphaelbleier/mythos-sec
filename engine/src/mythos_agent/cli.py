@@ -28,6 +28,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-steps", type=int, default=25, dest="max_steps")
     ap.add_argument("--proxy", help="route all agent HTTP via an upstream proxy "
                     "(Burp/Caido/ZAP), e.g. http://127.0.0.1:8080")
+    ap.add_argument("--objective", default="",
+                    help="explicit goal, e.g. 'capture the flag (flag{...})' for CTF/benchmark")
     ap.add_argument("--workdir")
     args = ap.parse_args(argv)
 
@@ -39,7 +41,7 @@ def main(argv=None) -> int:
         scope = Scope.from_dict({"target": args.target, "in_scope": [host]})
 
     res = run_agent(args.target, scope, backend_name=args.backend, model=args.model,
-                    max_steps=args.max_steps, proxy=args.proxy,
+                    max_steps=args.max_steps, proxy=args.proxy, objective=args.objective,
                     workdir=Path(args.workdir) if args.workdir else None,
                     log=lambda *a: print(*a, file=sys.stderr))
     c = res.store.counts()
