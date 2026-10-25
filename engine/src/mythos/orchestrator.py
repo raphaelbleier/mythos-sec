@@ -231,14 +231,16 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
                       if "?" in e.url or e.params]
         if external.have("dalfox"):
             log("[scan] dalfox XSS on parameterized endpoints")
-            for url in param_urls[:40]:
+            for url in param_urls[:12]:
                 if scope.contains(url):
-                    _safe(res.store, lambda u=url: external.dalfox(_with_params(u, cres)))
+                    _safe(res.store,
+                          lambda u=url: external.dalfox(_with_params(u, cres), timeout=90))
         if external.have("sqlmap") and scope.rules.allow_exploit:
             log("[scan] sqlmap on parameterized endpoints")
-            for url in param_urls[:15]:
+            for url in param_urls[:6]:
                 if scope.contains(url):
-                    _safe(res.store, lambda u=url: external.sqlmap(_with_params(u, cres)))
+                    _safe(res.store,
+                          lambda u=url: external.sqlmap(_with_params(u, cres), timeout=180))
         if external.have("nikto"):
             log("[scan] nikto server scan")
             _safe(res.store, lambda: external.nikto(target))

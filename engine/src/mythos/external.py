@@ -151,8 +151,10 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
         return []
     with tempfile.NamedTemporaryFile("r", suffix=".jsonl", delete=False) as tf:
         out_path = tf.name
+    # bounded concurrency + rate limit keep nuclei's memory/footprint in check
     cmd = ["nuclei", "-u", url, "-jsonl", "-o", out_path, "-silent",
-           "-severity", severity, "-no-color"]
+           "-severity", severity, "-no-color", "-c", "15", "-rl", "150",
+           "-timeout", "8", "-retries", "1"]
     if extra:
         cmd += extra
     _run(cmd, timeout=timeout)

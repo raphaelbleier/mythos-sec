@@ -63,9 +63,22 @@ class CoverageMatrix:
                      for s in e.values() if s != "untested")
         findings = sum(1 for e in self.cells.values()
                        for s in e.values() if s == "finding")
-        return {"endpoints": len(self.endpoints), "cells": total,
-                "tested": tested, "findings": findings,
-                "coverage_pct": round(100 * tested / total, 1) if total else 0.0}
+        # endpoints that were exercised by at least one check (the meaningful
+        # "did we cover the surface" number; matrix_fill_pct below is the raw
+        # cell fraction and is naturally low because most classes don't apply
+        # to most endpoints — it is not a recall figure).
+        endpoints_tested = sum(1 for e in self.cells.values()
+                               if any(s != "untested" for s in e.values()))
+        n_ep = len(self.endpoints)
+        return {
+            "endpoints": n_ep,
+            "endpoints_tested": endpoints_tested,
+            "surface_coverage_pct": round(100 * endpoints_tested / n_ep, 1) if n_ep else 0.0,
+            "cells": total,
+            "cells_tested": tested,
+            "matrix_fill_pct": round(100 * tested / total, 1) if total else 0.0,
+            "findings": findings,
+        }
 
     def to_dict(self) -> dict:
         return {"endpoints": self.endpoints, "cells": self.cells,
