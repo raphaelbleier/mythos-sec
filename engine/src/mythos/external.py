@@ -37,10 +37,14 @@ _SEV = {
 
 
 def have(tool: str) -> bool:
-    # MYTHOS_NO_EXTERNAL forces the pure-Python path even inside the toolbox
-    # (useful on memory-constrained hosts: skips nuclei/sqlmap subprocess spikes).
+    # MYTHOS_NO_EXTERNAL forces the pure-Python path even inside the toolbox.
+    # MYTHOS_SKIP_TOOLS=nuclei,amass disables only named tools (e.g. drop the
+    # memory-heavy nuclei on constrained hosts while keeping katana/arjun/dalfox).
     import os
     if os.environ.get("MYTHOS_NO_EXTERNAL"):
+        return False
+    skip = {t.strip() for t in os.environ.get("MYTHOS_SKIP_TOOLS", "").split(",") if t.strip()}
+    if tool in skip:
         return False
     return shutil.which(tool) is not None
 

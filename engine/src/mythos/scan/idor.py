@@ -17,9 +17,13 @@ from .common import InjectionPoint, send
 
 _ID_PARAM = re.compile(r"(^id$|_id$|uid|user|account|acct|order|invoice|doc|"
                        r"file|object|num|ref|customer|profile)", re.I)
+# anti-CSRF / session tokens are not object references — never flag them as IDOR
+_TOKEN_PARAM = re.compile(r"(token|csrf|nonce|xsrf|captcha|_wpnonce|authenticity)", re.I)
 
 
 def check_idor(client: HttpClient, point: InjectionPoint) -> list[Finding]:
+    if _TOKEN_PARAM.search(point.param):
+        return []
     if not _ID_PARAM.search(point.param):
         return []
     base_val = point.base_params.get(point.param, "1")
