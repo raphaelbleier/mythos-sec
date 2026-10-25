@@ -107,6 +107,27 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
             cres.pages = native.pages
         else:
             cres = crawl_mod.crawl(client, target, max_pages=max_pages)
+
+        # Parameter discovery (arjun): give parameterless REST/SPA endpoints
+        # testable parameters so the scan phase has injection points on APIs.
+        if external.have("arjun") and mode in ("standard", "deep"):
+            log("[recon] arjun parameter discovery")
+            cands = [target] + [e.url for e in cres.endpoints.values()
+                                if not e.params and "?" not in e.url]
+            cands = sorted(set(cands),
+                           key=lambda u: 0 if re.search(
+                               r"(api|rest|search|query|json|graphql|lookup|find)",
+                               u, re.I) else 1)
+            for u in cands[:6]:
+                if not scope.contains(u):
+                    continue
+                try:
+                    params = external.arjun(u, timeout=60)
+                except Exception:
+                    params = []
+                if params:
+                    cres.add_endpoint(u, params, "arjun")
+
         res.crawl = cres.to_dict()
         log(f"[recon] {len(cres.endpoints)} endpoints, {len(cres.forms)} forms, "
             f"{len(cres.pages)} pages")

@@ -54,11 +54,32 @@ class ScopeRules:
 
 
 @dataclass
+class Auth:
+    """Authenticated-scanning credentials, applied to every in-scope request."""
+    cookies: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    bearer: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Auth":
+        d = d or {}
+        return cls(
+            cookies={str(k): str(v) for k, v in (d.get("cookies") or {}).items()},
+            headers={str(k): str(v) for k, v in (d.get("headers") or {}).items()},
+            bearer=str(d.get("bearer", "")),
+        )
+
+    def active(self) -> bool:
+        return bool(self.cookies or self.headers or self.bearer)
+
+
+@dataclass
 class Scope:
     target: str = ""
     in_scope: list[str] = field(default_factory=list)
     out_of_scope: list[str] = field(default_factory=list)
     rules: ScopeRules = field(default_factory=ScopeRules)
+    auth: Auth = field(default_factory=Auth)
     program: str = ""
     notes: str = ""
 
@@ -70,6 +91,7 @@ class Scope:
             in_scope=[str(x) for x in (d.get("in_scope") or [])],
             out_of_scope=[str(x) for x in (d.get("out_of_scope") or [])],
             rules=ScopeRules.from_dict(d.get("rules") or {}),
+            auth=Auth.from_dict(d.get("auth") or {}),
             program=str(d.get("program", "")),
             notes=str(d.get("notes", "")),
         )

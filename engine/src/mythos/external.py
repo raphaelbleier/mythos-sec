@@ -105,6 +105,28 @@ def httpx_probe(hosts: list[str], timeout: int = 300) -> list[dict]:
     return rows
 
 
+def arjun(url: str, timeout: int = 180) -> list[str]:
+    """Discover hidden query/body parameters on an endpoint. Returns param names."""
+    if not have("arjun"):
+        return []
+    with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as tf:
+        out_path = tf.name
+    _run(["arjun", "-u", url, "-oJ", out_path, "-q"], timeout=timeout)
+    names: set[str] = set()
+    try:
+        data = json.loads(Path(out_path).read_text()) if Path(out_path).exists() else {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    # arjun JSON: { "<url>": {"params": [...], ...} } or {"<url>": [...]}
+    for v in (data.values() if isinstance(data, dict) else []):
+        if isinstance(v, dict):
+            names.update(v.get("params") or [])
+        elif isinstance(v, list):
+            names.update(v)
+    Path(out_path).unlink(missing_ok=True)
+    return sorted(n for n in names if isinstance(n, str))
+
+
 def katana(url: str, timeout: int = 300, depth: int = 3) -> list[str]:
     if not have("katana"):
         return []

@@ -67,6 +67,14 @@ class HttpClient:
         s.mount("https://", adapter)
         s.headers.update({"User-Agent": DEFAULT_UA, "Accept": "*/*"})
         s.headers.update(self.extra_headers)
+        # authenticated scanning: apply scope auth (cookies / headers / bearer)
+        auth = getattr(self.scope, "auth", None)
+        if auth is not None and auth.active():
+            s.headers.update(auth.headers)
+            if auth.bearer:
+                s.headers["Authorization"] = f"Bearer {auth.bearer}"
+            for ck, cv in auth.cookies.items():
+                s.cookies.set(ck, cv)
         if self.proxy:
             s.proxies.update({"http": self.proxy, "https": self.proxy})
         self._session = s

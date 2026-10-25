@@ -22,6 +22,8 @@ from ..http_client import HttpClient, ScopeViolation, BudgetExceeded
 _JS_ENDPOINT = re.compile(r"""["'](/[a-zA-Z0-9_\-./]{2,120})""")
 _SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
              ".woff2", ".ttf", ".eot", ".css", ".pdf", ".zip", ".mp4", ".webp")
+# never follow these during authenticated crawls: they destroy the session
+_SESSION_KILLERS = re.compile(r"(logout|signout|sign-out|logoff|log-off|/exit|destroy)", re.I)
 
 
 @dataclass
@@ -116,6 +118,8 @@ def crawl(client: HttpClient, seed: str, *, max_pages: int = 150,
         # links
         for a in soup.find_all("a", href=True):
             nxt = urljoin(url, a["href"])
+            if _SESSION_KILLERS.search(nxt):
+                continue  # don't log ourselves out mid-crawl
             if nxt.startswith(("http://", "https://")) and _same_site(seed_host, nxt) \
                     and client.scope.contains(nxt):
                 nq = parse_qs(urlparse(nxt).query)

@@ -39,6 +39,13 @@ def _client(args) -> HttpClient:
         if ":" in h:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
+    # CLI auth overrides/augments scope.auth
+    for c in getattr(args, "cookie", None) or []:
+        if "=" in c:
+            k, v = c.split("=", 1)
+            scope.auth.cookies[k.strip()] = v.strip()
+    if getattr(args, "bearer", None):
+        scope.auth.bearer = args.bearer
     return HttpClient(scope=scope, proxy=getattr(args, "proxy", None),
                       extra_headers=headers)
 
@@ -106,6 +113,9 @@ def _add_common(p: argparse.ArgumentParser, with_url: bool = True) -> None:
     p.add_argument("--scope", help="path to scope.yaml (overrides single-host default)")
     p.add_argument("--proxy", help="upstream proxy, e.g. http://127.0.0.1:8080 (Burp)")
     p.add_argument("--header", action="append", help="extra header 'Name: value' (repeatable)")
+    p.add_argument("--cookie", action="append",
+                   help="auth cookie 'name=value' for authenticated scanning (repeatable)")
+    p.add_argument("--bearer", help="Authorization: Bearer token for authenticated scanning")
     p.add_argument("--rps", type=float, help="requests per second ceiling")
 
 

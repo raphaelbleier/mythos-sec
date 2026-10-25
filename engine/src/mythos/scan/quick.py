@@ -61,9 +61,16 @@ _SQL_ERRORS = [
     r"quoted string not properly terminated",
     r"pg_query\(\)|postgresql.*error",
     r"sqlite3?\.(OperationalError|Warning)",
+    r"SQLITE_ERROR",
+    r"unrecognized token:",
+    r'near ".+": syntax error',
     r"ORA-\d{5}",
     r"syntax error at or near",
     r"SQLSTATE\[",
+    r"com\.mysql\.jdbc",
+    r"org\.hibernate",
+    r"System\.Data\.SqlClient",
+    r"MySqlException",
 ]
 _SQL_RX = re.compile("|".join(_SQL_ERRORS), re.I)
 
