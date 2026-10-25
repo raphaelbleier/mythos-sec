@@ -154,7 +154,7 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         # Templated scan across the whole target (fast, broad).
         if external.have("nuclei"):
             log("[scan] nuclei templated scan")
-            res.store.extend(external.nuclei(target, timeout=300))
+            _safe(res.store, lambda: external.nuclei(target, timeout=300))
 
         # Native checks on every injection point. quick = headline classes;
         # standard adds SSTI/CRLF/IDOR; deep adds the slow time-based oracles.
@@ -204,22 +204,23 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         if oast is not None:
             oast.stop()
 
-        # Deep per-endpoint tools on parameterized GET endpoints.
+        # Deep per-endpoint tools on parameterized GET endpoints. Each tool is
+        # isolated: a parser error or crash in one never aborts the engagement.
         param_urls = [e.url for e in cres.endpoints.values()
                       if "?" in e.url or e.params]
         if external.have("dalfox"):
             log("[scan] dalfox XSS on parameterized endpoints")
             for url in param_urls[:40]:
                 if scope.contains(url):
-                    res.store.extend(external.dalfox(_with_params(url, cres)))
+                    _safe(res.store, lambda u=url: external.dalfox(_with_params(u, cres)))
         if external.have("sqlmap") and scope.rules.allow_exploit:
             log("[scan] sqlmap on parameterized endpoints")
             for url in param_urls[:15]:
                 if scope.contains(url):
-                    res.store.extend(external.sqlmap(_with_params(url, cres)))
+                    _safe(res.store, lambda u=url: external.sqlmap(_with_params(u, cres)))
         if external.have("nikto"):
             log("[scan] nikto server scan")
-            res.store.extend(external.nikto(target))
+            _safe(res.store, lambda: external.nikto(target))
     elif do_scan:
         log("[scan] skipped: scope rules.allow_active is false")
 
@@ -267,6 +268,15 @@ def _with_params(url: str, cres) -> str:
     if not q and names:
         q = {n: ["1"] for n in names}
     return urlunparse(p._replace(query=urlencode(q, doseq=True)))
+
+
+def _safe(store, fn) -> None:
+    """Run an external-tool call, swallowing any failure so one tool never
+    aborts the engagement. Findings it returns are merged into the store."""
+    try:
+        store.extend(fn() or [])
+    except Exception:
+        pass
 
 
 def _oast_host() -> str:

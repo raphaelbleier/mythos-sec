@@ -223,17 +223,26 @@ def nikto(url: str, timeout: int = 900) -> list[Finding]:
           "-maxtime", str(timeout - 30), "-nointeractive"], timeout=timeout)
     findings: list[Finding] = []
     try:
-        data = json.loads(Path(out_path).read_text()) if Path(out_path).exists() else {}
+        data = json.loads(Path(out_path).read_text()) if Path(out_path).exists() else []
     except (json.JSONDecodeError, OSError):
-        data = {}
-    for v in (data.get("vulnerabilities") or []):
+        data = []
+    # nikto -Format json emits either a list of host objects or a single dict;
+    # each host carries a "vulnerabilities" list.
+    hosts = data if isinstance(data, list) else [data]
+    vulns = []
+    for host in hosts:
+        if isinstance(host, dict):
+            vulns.extend(host.get("vulnerabilities") or [])
+    for v in vulns:
+        if not isinstance(v, dict):
+            continue
         findings.append(Finding(
-            title=f"Nikto: {v.get('msg','web server issue')[:80]}",
+            title=f"Nikto: {str(v.get('msg', 'web server issue'))[:80]}",
             severity=Severity.LOW, kind="nikto-" + str(v.get("id", "")),
-            url=v.get("url", url), description=v.get("msg", ""),
+            url=v.get("url", url), description=str(v.get("msg", "")),
             impact="Server-side misconfiguration or known issue reported by nikto.",
             remediation="Review the reported item against hardening guidance.",
-            evidence=Evidence(matched=v.get("id", ""), note=v.get("msg", "")),
+            evidence=Evidence(matched=str(v.get("id", "")), note=str(v.get("msg", ""))),
             source="nikto", confidence="tentative"))
     Path(out_path).unlink(missing_ok=True)
     return findings
