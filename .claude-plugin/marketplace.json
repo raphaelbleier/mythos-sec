@@ -1,0 +1,17 @@
+{
+  "name": "mythos-sec",
+  "owner": {
+    "name": "raphaelbleier"
+  },
+  "metadata": {
+    "description": "Mythos security framework marketplace: the mythos-sec web red-team plugin.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "mythos-sec",
+      "source": "./",
+      "description": "Autonomous web red-team and bug-bounty framework (/cybersecurity)."
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "description": "Known vulnerabilities in lab/vulnapp/app.py. Used by the evaluation harness to score detection coverage and false-positive rate.",
+  "expected_findings": [
+    { "kind": "reflected-xss", "path": "/search", "param": "q" },
+    { "kind": "sqli", "path": "/user", "param": "id" },
+    { "kind": "open-redirect", "path": "/go", "param": "next" },
+    { "kind": "path-traversal", "path": "/download", "param": "file" },
+    { "kind": "cors-misconfig", "path": "/api/data", "param": "" },
+    { "kind": "sensitive-exposure", "path": "/.env", "param": "" },
+    { "kind": "cookie-flags", "path": "/profile", "param": "session" }
+  ],
+  "must_not_flag": [
+    {
+      "kind": "reflected-xss",
+      "path": "/safe",
+      "param": "q",
+      "reason": "output is HTML-escaped; flagging it is a false positive"
+    }
+  ]
+}

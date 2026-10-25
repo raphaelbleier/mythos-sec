@@ -1,0 +1,37 @@
+# Mythos test lab: deliberately vulnerable targets on an isolated network.
+# For LOCAL testing of the framework only. Never expose these ports publicly.
+#
+#   start:  docker compose -f lab/docker-compose.yml up -d
+#   stop:   docker compose -f lab/docker-compose.yml down
+#
+# Targets:
+#   vulnapp    http://localhost:5001   ground-truth app (known findings)
+#   juiceshop  http://localhost:3000   OWASP Juice Shop (modern JS web app)
+#   dvwa       http://localhost:4280   Damn Vulnerable Web App (classic)
+name: mythos-lab
+
+networks:
+  mythos-lab:
+    driver: bridge
+
+services:
+  vulnapp:
+    build: ./vulnapp
+    container_name: mythos-vulnapp
+    ports:
+      - "127.0.0.1:5001:5000"
+    networks: [mythos-lab]
+
+  juiceshop:
+    image: bkimminich/juice-shop:v17.1.1
+    container_name: mythos-juiceshop
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [mythos-lab]
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: mythos-dvwa
+    ports:
+      - "127.0.0.1:4280:80"
+    networks: [mythos-lab]

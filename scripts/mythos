@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Mythos host wrapper: run the engine (and the tools it orchestrates) inside the
+# Kali toolbox container, with the repo mounted so engagement paths match.
+#
+#   scripts/mythos engage https://target --scope engagements/t/scope.yaml --workdir engagements/t
+#   scripts/mythos tools
+#   scripts/mythos fingerprint https://target
+#
+# Falls back to the host engine only if explicitly asked with MYTHOS_NATIVE=1
+# (the native path needs the engine deps importable on the host).
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMG="${MYTHOS_IMAGE:-mythos-toolbox}"
+NAME="${MYTHOS_CONTAINER:-mythos-toolbox}"
+
+if [ "${MYTHOS_NATIVE:-0}" = "1" ]; then
+  exec python3 -m mythos.cli "$@"
+fi
+
+# Reach the docker daemon; re-exec under the docker group if needed.
+if ! docker info >/dev/null 2>&1; then
+  if command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
+    exec sg docker -c "$(printf '%q ' "${BASH_SOURCE[0]}" "$@")"
+  fi
+  echo "mythos: cannot reach the Docker daemon." >&2
+  echo "  Enable Docker Desktop -> Settings -> Resources -> WSL integration for this distro," >&2
+  echo "  or run from a shell where your user is in the 'docker' group." >&2
+  exit 1
+fi
+
+# Build the toolbox image on first use.
+if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+  echo "mythos: toolbox image '$IMG' not found; building (first run, a few minutes)..." >&2
+  docker build -t "$IMG" -f "$REPO/toolbox/Dockerfile" "$REPO" >&2
+fi
+
+# Ensure a long-lived container is up, with the repo mounted at /repo.
+if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker run -d --name "$NAME" \
+    --add-host=host.docker.internal:host-gateway \
+    -v "$REPO:/repo" -w /repo "$IMG" >/dev/null
+fi
+
+exec docker exec -w /repo "$NAME" mythos "$@"

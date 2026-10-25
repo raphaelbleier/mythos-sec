@@ -1,0 +1,14 @@
+{
+  "description": "Hard (advanced) known vulnerabilities in lab/vulnapp/app.py. Used by the evaluation harness in deep mode.",
+  "expected_findings": [
+    { "kind": "ssti", "path": "/render", "param": "name" },
+    { "kind": "command-injection", "path": "/ping", "param": "host" },
+    { "kind": "sqli", "path": "/blind", "param": "id" },
+    { "kind": "crlf-injection", "path": "/log", "param": "msg" },
+    { "kind": "ssrf", "path": "/fetch", "param": "url" },
+    { "kind": "graphql-introspection", "path": "/graphql", "param": "" },
+    { "kind": "jwt-weak-secret", "path": "/api/login", "param": "" },
+    { "kind": "idor", "path": "/api/account", "param": "id" }
+  ],
+  "must_not_flag": []
+}

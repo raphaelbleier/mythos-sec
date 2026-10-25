@@ -1,0 +1,15 @@
+{
+  "expected": 7,
+  "covered": 7,
+  "missed": [],
+  "total_findings": 11,
+  "false_positives": [],
+  "coverage": 1.0,
+  "false_positive_rate": 0.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "target": "http://127.0.0.1:5000",
+  "requests": 92,
+  "tools_used": {}
+}

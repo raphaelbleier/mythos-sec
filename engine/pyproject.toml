@@ -1,0 +1,28 @@
+[project]
+name = "mythos-engine"
+version = "0.1.0"
+description = "Mythos web red-team engine: scope-aware HTTP recon and vulnerability probing that works against any web application."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "PyYAML>=6.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+mythos = "mythos.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: time-based checks that add ~seconds (deselect with -m 'not slow')",
+]
+testpaths = ["tests"]

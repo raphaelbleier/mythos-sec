@@ -1,0 +1,21 @@
+# engagement data — never commit target data, loot, scope specifics
+engagements/*
+!engagements/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# tool output
+*.log
+nuclei-output/
+*.tmp
+
+# OS
+.DS_Store
