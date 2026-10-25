@@ -31,5 +31,12 @@
     "result": "autonomous engagement detects critical SQL injection at /rest/products/search?q= (SQLITE_ERROR) end-to-end, plus BOLA on /api/Challenges",
     "chain": "crawl -> JS/template-literal mining -> query-param capture -> native SQLi check",
     "note": "full nuclei pass OOMs on this 3.7GB VM; run gentle (low rps, nuclei skipped) here"
-  }
+  },
+  "vampi": {
+    "target": "VAmPI (vulnerable REST API)",
+    "discovery": "OpenAPI spec import (/openapi.json) -> 13 endpoints (link-crawl found 1)",
+    "result": "HIGH sensitive-data exposure at /users/v1/_debug (dumps every user's credentials), detected autonomously",
+    "demonstrates": "API red teaming: spec import + excessive-data-exposure check"
+  },
+  "summary_real_apps": "4 real apps with genuine findings: Juice Shop (SPA, crit SQLi), DVWA (authenticated, 2 crit SQLi + 4 XSS), VAmPI (API, cred disclosure), vulnapp (15/15 + 32 multi-tool)"
 }

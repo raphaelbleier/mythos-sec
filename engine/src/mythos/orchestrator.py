@@ -108,6 +108,21 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         else:
             cres = crawl_mod.crawl(client, target, max_pages=max_pages)
 
+        # API surface: import an OpenAPI/Swagger spec (pure APIs have no link
+        # graph to crawl) and fold in operator-supplied seed endpoints.
+        from .recon import openapi as openapi_mod
+        from urllib.parse import urljoin as _urljoin
+        api_eps = openapi_mod.import_endpoints(client, target)
+        if api_eps:
+            log(f"[recon] OpenAPI spec: imported {len(api_eps)} endpoints")
+            for e in api_eps:
+                if scope.contains(e["url"]):
+                    cres.add_endpoint(e["url"], e["query_params"], "openapi")
+        for s in scope.seed_endpoints:
+            u = s if s.startswith("http") else _urljoin(target, s)
+            if scope.contains(u):
+                cres.add_endpoint(u, [], "seed")
+
         # Parameter discovery (arjun): give parameterless REST/SPA endpoints
         # testable parameters so the scan phase has injection points on APIs.
         if external.have("arjun") and mode in ("standard", "deep"):
@@ -155,10 +170,12 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
                 surface.append(u)
             if len(surface) >= 40:
                 break
+        from .scan import api as api_mod
         for u in surface:
             try:
                 res.store.extend(headers_mod.check_cookies(client, u))
                 res.store.extend(headers_mod.check_cors(client, u))
+                res.store.extend(api_mod.check_sensitive_api_response(client, u))
             except (ScopeViolation, BudgetExceeded):
                 break
             except Exception:

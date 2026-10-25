@@ -1,0 +1,38 @@
+"""OpenAPI import parsing (offline) and the API sensitive-data check."""
+
+from mythos.recon.openapi import parse_spec
+from mythos.scan.api import check_sensitive_api_response
+
+SPEC = {
+    "basePath": "",
+    "paths": {
+        "/users/v1": {"get": {"parameters": [{"name": "limit", "in": "query"}]}},
+        "/users/v1/{username}": {"get": {"parameters": [{"name": "username", "in": "path"}]}},
+        "/users/v1/login": {"post": {}},
+        "/books/v1/{title}": {"get": {}},
+    },
+}
+
+
+def test_parse_spec_builds_concrete_endpoints():
+    eps = parse_spec(SPEC, "http://t")
+    urls = {(e["url"].split("http://t")[-1], e["method"]) for e in eps}
+    assert ("/users/v1", "GET") in urls
+    assert ("/users/v1/1", "GET") in urls          # {username} -> 1
+    assert ("/users/v1/login", "POST") in urls
+    # query param captured
+    users = [e for e in eps if e["url"].endswith("/users/v1") and e["method"] == "GET"][0]
+    assert "limit" in users["query_params"]
+
+
+def test_api_sensitive_response_flagged(client, vulnapp):
+    f = check_sensitive_api_response(client, vulnapp + "/api/debug")
+    assert f and f[0].kind == "sensitive-exposure"
+    assert f[0].severity.value == "high"      # >=3 sensitive fields (password/token x2)
+    # the actual secret values must be redacted in evidence
+    assert "s3cr3t" not in f[0].evidence.response
+
+
+def test_api_check_ignores_clean_json(client, vulnapp):
+    f = check_sensitive_api_response(client, vulnapp + "/api/data")
+    assert f == []

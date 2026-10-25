@@ -80,6 +80,9 @@ class Scope:
     out_of_scope: list[str] = field(default_factory=list)
     rules: ScopeRules = field(default_factory=ScopeRules)
     auth: Auth = field(default_factory=Auth)
+    # operator-supplied known API endpoints (realistic for bounty: you know the
+    # API). Paths or full URLs; added to the crawl surface and scanned.
+    seed_endpoints: list[str] = field(default_factory=list)
     program: str = ""
     notes: str = ""
 
@@ -92,6 +95,7 @@ class Scope:
             out_of_scope=[str(x) for x in (d.get("out_of_scope") or [])],
             rules=ScopeRules.from_dict(d.get("rules") or {}),
             auth=Auth.from_dict(d.get("auth") or {}),
+            seed_endpoints=[str(x) for x in (d.get("seed_endpoints") or [])],
             program=str(d.get("program", "")),
             notes=str(d.get("notes", "")),
         )

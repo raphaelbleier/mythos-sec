@@ -243,6 +243,15 @@ def api_account():
     return ACCOUNTS.get(aid, {"error": "not found"})
 
 
+@app.route("/api/debug")
+def api_debug():
+    # VULN: excessive data exposure — dumps every user's credentials unauth
+    return {"users": [
+        {"name": "alice", "password": "s3cr3t", "token": "ey.alice"},
+        {"name": "bob", "password": "hunter2", "token": "ey.bob"},
+    ]}
+
+
 if __name__ == "__main__":
     import os
     # threaded so the dev server survives concurrent scanner traffic
