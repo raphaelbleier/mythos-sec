@@ -11,20 +11,24 @@ from __future__ import annotations
 import re
 from collections import deque
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse, parse_qs, urldefrag
+from urllib.parse import urljoin, urlparse, parse_qs, urldefrag, urlunparse
 
 from bs4 import BeautifulSoup
 
 from ..http_client import HttpClient, ScopeViolation, BudgetExceeded
 
-# endpoints referenced from JS, two complementary patterns:
+# endpoints referenced from JS, two complementary patterns. Both optionally
+# capture a trailing query string so parameter names (e.g. ?q=) are recovered
+# straight from the source without needing a separate discovery step.
+_Q = r"(?:\?[a-zA-Z0-9_\-=&%.]{0,80})?"
 #   quoted root-relative paths:  "/api/x", fetch("/y?a=1")
-_JS_ENDPOINT = re.compile(r"""["'](/[a-zA-Z0-9_\-./]{2,120})""")
+_JS_ENDPOINT = re.compile(r"""["'](/[a-zA-Z0-9_\-./]{2,120}""" + _Q + r")")
 #   api/rest/graphql/vN paths ANYWHERE (even in template literals like
-#   `${base}/rest/products/search`): the prefix is specific enough to be safe.
+#   `${base}/rest/products/search?q=`): the prefix is specific enough to be safe.
 #   A non-word lookbehind avoids matching mid-identifier.
 _JS_API = re.compile(
-    r"(?<![A-Za-z0-9_])(/?(?:api|rest|graphql|v[0-9]+)/[a-zA-Z0-9_\-./]{1,120})")
+    r"(?<![A-Za-z0-9_])(/?(?:api|rest|graphql|v[0-9]+)/[a-zA-Z0-9_\-./]{1,120}"
+    + _Q + r")")
 _SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
              ".woff2", ".ttf", ".eot", ".css", ".pdf", ".zip", ".mp4", ".webp")
 # never follow these during authenticated crawls: they destroy the session
@@ -58,11 +62,17 @@ class CrawlResult:
 
     def add_endpoint(self, url: str, params: list[str], source: str) -> None:
         url, _ = urldefrag(url)
-        ep = self.endpoints.get(url)
+        parsed = urlparse(url)
+        # normalize: key endpoints by path (query stripped) and fold the query's
+        # parameter names into the endpoint's params, so '/x?q=' and '/x' merge
+        qparams = list(parse_qs(parsed.query, keep_blank_values=True).keys())
+        base = urlunparse(parsed._replace(query="", fragment=""))
+        allp = set(params) | set(qparams)
+        ep = self.endpoints.get(base)
         if ep is None:
-            self.endpoints[url] = Endpoint(url=url, params=sorted(set(params)), source=source)
+            self.endpoints[base] = Endpoint(url=base, params=sorted(allp), source=source)
         else:
-            ep.params = sorted(set(ep.params) | set(params))
+            ep.params = sorted(set(ep.params) | allp)
 
     def to_dict(self) -> dict:
         return {
@@ -179,7 +189,8 @@ def _mine_js(result: CrawlResult, seed_host: str, base: str, body: str,
         # directory of the JS file (which may live under /assets/)
         full = urljoin(origin + "/", m) if not m.startswith("/") else urljoin(origin, m)
         if _same_site(seed_host, full):
-            q = parse_qs(urlparse(full).query)
+            # keep_blank_values so '?q=' (no value) still yields the param name
+            q = parse_qs(urlparse(full).query, keep_blank_values=True)
             result.add_endpoint(full, list(q.keys()), "js")
 
 
