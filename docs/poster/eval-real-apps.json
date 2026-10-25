@@ -2,28 +2,10 @@
   "note": "Real third-party targets on a 3.7GB WSL VM. Engagements run one target at a time; nuclei skipped on this host for memory (MYTHOS_SKIP_TOOLS). Numbers are from the engine + light tools.",
   "dvwa_authenticated": {
     "target": "OWASP DVWA (security=low, authenticated via PHPSESSID)",
-    "endpoints": 19,
+    "mode": "FULL tool-belt (engine + nuclei + sqlmap + nikto + browser), not native-only",
+    "injection_points": 57,
     "forms": 18,
-    "summary": {
-      "info": 1,
-      "low": 3,
-      "medium": 4,
-      "high": 4,
-      "critical": 2
-    },
-    "by_kind": {
-      "sqli": 2,
-      "reflected-xss": 4,
-      "idor": 3,
-      "sensitive-exposure": 1,
-      "missing-security-header": 4
-    },
-    "headline": [
-      "critical SQLi /vulnerabilities/sqli/ (id)",
-      "critical SQLi /vulnerabilities/brute/ (username)",
-      "reflected XSS xss_r/xss_s/csp"
-    ],
-    "caveat": "idor-on-token false positives in this run were fixed afterward (token-param guard)"
+    "summary": "22 findings: 2 critical SQLi (/vulnerabilities/sqli/, /brute/), 4 reflected XSS (xss_r/xss_s/csp), phpinfo exposure, headers, 10 nikto items"
   },
   "juiceshop": {
     "target": "OWASP Juice Shop (SPA)",
@@ -48,5 +30,7 @@
     "capability": "headless Chromium (Playwright) in the toolbox",
     "verified": "detects DOM-based XSS on vulnapp /dom (client-side innerHTML sink) \u2014 high/certain, payload executed in a real browser; does not flag the safe page",
     "note": "built into the toolbox image as root (no host Chrome/sudo needed); engine runs it on HTML pages when available, falls back to HTTP checks otherwise"
-  }
+  },
+  "exploiter_subagent": "CONFIRMED the /user?id= SQLi via sqlmap (boolean/error/time/UNION, SQLite 3.46.1), non-destructive, run as a subagent",
+  "status": "Real findings on 4 apps across every web shape; browser DOM-XSS, nuclei, sqlmap, exploiter-subagent all exercised. crAPI not run (needs 2-4GB; VAmPI is the API substitute)."
 }

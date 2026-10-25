@@ -8,13 +8,15 @@ _Generated 2026-10-25 by mythos-sec. For authorized testing only._
 |---|---|
 | Critical | 2 |
 | High | 4 |
-| Medium | 4 |
-| Low | 3 |
+| Medium | 2 |
+| Low | 13 |
 | Info | 1 |
-| **Total** | **14** |
+| **Total** | **22** |
 
 **Server:** Apache/2.4.25 (Debian)  
 **Technologies:** Apache  
+
+**Tools available:** subfinder, httpx, nuclei, ffuf, sqlmap, nikto, whatweb, nmap
 
 ## Findings
 
@@ -93,18 +95,18 @@ The parameter 'include' reflects input into the HTML response without adequate o
 **Payload / Steps to reproduce:**
 
 ```
-mxf8d495fex'"<svg/onload=1>
+mx6e23afb0x'"<svg/onload=1>
 ```
 
 **Evidence:**
 
 ```http
-POST http://mythos-dvwa/vulnerabilities/csp/ [body:include] payload=mxf8d495fex'"<svg/onload=1>
+POST http://mythos-dvwa/vulnerabilities/csp/ [body:include] payload=mx6e23afb0x'"<svg/onload=1>
 ---
 ass</h1>
 
 	<div class="vulnerable_code_area">
-	<script src='mxf8d495fex'"<svg/onload=1>'></script>
+	<script src='mx6e23afb0x'"<svg/onload=1>'></script>
 
 <form name="csp" met
 [matched] <svg/onload=1>
@@ -129,19 +131,19 @@ The parameter 'name' reflects input into the HTML response without adequate outp
 **Payload / Steps to reproduce:**
 
 ```
-mxeb35e815x'"<svg/onload=1>
+mxf0ade395x'"<svg/onload=1>
 ```
 
 **Evidence:**
 
 ```http
-GET http://mythos-dvwa/vulnerabilities/xss_r/ [query:name] payload=mxeb35e815x'"<svg/onload=1>
+GET http://mythos-dvwa/vulnerabilities/xss_r/ [query:name] payload=mxf0ade395x'"<svg/onload=1>
 ---
 "submit" value="Submit">
 			</p>
 
 		</form>
-		<pre>Hello mxeb35e815x'"<svg/onload=1></pre>
+		<pre>Hello mxf0ade395x'"<svg/onload=1></pre>
 	</div>
 
 	<h2>More Info
@@ -167,18 +169,18 @@ The parameter 'txtName' reflects input into the HTML response without adequate o
 **Payload / Steps to reproduce:**
 
 ```
-mx9409ff0ex'"<svg/onload=1>
+mx0636a065x'"<svg/onload=1>
 ```
 
 **Evidence:**
 
 ```http
-POST http://mythos-dvwa/vulnerabilities/xss_s/ [body:txtName] payload=mx9409ff0ex'"<svg/onload=1>
+POST http://mythos-dvwa/vulnerabilities/xss_s/ [body:txtName] payload=mx0636a065x'"<svg/onload=1>
 ---
 </div>
 	<br />
 
-	<div id="guestbook_comments">Name: mx9409ff0ex'"<svg/onload=1><br />Message: test<br /></div>
+	<div id="guestbook_comments">Name: mx0636a065x'"<svg/onload=1><br />Message: test<br /></div>
 [matched] <svg/onload=1>
 ```
 
@@ -201,17 +203,17 @@ The parameter 'mtxMessage' reflects input into the HTML response without adequat
 **Payload / Steps to reproduce:**
 
 ```
-mxf909c3c9x'"<svg/onload=1>
+mx7239532bx'"<svg/onload=1>
 ```
 
 **Evidence:**
 
 ```http
-POST http://mythos-dvwa/vulnerabilities/xss_s/ [body:mtxMessage] payload=mxf909c3c9x'"<svg/onload=1>
+POST http://mythos-dvwa/vulnerabilities/xss_s/ [body:mtxMessage] payload=mx7239532bx'"<svg/onload=1>
 ---
 >
 
-	<div id="guestbook_comments">Name: test<br />Message: mxf909c3c9x'"<svg/onload=1><br /></div>
+	<div id="guestbook_comments">Name: test<br />Message: mx7239532bx'"<svg/onload=1><br /></div>
 
 	<br />
 
@@ -226,68 +228,6 @@ POST http://mythos-dvwa/vulnerabilities/xss_s/ [body:mtxMessage] payload=mxf909c
 ---
 
 ### 7. 🟡 Potential IDOR / Broken Object Level Authorization
-
-- **Severity:** Medium (`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N`)
-- **Asset:** http://mythos-dvwa/security.php#
-- **Parameter:** `user_token`
-- **Confidence:** tentative
-- **Source:** mythos-engine
-
-Changing 'user_token' from 1 to 2 returns a different object while unauthenticated. If these objects belong to different users, this is an authorization flaw.
-
-**Payload / Steps to reproduce:**
-
-```
-user_token=1 vs 2
-```
-
-**Evidence:**
-
-```http
-POST http://mythos-dvwa/security.php# [body:user_token] (user_token=1 then 2)
----
-len(1)=5470 vs len(2)=5470
-[matched] distinct objects for sequential ids
-```
-
-**Impact:** An attacker can read or modify other users' objects by changing an id.
-
-**Remediation:** Enforce per-object authorization on every request; scope queries to the authenticated principal; use unguessable identifiers.
-
----
-
-### 8. 🟡 Potential IDOR / Broken Object Level Authorization
-
-- **Severity:** Medium (`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N`)
-- **Asset:** http://mythos-dvwa/setup.php#
-- **Parameter:** `user_token`
-- **Confidence:** tentative
-- **Source:** mythos-engine
-
-Changing 'user_token' from 1 to 2 returns a different object while unauthenticated. If these objects belong to different users, this is an authorization flaw.
-
-**Payload / Steps to reproduce:**
-
-```
-user_token=1 vs 2
-```
-
-**Evidence:**
-
-```http
-POST http://mythos-dvwa/setup.php# [body:user_token] (user_token=1 then 2)
----
-len(1)=5522 vs len(2)=5522
-[matched] distinct objects for sequential ids
-```
-
-**Impact:** An attacker can read or modify other users' objects by changing an id.
-
-**Remediation:** Enforce per-object authorization on every request; scope queries to the authenticated principal; use unguessable identifiers.
-
----
-
-### 9. 🟡 Potential IDOR / Broken Object Level Authorization
 
 - **Severity:** Medium (`CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N`)
 - **Asset:** http://mythos-dvwa/vulnerabilities/sqli/#
@@ -318,7 +258,7 @@ len(1)=4538 vs len(2)=4539
 
 ---
 
-### 10. 🟡 phpinfo() information disclosure
+### 8. 🟡 phpinfo() information disclosure
 
 - **Severity:** Medium (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`)
 - **Asset:** http://mythos-dvwa/phpinfo.php
@@ -332,7 +272,7 @@ The path 'phpinfo.php' is reachable and returned HTTP 200.
 ```http
 GET http://mythos-dvwa/phpinfo.php
 ---
-HTTP 200, 90103 bytes
+HTTP 200, 90102 bytes
 [matched] phpinfo.php
 ```
 
@@ -342,7 +282,7 @@ HTTP 200, 90103 bytes
 
 ---
 
-### 11. 🔵 Missing Content-Security-Policy
+### 9. 🔵 Missing Content-Security-Policy
 
 - **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-dvwa
@@ -367,7 +307,7 @@ GET http://mythos-dvwa
 
 ---
 
-### 12. 🔵 Missing HTTP Strict-Transport-Security
+### 10. 🔵 Missing HTTP Strict-Transport-Security
 
 - **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-dvwa
@@ -392,7 +332,7 @@ GET http://mythos-dvwa
 
 ---
 
-### 13. 🔵 Missing X-Frame-Options / frame-ancestors
+### 11. 🔵 Missing X-Frame-Options / frame-ancestors
 
 - **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-dvwa
@@ -417,7 +357,217 @@ GET http://mythos-dvwa
 
 ---
 
-### 14. ⚪ Missing X-Content-Type-Options
+### 12. 🔵 Nikto: Configuration information may be available remotely.
+
+- **Severity:** Low
+- **Asset:** /config/
+- **Confidence:** tentative
+- **Source:** nikto
+
+Configuration information may be available remotely.
+
+**Evidence:**
+
+```http
+[matched] 000998
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 13. 🔵 Nikto: Apache default file found.
+
+- **Severity:** Low
+- **Asset:** /icons/README
+- **Confidence:** tentative
+- **Source:** nikto
+
+Apache default file found.
+
+**Evidence:**
+
+```http
+[matched] 003584
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 14. 🔵 Nikto: Admin login page/section found.
+
+- **Severity:** Low
+- **Asset:** /login.php
+- **Confidence:** tentative
+- **Source:** nikto
+
+Admin login page/section found.
+
+**Evidence:**
+
+```http
+[matched] 006333
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 15. 🔵 Nikto: .gitignore file found. It is possible to grasp the directory structure.
+
+- **Severity:** Low
+- **Asset:** /.gitignore
+- **Confidence:** tentative
+- **Source:** nikto
+
+.gitignore file found. It is possible to grasp the directory structure.
+
+**Evidence:**
+
+```http
+[matched] 007224
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 16. 🔵 Nikto: X-Frame-Options header is deprecated and was replaced with the Content-Security-
+
+- **Severity:** Low
+- **Asset:** /
+- **Confidence:** tentative
+- **Source:** nikto
+
+X-Frame-Options header is deprecated and was replaced with the Content-Security-Policy HTTP header with the frame-ancestors directive.
+
+**Evidence:**
+
+```http
+[matched] 007342
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 17. 🔵 Nikto: The X-Content-Type-Options header is not set. This could allow the user agent to
+
+- **Severity:** Low
+- **Asset:** /
+- **Confidence:** tentative
+- **Source:** nikto
+
+The X-Content-Type-Options header is not set. This could allow the user agent to render the content of the site in a different fashion to the MIME type.
+
+**Evidence:**
+
+```http
+[matched] 007352
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 18. 🔵 Nikto: Suggested security header missing: permissions-policy.
+
+- **Severity:** Low
+- **Asset:** /
+- **Confidence:** tentative
+- **Source:** nikto
+
+Suggested security header missing: permissions-policy.
+
+**Evidence:**
+
+```http
+[matched] 013587
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 19. 🔵 Nikto: Apache/2.4.25 appears to be outdated (current is at least 2.4.68).
+
+- **Severity:** Low
+- **Asset:** /
+- **Confidence:** tentative
+- **Source:** nikto
+
+Apache/2.4.25 appears to be outdated (current is at least 2.4.68).
+
+**Evidence:**
+
+```http
+[matched] 600050
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 20. 🔵 Nikto: Directory indexing found.
+
+- **Severity:** Low
+- **Asset:** /config/
+- **Confidence:** tentative
+- **Source:** nikto
+
+Directory indexing found.
+
+**Evidence:**
+
+```http
+[matched] 750500
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 21. 🔵 Nikto: Directory indexing found.
+
+- **Severity:** Low
+- **Asset:** /docs/
+- **Confidence:** tentative
+- **Source:** nikto
+
+Directory indexing found.
+
+**Evidence:**
+
+```http
+[matched] 750500
+```
+
+**Impact:** Server-side misconfiguration or known issue reported by nikto.
+
+**Remediation:** Review the reported item against hardening guidance.
+
+---
+
+### 22. ⚪ Missing X-Content-Type-Options
 
 - **Severity:** Info (`CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`)
 - **Asset:** http://mythos-dvwa
