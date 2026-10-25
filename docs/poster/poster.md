@@ -74,6 +74,24 @@ closure (dalfox XSS ×2, sqlmap SQLi, JWT weak secret). The pure-Python engine
 also mapped 97 endpoints on live OWASP Juice Shop, confirming the crawler works
 on a real Angular SPA.
 
+**Real third-party targets** (see `docs/poster/eval-real-apps.json`):
+
+- **OWASP DVWA, authenticated** (security=low, session via the cookie-auth
+  feature): a full engagement found 14 findings — 2 critical SQL injections
+  (`/vulnerabilities/sqli/`, `/vulnerabilities/brute/`), 4 reflected XSS
+  (`xss_r`, `xss_s`, `csp`), a phpinfo exposure and missing headers. The
+  authenticated crawl reached 18 forms / 57 injection points, impossible
+  unauthenticated.
+- **OWASP Juice Shop**: the engine detects the critical SQL injection in
+  `/rest/products/search?q=` (SQLITE_ERROR), reproducibly; katana JS-crawling
+  maps 116 endpoints on the SPA.
+
+_Environment caveat: tested on a 3.7 GB VM, so targets run one at a time and the
+memory-heavy nuclei is skipped there (`MYTHOS_SKIP_TOOLS`). SPA endpoints built
+at runtime (Juice Shop XHR) need katana or the browser agent; a static HTTP
+crawl alone misses them. These are honest limits of the test host, not the
+framework._
+
 ## Contribution
 
 Mythos is the intersection of the four frameworks' strengths plus two things
