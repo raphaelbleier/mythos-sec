@@ -43,4 +43,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
     -v "$REPO:/repo" -w /repo "$IMG" >/dev/null
 fi
 
-exec docker exec -w /repo "$NAME" mythos "$@"
+# Use the mounted repo source as authoritative, so engine edits take effect
+# without rebuilding the image. Deps are already installed in the container.
+exec docker exec -e PYTHONPATH=/repo/engine/src -w /repo "$NAME" \
+  python3 -m mythos.cli "$@"

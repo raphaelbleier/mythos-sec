@@ -245,4 +245,6 @@ def api_account():
 
 if __name__ == "__main__":
     import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    # threaded so the dev server survives concurrent scanner traffic
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")),
+            threaded=True, use_reloader=False)

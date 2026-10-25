@@ -93,7 +93,8 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
 
         log("[recon] crawling attack surface")
         if external.have("katana"):
-            urls = [u for u in external.katana(target, depth=3) if scope.contains(u)]
+            urls = [u for u in external.katana(target, depth=3, timeout=90)
+                    if scope.contains(u)]
             cres = crawl_mod.CrawlResult(seed=target)
             for u in urls:
                 from urllib.parse import urlparse as _up, parse_qs
@@ -153,7 +154,7 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         # Templated scan across the whole target (fast, broad).
         if external.have("nuclei"):
             log("[scan] nuclei templated scan")
-            res.store.extend(external.nuclei(target))
+            res.store.extend(external.nuclei(target, timeout=300))
 
         # Native checks on every injection point. quick = headline classes;
         # standard adds SSTI/CRLF/IDOR; deep adds the slow time-based oracles.

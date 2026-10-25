@@ -152,29 +152,43 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
 
 
 def dalfox(url: str, timeout: int = 900) -> list[Finding]:
-    """Dalfox XSS scanner (single URL with query params)."""
+    """Dalfox XSS scanner (v3 CLI). Emits JSONL: first line meta, rest findings."""
     if not have("dalfox") or "?" not in url:
         return []
-    out = _run(["dalfox", "url", url, "--format", "json", "--silence",
-                "--no-color", "--no-spinner"], timeout=timeout)
+    out = _run(["dalfox", "url", "--url", url, "--format", "jsonl",
+                "--silence", "--no-color"], timeout=timeout)
+    return parse_dalfox_jsonl(out, url)
+
+
+def parse_dalfox_jsonl(out: str, url: str = "") -> list[Finding]:
+    """Parse dalfox v3 JSONL (first line meta, rest findings) into Findings."""
     findings: list[Finding] = []
-    try:
-        data = json.loads(out) if out.strip() else []
-    except json.JSONDecodeError:
-        data = []
-    for poc in data if isinstance(data, list) else []:
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or '"meta"' in line[:12]:
+            continue
+        try:
+            poc = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "meta" in poc or not (poc.get("payload") or poc.get("param")):
+            continue
+        sev = _SEV.get(str(poc.get("severity", "high")).lower(), Severity.HIGH)
         findings.append(Finding(
             title="Cross-Site Scripting (XSS) — dalfox",
-            severity=Severity.HIGH, kind="reflected-xss",
+            severity=sev, kind="reflected-xss",
             url=poc.get("data", url), param=poc.get("param", ""),
             payload=poc.get("payload", ""),
-            description="Dalfox confirmed an XSS injection point.",
+            description="Dalfox confirmed an XSS injection point: "
+                        + (poc.get("evidence") or poc.get("message_str") or ""),
             impact="Arbitrary JavaScript execution in a victim's browser.",
             remediation="Context-aware output encoding and a strict CSP.",
+            references=[poc["cwe"]] if poc.get("cwe") else [],
             evidence=Evidence(request=poc.get("data", ""),
                               matched=poc.get("payload", ""),
-                              note=poc.get("type", "")),
-            source="dalfox", confidence="certain"))
+                              note=poc.get("inject_type", "")),
+            source="dalfox",
+            confidence="certain" if poc.get("type") == "V" else "firm"))
     return findings
 
 
