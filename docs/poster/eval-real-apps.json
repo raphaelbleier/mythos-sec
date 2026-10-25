@@ -43,5 +43,10 @@
     "result": "HIGH sensitive-data exposure at /users/v1/_debug (dumps every user's credentials), detected autonomously",
     "demonstrates": "API red teaming: spec import + excessive-data-exposure check"
   },
-  "summary_real_apps": "4 real apps with genuine findings: Juice Shop (SPA, crit SQLi), DVWA (authenticated, 2 crit SQLi + 4 XSS), VAmPI (API, cred disclosure), vulnapp (15/15 + 32 multi-tool)"
+  "summary_real_apps": "4 real apps with genuine findings: Juice Shop (SPA, crit SQLi), DVWA (authenticated, 2 crit SQLi + 4 XSS), VAmPI (API, cred disclosure), vulnapp (15/15 + 32 multi-tool)",
+  "browser_dom_xss": {
+    "capability": "headless Chromium (Playwright) in the toolbox",
+    "verified": "detects DOM-based XSS on vulnapp /dom (client-side innerHTML sink) \u2014 high/certain, payload executed in a real browser; does not flag the safe page",
+    "note": "built into the toolbox image as root (no host Chrome/sudo needed); engine runs it on HTML pages when available, falls back to HTTP checks otherwise"
+  }
 }
