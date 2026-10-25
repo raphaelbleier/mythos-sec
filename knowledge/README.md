@@ -13,3 +13,15 @@ and sourced.
 - [Server-Side Template Injection](web/ssti.md)
 - [JWT / OAuth / Session](web/jwt-oauth.md)
 - [Security Headers, Cookies & CORS](web/headers-cors.md)
+- [Unsafe Deserialization → RCE](web/deserialization.md)
+- [OS Command Injection (CWE-78)](web/command-injection.md)
+- [Path Traversal & Arbitrary File Write](web/path-traversal.md)
+- [Unrestricted File Upload → RCE](web/file-upload.md)
+- [XXE / XML External Entity Injection](web/xxe.md)
+- [GraphQL & Modern API Testing](web/graphql-api.md)
+
+## Techniques
+Cross-cutting methodology used by the `cve-deep-dive` skill.
+- [CVE Triage 2026 (KEV/EPSS pipeline)](techniques/cve-triage-2026.md)
+- [Patch Diffing](techniques/patch-diffing.md)
+- [Exploit Chaining](techniques/exploit-chaining.md)

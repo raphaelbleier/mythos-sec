@@ -32,25 +32,26 @@ flow: recon (whatweb/httpx + katana JS-aware crawl, 56 URLs) → targeted scan �
 exploit. Every confirmed finding below has real tool evidence; see
 `engagements/juiceshop-<date>/report.md` for the full report.
 
-| Finding                                                                                                        | Severity | Status                                                 |
-| -------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------ |
-| SQLi (UNION) in `/rest/products/search?q=` → full Users dump (emails + MD5 hashes; admin cracks to `admin123`) | Critical | Confirmed                                              |
-| Sensitive file disclosure via `/ftp/` directory listing (incl. a KeePass `.kdbx`)                              | High     | Confirmed                                              |
-| Poison-null-byte extension-filter bypass (`.bak` 403 directly, 200 via `%2500.md`)                             | High     | Confirmed                                              |
-| Open redirect in `/redirect?to=` (allowlist-substring bypass)                                                  | Medium   | Confirmed                                              |
-| Info disclosure: `/rest/admin/application-configuration`                                                       | Low      | Confirmed                                              |
-| DOM XSS in client-side search                                                                                  | High     | Candidate (flagged for the browser agent, not claimed) |
+| Finding                                                                                                        | Severity | Status                                                     |
+| -------------------------------------------------------------------------------------------------------------- | -------- | ---------------------------------------------------------- |
+| SQLi (UNION) in `/rest/products/search?q=` → full Users dump (emails + MD5 hashes; admin cracks to `admin123`) | Critical | Confirmed                                                  |
+| Sensitive file disclosure via `/ftp/` directory listing (incl. a KeePass `.kdbx`)                              | High     | Confirmed                                                  |
+| Poison-null-byte extension-filter bypass (`.bak` 403 directly, 200 via `%2500.md`)                             | High     | Confirmed                                                  |
+| Open redirect in `/redirect?to=` (allowlist-substring bypass)                                                  | Medium   | Confirmed                                                  |
+| Info disclosure: `/rest/admin/application-configuration`                                                       | Low      | Confirmed                                                  |
+| DOM XSS in client-side search (`<iframe src="javascript:…">`)                                                  | High     | **Confirmed** (browser agent — JS executed, `alert` fired) |
 
-**6 classes surfaced on a real app; 5 confirmed unauthenticated with tool
-output, 1 honestly reported as a browser-agent candidate.** The SQLi, the
-null-byte bypass and the open-redirect each required the agent to _reason past a
-first failed payload_ (wrong quote closure, wrong allowlist org, wrong
-extension) — exactly what the skill-driven model is for.
+**6 classes confirmed on a real app**, 5 unauthenticated with tool output and
+the DOM XSS confirmed in a real browser. The SQLi, the null-byte bypass and the
+open-redirect each required the agent to _reason past a first failed payload_
+(wrong quote closure, wrong allowlist org, wrong extension) — exactly what the
+skill-driven model is for.
 
 ## Notes / honest limits
 
-- DOM XSS is not claimed from static requests; it needs the `mythos-browser`
-  (Playwright) agent to confirm execution. Reported as a candidate.
+- DOM XSS was confirmed by the `mythos-browser` agent: headless Chromium +
+  Playwright in the toolbox navigated the search payload and captured the
+  `alert('MYTHOSXSS')` dialog firing (JS execution, not just reflection).
 - A tag-scoped `nuclei` exposures pass added nothing on this SPA in the time
   box; the manual, stack-aware checks found the real issues. nuclei stays in the
   flow for CVE/misconfig breadth on server-rendered stacks.

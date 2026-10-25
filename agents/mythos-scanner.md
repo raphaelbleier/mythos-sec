@@ -31,7 +31,8 @@ Then:
 3. Rank by severity and exploitability. Note which findings the exploiter
    should validate with a PoC.
 4. Consult `knowledge/web/` for check-specific guidance (e.g. confirming blind
-   vs reflected, SQLi DBMS fingerprinting) to reduce false positives.
+   vs reflected, SQLi DBMS fingerprinting) to reduce false positives, and
+   `knowledge/techniques/` for CVE triage and validation methodology.
 
 Return the ranked candidate list with one evidence snippet each. Do not weaponize
 anything — hand confirmed-but-unexploited findings to the exploiter or the

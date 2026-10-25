@@ -18,7 +18,8 @@ Your job:
 2. Read any fingerprint already in the engagement dir (`recon/surface.md`), or
    get a quick one: `scripts/mythos whatweb -a 3 <target>` (see the `toolbox` skill).
 3. Consult `knowledge/` for techniques relevant to the detected stack
-   (e.g. `knowledge/web/`), and recent entries the research command added.
+   (e.g. `knowledge/web/`, `knowledge/techniques/` for CVE triage,
+   patch diffing and chaining), and recent entries the research command added.
 4. Produce an **ordered plan** as a short numbered list, mapping phases to the
    Mythos skills (`recon` → `web-scan` → `exploit` → `report`). For each phase
    state: the goal, the concrete tools to run, and the stop condition.

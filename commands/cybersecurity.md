@@ -70,6 +70,18 @@ redirect, CRLF), auth/API/access-control checks (JWT/CORS/BOLA), blind/OOB via
 `interactsh-client`, and passive header/cookie/CORS checks. Returns candidate
 findings with evidence. For SPA/DOM work, pull in **mythos-browser**.
 
+## Step 3.5 — CVE intelligence pass
+
+When recon fingerprints a technology/version pair (appliances, frameworks,
+CMS), delegate a **CVE intelligence pass** to the planner: run `cve_lookup`
+against the fingerprinted products, prioritize by CISA KEV membership and EPSS
+score (see `knowledge/techniques/cve-triage-2026.md`), and for any relevant
+CVE run the **`cve-deep-dive` skill** to turn the advisory into scoped
+detection knowledge: patch-diff root cause, lab reproduction with a
+non-destructive oracle (OOB callback), then concrete detection/confirmation
+steps injected into the scan and exploit phases. KEV entries feed the
+scanner's target list; findings carry `kev`/`epss` metadata.
+
 ## Step 4 — exploitation triage
 
 Delegate to **mythos-exploiter** (follows the `exploit` skill) _only if_

@@ -55,11 +55,59 @@ showed **A's own** email changed, not B's — the endpoint keys on the token
 identity, not the path. Reported as not-vulnerable rather than claimed. A basic
 `' OR '1'='1` login-bypass payload also failed and was not claimed.
 
+## Target 3 — Vuln Bank (modern banking app, 2025/26)
+
+A current, deliberately vulnerable banking platform (Flask + PostgreSQL +
+GraphQL), chosen as a harder, newer analogue to Juice Shop. The flow produced a
+textbook multi-step chain plus a GraphQL-resolver SQLi.
+
+| Finding                                                                                                | Severity | Status    |
+| ------------------------------------------------------------------------------------------------------ | -------- | --------- |
+| `/.env` exposed → `JWT_SECRET`, `SECRET_KEY`, DB credentials                                           | Critical | Confirmed |
+| **JWT forgery → admin takeover** (server accepts an HS256 token signed with the leaked secret)         | Critical | Confirmed |
+| SQL injection in the GraphQL `transactionSummary(accountNumber)` resolver (Postgres error-based)       | High     | Confirmed |
+| Verbose debug disclosure (`FLASK_DEBUG=true`): register/login leak `is_admin`, raw password, `user_id` | Medium   | Confirmed |
+
+**The chain** (what a scanner won't assemble, and the point of the agent):
+
+```
+GET /.env                       -> JWT_SECRET=00af85...   (unauth info disclosure)
+decode a real login JWT         -> {user_id, username, is_admin, iat}  HS256
+forge {is_admin:true} w/ secret -> server accepts it on /graphql (which rejects a missing token)
+                                -> authenticated admin access  (privilege escalation)
+```
+
+**GraphQL SQLi proof** — `transactionSummary(accountNumber:"1'")` returns the DB
+error `unterminated quoted string ... FROM users WHERE account_number=...`,
+exposing a concatenated query. (Error-based proof only; no data dumped.)
+
+## Aggregate scorecard
+
+Confirmed, evidence-backed findings across six targets / five stacks, run
+through the skill-driven toolbox flow (DOM XSS via the Playwright browser agent):
+
+| Target                 | Stack                        | Headline confirmed classes                                                                                                       |
+| ---------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| vulnapp (ground truth) | Flask                        | XSS, SQLi, open-redirect, traversal, CORS, exposure (7, self-test)                                                               |
+| OWASP Juice Shop       | Node SPA + REST              | UNION SQLi (Users dump), `/ftp` disclosure, null-byte filter bypass, open redirect, config leak, **DOM XSS (browser-confirmed)** |
+| DVGA                   | Python GraphQL               | **unauth RCE** (introspection→SSRF→cmd-injection), broken access control, introspection                                          |
+| VAmPI                  | Python REST                  | `_debug` plaintext-password dump; BOLA tested & disproven                                                                        |
+| Vuln Bank              | Flask + PostgreSQL + GraphQL | `.env` leak → **JWT forge → admin**, GraphQL-resolver SQLi, debug disclosure                                                     |
+
+Classes demonstrated end to end: reflected/DOM/stored-surface XSS, error- and
+UNION-based SQLi, GraphQL-resolver SQLi, unauthenticated RCE (command injection),
+SSRF, path traversal + filter-evasion, open redirect, CORS, sensitive-file
+exposure, verbose-debug disclosure, JWT forgery / privilege escalation, broken
+access control, and a correctly-disproven BOLA.
+
 ## Takeaway
 
 - **Mythos handles the hard classes.** It chained GraphQL introspection → SSRF →
-  RCE unauthenticated, and found a critical credential-dumping debug endpoint —
-  both the kind of thing that stalls scanners and less-experienced testers.
+  RCE unauthenticated (DVGA), `.env` → JWT forge → admin takeover (Vuln Bank),
+  and found GraphQL-resolver SQLi and a credential-dumping debug endpoint — the
+  multi-step chains that stall scanners and less-experienced testers.
+- **Repro (Vuln Bank):** `git clone https://github.com/Commando-X/vuln-bank &&
+cd vuln-bank && docker compose up -d db web` (web on `:5000`).
 - **It does not over-claim.** The VAmPI BOLA was disproven by impact
   verification. Findings are evidence-backed, negatives are stated.
 - **Known limits (honest):** full crAPI (7-container API-logic chain: VIN-based
