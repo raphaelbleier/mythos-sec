@@ -27,8 +27,9 @@
   },
   "juiceshop": {
     "target": "OWASP Juice Shop (SPA)",
-    "endpoints_crawled_with_katana": 116,
-    "confirmed": "critical SQL injection at /rest/products/search?q= (SQLITE_ERROR), reproducible",
-    "caveat": "full multi-tool engagement exceeded VM memory; SPA XHR endpoints need katana/browser; detection of the signature SQLi verified via the native check"
+    "endpoints_crawled": 124,
+    "result": "autonomous engagement detects critical SQL injection at /rest/products/search?q= (SQLITE_ERROR) end-to-end, plus BOLA on /api/Challenges",
+    "chain": "crawl -> JS/template-literal mining -> query-param capture -> native SQLi check",
+    "note": "full nuclei pass OOMs on this 3.7GB VM; run gentle (low rps, nuclei skipped) here"
   }
 }
