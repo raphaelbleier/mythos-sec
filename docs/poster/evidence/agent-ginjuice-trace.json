@@ -1,0 +1,45 @@
+{
+  "target": "https://ginandjuice.shop",
+  "steps": 13,
+  "summary": "Target https://ginandjuice.shop (PortSwigger demo). Fingerprint: 200, title 'Gin & Juice Shop', session+AWSALB cookies. Mapped 7 param endpoints via crawl: /catalog (category,searchTerm), /catalog/product (productId), /blog/ (back,search), /blog/post (postId), /v8/issues/detail (id), /api/webview-tag, /script. Discover: /admin/ 403, /login 200. Active checks (reflected-xss, sqli, blind-sqli, open-redirect) on searchTerm/category/productId/postId/back all returned no confirmation via check tool; nuclei unavailable. CONFIRMED/RECORDED: cookie-flags (low) \u2014 session/AWSALB cookies missing Secure/H",
+  "actions": [
+    "fingerprint",
+    "crawl",
+    "passive_checks",
+    "check",
+    "check",
+    "check",
+    "check",
+    "run_tool",
+    "check",
+    "check",
+    "record_finding",
+    "discover"
+  ],
+  "findings": [
+    {
+      "kind": "cookie-flags",
+      "severity": "low"
+    },
+    {
+      "kind": "cookie-flags",
+      "severity": "low"
+    },
+    {
+      "kind": "cookie-flags",
+      "severity": "low"
+    },
+    {
+      "kind": "missing-security-header",
+      "severity": "low"
+    },
+    {
+      "kind": "missing-security-header",
+      "severity": "low"
+    },
+    {
+      "kind": "missing-security-header",
+      "severity": "info"
+    }
+  ]
+}
