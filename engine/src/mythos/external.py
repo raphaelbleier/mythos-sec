@@ -37,6 +37,11 @@ _SEV = {
 
 
 def have(tool: str) -> bool:
+    # MYTHOS_NO_EXTERNAL forces the pure-Python path even inside the toolbox
+    # (useful on memory-constrained hosts: skips nuclei/sqlmap subprocess spikes).
+    import os
+    if os.environ.get("MYTHOS_NO_EXTERNAL"):
+        return False
     return shutil.which(tool) is not None
 
 
