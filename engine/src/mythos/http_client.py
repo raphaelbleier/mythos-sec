@@ -119,10 +119,15 @@ class HttpClient:
                 elapsed_ms=(time.monotonic() - start) * 1000, error=str(exc)))
             return None
         elapsed = (time.monotonic() - start) * 1000
+        # lean mode: keep only a small body slice in the evidence log to cap the
+        # engine's memory on large/constrained runs (checks use the live resp)
+        import os
+        body_text = _safe_text(resp)
+        stored_body = body_text[:4096] if os.environ.get("MYTHOS_LEAN") else body_text
         self.transactions.append(Transaction(
             method=method.upper(), url=resp.url, status=resp.status_code,
             req_headers=dict(resp.request.headers), req_body=_str(body),
-            resp_headers=dict(resp.headers), resp_body=_safe_text(resp),
+            resp_headers=dict(resp.headers), resp_body=stored_body,
             elapsed_ms=elapsed))
         return resp
 
