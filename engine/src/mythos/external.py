@@ -151,10 +151,17 @@ def nuclei(url: str, timeout: int = 1800, severity: str = "low,medium,high,criti
         return []
     with tempfile.NamedTemporaryFile("r", suffix=".jsonl", delete=False) as tf:
         out_path = tf.name
-    # bounded concurrency + rate limit keep nuclei's memory/footprint in check
+    # bounded concurrency + rate limit keep nuclei's memory/footprint in check.
+    # MYTHOS_NUCLEI_TAGS / MYTHOS_NUCLEI_CONC let memory-constrained hosts scope
+    # the template set (loading all ~9k templates is the memory cost).
+    import os
+    conc = os.environ.get("MYTHOS_NUCLEI_CONC", "15")
     cmd = ["nuclei", "-u", url, "-jsonl", "-o", out_path, "-silent",
-           "-severity", severity, "-no-color", "-c", "15", "-rl", "150",
+           "-severity", severity, "-no-color", "-c", conc, "-rl", "150",
            "-timeout", "8", "-retries", "1"]
+    tags = os.environ.get("MYTHOS_NUCLEI_TAGS")
+    if tags:
+        cmd += ["-tags", tags]
     if extra:
         cmd += extra
     _run(cmd, timeout=timeout)
