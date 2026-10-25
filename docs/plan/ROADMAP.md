@@ -28,10 +28,14 @@ model drive — but native to Claude Code and keyless.
 
 ## Validated
 
-- ✅ End-to-end against the ground-truth app (`lab/vulnapp`): reflected XSS,
-  SQLi (sqlmap, boolean-blind), open redirect, path traversal, CORS, `.env`
-  exposure — all confirmed with real tool output through the toolbox.
-- ✅ Scope-guard hook: warns on out-of-scope hosts, silent in-scope.
+- ✅ **Regression self-test** (`scripts/selftest.sh`): 10/10 — 7 ground-truth
+  classes + a no-false-positive control + 2 scope-guard checks, all through the
+  toolbox. Repeatable automated suite for the skill-driven architecture.
+- ✅ **Live benchmark — OWASP Juice Shop** (Angular SPA + REST): 6 classes
+  surfaced, 5 confirmed unauthenticated with tool evidence (critical UNION SQLi
+  → Users dump, `/ftp` disclosure, poison-null-byte filter bypass, open-redirect
+  allowlist bypass, config leak), 1 DOM-XSS candidate flagged for the browser
+  agent. See `docs/poster/benchmark-skill-driven.md`.
 
 ## Backlog
 
@@ -41,9 +45,8 @@ model drive — but native to Claude Code and keyless.
 - ⏳ OOB exfil recipe hardening in `exploit` (interactsh templates for blind
   SQLi/RCE/SSRF/XXE, filter-evasion payload library).
 - ⏳ GHCR-published toolbox image for one-pull setup (no local build).
-- ⏳ A lightweight benchmark note: point `/cybersecurity` at the bundled lab and
-  at XBOW challenges, score found-vs-expected by hand (the automated harness that
-  drove the old standalone agent was removed with the engine).
+- ⏳ Extend the live benchmark set beyond Juice Shop (DVWA authenticated, VAmPI
+  API/BOLA) and record each in `docs/poster/`.
 
 ## Design references
 

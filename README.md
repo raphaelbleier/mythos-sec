@@ -98,6 +98,14 @@ scanning.
 
 ## Testing
 
+Repeatable regression suite — drives the toolbox against the ground-truth app
+and asserts each class is found (plus a no-false-positive control and the
+scope-guard hook):
+
+```bash
+scripts/selftest.sh        # 10/10: 7 classes + FP control + 2 scope-guard checks
+```
+
 Validated end-to-end against the bundled ground-truth app (`lab/vulnapp`,
 `http://localhost:5001`) — every expected class confirmed with real tool output
 through the toolbox:
@@ -111,6 +119,13 @@ through the toolbox:
 | CORS               | `/api/data` reflects attacker `Origin` | curl        |
 | sensitive exposure | `/.env` → 200                          | httpx       |
 | cookie flags       | `/profile` session cookie              | passive     |
+
+Live benchmark on a real modern app — **OWASP Juice Shop** (Angular SPA + REST):
+the full flow surfaced 6 vulnerability classes, 5 confirmed unauthenticated with
+tool evidence (critical UNION SQLi dumping the Users table, `/ftp` disclosure,
+poison-null-byte filter bypass, open-redirect allowlist bypass, config leak),
+one DOM-XSS candidate flagged for the browser agent. See
+`docs/poster/benchmark-skill-driven.md`.
 
 More vulnerable targets for practice are in `lab/docker-compose.yml`: OWASP
 Juice Shop, DVWA, VAmPI.
