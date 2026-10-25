@@ -262,6 +262,20 @@ def run_engagement(client: HttpClient, target: str, *, workdir: Path | None = No
         # JWT weaknesses: scan captured traffic for JWT-like tokens
         res.store.extend(_jwt_from_traffic(client, target))
 
+        # BOLA via a second identity (two-account method): replay the primary
+        # user's object requests with the attacker identity and confirm access.
+        if scope.identities:
+            import dataclasses as _dc
+            from .scan import bola as bola_mod
+            attacker_scope = _dc.replace(scope, auth=scope.identities[0])
+            attacker = HttpClient(scope=attacker_scope, proxy=client.proxy)
+            obj_urls = [e.url for e in cres.endpoints.values()
+                        if re.search(r"/\d+(/|$)", e.url) or "id" in [p.lower() for p in e.params]]
+            log(f"[scan] BOLA cross-access with 2nd identity on {len(obj_urls[:15])} objects")
+            for u in obj_urls[:15]:
+                if scope.contains(u):
+                    _safe(res.store, lambda u=u: bola_mod.check_bola(client, attacker, u))
+
         if oast is not None:
             oast.stop()
 

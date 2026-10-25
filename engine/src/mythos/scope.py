@@ -83,12 +83,17 @@ class Scope:
     # operator-supplied known API endpoints (realistic for bounty: you know the
     # API). Paths or full URLs; added to the crawl surface and scanned.
     seed_endpoints: list[str] = field(default_factory=list)
+    # extra identities (second+ user) for two-account BOLA/authorization testing
+    identities: list[Auth] = field(default_factory=list)
     program: str = ""
     notes: str = ""
 
     # ---- loading -------------------------------------------------------
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Scope":
+        idents = []
+        for x in d.get("identities") or []:
+            idents.append(Auth.from_dict(x.get("auth") if isinstance(x, dict) and "auth" in x else x))
         return cls(
             target=str(d.get("target", "")),
             in_scope=[str(x) for x in (d.get("in_scope") or [])],
@@ -96,6 +101,7 @@ class Scope:
             rules=ScopeRules.from_dict(d.get("rules") or {}),
             auth=Auth.from_dict(d.get("auth") or {}),
             seed_endpoints=[str(x) for x in (d.get("seed_endpoints") or [])],
+            identities=idents,
             program=str(d.get("program", "")),
             notes=str(d.get("notes", "")),
         )

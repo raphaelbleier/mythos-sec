@@ -270,6 +270,20 @@ def api_jsonlogin():
         con.close()
 
 
+ORDERS = {1: {"owner": "tokenA", "item": "laptop", "total": 1299},
+          2: {"owner": "tokenB", "item": "phone", "total": 799}}
+
+
+@app.route("/api/order/<int:oid>")
+def order(oid):
+    # VULN: BOLA — returns the order regardless of which user's token is presented.
+    # A correct implementation would check that the order's owner == caller.
+    o = ORDERS.get(oid)
+    if not o:
+        return Response("not found", status=404)
+    return {"id": oid, "item": o["item"], "total": o["total"], "owner": o["owner"]}
+
+
 @app.route("/item/<thing>")
 def item(thing):
     # VULN: SQLi via a PATH segment (REST-style path parameter injection)
