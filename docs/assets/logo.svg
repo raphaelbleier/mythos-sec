@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 120" role="img" aria-label="Mythos">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6d5efc"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <!-- mark: a shield with an agent 'eye' / node graph -->
+  <g transform="translate(14,12)">
+    <path d="M48 2 L92 16 V52 C92 74 72 90 48 96 C24 90 4 74 4 52 V16 Z"
+          fill="none" stroke="url(#g)" stroke-width="5" stroke-linejoin="round"/>
+    <!-- agent graph inside the shield: one root, parallel children -->
+    <circle cx="48" cy="30" r="7" fill="url(#g)"/>
+    <circle cx="28" cy="60" r="6" fill="#22d3ee"/>
+    <circle cx="48" cy="66" r="6" fill="#6d5efc"/>
+    <circle cx="68" cy="60" r="6" fill="#22d3ee"/>
+    <g stroke="url(#g)" stroke-width="3">
+      <line x1="48" y1="30" x2="28" y2="60"/>
+      <line x1="48" y1="30" x2="48" y2="66"/>
+      <line x1="48" y1="30" x2="68" y2="60"/>
+    </g>
+  </g>
+  <!-- wordmark -->
+  <text x="120" y="60" font-family="Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="46" font-weight="700" fill="url(#g)">mythos</text>
+  <text x="122" y="90" font-family="Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="16" letter-spacing="3" fill="#8b93a7">AI WEB RED-TEAM AGENT</text>
+</svg>

@@ -1,120 +1,124 @@
-# Mythos — autonomous web red-team framework for Claude Code
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="Mythos" width="420">
+</p>
 
-Mythos (`mythos-sec`) is a Claude Code plugin for **authorized** web red-teaming
-and bug-bounty work. Point `/cybersecurity` at a target you are allowed to test
-and it runs recon, scanning, exploitation triage and reporting — through a
-scope-aware engine and a Kali toolbox, with the agent loop provided by Claude
-Code itself.
+<p align="center">
+  <b>Mythos</b> — an autonomous, LLM-driven web red-team agent for authorized pentesting and bug bounty.
+</p>
 
-> For authorized testing only: bug-bounty programs, systems you own, or lab
-> targets. Scope is a hard boundary, enforced in the engine and by a hook.
+<p align="center">
+  <i>Point it at a target you're allowed to test; an LLM reasons step by step and drives a scope-aware engine plus a Kali toolbox to find — and prove — web vulnerabilities.</i>
+</p>
 
-## Why it exists
+---
 
-A source analysis of four AI pentest frameworks (CAI, Strix, HexStrike,
-PentestGPT — see `docs/research/frameworks-analysis.md`) fed a design that takes
-the best of each and adds two things none combine: **hard scope enforcement**
-(engine + hook) and a **pure-Python engine** that finds the headline web bug
-classes with no external tools installed.
+> **For authorized testing only** — bug-bounty programs in scope, systems you own,
+> or lab targets. Scope is a hard boundary, enforced in the engine and by a hook.
 
-## Install (as a Claude Code plugin)
+## What it is
+
+Mythos is in the spirit of CAI / Strix / HexStrike / PentestGPT, with two things
+those don't combine: it runs **with Claude Code and no API key** (the model
+backend is the local `claude` CLI), and it ships a **scope-aware engine** that
+works even with zero external tools installed.
+
+- **Autonomous agent** (`mythos-agent`): a ReAct loop where an LLM chooses tools,
+  observes results, and plans — like a human pentester.
+- **Pluggable model backend:** the `claude` CLI (no API key, uses Claude Code
+  auth) · **LiteLLM** (any provider or local Ollama) · the Anthropic API.
+- **Claude Code plugin** (`/cybersecurity`): the same capabilities driven by
+  Claude Code's own agents.
+- **Engine:** recon (fingerprint, SPA/JS crawl, OpenAPI import, content/param
+  discovery), a broad vulnerability-check catalog, and OSS-tool orchestration.
+
+## Architecture
+
+![Mythos architecture](docs/assets/architecture.svg)
+
+(Source: `docs/assets/architecture.dot` — `dot -Tsvg` renders the diagram.)
+
+## Quick start — the agent
 
 ```bash
-# from a local clone
+# no API key: uses the local `claude` CLI (Claude Code auth), model your choice
+mythos-agent https://target.example --scope scope.yaml --model claude-opus-4-8
+
+# any provider via LiteLLM (needs that provider's key, or local Ollama = no key)
+mythos-agent https://target.example --backend litellm --model gpt-4o
+mythos-agent https://target.example --backend litellm --model ollama/llama3
+
+# route all traffic through Burp/Caido/ZAP
+mythos-agent https://target.example --proxy http://127.0.0.1:8080
+```
+
+The agent's tools: `fingerprint`, `crawl`, `discover`, `http_request`, `check`
+(per class), `scan_all` (exhaustive sweep), `passive_checks`, `run_tool`
+(nuclei/sqlmap/dalfox — local **or via the toolbox container**), `browser_dom_xss`
+(headless Chromium), `bola` (two-account), `cve_lookup` (NVD), `record_finding`.
+
+## Quick start — the Claude Code plugin
+
+```bash
 /plugin marketplace add /path/to/mythos-sec
 /plugin install mythos-sec
-# then, in any session:
 /cybersecurity https://target.example
 ```
 
-Model choice: the agents use `model: inherit`. Pick per engagement with
-`/model claude-opus-4-6` (fast default), `/model claude-mythos-5-1` (deepest
-reasoning) or `/model claude-opus-4-8` (latest).
+Agents use `model: inherit`; pick per engagement with `/model claude-opus-4-6 | claude-mythos-5-1 | claude-opus-4-8`.
 
-## How a run goes
-
-1. **Scope** — an engagement workspace and a `scope.yaml` are created; you fill
-   in exactly what the program authorizes.
-2. **Plan** → **Recon** → **Scan** → **Browser** → **Exploit-triage** →
-   **Report**, each a subagent. Exploitation runs only if the scope allows it.
-3. **Output** — `report.md` in bug-bounty format (title, severity + CVSS, asset,
-   steps, evidence, impact, remediation), plus `findings.json` and
-   `coverage.json`. A German lab `.docx` is available via the `security-lab` skill.
-
-## Scan modes
-
-| Mode               | Adds                                                               |
-| ------------------ | ------------------------------------------------------------------ |
-| quick              | reflected XSS, SQLi, open redirect, path traversal, passive checks |
-| standard (default) | + SSTI, CRLF, IDOR, SSRF (OOB), GraphQL, JWT                       |
-| deep               | + time-based oracles (OS command injection, blind SQLi)            |
-
-## The engine on its own
-
-The engine runs without Claude Code, in the toolbox or on any host with Python:
-
-```bash
-scripts/mythos engage https://target.example \
-    --scope engagements/target/scope.yaml --workdir engagements/target --mode deep
-scripts/mythos tools            # show which OSS tools are available
-scripts/mythos init-scope https://target.example --out scope.yaml
-```
-
-`scripts/mythos` runs everything inside the Kali toolbox container (built on
-first use from `toolbox/Dockerfile`). Set `MYTHOS_NATIVE=1` to use the host
-engine directly (pure-Python, no external tools).
-
-## Toolbox
+## Toolbox (Kali) and the proxy
 
 `toolbox/Dockerfile` builds a Kali image with nuclei, dalfox, sqlmap, ffuf,
-katana, subfinder, httpx, naabu, dnsx, nmap, nikto, whatweb, wafw00f, arjun,
-jwt_tool, interactsh-client, gau/waybackurls/qsreplace, semgrep, gitleaks and
-the Mythos engine. Metasploit is opt-in (`--build-arg INSTALL_METASPLOIT=true`).
-
-## Test lab
+katana, subfinder, httpx, nmap, nikto, arjun, jwt_tool, interactsh and more,
+plus headless Chromium and the Mythos engine. The agent can run from the **host
+with no Kali tools installed** — tool calls are proxied into the running
+`mythos-toolbox` container via `docker exec`.
 
 ```bash
-docker compose -f lab/docker-compose.yml up -d   # vulnapp, Juice Shop, DVWA
-python scripts/eval/run_eval.py --target http://localhost:5001 --mode deep \
-    --ground-truth lab/vulnapp/ground_truth.json,lab/vulnapp/ground_truth_hard.json
+scripts/mythos engage https://target --scope scope.yaml --workdir engagements/t
 ```
 
-`lab/vulnapp/` is a labelled ground-truth app (15 planted vulns across 8 classes)
-used by the test suite and the evaluation harness. On it the pure-Python engine
-scores 15/15 coverage at 0% false positives (see `docs/poster/eval.json`).
+## Capabilities
 
-## Safety model
+Injection (query/form/JSON-body/path), reflected & DOM XSS, SSTI, OS command
+injection (time-based), SQLi (error + blind), SSRF (out-of-band), CRLF, path
+traversal, open redirect, IDOR + two-account BOLA, CORS, JWT, GraphQL, API
+excessive-data-exposure, sensitive-file exposure, security headers/cookies;
+authenticated scanning (cookie/bearer); OpenAPI import; CVE intelligence (NVD).
 
-- Scope is enforced in the engine (`ScopeViolation` before any out-of-scope
-  request) and by a warn-only hook (`hooks/scope-guard.py`; set
-  `MYTHOS_SCOPE_ENFORCE=block` to hard-block).
-- A per-engagement request budget and requests-per-second ceiling.
-- Exploitation is off unless `scope.rules.allow_exploit` is true, and is always
-  minimal and non-destructive.
-- Engagement data (`engagements/`) is git-ignored and never pushed.
+## Scope & safety
+
+- Enforced in the engine (`ScopeViolation` before any out-of-scope request) and
+  by a warn-only PreToolUse hook (`MYTHOS_SCOPE_ENFORCE=block` to hard-block).
+- Per-engagement request budget and rate limit; non-destructive by default;
+  exploitation only when `scope.rules.allow_exploit` is set.
+- Engagement data lives under `engagements/` and is git-ignored.
+
+## Testing & benchmarks
+
+```bash
+cd engine && pytest                                   # 44 tests
+python scripts/eval/run_eval.py --target <lab> --mode deep ...   # coverage/FP on ground truth
+python scripts/eval/xbow_bench.py <XBOW challenge dir> ...        # XBOW benchmark
+```
+
+- Ground-truth app: **18/18 vulnerability classes, 0 false positives** in one deep run.
+- Real third-party targets: OWASP Juice Shop, DVWA (authenticated), VAmPI,
+  crAPI (confirmed vehicle BOLA across two accounts), PortSwigger ginandjuice.shop.
+- Benchmarked against **XBOW validation benchmarks** (see `docs/plan/` and
+  `docs/poster/`).
 
 ## Layout
 
 ```
-commands/        /cybersecurity entry point
-agents/          planner, recon, scanner, browser, exploiter, reporter
-skills/          engagement-setup, research-ingest
-hooks/           scope-guard (warn-only PreToolUse)
-engine/          the Mythos engine (Python package + tests)
-toolbox/         Kali toolbox Dockerfile
-lab/             ground-truth vuln app + Juice Shop/DVWA compose
-knowledge/       per-bug-class notes the agents read at runtime
-scripts/         mythos wrapper + evaluation harness
-docs/            research analysis, architecture, poster
-engagements/     per-target workspaces (git-ignored)
-```
-
-## Tests
-
-```bash
-cd engine && pytest            # 30 tests; -m "not slow" to skip time-based
+commands/  agents/  skills/  hooks/      Claude Code plugin surface
+engine/src/mythos/                       scope-aware engine (+ tests)
+engine/src/mythos_agent/                 autonomous LLM agent runtime
+toolbox/   lab/                          Kali toolbox + vulnerable test lab
+scripts/   scripts/eval/                 mythos wrapper + eval/benchmark harnesses
+knowledge/ docs/                         runtime knowledge, research, plans, evidence
 ```
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. Built for Security Engineering research into AI pentest agents.
