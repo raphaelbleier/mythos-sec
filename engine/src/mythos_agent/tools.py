@@ -124,6 +124,43 @@ def _passive(st: AgentState, args: dict) -> str:
     return json.dumps([{"kind": f.kind, "severity": f.severity.value} for f in finds]) or "none"
 
 
+def _scan_all(st: AgentState, args: dict) -> str:
+    """Exhaustive native sweep over every crawled injection point + passive checks."""
+    if st.crawl is None:
+        st.crawl = crawl(st.client, st.target, max_pages=int(args.get("max_pages", 60)))
+    pts = points_from_crawl(st.crawl)
+    checks = [quick.check_xss, quick.check_sqli, quick.check_open_redirect,
+              quick.check_path_traversal, advanced.check_ssti, advanced.check_crlf,
+              idor_mod.check_idor]
+    before = len(st.store)
+    for pt in pts:
+        for fn in checks:
+            try:
+                for f in fn(st.client, pt):
+                    st.store.add(f)
+            except Exception:
+                continue
+    # passive across a bounded surface
+    seen = set()
+    for u in ([st.target] + [e.url for e in st.crawl.endpoints.values()])[:40]:
+        key = u.split("?")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        for fn in (headers_mod.check_cookies, headers_mod.check_cors,
+                   api_mod.check_sensitive_api_response):
+            try:
+                for f in fn(st.client, u):
+                    st.store.add(f)
+            except Exception:
+                continue
+    new = [{"kind": f.kind, "severity": f.severity.value, "url": f.url, "param": f.param}
+           for f in st.store.findings]
+    return json.dumps({"injection_points": len(pts), "total_findings": len(st.store),
+                       "new_this_sweep": len(st.store) - before,
+                       "findings": new[:40]})[:3500]
+
+
 def _run_tool(st: AgentState, args: dict) -> str:
     tool = args.get("tool", "")
     url = args.get("url") or st.target
@@ -169,6 +206,7 @@ def registry() -> dict[str, Tool]:
         Tool("check", "Run a vulnerability check on a parameter. args: {kind, url, param, method?, where?(query|body|json|path), base_params?, template?}. kinds: "
              + ", ".join(_PARAM_CHECKS), _check),
         Tool("passive_checks", "Run header/cookie/CORS/API-exposure checks on a URL. args: {url?}", _passive),
+        Tool("scan_all", "Exhaustive sweep: run every native vuln check on ALL crawled injection points + passive checks. Call once after crawl for breadth, then reason about depth. args: {}", _scan_all),
         Tool("run_tool", "Run a Kali tool and parse findings. args: {tool(nuclei|dalfox|sqlmap|nikto), url?}", _run_tool),
         Tool("record_finding", "Record a confirmed finding. args: {title, severity, kind, url, param?, description?, evidence?}", _record),
     ]}
