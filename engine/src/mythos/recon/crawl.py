@@ -17,9 +17,13 @@ from bs4 import BeautifulSoup
 
 from ..http_client import HttpClient, ScopeViolation, BudgetExceeded
 
-# endpoints referenced from JS: "/api/...", 'url: "/x"', fetch("/y?a=1")
-# capture a root-relative path after a quote; the char class stops at ?, " or '
-_JS_ENDPOINT = re.compile(r"""["'](/[a-zA-Z0-9_\-./]{2,120})""")
+# endpoints referenced from JS. Two forms, both common in SPAs:
+#   root-relative:  "/api/x", fetch("/y?a=1")
+#   bare relative:  'rest/products/search', "api/Users"  (Angular/axios style)
+# the char class stops at ?, " or '
+_JS_ENDPOINT = re.compile(
+    r"""["'](/[a-zA-Z0-9_\-./]{2,120}"""
+    r"""|(?:api|rest|graphql|v[0-9]+)/[a-zA-Z0-9_\-./]{1,120})""")
 _SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
              ".woff2", ".ttf", ".eot", ".css", ".pdf", ".zip", ".mp4", ".webp")
 # never follow these during authenticated crawls: they destroy the session
@@ -163,10 +167,13 @@ def _extract_form(result: CrawlResult, page_url: str, form) -> None:
 
 def _mine_js(result: CrawlResult, seed_host: str, base: str, body: str,
              queue: deque, depth: int) -> None:
+    origin = f"{urlparse(base).scheme}://{urlparse(base).netloc}"
     for m in set(_JS_ENDPOINT.findall(body or "")):
         if m.startswith("//") or any(m.lower().endswith(e) for e in _SKIP_EXT):
             continue
-        full = urljoin(base, m)
+        # bare relative api/rest paths resolve against the site root, not the
+        # directory of the JS file (which may live under /assets/)
+        full = urljoin(origin + "/", m) if not m.startswith("/") else urljoin(origin, m)
         if _same_site(seed_host, full):
             q = parse_qs(urlparse(full).query)
             result.add_endpoint(full, list(q.keys()), "js")
