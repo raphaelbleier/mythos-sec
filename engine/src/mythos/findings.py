@@ -83,9 +83,13 @@ class Finding:
     def has_poc(self) -> bool:
         return bool(self.payload or self.evidence.matched or self.evidence.request)
 
+    # host-level issues: the same cookie/header is one issue per host, not per path
+    _HOST_LEVEL = {"cookie-flags", "missing-security-header", "cors-misconfig"}
+
     @property
     def dedup_key(self) -> str:
-        raw = f"{self.kind}|{_host(self.url)}|{_path(self.url)}|{self.param}"
+        path = "" if self.kind in self._HOST_LEVEL else _path(self.url)
+        raw = f"{self.kind}|{_host(self.url)}|{path}|{self.param}"
         return hashlib.sha1(raw.encode()).hexdigest()[:12]
 
     def to_dict(self) -> dict:
