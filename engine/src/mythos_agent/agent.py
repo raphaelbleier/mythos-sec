@@ -70,7 +70,7 @@ def run_agent(target: str, scope: Scope, *, backend_name: str = "claude-cli",
     while step < max_steps:
         step += 1
         prompt = render_prompt(target, scope_desc, tools, transcript, step, max_steps,
-                               objective=objective)
+                               objective=objective, state=state.state_summary())
         try:
             reply = backend.complete(SYSTEM, prompt)
         except Exception as e:

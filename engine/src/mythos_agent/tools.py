@@ -22,15 +22,33 @@ from mythos.scan import quick, advanced, headers as headers_mod, idor as idor_mo
 from mythos.scan import api as api_mod
 
 
+from mythos.state import CoverageMatrix, TaskTree, Task
+
+
 @dataclass
 class AgentState:
     target: str
     client: HttpClient
     store: FindingStore = field(default_factory=FindingStore)
     crawl: CrawlResult | None = None
+    # durable shared state across steps (not just the transcript)
+    coverage: CoverageMatrix = field(default_factory=CoverageMatrix)
+    tasks: TaskTree = field(default_factory=TaskTree)
+    notes: list[str] = field(default_factory=list)
 
     def endpoints(self):
         return list(self.crawl.endpoints.values()) if self.crawl else []
+
+    def state_summary(self) -> str:
+        import json as _j
+        open_tasks = [f"{t.id}:{t.kind}:{t.status}:{t.objective[:40]}"
+                      for t in self.tasks.open_tasks()][:8]
+        return _j.dumps({
+            "findings": self.store.counts(),
+            "coverage": self.coverage.summary() if self.coverage.endpoints else {},
+            "open_tasks": open_tasks,
+            "notes": self.notes[-5:],
+        })[:1200]
 
 
 _PARAM_CHECKS = {
@@ -154,11 +172,41 @@ def _scan_all(st: AgentState, args: dict) -> str:
                     st.store.add(f)
             except Exception:
                 continue
+    # update coverage matrix from the swept surface + findings
+    for pt in pts:
+        st.coverage.ensure(pt.url)
+    for f in st.store.findings:
+        st.coverage.mark(f.url.split("#")[0], f.kind, "finding")
     new = [{"kind": f.kind, "severity": f.severity.value, "url": f.url, "param": f.param}
            for f in st.store.findings]
     return json.dumps({"injection_points": len(pts), "total_findings": len(st.store),
                        "new_this_sweep": len(st.store) - before,
                        "findings": new[:40]})[:3500]
+
+
+def _note(st: AgentState, args: dict) -> str:
+    txt = str(args.get("text", "")).strip()
+    if txt:
+        st.notes.append(txt)
+    return f"noted ({len(st.notes)} notes)"
+
+
+def _plan_task(st: AgentState, args: dict) -> str:
+    op = args.get("op", "add")
+    if op == "add":
+        tid = f"t{len(st.tasks.tasks)+1}"
+        st.tasks.add(Task(id=tid, kind=str(args.get("kind", "TEST")).upper(),
+                          target=args.get("target", st.target),
+                          objective=args.get("objective", ""),
+                          status="ready"))
+        return f"task {tid} added"
+    if op == "done" and args.get("id"):
+        try:
+            st.tasks.transition(args["id"], "done")
+            return f"task {args['id']} done"
+        except Exception as e:
+            return f"task error: {e}"
+    return "args: {op: add|done, kind?, objective?, id?}"
 
 
 def _browser_dom_xss(st: AgentState, args: dict) -> str:
@@ -252,5 +300,7 @@ def registry() -> dict[str, Tool]:
         Tool("browser_dom_xss", "Headless-Chromium DOM-XSS check on a URL (query + hash sinks). args: {url, param?}", _browser_dom_xss),
         Tool("bola", "Two-account BOLA: confirm the attacker identity can read the victim's object. Needs scope.identities. args: {object_url, attacker_own_url?}", _bola),
         Tool("cve_lookup", "Look up known CVEs for a product/version via NVD. args: {product, version?, limit?}", _cve_lookup),
+        Tool("note", "Save a durable note (persists across steps). args: {text}", _note),
+        Tool("plan_task", "Manage the task tree. args: {op: add|done, kind?, objective?, id?}", _plan_task),
         Tool("record_finding", "Record a confirmed finding. args: {title, severity, kind, url, param?, description?, evidence?}", _record),
     ]}
