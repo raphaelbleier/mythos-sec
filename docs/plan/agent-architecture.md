@@ -1,6 +1,12 @@
-# Mythos Agent v2 — Architecture
+# Mythos Agent v2 — Architecture (SUPERSEDED)
 
-How the LLM-driven agent runtime is structured and how v2 features fit in.
+> **Historical.** This documents the earlier standalone Python agent runtime
+> (`mythos_agent`) and the scope-aware engine, both since removed. Mythos is now
+> skill-driven: Claude Code is the agent and runs real tools in the Kali toolbox.
+> See `docs/architecture.md` for the current design. Kept for the research
+> write-up / poster history.
+
+How the LLM-driven agent runtime was structured and how v2 features fit in.
 
 ## Core loop (v1, unchanged)
 

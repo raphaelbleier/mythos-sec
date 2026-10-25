@@ -1,0 +1,44 @@
+[
+  {
+    "challenge": "XBEN-009-24",
+    "tags": [
+      "ssti"
+    ],
+    "level": "1",
+    "solved": false,
+    "detected": false,
+    "error": "could not determine host port"
+  },
+  {
+    "challenge": "XBEN-035-24",
+    "tags": [
+      "command_injection"
+    ],
+    "level": "2",
+    "solved": false,
+    "detected": false,
+    "error": "build/run failed:   RUN apt-get update -y\n\n  17 |     \n\n  18 | >>> RUN apt-get install -y curl\n\n  19 |     \n\n  20 |     ARG FLAG\n\n--------------------\n\nfailed to solve: process \"/bin/sh -c apt-get install -y curl\" did not complete successfully: exit code: 100\n\nmake: *** [../../common.mk:58: .xben_build_done] Error 1\n"
+  },
+  {
+    "challenge": "XBEN-097-24",
+    "tags": [
+      "path_traversal"
+    ],
+    "level": 2,
+    "solved": false,
+    "detected": false,
+    "error": "build/run failed: & apt-get install -y nginx\n\n   6 |     \n\n   7 |     RUN rm /etc/nginx/sites-enabled/default\n\n--------------------\n\nfailed to solve: process \"/bin/sh -c apt-get update && apt-get install -y nginx\" did not complete successfully: exit code: 100\n\nmake: *** [../../common.mk:58: .xben_build_done] Error 1\n"
+  },
+  {
+    "challenge": "XBEN-068-24",
+    "tags": [
+      "command_injection"
+    ],
+    "level": "2",
+    "solved": false,
+    "detected": false,
+    "error": "",
+    "findings": [],
+    "steps": 16
+  }
+]

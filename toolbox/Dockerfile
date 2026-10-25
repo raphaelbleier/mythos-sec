@@ -1,6 +1,7 @@
-# Mythos toolbox: Kali-based image with a broad web red-team tool belt plus the
-# Mythos engine. The belt is the union of what CAI, Strix, HexStrike and
-# PentestGPT drive, focused on web and API testing.
+# Mythos toolbox: Kali-based image with a broad web red-team tool belt. Mythos
+# is skill-driven — Claude Code is the agent and runs these tools via the
+# scripts/mythos shim; the image ships no engine. The belt is the union of what
+# CAI, Strix, HexStrike and PentestGPT drive, focused on web and API testing.
 #
 #   build:  docker build -t mythos-toolbox -f toolbox/Dockerfile .   (context = repo root)
 #   run:    kept alive by the compose service; exec tools into it per command.
@@ -87,11 +88,6 @@ RUN pip3 install --break-system-packages --no-cache-dir playwright \
         || (apt-get update && apt-get install -y --no-install-recommends chromium \
             && rm -rf /var/lib/apt/lists/*) \
         || echo "browser install best-effort")
-
-# --- Mythos engine ------------------------------------------------------
-WORKDIR /opt/mythos-engine
-COPY engine/ /opt/mythos-engine/
-RUN pip3 install --break-system-packages --no-cache-dir -e . && mythos --version
 
 ENV MYTHOS_WORDLIST=/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
 

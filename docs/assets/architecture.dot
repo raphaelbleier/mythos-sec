@@ -6,44 +6,40 @@ digraph mythos {
         color="#6d5efc", fillcolor="#f3f1ff", fontcolor="#1f2430"];
   edge [color="#6d7086", fontname="Helvetica", fontsize=9, fontcolor="#6d7086"];
 
-  user [label="operator\n/cybersecurity <target>\nor  mythos-agent <target>", fillcolor="#e0f7fb", color="#22d3ee"];
+  user [label="operator\n/cybersecurity <target>", fillcolor="#e0f7fb", color="#22d3ee"];
 
-  subgraph cluster_llm {
-    label="LLM backends (pluggable)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
-    cli   [label="claude CLI\n(no API key)"];
-    lite  [label="LiteLLM\n(any provider / local Ollama)"];
-    api   [label="Anthropic API\n(ANTHROPIC_API_KEY)"];
+  cc [label="Claude Code\n= the agent\n(reason → run tool → observe)", fillcolor="#efeaff", color="#6d5efc"];
+
+  subgraph cluster_skills {
+    label="phase skills (playbooks)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
+    setup   [label="engagement-setup\nscope.yaml"];
+    recon   [label="recon\nwhatweb · subfinder\nkatana · arjun · ffuf"];
+    scan    [label="web-scan\nnuclei · dalfox · sqlmap\nmanual checks · passive"];
+    exploit [label="exploit\nminimal PoC · OOB\n(if allow_exploit)"];
+    report  [label="report\nbounty-format report.md"];
   }
 
-  agent [label="Agent runtime\nReAct loop\n(reason → act → observe)", fillcolor="#efeaff", color="#6d5efc"];
-  orch  [label="Multi-agent orchestrator\nparallel sub-agents\n(recon · scan · validate)", fillcolor="#efeaff", color="#6d5efc"];
-  state [label="shared state\ncoverage matrix · task tree · notes", fillcolor="#fff7e6", color="#e0a800"];
-
-  subgraph cluster_tools {
-    label="tool registry"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
-    recon [label="recon\nfingerprint · crawl (SPA/JS)\nOpenAPI import · discover"];
-    checks [label="checks\nSQLi/XSS/SSTI/SSRF/CRLF\npath · IDOR/BOLA · JWT · CORS"];
-    browser [label="browser\nheadless Chromium\nDOM-XSS"];
-    intel [label="CVE intel\nNVD lookup"];
+  subgraph cluster_agents {
+    label="sub-agents (model: inherit)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
+    planner [label="planner"];
+    browser [label="browser\nPlaywright MCP\nDOM-XSS · auth flows"];
   }
 
-  engine [label="scope-aware engine\nHttpClient: scope gate · rate limit\nbudget · evidence", fillcolor="#eafff0", color="#1faa59"];
-  toolbox [label="Kali toolbox (Docker)\nnuclei · sqlmap · dalfox · ffuf\nkatana · subfinder · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
-  proxy [label="upstream proxy\nBurp / Caido / ZAP\n(optional)", fillcolor="#f6f6f6", color="#8b93a7"];
-  target [label="target\n(authorized web app / API)", fillcolor="#fff0f0", color="#e03131"];
-  report [label="findings → report.md\n(bounty format) + agent.json", fillcolor="#f3f1ff", color="#6d5efc"];
+  shim    [label="scripts/mythos\n(docker exec shim)", fillcolor="#fff7e6", color="#e0a800"];
+  toolbox [label="mythos-toolbox (Kali, Docker)\nnuclei · sqlmap · dalfox · ffuf · katana\nsubfinder · httpx · commix · interactsh · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
+  hook    [label="scope-guard hook\nPreToolUse: warn/block\nout-of-scope hosts", fillcolor="#eafff0", color="#1faa59"];
+  target  [label="target\n(authorized web app / API)", fillcolor="#fff0f0", color="#e03131"];
+  out     [label="engagements/<dir>\nrecon · scan · findings · report.md", fillcolor="#f3f1ff", color="#6d5efc"];
 
-  user -> agent;
-  cli -> agent; lite -> agent; api -> agent;
-  agent -> orch [label="spawns"];
-  agent -> state [dir=both];
-  orch -> state [dir=both];
-  agent -> recon; agent -> checks; agent -> browser; agent -> intel;
-  recon -> engine; checks -> engine; browser -> engine;
-  checks -> toolbox [label="docker exec\nproxy", style=dashed];
-  engine -> proxy [style=dashed];
-  engine -> target [label="scope-gated HTTP"];
-  toolbox -> target [label="scope-gated"];
-  proxy -> target;
-  agent -> report;
+  user -> cc;
+  cc -> planner [label="delegates", style=dashed];
+  cc -> setup; cc -> recon; cc -> scan; cc -> exploit; cc -> report;
+  cc -> browser [style=dashed];
+  recon -> shim; scan -> shim; exploit -> shim;
+  browser -> target [label="renders DOM", style=dashed];
+  shim -> toolbox [label="docker exec"];
+  shim -> hook [label="checked by", style=dashed];
+  toolbox -> target [label="scope-gated tools"];
+  cc -> out;
+  report -> out;
 }

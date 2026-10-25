@@ -3,33 +3,36 @@
 </p>
 
 <p align="center">
-  <b>Mythos</b> — an autonomous, LLM-driven web red-team agent for authorized pentesting and bug bounty.
+  <b>Mythos</b> — a skill-driven web red-team framework for Claude Code, for authorized pentesting and bug bounty.
 </p>
 
 <p align="center">
-  <i>Point it at a target you're allowed to test; an LLM reasons step by step and drives a scope-aware engine plus a Kali toolbox to find — and prove — web vulnerabilities.</i>
+  <i>Point <code>/cybersecurity</code> at a target you're allowed to test. Claude Code <b>is</b> the agent: it reasons like a pentester and drives real security tools in a Kali toolbox to find — and prove — web vulnerabilities.</i>
 </p>
 
 ---
 
 > **For authorized testing only** — bug-bounty programs in scope, systems you own,
-> or lab targets. Scope is a hard boundary, enforced in the engine and by a hook.
+> or lab targets. Scope is a hard boundary, stated up front and watched by a hook.
 
 ## What it is
 
-Mythos is in the spirit of CAI / Strix / HexStrike / PentestGPT, with two things
-those don't combine: it runs **with Claude Code and no API key** (the model
-backend is the local `claude` CLI), and it ships a **scope-aware engine** that
-works even with zero external tools installed.
+Mythos is in the spirit of CAI / Strix / HexStrike / PentestGPT, but built the
+way Claude Code works best: **skill-driven, no external API key, no second LLM
+runtime.** Claude Code is the agent loop. Mythos supplies the methodology
+(skills), the orchestration (one command, six sub-agents), a real Kali tool
+belt (Docker), and a knowledge base.
 
-- **Autonomous agent** (`mythos-agent`): a ReAct loop where an LLM chooses tools,
-  observes results, and plans — like a human pentester.
-- **Pluggable model backend:** the `claude` CLI (no API key, uses Claude Code
-  auth) · **LiteLLM** (any provider or local Ollama) · the Anthropic API.
-- **Claude Code plugin** (`/cybersecurity`): the same capabilities driven by
-  Claude Code's own agents.
-- **Engine:** recon (fingerprint, SPA/JS crawl, OpenAPI import, content/param
-  discovery), a broad vulnerability-check catalog, and OSS-tool orchestration.
+- **`/cybersecurity` command** — the orchestrator. Sets up a scoped engagement,
+  then runs the phases: recon → scan → exploit → report.
+- **Phase skills** (`skills/`) — the playbooks Claude follows, each naming the
+  exact tools and techniques: `engagement-setup`, `recon`, `web-scan`,
+  `exploit`, `report`, `toolbox`.
+- **Sub-agents** (`agents/`) — planner, recon, scanner, browser, exploiter,
+  reporter. Each uses `model: inherit`, so your session model drives them.
+- **Kali toolbox** (Docker) — Claude runs nuclei, sqlmap, dalfox, ffuf, katana,
+  subfinder, httpx, nikto, commix, interactsh, jwt_tool and more inside the
+  `mythos-toolbox` container via a thin shim. No API key, no Python engine.
 
 ## Architecture
 
@@ -37,88 +40,100 @@ works even with zero external tools installed.
 
 (Source: `docs/assets/architecture.dot` — `dot -Tsvg` renders the diagram.)
 
-## Quick start — the agent
+## Quick start
 
 ```bash
-# no API key: uses the local `claude` CLI (Claude Code auth), model your choice
-mythos-agent https://target.example --scope scope.yaml --model claude-opus-4-8
-
-# any provider via LiteLLM (needs that provider's key, or local Ollama = no key)
-mythos-agent https://target.example --backend litellm --model gpt-4o
-mythos-agent https://target.example --backend litellm --model ollama/llama3
-
-# route all traffic through Burp/Caido/ZAP
-mythos-agent https://target.example --proxy http://127.0.0.1:8080
-```
-
-The agent's tools: `fingerprint`, `crawl`, `discover`, `http_request`, `check`
-(per class), `scan_all` (exhaustive sweep), `passive_checks`, `run_tool`
-(nuclei/sqlmap/dalfox — local **or via the toolbox container**), `browser_dom_xss`
-(headless Chromium), `bola` (two-account), `cve_lookup` (NVD), `record_finding`.
-
-## Quick start — the Claude Code plugin
-
-```bash
+# install the plugin
 /plugin marketplace add /path/to/mythos-sec
 /plugin install mythos-sec
+
+# build + start the Kali toolbox (first run takes a few minutes)
+scripts/mythos up
+scripts/mythos tools        # sanity-check the tool belt
+
+# run an engagement against an AUTHORIZED target
 /cybersecurity https://target.example
 ```
 
-Agents use `model: inherit`; pick per engagement with `/model claude-opus-4-6 | claude-mythos-5-1 | claude-opus-4-8`.
+Agents use `model: inherit`; pick per engagement with
+`/model claude-opus-4-6 | claude-mythos-5-1 | claude-opus-4-8`.
 
-## Toolbox (Kali) and the proxy
+## Running tools (the toolbox)
 
-`toolbox/Dockerfile` builds a Kali image with nuclei, dalfox, sqlmap, ffuf,
-katana, subfinder, httpx, nmap, nikto, arjun, jwt_tool, interactsh and more,
-plus headless Chromium and the Mythos engine. The agent can run from the **host
-with no Kali tools installed** — tool calls are proxied into the running
-`mythos-toolbox` container via `docker exec`.
+Everything runs in the `mythos-toolbox` Kali container via `scripts/mythos`:
 
 ```bash
-scripts/mythos engage https://target --scope scope.yaml --workdir engagements/t
+scripts/mythos up                      # build (first run) + start the container
+scripts/mythos <tool> [args]           # run one tool,  e.g. scripts/mythos nuclei -u URL
+scripts/mythos sh '<pipeline>'         # run a shell pipeline in the toolbox
+scripts/mythos down                    # stop + remove the container
 ```
+
+The repo is mounted at `/repo`, so output lands under `engagements/`. A local
+lab target on `localhost:PORT` is reached as `http://host.docker.internal:PORT`.
+
+`toolbox/Dockerfile` builds the Kali image: nuclei, dalfox, sqlmap, ffuf,
+katana, subfinder, httpx, nmap, nikto, whatweb, wafw00f, arjun, commix,
+jwt_tool, interactsh-client, gf/qsreplace/gau, plus headless Chromium for
+DOM work. A tool missing from a given Kali snapshot is skipped, never fatal.
 
 ## Capabilities
 
-Injection (query/form/JSON-body/path), reflected & DOM XSS, SSTI, OS command
-injection (time-based), SQLi (error + blind), SSRF (out-of-band), CRLF, path
-traversal, open redirect, IDOR + two-account BOLA, CORS, JWT, GraphQL, API
-excessive-data-exposure, sensitive-file exposure, security headers/cookies;
-authenticated scanning (cookie/bearer); OpenAPI import; CVE intelligence (NVD).
+Reflected & DOM XSS, SQLi (error + blind, via sqlmap), SSTI → RCE, OS command
+injection (reflected + blind/OOB), SSRF (out-of-band via interactsh), path
+traversal / LFI, open redirect, CRLF, IDOR + two-account BOLA, CORS, JWT
+weaknesses, GraphQL introspection, API excessive-data-exposure, sensitive-file
+exposure, security headers/cookies; authenticated flows (cookie/bearer, and
+Playwright for SPAs); OpenAPI/GraphQL import; CVE lookups; nuclei templated
+scanning.
 
 ## Scope & safety
 
-- Enforced in the engine (`ScopeViolation` before any out-of-scope request) and
-  by a warn-only PreToolUse hook (`MYTHOS_SCOPE_ENFORCE=block` to hard-block).
-- Per-engagement request budget and rate limit; non-destructive by default;
-  exploitation only when `scope.rules.allow_exploit` is set.
+- Scope is stated up front and watched by a warn-only `PreToolUse` hook
+  (`hooks/scope-guard.py`; set `MYTHOS_SCOPE_ENFORCE=block` to hard-block
+  out-of-scope hosts). The agent must honor `scope.yaml` in every tool call.
+- Non-destructive by default; exploitation only when `scope.rules.allow_exploit`
+  is set; proofs are minimal (no data dumps, no DoS, no brute-force).
 - Engagement data lives under `engagements/` and is git-ignored.
 
-## Testing & benchmarks
+## Testing
+
+Validated end-to-end against the bundled ground-truth app (`lab/vulnapp`,
+`http://localhost:5001`) — every expected class confirmed with real tool output
+through the toolbox:
+
+| Class              | Check                                  | Tool        |
+| ------------------ | -------------------------------------- | ----------- |
+| reflected XSS      | `/search?q=` unencoded reflection      | curl/dalfox |
+| SQLi               | `/user?id=` boolean-blind, SQLite      | sqlmap      |
+| open redirect      | `/go?next=` → external `Location`      | curl        |
+| path traversal     | `/download?file=../../etc/passwd`      | curl        |
+| CORS               | `/api/data` reflects attacker `Origin` | curl        |
+| sensitive exposure | `/.env` → 200                          | httpx       |
+| cookie flags       | `/profile` session cookie              | passive     |
+
+More vulnerable targets for practice are in `lab/docker-compose.yml`: OWASP
+Juice Shop, DVWA, VAmPI.
 
 ```bash
-cd engine && pytest                                   # 44 tests
-python scripts/eval/run_eval.py --target <lab> --mode deep ...   # coverage/FP on ground truth
-python scripts/eval/xbow_bench.py <XBOW challenge dir> ...        # XBOW benchmark
+docker compose -f lab/docker-compose.yml up -d        # start the lab
 ```
-
-- Ground-truth app: **18/18 vulnerability classes, 0 false positives** in one deep run.
-- Real third-party targets: OWASP Juice Shop, DVWA (authenticated), VAmPI,
-  crAPI (confirmed vehicle BOLA across two accounts), PortSwigger ginandjuice.shop.
-- Benchmarked against **XBOW validation benchmarks** (see `docs/plan/` and
-  `docs/poster/`).
 
 ## Layout
 
 ```
-commands/  agents/  skills/  hooks/      Claude Code plugin surface
-engine/src/mythos/                       scope-aware engine (+ tests)
-engine/src/mythos_agent/                 autonomous LLM agent runtime
-toolbox/   lab/                          Kali toolbox + vulnerable test lab
-scripts/   scripts/eval/                 mythos wrapper + eval/benchmark harnesses
-knowledge/ docs/                         runtime knowledge, research, plans, evidence
+commands/   /cybersecurity orchestrator
+agents/     planner · recon · scanner · browser · exploiter · reporter
+skills/     engagement-setup · recon · web-scan · exploit · report · toolbox
+hooks/      scope-guard PreToolUse hook (authorization safety net)
+toolbox/    Kali toolbox Dockerfile (the tool belt)
+lab/        deliberately vulnerable targets for local testing
+scripts/    mythos — the toolbox shim
+knowledge/  runtime technique knowledge base
+docs/       architecture, research, plans, poster evidence
 ```
 
 ## License
 
-MIT. See `LICENSE`. Built for Security Engineering research into AI pentest agents.
+MIT. See `LICENSE`. Built by raphaelbleier for Security Engineering research
+into AI pentest agents.

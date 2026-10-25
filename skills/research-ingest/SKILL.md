@@ -37,7 +37,7 @@ during engagements. Keep notes short, concrete and sourced.
 
    ## How Mythos detects it
 
-   Concrete signals the engine/tools look for; which tool/check applies.
+   Concrete signals the tools look for; which tool/check applies.
 
    ## How to confirm (non-destructive)
 

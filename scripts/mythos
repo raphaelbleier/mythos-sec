@@ -1,49 +1,73 @@
 #!/usr/bin/env bash
-# Mythos host wrapper: run the engine (and the tools it orchestrates) inside the
-# Kali toolbox container, with the repo mounted so engagement paths match.
+# Mythos toolbox driver — a thin shim over the Kali "mythos-toolbox" container.
 #
-#   scripts/mythos engage https://target --scope engagements/t/scope.yaml --workdir engagements/t
-#   scripts/mythos tools
-#   scripts/mythos fingerprint https://target
+# Mythos is skill-driven: Claude Code is the agent, and it runs REAL security
+# tools (nuclei, sqlmap, dalfox, ffuf, katana, subfinder, httpx, nikto, commix,
+# interactsh-client, jwt_tool, ...) inside this container via the subcommands
+# below. There is no Python engine and no second LLM runtime.
 #
-# Falls back to the host engine only if explicitly asked with MYTHOS_NATIVE=1
-# (the native path needs the engine deps importable on the host).
+#   scripts/mythos up                 # build (first run) + start the toolbox
+#   scripts/mythos tools              # show the key tools and versions
+#   scripts/mythos run nuclei -u URL  # run one tool in the toolbox
+#   scripts/mythos sh 'ffuf -u ...'   # run a shell command in the toolbox
+#   scripts/mythos <tool> [args...]   # shorthand for `run <tool> ...`
+#   scripts/mythos down               # stop + remove the toolbox
+#
+# The repo is mounted at /repo (cwd), so engagement artifacts written by a tool
+# land on the host under engagements/. host.docker.internal reaches the host,
+# so a lab target on localhost is reachable as http://host.docker.internal:PORT.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMG="${MYTHOS_IMAGE:-mythos-toolbox}"
 NAME="${MYTHOS_CONTAINER:-mythos-toolbox}"
 
-if [ "${MYTHOS_NATIVE:-0}" = "1" ]; then
-  exec python3 -m mythos.cli "$@"
-fi
-
-# Reach the docker daemon; re-exec under the docker group if needed.
+# --- reach the docker daemon; re-exec under the docker group if needed -------
 if ! docker info >/dev/null 2>&1; then
   if command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
     exec sg docker -c "$(printf '%q ' "${BASH_SOURCE[0]}" "$@")"
   fi
   echo "mythos: cannot reach the Docker daemon." >&2
-  echo "  Enable Docker Desktop -> Settings -> Resources -> WSL integration for this distro," >&2
-  echo "  or run from a shell where your user is in the 'docker' group." >&2
+  echo "  Enable Docker Desktop -> Settings -> Resources -> WSL integration," >&2
+  echo "  or run from a shell whose user is in the 'docker' group." >&2
   exit 1
 fi
 
-# Build the toolbox image on first use.
-if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-  echo "mythos: toolbox image '$IMG' not found; building (first run, a few minutes)..." >&2
-  docker build -t "$IMG" -f "$REPO/toolbox/Dockerfile" "$REPO" >&2
-fi
+build() {
+  if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+    echo "mythos: building toolbox image '$IMG' (first run, a few minutes)..." >&2
+    docker build -t "$IMG" -f "$REPO/toolbox/Dockerfile" "$REPO" >&2
+  fi
+}
 
-# Ensure a long-lived container is up, with the repo mounted at /repo.
-if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
-  docker run -d --name "$NAME" \
-    --add-host=host.docker.internal:host-gateway \
-    -v "$REPO:/repo" -w /repo "$IMG" >/dev/null
-fi
+up() {
+  build
+  if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker run -d --rm --name "$NAME" \
+      --add-host=host.docker.internal:host-gateway \
+      -v "$REPO:/repo" -w /repo "$IMG" >/dev/null
+    echo "mythos: toolbox '$NAME' up (repo mounted at /repo)." >&2
+  fi
+}
 
-# Use the mounted repo source as authoritative, so engine edits take effect
-# without rebuilding the image. Deps are already installed in the container.
-exec docker exec -e PYTHONPATH=/repo/engine/src -w /repo "$NAME" \
-  python3 -m mythos.cli "$@"
+ensure_up() { docker ps --format '{{.Names}}' | grep -qx "$NAME" || up; }
+
+case "${1:-}" in
+  up)    up; exit 0 ;;
+  down)  docker rm -f "$NAME" >/dev/null 2>&1 || true; echo "mythos: toolbox down." >&2; exit 0 ;;
+  build) build; exit 0 ;;
+  tools)
+    ensure_up
+    exec docker exec "$NAME" bash -lc '
+      for t in nuclei sqlmap dalfox ffuf katana subfinder httpx nikto whatweb \
+               arjun wafw00f interactsh-client commix gf qsreplace jwt_tool; do
+        printf "%-18s " "$t"
+        command -v "$t" >/dev/null 2>&1 && ("$t" -version 2>/dev/null || "$t" --version 2>/dev/null || echo OK) | head -1 || echo MISSING
+      done'
+    ;;
+  sh)    ensure_up; shift; exec docker exec -w /repo "$NAME" bash -lc "$*" ;;
+  run)   ensure_up; shift; exec docker exec -w /repo "$NAME" "$@" ;;
+  "" )   echo "usage: scripts/mythos {up|down|tools|sh <cmd>|run <tool ...>|<tool ...>}" >&2; exit 2 ;;
+  * )    ensure_up; exec docker exec -w /repo "$NAME" "$@" ;;   # shorthand: scripts/mythos nuclei -u ...
+esac

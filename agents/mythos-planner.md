@@ -15,12 +15,13 @@ Your job:
 
 1. Read `scope.yaml` and restate the boundary: in-scope hosts, out-of-scope,
    rate limit, request budget, `allow_active`, `allow_exploit`, program notes.
-2. Read any fingerprint already in the engagement dir (`findings.json`), or run
-   `scripts/mythos fingerprint <target>` (toolbox) / the engine directly.
+2. Read any fingerprint already in the engagement dir (`recon/surface.md`), or
+   get a quick one: `scripts/mythos whatweb -a 3 <target>` (see the `toolbox` skill).
 3. Consult `knowledge/` for techniques relevant to the detected stack
    (e.g. `knowledge/web/`), and recent entries the research command added.
-4. Produce an **ordered plan** as a short numbered list. For each phase state:
-   the goal, the concrete tools/engine commands to run, and the stop condition.
+4. Produce an **ordered plan** as a short numbered list, mapping phases to the
+   Mythos skills (`recon` → `web-scan` → `exploit` → `report`). For each phase
+   state: the goal, the concrete tools to run, and the stop condition.
    Default order: recon → scan → exploit-triage (only if `allow_exploit`) →
    report. Tune it: skip subdomain enum for a single-IP target; prioritise API
    testing if the fingerprint shows Swagger/GraphQL; flag login forms as
@@ -29,4 +30,5 @@ Your job:
    rate-limit concern, anything that needs user confirmation.
 
 Output only the plan and the restated scope. Keep it tight. Do not run scans
-yourself — the recon/scanner/exploiter agents execute the plan.
+yourself — the recon/scanner/exploiter agents execute the plan by following
+their phase skills and running real tools in the Kali toolbox.
