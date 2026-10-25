@@ -8,6 +8,8 @@
 #   vulnapp    http://localhost:5001   ground-truth app (known findings)
 #   juiceshop  http://localhost:3000   OWASP Juice Shop (modern JS web app)
 #   dvwa       http://localhost:4280   Damn Vulnerable Web App (classic)
+#   vampi      http://localhost:5002   VAmPI (vulnerable REST API)
+#   dvga       http://localhost:5013   Damn Vulnerable GraphQL App (hard: GraphQL RCE)
 name: mythos-lab
 
 networks:
@@ -45,4 +47,15 @@ services:
       - vulnerable=1
     ports:
       - "127.0.0.1:5002:5000"
+    networks: [mythos-lab]
+
+  # Damn Vulnerable GraphQL Application — hard class: GraphQL code execution,
+  # SSRF->RCE via importPaste, introspection, broken access control.
+  dvga:
+    image: dolevf/dvga:latest
+    container_name: mythos-dvga
+    environment:
+      - WEB_HOST=0.0.0.0
+    ports:
+      - "127.0.0.1:5013:5013"
     networks: [mythos-lab]

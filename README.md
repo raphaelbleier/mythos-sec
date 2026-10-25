@@ -127,8 +127,18 @@ poison-null-byte filter bypass, open-redirect allowlist bypass, config leak),
 one DOM-XSS candidate flagged for the browser agent. See
 `docs/poster/benchmark-skill-driven.md`.
 
+Hard-target benchmark (`docs/poster/benchmark-hard-targets.md`) — classes
+experienced testers miss, across stacks:
+
+- **DVGA (GraphQL)** — unauthenticated **RCE** chained from introspection →
+  `importPaste` SSRF → OS command injection (read `/etc/passwd`); private-paste
+  access; introspection disclosure.
+- **VAmPI (REST API)** — critical `_debug` plaintext-password dump; a BOLA was
+  **tested and disproven** by impact verification (reported as not-vulnerable,
+  not claimed).
+
 More vulnerable targets for practice are in `lab/docker-compose.yml`: OWASP
-Juice Shop, DVWA, VAmPI.
+Juice Shop, DVWA, VAmPI, DVGA.
 
 ```bash
 docker compose -f lab/docker-compose.yml up -d        # start the lab
