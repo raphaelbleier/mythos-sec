@@ -9,7 +9,7 @@ workdir layout (created here, owned by the harness):
   transcript.jsonl  agent stdout (opencode: JSON event stream)
   stderr.log, proc.json (exit_code, timed_out, wall_s)
 """
-import json, os, signal, subprocess, time
+import json, os, shutil, signal, subprocess, time
 from pathlib import Path
 
 PROMPT = """Authorized black-box security assessment of a deliberately vulnerable CTF-style web \
@@ -92,3 +92,24 @@ def run_proc(argv, cwd, env, budget_s, workdir):
 def opencode_argv(agent, model, cwd, text, pure):
     return ["opencode", "run", *(["--pure"] if pure else []), "--agent", agent, "--model", model,
             "--format", "json", "--auto", "--dir", str(cwd), text]
+
+
+def claude_env(home):
+    """Clean HOME for the Claude Code host, carrying only the login.
+
+    The real HOME would drag in the operator's global CLAUDE.md, skills, hooks and MCP
+    servers, which would distort both arms. A fresh HOME loses the credentials, so copy that
+    one file across and leave settings empty.
+    """
+    home = Path(home)
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    creds = Path(os.path.expanduser("~/.claude/.credentials.json"))
+    if creds.exists() and not (home / ".claude/.credentials.json").exists():
+        shutil.copy2(creds, home / ".claude/.credentials.json")
+    (home / ".claude/settings.json").write_text("{}")
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+               XDG_DATA_HOME=str(home / ".local/share"), XDG_STATE_HOME=str(home / ".state"))
+    for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_MESSAGING_TOKEN", "LLM_API_KEY",
+                "LLM_API_BASE", "STRIX_LLM"):
+        env.pop(key, None)
+    return env

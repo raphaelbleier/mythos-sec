@@ -10,7 +10,8 @@ local: every published port is rebound to the docker0 gateway (or loopback), and
 endpoint is not local is refused. Each cell gets a fresh compose project bench_<fw>_<chal>_<run>,
 a random FLAG baked in at build time, a scope.yaml restricted to its one host:port, a fixed wall
 clock and a clean agent HOME. Scoring: see score.py. Existing result.json cells are skipped, so a
-sweep can be resumed. Frameworks are adapters in bench/runners/ (mythos, control, strix;
+sweep can be resumed. Frameworks are adapters in bench/runners/: mythos and control run on the OpenCode host,
+claude_mythos and claude_control on the Claude Code host, plus strix (
 pentestgpt and cai are interactive-only and refused).
 """
 import argparse, hashlib, importlib, ipaddress, json, os, secrets, subprocess, sys
@@ -21,7 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import score, xben
 
-FRAMEWORKS = ("mythos", "control", "strix", "pentestgpt", "cai")
+FRAMEWORKS = ("mythos", "control", "claude_mythos", "claude_control", "strix",
+              "pentestgpt", "cai")
 
 
 def is_local(host, gateway):

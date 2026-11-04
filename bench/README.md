@@ -51,6 +51,19 @@ python3 bench/labs.py selftest
   positives that match no entry. `score` will not overwrite an existing `triage.json` without `--force`.
 - `stats` counts only human statuses; `pending` shows unfinished triage, so recall is a lower bound.
 
+## Hosts and arms
+
+| arm | host | what it is |
+|---|---|---|
+| `mythos` / `control` | OpenCode | the suite, and the bare model with a shell |
+| `claude_mythos` / `claude_control` | Claude Code | the same pair on the Claude Code host |
+| `strix` | own CLI | third-party framework, its own sandbox and LiteLLM model id |
+
+Pair an arm only with its twin on the same host and the same model: that pairing is the
+ablation (what the scaffolding adds), while a cross-host pairing also changes the agent loop.
+The Claude arms run with a clean HOME that carries only the login, so the operator's global
+instructions, skills, hooks and MCP servers cannot distort either side.
+
 ## Usage
 
 ```sh
