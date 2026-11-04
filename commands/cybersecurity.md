@@ -22,8 +22,10 @@ httpx, nikto, commix, interactsh-client, jwt_tool and the rest — inside the
 `mythos-toolbox` Kali container via `scripts/mythos` (the `toolbox` skill).
 There is no separate engine and no external API key. Each phase has a skill
 playbook you follow: `engagement-setup` → `recon` → `web-scan` → `exploit` →
-`report`. Delegate the heavy phases to the sub-agents below (they follow the
-same skills); do the lightweight coordination yourself.
+`report`. Delegate a phase to a sub-agent only when the surface is big enough
+to earn the hand-off (see "Scale the work to the target"); otherwise do it
+yourself. Every delegation costs a full round trip, so an unearned one is pure
+latency.
 
 ## One human gate
 
@@ -52,28 +54,59 @@ Follow the **`engagement-setup` skill**:
    `engagements/<dir>/scope.yaml` from the template in the `engagement-setup`
    skill, and **fill `in_scope` with exactly what the program authorizes**.
    Default `in_scope` to the target host only. Never widen scope on your own.
-4. Start the toolbox: `scripts/mythos up`. State the scope back to the user in
-   one line (in-scope hosts, rate limit, whether exploitation is allowed).
+4. State the scope back to the user in one line (in-scope hosts, rate limit,
+   whether exploitation is allowed). Do **not** start the toolbox yet: start it
+   with `scripts/mythos up` the first time you actually need a container tool.
+   Plain HTTP requests run faster with the host's own `curl`.
    - **With `--scope <file>`** (including non-interactive runs such as
      `opencode run ... --auto`): the scope file *is* the confirmation. State
      the scope and continue without asking.
    - **Without `--scope`**: wait for the user's confirmation of the scope you
      wrote. This is the only question of the engagement.
 
-## Step 1 — plan
+## Step 1 — fast triage (yourself, first, always)
 
-Delegate to the **mythos-planner** agent. Give it the scope and target. It
-returns an ordered phase plan (recon → scan → exploit-triage → report) tuned to
-what the fingerprint suggests.
+Before any tool, spend a few minutes on the target by hand with `curl`. This is
+the step that finds most bugs on a small app, and it tells you how big the job
+really is.
 
-## Step 2 — recon
+1. `curl -sS -D- <target>` the entry point. Read the body and the headers.
+2. Follow the links and forms you see. Note every parameter, every id, every
+   redirect, every error message, the stack, and the auth mechanism.
+3. Form a ranked hypothesis list from what you saw, not from a checklist: a
+   reflected parameter suggests XSS or SSTI, a numeric id suggests IDOR, a
+   search box suggests SQLi, a url parameter suggests SSRF or open redirect, a
+   file parameter suggests traversal.
+4. Probe the top hypotheses directly, one request each. A single well-aimed
+   request beats a template scan on a small app.
+
+Stop this step and go to Step 4 the moment a probe proves a vulnerability. If
+the engagement names a specific proof to obtain, such as a secret to read or a
+privilege to reach, pursue that objective first and keep breadth for later.
+
+## Scale the work to the target
+
+Count the surface after Step 1 and pick the path:
+
+- **Small** (one host, roughly under 20 endpoints, no SPA): do everything
+  yourself with `curl` plus the one or two tools that fit the hypothesis, for
+  example `sqlmap` on a single parameter. Skip the planner and the broad
+  crawl. Write the report yourself at the end.
+- **Large** (many hosts or endpoints, an SPA, an API with a schema): delegate
+  the phases below. Start with **mythos-planner** for an ordered plan.
+- **DOM or client-side work** at any size: delegate to **mythos-browser**.
+
+Do not run a phase whose output you cannot use. Broad recon on a four-page app
+is wasted budget; the same minutes spent on targeted probes find the bug.
+
+## Step 2 — recon (large surface only)
 
 Delegate to **mythos-recon** (follows the `recon` skill). It fingerprints the
 stack, enumerates subdomains (`subfinder`), crawls (`katana -jc` + `gau`),
 discovers parameters (`arjun`) and content (`ffuf`), and summarizes the attack
 surface: live hosts, endpoints, parameters, forms, technologies, exposed files.
 
-## Step 3 — scan
+## Step 3 — scan (large surface, or when the hypotheses are exhausted)
 
 Delegate to **mythos-scanner** (follows the `web-scan` skill). It runs `nuclei`
 (tag-scoped), `dalfox` on parameterized endpoints, `sqlmap` to confirm SQLi,
@@ -82,7 +115,7 @@ redirect, CRLF), auth/API/access-control checks (JWT/CORS/BOLA), blind/OOB via
 `interactsh-client`, and passive header/cookie/CORS checks. Returns candidate
 findings with evidence. For SPA/DOM work, pull in **mythos-browser**.
 
-## Step 3.5 — CVE intelligence pass
+## Step 3.5 — CVE intelligence pass (only when a version is known)
 
 When recon fingerprints a technology/version pair (appliances, frameworks,
 CMS), delegate a **CVE intelligence pass** to the planner: run `cve_lookup`
@@ -94,9 +127,10 @@ non-destructive oracle (OOB callback), then concrete detection/confirmation
 steps injected into the scan and exploit phases. KEV entries feed the
 scanner's target list; findings carry `kev`/`epss` metadata.
 
-## Step 4 — exploitation triage
+## Step 4 — exploitation and validation
 
-Delegate to **mythos-exploiter** (follows the `exploit` skill) _only if_
+On a small target, validate what you found yourself, following the `exploit`
+skill. On a large one, delegate to **mythos-exploiter** (follows the `exploit` skill) _only if_
 `scope.rules.allow_exploit` is true. It validates the highest-severity
 candidates with a minimal, non-destructive proof of concept (e.g. `sqlmap`
 `--banner`, a single reflected-XSS PoC, an OOB callback for blind RCE). It must
@@ -106,7 +140,8 @@ is asked before this step.
 
 ## Step 5 — report
 
-Delegate to **mythos-reporter** (follows the `report` skill). It produces
+Write it yourself on a small target. On a large one delegate to
+**mythos-reporter** (follows the `report` skill). It produces
 `report.md` in bug-bounty format (title, severity + CVSS, asset, steps to
 reproduce, evidence, impact, remediation), ranked by severity. If the user asks
 for a German lab `.docx`, hand the findings to the `security-lab` skill.
@@ -128,6 +163,9 @@ is reached as `http://host.docker.internal:PORT`. No external API key is needed
 - Keep every engagement artifact under `engagements/<dir>/` (git-ignored).
 - Report honestly: say what was tested, what was found, what was skipped and
   why. Mark tentative findings as tentative.
+- Spend the budget where the evidence points. Re-rank your hypotheses after
+  every result instead of finishing a checklist, and stop a line of attack that
+  two probes have not moved.
 - Never run anything destructive or denial-of-service, and keep every proof of
   concept minimal, even if scope allows more. If something could only be
   proven destructively, skip it and report it as unconfirmed; do not stop to
