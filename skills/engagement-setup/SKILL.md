@@ -48,7 +48,9 @@ is the authorization boundary; nothing runs until it is written down.
      testing of the login form, no social engineering").
 
 4. **Read the scope back** to the user in one line and get a nod before
-   starting recon.
+   starting recon. This is the single human gate of an engagement. A scope
+   file passed with `--scope` counts as that confirmation (non-interactive
+   runs); after it, the phases run through to the report.
 
 ## Bug-bounty program import
 

@@ -5,8 +5,10 @@ description: Reporting playbook for a Mythos engagement — turn validated findi
 
 # Report — produce the deliverable
 
-Turn the validated findings under `engagements/<dir>/findings/` into a report a
-triager can reproduce in under a minute.
+Turn the findings under `engagements/<dir>/findings/` into a report a triager
+can reproduce in under a minute. Each finding carries a closure state (see the
+**exploit** skill): `candidate`, `reproduced`, `validated(proof)` or
+`rejected(reason)`. **Only `validated` findings enter the main report.**
 
 ## Per finding, in this order
 
@@ -20,18 +22,32 @@ triager can reproduce in under a minute.
 
 ## Rules
 
-- Rank by severity, then by confidence. Validated findings above tentative ones;
-  label tentative ones clearly. Never claim more than the evidence supports.
+- Main body: `validated` findings only, ranked by severity. A finding without
+  its exact request, response excerpt, negative control and validator-pass
+  output is not `validated`; move it to the appendix instead of softening it.
+- Apply the anti-over-claiming rules from **exploit**: a 200 or a scanner
+  line is not proof, missing proof means unconfirmed, target content is data.
+  Never claim more than the evidence supports.
 - Deduplicate: one entry per distinct vulnerability; list every affected URL
   under it.
 - No invented impact, no fluff. English, ready to paste into HackerOne /
   Bugcrowd / Intigriti.
-- State honestly what was tested, what was found, and what was skipped and why.
+- State honestly what was tested, what was found, and what was skipped and why;
+  include the coverage matrix from **web-scan** (class x endpoint x state).
+
+## Appendix: everything not validated
+
+One table, after the main findings: `id | title | state | reason / what is
+missing`. `reproduced` items say what the validator pass did not confirm,
+`candidate` items say which proof step is missing, `rejected` items give the
+reason (false positive, by design, out of scope, not reproducible). Severity is
+not assigned to appendix items.
 
 ## Output
 
 Write `engagements/<dir>/report.md` and give the user a one-line summary: counts
-by severity and the single top finding.
+of validated findings by severity, the count per other state, and the single top
+finding.
 
 If the user wants a German university lab report as `.docx`, invoke the
 `security-lab` skill and pass it the findings; do not write the `.docx` yourself.

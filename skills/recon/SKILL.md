@@ -81,7 +81,9 @@ scripts/mythos sh 'for p in .git/HEAD .env actuator/env swagger.json openapi.jso
 
 If you find an OpenAPI/Swagger or GraphQL endpoint, pull it and enumerate every
 operation/field — those are high-value, often under-tested surface. Note each
-endpoint + its parameters for the scan phase. For GraphQL run introspection:
+endpoint + its parameters for the scan phase. Save the spec as
+`engagements/<dir>/recon/openapi.json`; **business-logic** diffs it for mass
+assignment and takes its id-bearing paths for BOLA. For GraphQL run introspection:
 
 ```
 scripts/mythos sh "curl -s <URL>/graphql -H 'Content-Type: application/json' \
@@ -97,8 +99,14 @@ Write `engagements/<dir>/recon/surface.md` summarizing:
 - endpoints grouped by interest: auth, admin, API, upload, redirect-like, file-like, numeric-id (IDOR), reflected;
 - forms and their parameters;
 - exposed files found;
-- **the most promising injection points** and which bug class each suggests.
+- **the most promising injection points** and which bug class each suggests;
+- the login mechanism (form, JSON API, SPA, SSO/OAuth) and the endpoints that
+  carry per-user objects.
 
 Respect the rate limit in `scope.yaml` (throttle `-t`/`-rate` flags). Do not run
-injection attacks here — that is the **web-scan** / **exploit** phase. Hand the
-surface to the scanner.
+injection attacks here — that is the **web-scan** / **exploit** phase.
+
+If there is a login: run **auth-session** next (one session per role), then
+repeat steps 3 to 6 authenticated (`katana -H engagements/<dir>/sessions/userA.headers`,
+or `-headless -xhr` for an SPA) and add what only a logged-in user sees to
+`surface.md`. Then hand the surface to the scanner.

@@ -19,6 +19,10 @@ and sourced.
 - [Unrestricted File Upload → RCE](web/file-upload.md)
 - [XXE / XML External Entity Injection](web/xxe.md)
 - [GraphQL & Modern API Testing](web/graphql-api.md)
+- [Race Conditions](web/race-conditions.md)
+- [Mass Assignment (BOPLA)](web/mass-assignment.md)
+- [Web Cache Poisoning & Deception](web/cache-poisoning.md)
+- [HTTP Request Smuggling](web/request-smuggling.md)
 
 ## Techniques
 Cross-cutting methodology used by the `cve-deep-dive` skill.
