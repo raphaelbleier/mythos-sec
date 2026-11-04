@@ -4,8 +4,9 @@
 Reads the Claude Code hook event on stdin. For Bash/tool calls it extracts the
 hosts and URLs the command targets and checks them against the active
 engagement scope. If a target is out of scope it prints a prominent warning
-but does NOT block (the user chose warn-only). Set MYTHOS_SCOPE_ENFORCE=block
-to turn it into a hard block instead.
+but does NOT block (the default is warn-only). MYTHOS_SCOPE_ENFORCE picks the
+mode: "warn" (default, warn and continue), "ask" (the host asks the user to
+confirm the call) or "block" (refuse the call outright).
 
 Finding the active scope, in order:
   1. $MYTHOS_SCOPE                       (explicit path)
@@ -155,10 +156,21 @@ def main() -> int:
     if not msg:
         return 0
 
-    if os.environ.get("MYTHOS_SCOPE_ENFORCE") == "block":
+    mode = os.environ.get("MYTHOS_SCOPE_ENFORCE", "warn")
+    if mode == "block":
         # exit code 2 blocks the tool call and feeds stderr back to Claude
         print(msg, file=sys.stderr)
         return 2
+    if mode == "ask":
+        # hand the decision to the user: the host shows the reason and prompts
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": msg,
+            }
+        }))
+        return 0
     # warn-only: surface the warning without blocking
     print(json.dumps({
         "hookSpecificOutput": {

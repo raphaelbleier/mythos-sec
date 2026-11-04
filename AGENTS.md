@@ -40,7 +40,8 @@ mounted at `/repo`, so tool output lands under `engagements/`. A lab target on
 - The scope guard (`hooks/scope-guard.py`, wired as a Claude Code PreToolUse
   hook and as the OpenCode plugin `.opencode/plugin/scope-guard.ts`) warns on
   out-of-scope hosts in bash/webfetch calls. It is warn-only by design
-  (`MYTHOS_SCOPE_ENFORCE=block` turns it into a block). A warning means: do
+  (`MYTHOS_SCOPE_ENFORCE` picks the mode: `warn` default, `ask` to refuse
+  pending the user's decision, `block` to refuse outright). A warning means: do
   not run that command.
 - Honor `rules.rate_limit_rps` and `rules.max_requests`.
 - Keep all engagement artifacts under `engagements/<dir>/` (git-ignored).

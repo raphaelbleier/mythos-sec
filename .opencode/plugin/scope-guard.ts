@@ -6,8 +6,9 @@
 // same way ($MYTHOS_SCOPE, else the newest engagements/*/scope.yaml).
 //
 // Warn-only by default: the warning is printed to the bash tool's stderr so
-// the model sees it, and to the OpenCode log. MYTHOS_SCOPE_ENFORCE=block
-// throws instead, which blocks the tool call.
+// the model sees it, and to the OpenCode log. MYTHOS_SCOPE_ENFORCE picks the
+// mode: "warn" (default), "ask" (refuse and name the reason, since OpenCode
+// has no hook-level user prompt) or "block" (refuse outright).
 //
 // Dual export, no imports from a plugin package: OpenCode 1.x (>= 1.18.29)
 // calls `server()`; OpenCode 2.x calls `setup(ctx)` (Plugin.define is the
@@ -28,7 +29,14 @@ function check(tool: string, args: any, cwd: string): void {
     return // guard unavailable (no python3?): stay out of the way, like the Claude hook
   }
   if (!msg) return
-  if (process.env.MYTHOS_SCOPE_ENFORCE === "block") throw new Error(msg)
+  const mode = process.env.MYTHOS_SCOPE_ENFORCE ?? "warn"
+  if (mode === "block") throw new Error(msg)
+  if (mode === "ask") {
+    // OpenCode has no hook-level "ask", so an unattended run must not pass silently:
+    // refuse the call and name the scope reason. Interactive users re-run it after
+    // widening scope.yaml, or set MYTHOS_SCOPE_ENFORCE=warn.
+    throw new Error(msg + "\n(MYTHOS_SCOPE_ENFORCE=ask: refused pending your decision)")
+  }
   console.error(msg)
   if (tool === "bash") {
     const quoted = "'" + msg.replace(/'/g, `'\\''`) + "'"

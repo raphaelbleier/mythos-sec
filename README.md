@@ -237,7 +237,8 @@ is not provable without authorized access to each target.
 - Scope is stated up front and watched by a warn-only scope guard
   (`hooks/scope-guard.py` as a Claude Code `PreToolUse` hook,
   `.opencode/plugin/scope-guard.ts` for OpenCode; set
-  `MYTHOS_SCOPE_ENFORCE=block` to hard-block out-of-scope hosts). It is a safety
+  `MYTHOS_SCOPE_ENFORCE=ask` to decide per call, `=block` to hard-block
+  out-of-scope hosts). It is a safety
   net, not a sandbox; coverage inside OpenCode sub-agents is not yet verified.
   The agent honors `scope.yaml` in every tool call.
 - Non-destructive by default; exploitation only when `scope.rules.allow_exploit`

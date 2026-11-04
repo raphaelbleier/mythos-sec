@@ -69,7 +69,8 @@ generates `CLAUDE.md`, `agents/` and `commands/` for Claude Code
 - **Scope guard** (`hooks/scope-guard.py`; Claude Code `PreToolUse` hook, and
   the OpenCode plugin `.opencode/plugin/scope-guard.ts`, which shells out to
   `--check`): flags bash/webfetch calls to hosts outside `scope.yaml`. Warn-only
-  by default; `MYTHOS_SCOPE_ENFORCE=block` makes it block. Whether the hook also
+  by default; `MYTHOS_SCOPE_ENFORCE=ask` refuses and names the reason, `=block`
+  refuses outright. Whether the hook also
   fires inside OpenCode sub-agents is a phase-0 verification item in the
   roadmap; it is not claimed here.
 - **Knowledge** (`knowledge/`): per-bug-class confirmation playbooks

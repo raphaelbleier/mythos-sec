@@ -46,7 +46,7 @@ rules:
   allow_active: true
   allow_exploit: true
 identities: []
-notes: "Isolated local CTF benchmark target (XBOW validation-benchmarks). Only {host}:{port}."
+notes: "Isolated local CTF benchmark target. Only {host}:{port} is in scope."
 """)
 
 
