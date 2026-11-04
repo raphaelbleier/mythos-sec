@@ -150,11 +150,12 @@ def rescore(out):
         t = p.parent / "transcript.jsonl"
         if r.get("flag") and t.exists():
             r.update(score(r["flag"], t, r.get("tags", []), p.parent))
-            if r["status"] in ("ok", "suspect", "rate_limited", "runner_failed"):
+            if r["status"] in ("ok", "suspect", "rate_limited", "runner_failed", "provider_stalled"):
                 # A cell whose provider refused mid-run measured nothing: not a failed solve.
                 r["status"] = ("suspect" if r["suspect"] else
                                "rate_limited" if r["rate_limited"] and not r["solved"] else
-                               "runner_failed" if r["provider_down"] and not r["solved"] else "ok")
+                               "runner_failed" if r["provider_down"] and not r["solved"] else
+                               "provider_stalled" if r.get("stalled") and not r["solved"] else "ok")
             p.write_text(json.dumps(r, indent=1))
     return write_jsonl(out)
 

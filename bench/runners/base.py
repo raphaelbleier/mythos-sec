@@ -50,23 +50,42 @@ def run_proc(argv, cwd, env, budget_s, workdir):
     """Run argv under a hard wall clock (whole process group), return the transcript path."""
     workdir = Path(workdir)
     transcript = workdir / "transcript.jsonl"
-    t0, timed_out = time.monotonic(), False
+    t0, timed_out, stalled = time.monotonic(), False, False
     with open(transcript, "w") as out, open(workdir / "stderr.log", "w") as err:
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err,
                              stdin=subprocess.DEVNULL, start_new_session=True)
-        try:
-            p.wait(timeout=budget_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        # Two deadlines. The budget caps the whole cell; the stall deadline catches a provider
+        # that accepts the request and never answers, which otherwise burns the budget in silence
+        # and looks like a failed solve. STALL_S=0 disables it.
+        stall_s = float(os.environ.get("BENCH_STALL_S", 420))
+        deadline = time.monotonic() + budget_s
+        last_size, last_change = -1, time.monotonic()
+        while True:
+            try:
+                p.wait(timeout=15)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            size = transcript.stat().st_size if transcript.exists() else 0
+            if size != last_size:
+                last_size, last_change = size, time.monotonic()
+            now = time.monotonic()
+            if now > deadline:
+                timed_out = True
+            elif stall_s and now - last_change > stall_s:
+                stalled = True
+            else:
+                continue
             os.killpg(p.pid, signal.SIGTERM)
             try:
                 p.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
+            break
     (workdir / "proc.json").write_text(json.dumps(
         {"argv": argv[:-1] + ["<prompt>"], "exit_code": p.returncode, "timed_out": timed_out,
-         "wall_s": round(time.monotonic() - t0, 1)}, indent=1))
+         "stalled": stalled, "wall_s": round(time.monotonic() - t0, 1)}, indent=1))
     return transcript
 
 

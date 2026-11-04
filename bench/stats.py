@@ -5,7 +5,7 @@
 
 Per (framework, model): solve rate with Wilson 95% CI over scored runs, detection rate,
 pass@k over repeats (unbiased estimator, averaged over challenges), suspect and rate-limited
-counts. Cells with status target_failed / scope_refused / runner_failed / rate_limited are not scored.
+counts. Cells with status target_failed / scope_refused / runner_failed / rate_limited / provider_stalled are not scored.
 --compare A,B: paired McNemar on (challenge, run) pairs both frameworks have, exact two-sided
 binomial on the discordant pairs.
 """
