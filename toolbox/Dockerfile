@@ -1,64 +1,74 @@
-# Mythos toolbox: Kali-based image with a broad web red-team tool belt. Mythos
+# syntax=docker/dockerfile:1.7
+# Mythos toolbox: Kali-based image with a curated web red-team tool belt. Mythos
 # is skill-driven — Claude Code is the agent and runs these tools via the
-# scripts/mythos shim; the image ships no engine. The belt is the union of what
-# CAI, Strix, HexStrike and PentestGPT drive, focused on web and API testing.
+# scripts/mythos shim; the image ships no engine.
 #
 #   build:  docker build -t mythos-toolbox -f toolbox/Dockerfile .   (context = repo root)
-#   run:    kept alive by the compose service; exec tools into it per command.
+#   run:    scripts/mythos up  (cap-drop ALL + NET_RAW, no docker.sock)
 #
-# Extra tool layers are best-effort: a package missing from a given Kali
+# Stage 1 compiles pinned Go tools (multi-arch for free); stage 2 is Kali with
+# apt tools. Extra layers are best-effort: a package missing from a given Kali
 # snapshot is skipped, never fatal. Metasploit is opt-in (large).
-FROM kalilinux/kali-rolling
+
+# Base pinned by digest for reproducibility. Refresh weekly (CI does this on
+# rebuild; do it by hand with):
+#   docker buildx imagetools inspect kalilinux/kali-rolling | grep Digest
+ARG KALI_DIGEST=sha256:7997e0581c4f5c185cfe6773d5cae8fcc7c6b79798726ccaabf843af4bcd2013
+
+# ---------------------------------------------------------------- go builder
+FROM golang:1.26-bookworm AS gobuilder
+# Versions: see toolbox/tools.txt. Each install is independent, a failure is non-fatal.
+RUN for pkg in \
+        github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.11.1 \
+        github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0 \
+        github.com/projectdiscovery/katana/cmd/katana@v1.8.0 \
+        github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.17.0 \
+        github.com/ffuf/ffuf/v2@v2.3.0 \
+        github.com/hahwul/dalfox/v2@v2.13.0 \
+        github.com/projectdiscovery/interactsh/cmd/interactsh-client@v1.4.1 \
+        github.com/lc/gau/v2/cmd/gau@v2.2.4 \
+        github.com/tomnomnom/qsreplace@v0.0.3 \
+        github.com/tomnomnom/gf@v0.0.0-20200618134122-dcd4c361f9f5 ; do \
+      GOBIN=/out go install "$pkg" || echo "skip $pkg"; \
+    done; ls /out
+
+# ------------------------------------------------------------------- runtime
+FROM kalilinux/kali-rolling@${KALI_DIGEST}
 
 ARG INSTALL_METASPLOIT=false
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     MYTHOS_IN_TOOLBOX=1 \
-    GOBIN=/usr/local/bin \
-    PATH=/usr/local/bin:/root/go/bin:$PATH
+    HOME=/home/pentester \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    CHROME_BIN=/usr/bin/chromium \
+    PATH=/usr/local/bin:$PATH
 
 # --- core (must succeed) -----------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        nmap nikto whatweb sqlmap ffuf gobuster wfuzz dirb dirsearch \
-        curl wget jq git ca-certificates dnsutils unzip \
-        python3 python3-pip python3-venv pipx golang-go seclists wordlists \
-    && rm -rf /var/lib/apt/lists/*
-
-# --- recon / scanning: proven-good group (one atomic install) ----------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        nuclei subfinder katana dnsx naabu dalfox amass masscan feroxbuster \
+        nmap nikto whatweb sqlmap gobuster wfuzz dirb dirsearch \
+        curl wget jq git ca-certificates dnsutils unzip openssl \
+        python3 python3-pip python3-venv seclists wordlists chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # --- extras: per-package so one missing name never kills the rest ------
 RUN apt-get update && for p in \
-        wafw00f commix dotdotpwn xsser sslscan testssl.sh wpscan \
-        hydra john hashcat nbtscan enum4linux hakrawler httpx-toolkit; do \
+        commix dotdotpwn xsser sslscan testssl.sh wpscan amass masscan feroxbuster \
+        hydra john hashcat nbtscan enum4linux; do \
       apt-get install -y --no-install-recommends "$p" || echo "skip apt:$p"; \
     done && rm -rf /var/lib/apt/lists/*
 
-# ProjectDiscovery httpx binary (kali's package name varies; ensure `httpx`)
-RUN set -e; \
-    if ! command -v httpx >/dev/null 2>&1; then \
-      (command -v httpx-toolkit >/dev/null 2>&1 && ln -sf "$(command -v httpx-toolkit)" /usr/local/bin/httpx) || \
-      (GOBIN=/usr/local/bin go install github.com/projectdiscovery/httpx/cmd/httpx@latest) || \
-      echo "httpx unavailable"; \
-    fi; command -v httpx || true
+# --- metasploit (opt-in) -----------------------------------------------
+RUN if [ "$INSTALL_METASPLOIT" = "true" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends metasploit-framework && \
+      rm -rf /var/lib/apt/lists/* ; \
+    fi
 
-# --- Go belt (best-effort; small, high-value url/param tools) ----------
-RUN for pkg in \
-        github.com/tomnomnom/waybackurls@latest \
-        github.com/tomnomnom/anew@latest \
-        github.com/tomnomnom/qsreplace@latest \
-        github.com/tomnomnom/gf@latest \
-        github.com/lc/gau/v2/cmd/gau@latest \
-        github.com/jaeles-project/gospider@latest \
-        github.com/tomnomnom/assetfinder@latest \
-        github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest ; do \
-      GOBIN=/usr/local/bin go install "$pkg" 2>/dev/null || echo "skip $pkg"; \
-    done; rm -rf /root/go/pkg || true
+# --- pinned Go binaries ------------------------------------------------
+COPY --from=gobuilder /out/ /usr/local/bin/
 
 # --- Python belt (best-effort, each independent) -----------------------
-RUN for pkg in arjun wafw00f semgrep graphw00f paramspider; do \
+RUN for pkg in arjun wafw00f semgrep graphw00f paramspider playwright; do \
       pip3 install --break-system-packages --no-cache-dir "$pkg" || echo "skip pip:$pkg"; \
     done
 
@@ -68,28 +78,25 @@ RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool 2>/dev
     printf '#!/bin/sh\nexec python3 /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool && \
     chmod +x /usr/local/bin/jwt_tool || echo "jwt_tool skipped"
 
-# --- secrets / SCA (best-effort) ---------------------------------------
-RUN apt-get update && (apt-get install -y --no-install-recommends trufflehog 2>/dev/null; \
-    GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@latest 2>/dev/null; \
-    true) && rm -rf /var/lib/apt/lists/*
+# --- non-root user. nmap runs unprivileged (-sT); file caps are useless under
+# no-new-privileges. For raw scans: scripts/mythos with `docker exec -u 0` (NET_RAW is granted).
+RUN useradd -m -u 1000 -s /bin/bash pentester \
+    && mkdir -p /work /repo && chown pentester:pentester /work
 
-# --- metasploit (opt-in) -----------------------------------------------
-RUN if [ "$INSTALL_METASPLOIT" = "true" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends metasploit-framework && \
-      rm -rf /var/lib/apt/lists/* ; \
-    fi
+# nuclei templates baked at build (best-effort; needs network at build time).
+# World-writable home so the shim can run the container as the host uid.
+USER pentester
+RUN nuclei -update-templates || echo "nuclei templates skipped (fetched on first use)"
+USER root
+RUN chmod -R a+rwX /home/pentester \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /root/.cache /tmp/* \
+    && find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en*' ! -name locale.alias -exec rm -rf {} +
 
-# nuclei templates (best-effort; needs network at build time)
-RUN nuclei -update-templates 2>/dev/null || true
-
-# --- headless browser for DOM-XSS / SPA testing (built as root, no sudo) ---
-RUN pip3 install --break-system-packages --no-cache-dir playwright \
-    && (playwright install --with-deps chromium \
-        || (apt-get update && apt-get install -y --no-install-recommends chromium \
-            && rm -rf /var/lib/apt/lists/*) \
-        || echo "browser install best-effort")
-
+# Chromium as non-root in a container: launch with --no-sandbox (Playwright:
+# executable_path="/usr/bin/chromium", args=["--no-sandbox"]).
 ENV MYTHOS_WORDLIST=/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
 
+USER pentester
 WORKDIR /work
 ENTRYPOINT ["sleep", "infinity"]

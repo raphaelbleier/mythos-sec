@@ -10,10 +10,15 @@
 #   dvwa       http://localhost:4280   Damn Vulnerable Web App (classic)
 #   vampi      http://localhost:5002   VAmPI (vulnerable REST API)
 #   dvga       http://localhost:5013   Damn Vulnerable GraphQL App (hard: GraphQL RCE)
+#   vuln-bank-web http://localhost:5003  Vuln Bank (needs VULNBANK_DIR checkout)
+#   oast       http://localhost:8081   HTTP+DNS catcher (OAST), log at /__log
+#   admin-bot  http://localhost:8000   POST /visit {url} with admin cookie
+# Network `mythos-lab` has a fixed name: scripts/mythos net mythos-lab
 name: mythos-lab
 
 networks:
   mythos-lab:
+    name: mythos-lab
     driver: bridge
 
 services:
@@ -59,3 +64,61 @@ services:
     ports:
       - "127.0.0.1:5013:5013"
     networks: [mythos-lab]
+
+  # Vuln Bank (Commando-X/vuln-bank): race conditions, GraphQL, BOPLA, stored XSS.
+  # Clone it first: git clone https://github.com/Commando-X/vuln-bank "$VULNBANK_DIR"
+  vuln-bank-db:
+    image: postgres:13
+    container_name: mythos-vuln-bank-db
+    environment:
+      - POSTGRES_DB=vulnerable_bank
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    networks: [mythos-lab]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vulnerable_bank"]
+      interval: 5s
+      retries: 10
+
+  vuln-bank-web:
+    build: ${VULNBANK_DIR:-/mnt/linux-data/mythos-bench/vuln-bank}
+    container_name: mythos-vuln-bank
+    environment:
+      - DB_NAME=vulnerable_bank
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_HOST=vuln-bank-db
+      - DB_PORT=5432
+    depends_on:
+      vuln-bank-db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5003:5000"
+    networks: [mythos-lab]
+
+  # Out-of-band catcher for blind SSRF/XSS/XXE. From the lab: http://oast:8080/x,
+  # DNS oast:5353/udp. Internet-free replacement for interactsh.
+  oast:
+    build: ./oast
+    container_name: mythos-oast
+    volumes:
+      - oast-data:/data
+    ports:
+      - "127.0.0.1:8081:8080"
+    networks: [mythos-lab]
+
+  # Visits URLs as admin to trigger stored XSS. Set ADMIN_COOKIE_VALUE to an
+  # admin session token of the target app (ADMIN_COOKIE_NAME defaults to `token`).
+  admin-bot:
+    build: ./admin-bot
+    container_name: mythos-admin-bot
+    environment:
+      - ADMIN_COOKIE_NAME=${ADMIN_COOKIE_NAME:-token}
+      - ADMIN_COOKIE_VALUE=${ADMIN_COOKIE_VALUE:-}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-vulnapp,juiceshop,dvwa,vampi,dvga,vuln-bank-web}
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [mythos-lab]
+
+volumes:
+  oast-data:

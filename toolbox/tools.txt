@@ -1,0 +1,16 @@
+# Pinned Go tools (installed via `go install pkg@version` in toolbox/Dockerfile).
+# Keep in sync with the ARGs in the Dockerfile builder stage.
+nuclei          v3.11.1
+httpx           v1.12.0
+katana          v1.8.0
+subfinder       v2.17.0
+ffuf            v2.3.0
+dalfox          v2.13.0
+interactsh-client v1.4.1
+gau             v2.2.4
+qsreplace       v0.0.3
+gf              v0.0.0-20200618134122-dcd4c361f9f5
+# apt (Kali rolling, version = snapshot at build): nmap sqlmap nikto commix whatweb
+#   sslscan wafw00f hydra chromium python3 curl jq openssl ... (see Dockerfile)
+# pip (best-effort): arjun wafw00f semgrep graphw00f paramspider playwright
+# git: jwt_tool (ticarpi/jwt_tool, shallow clone at build)

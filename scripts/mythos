@@ -1,73 +1,124 @@
-#!/usr/bin/env bash
-# Mythos toolbox driver — a thin shim over the Kali "mythos-toolbox" container.
-#
-# Mythos is skill-driven: Claude Code is the agent, and it runs REAL security
-# tools (nuclei, sqlmap, dalfox, ffuf, katana, subfinder, httpx, nikto, commix,
-# interactsh-client, jwt_tool, ...) inside this container via the subcommands
-# below. There is no Python engine and no second LLM runtime.
-#
-#   scripts/mythos up                 # build (first run) + start the toolbox
-#   scripts/mythos tools              # show the key tools and versions
-#   scripts/mythos run nuclei -u URL  # run one tool in the toolbox
-#   scripts/mythos sh 'ffuf -u ...'   # run a shell command in the toolbox
-#   scripts/mythos <tool> [args...]   # shorthand for `run <tool> ...`
-#   scripts/mythos down               # stop + remove the toolbox
-#
-# The repo is mounted at /repo (cwd), so engagement artifacts written by a tool
-# land on the host under engagements/. host.docker.internal reaches the host,
-# so a lab target on localhost is reachable as http://host.docker.internal:PORT.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Mythos toolbox driver: a thin stdlib-only shim over the Kali toolbox container.
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMG="${MYTHOS_IMAGE:-mythos-toolbox}"
-NAME="${MYTHOS_CONTAINER:-mythos-toolbox}"
+Mythos is skill-driven: Claude Code is the agent and runs REAL security tools
+inside the container via the subcommands below. No engine, no second LLM.
 
-# --- reach the docker daemon; re-exec under the docker group if needed -------
-if ! docker info >/dev/null 2>&1; then
-  if command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
-    exec sg docker -c "$(printf '%q ' "${BASH_SOURCE[0]}" "$@")"
-  fi
-  echo "mythos: cannot reach the Docker daemon." >&2
-  echo "  Enable Docker Desktop -> Settings -> Resources -> WSL integration," >&2
-  echo "  or run from a shell whose user is in the 'docker' group." >&2
-  exit 1
-fi
+  scripts/mythos up                  pull (or build) the image + start the toolbox
+  scripts/mythos tools               show key tools and versions
+  scripts/mythos run nuclei -u URL   run one tool (argv passed as a list, no shell)
+  scripts/mythos sh 'ffuf ... | jq'  run a shell pipeline in the toolbox
+  scripts/mythos <tool> [args...]    shorthand for `run <tool> ...`
+  scripts/mythos net <network>       connect the toolbox to a lab docker network
+  scripts/mythos down                stop + remove the toolbox
 
-build() {
-  if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-    echo "mythos: building toolbox image '$IMG' (first run, a few minutes)..." >&2
-    docker build -t "$IMG" -f "$REPO/toolbox/Dockerfile" "$REPO" >&2
-  fi
-}
+Env: MYTHOS_IMAGE (default ghcr.io/raphaelbleier/mythos-toolbox:latest),
+     MYTHOS_BUILD=1 (force local build), MYTHOS_CONTAINER (default mythos-toolbox).
+Every exec is logged (before and after) to engagements/audit.jsonl.
+The repo is mounted at /repo; host.docker.internal reaches the host.
+"""
+import json, os, subprocess, sys, time
+from pathlib import Path
 
-up() {
-  build
-  if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
-    docker run -d --rm --name "$NAME" \
-      --add-host=host.docker.internal:host-gateway \
-      -v "$REPO:/repo" -w /repo "$IMG" >/dev/null
-    echo "mythos: toolbox '$NAME' up (repo mounted at /repo)." >&2
-  fi
-}
+REPO = Path(__file__).resolve().parent.parent
+IMG = os.environ.get("MYTHOS_IMAGE", "ghcr.io/raphaelbleier/mythos-toolbox:latest")
+LOCAL = "mythos-toolbox"
+NAME = os.environ.get("MYTHOS_CONTAINER", "mythos-toolbox")
+AUDIT = REPO / "engagements" / "audit.jsonl"
+ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}  # Git Bash must not rewrite /repo
 
-ensure_up() { docker ps --format '{{.Names}}' | grep -qx "$NAME" || up; }
+TOOLS = ("nuclei sqlmap dalfox ffuf katana subfinder httpx nikto whatweb arjun "
+         "wafw00f interactsh-client commix gf qsreplace jwt_tool").split()
+TOOLS_SH = ('for t in %s; do printf "%%-18s " "$t"; if command -v "$t" >/dev/null 2>&1; then '
+            '("$t" -version || "$t" --version || echo OK) 2>&1 | head -1; '
+            'else echo MISSING; fi; done' % " ".join(TOOLS))
 
-case "${1:-}" in
-  up)    up; exit 0 ;;
-  down)  docker rm -f "$NAME" >/dev/null 2>&1 || true; echo "mythos: toolbox down." >&2; exit 0 ;;
-  build) build; exit 0 ;;
-  tools)
-    ensure_up
-    exec docker exec "$NAME" bash -lc '
-      for t in nuclei sqlmap dalfox ffuf katana subfinder httpx nikto whatweb \
-               arjun wafw00f interactsh-client commix gf qsreplace jwt_tool; do
-        printf "%-18s " "$t"
-        command -v "$t" >/dev/null 2>&1 && ("$t" -version 2>/dev/null || "$t" --version 2>/dev/null || echo OK) | head -1 || echo MISSING
-      done'
-    ;;
-  sh)    ensure_up; shift; exec docker exec -w /repo "$NAME" bash -lc "$*" ;;
-  run)   ensure_up; shift; exec docker exec -w /repo "$NAME" "$@" ;;
-  "" )   echo "usage: scripts/mythos {up|down|tools|sh <cmd>|run <tool ...>|<tool ...>}" >&2; exit 2 ;;
-  * )    ensure_up; exec docker exec -w /repo "$NAME" "$@" ;;   # shorthand: scripts/mythos nuclei -u ...
-esac
+
+def docker(*a, check=False, quiet=True):
+    r = subprocess.run(["docker", *a], env=ENV, capture_output=quiet, text=True)
+    if check and r.returncode:
+        sys.exit(r.stderr or r.returncode)
+    return r
+
+
+def audit(**kw):
+    AUDIT.parent.mkdir(exist_ok=True)
+    with AUDIT.open("a") as f:
+        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **kw}) + "\n")
+
+
+def running():
+    return NAME in docker("ps", "--format", "{{.Names}}").stdout.split()
+
+
+def have(img):
+    return docker("image", "inspect", img).returncode == 0
+
+
+def image():
+    """Pick the image to run: pulled GHCR image, else local build."""
+    global IMG
+    if os.environ.get("MYTHOS_BUILD") != "1":
+        if have(IMG) or docker("pull", IMG, quiet=False).returncode == 0:
+            return IMG
+        print(f"mythos: pull of {IMG} failed, building locally.", file=sys.stderr)
+    if os.environ.get("MYTHOS_BUILD") == "1" or not have(LOCAL):
+        print("mythos: building toolbox image (a few minutes)...", file=sys.stderr)
+        docker("build", "-t", LOCAL, "-f", str(REPO / "toolbox" / "Dockerfile"), str(REPO),
+               check=True, quiet=False)
+    return LOCAL
+
+
+def up():
+    if running():
+        return
+    img = image()
+    docker("rm", "-f", NAME)
+    args = ["run", "-d", "--rm", "--init", "--name", NAME,
+            "--cap-drop", "ALL", "--cap-add", "NET_RAW",
+            "--security-opt", "no-new-privileges",
+            "--add-host=host.docker.internal:host-gateway",
+            "-v", f"{REPO}:/repo", "-w", "/repo"]
+    if sys.platform.startswith("linux"):  # keep bind-mount files owned by the host user
+        args += ["--user", f"{os.getuid()}:{os.getgid()}"]
+    docker(*args, img, check=True)
+    print(f"mythos: toolbox '{NAME}' up (repo mounted at /repo).", file=sys.stderr)
+
+
+def exec_(argv):
+    if not running():
+        up()
+    t = time.time()
+    audit(phase="start", argv=argv)
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    rc = subprocess.run(["docker", "exec", "-i", *tty, "-w", "/repo", NAME, *argv], env=ENV).returncode
+    audit(phase="end", argv=argv, exit=rc, seconds=round(time.time() - t, 2))
+    return rc
+
+
+def main(a):
+    if not a:
+        sys.exit("usage: scripts/mythos {up|down|tools|net <network>|sh <cmd>|run <tool ...>|<tool ...>}")
+    if docker("info").returncode:
+        sys.exit("mythos: cannot reach the Docker daemon (is it running, and is your user in the docker group?)")
+    c, rest = a[0], a[1:]
+    if c == "up": up()
+    elif c == "down":
+        docker("rm", "-f", NAME); print("mythos: toolbox down.", file=sys.stderr)
+    elif c == "build":
+        os.environ["MYTHOS_BUILD"] = "1"; image()
+    elif c == "tools": return exec_(["bash", "-lc", TOOLS_SH])
+    elif c == "net":
+        if not rest: sys.exit("usage: scripts/mythos net <docker-network>")
+        if not running(): up()
+        r = docker("network", "connect", rest[0], NAME)
+        if r.returncode and "already exists" not in r.stderr: sys.exit(r.stderr)
+        print(f"mythos: toolbox connected to {rest[0]}.", file=sys.stderr)
+    elif c == "sh": return exec_(["bash", "-lc", " ".join(rest)])
+    elif c == "run": return exec_(rest)
+    else: return exec_(a)  # shorthand: scripts/mythos nuclei -u ...
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
