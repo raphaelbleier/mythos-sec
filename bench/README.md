@@ -26,6 +26,31 @@ rules are in `data/ground_truth/README.md`. Which frameworks are actual harness
 arms vs. interactive-only is in `data/frameworks.json` — PentestGPT and CAI are
 interactive-only, refused by `run.py`, and not part of any sweep.
 
+### `labs.py`: running and scoring the flagless targets
+
+```sh
+python3 bench/labs.py list                     # targets, scored/total from the ground-truth JSONs
+python3 bench/labs.py up vampi                 # also: crapi, vulnbank, dvga; `down` removes it again
+python3 bench/labs.py run vampi --framework mythos --model opencode/glm-5.3-flash-free \
+    --budget 1800 --out /mnt/linux-data/mythos-bench/results/labs --scope-confirmed
+python3 bench/labs.py score vampi /mnt/linux-data/mythos-bench/results/labs/mythos/vampi/run0
+#   -> triage.json next to the transcript; edit each row's status to found|missed|fp
+python3 bench/labs.py stats vampi <rundir>...  # markdown: recall = found/scored, precision = found/(found+fp)
+python3 bench/labs.py selftest
+```
+
+- `up`/`down` use `lab/docker-compose.yml` (VAmPI :5002, DVGA :5013, Vuln Bank :5003, all bound to
+  127.0.0.1) and the crAPI checkout under `/mnt/linux-data/mythos-bench/crAPI` (`LISTEN_IP=127.0.0.1`,
+  web :8888). Vuln Bank deliberately runs from the lab file: its own compose publishes
+  `0.0.0.0:5000`, `:80` and Postgres `:5432`. `up vampi` also calls `/createdb`.
+- `run` uses the same adapters, prompt, budget and local-only gate as `run.py` (loopback or the docker0
+  gateway only; exits 2 without `--scope-confirmed`). Output: `OUT/<fw>/<target>/run<N>/`.
+- `score` pre-fills `candidate` when the final report matches a row's `bench_tag` via `score.py`
+  ALIASES. That is a coarse hint (one tag covers many rows), not a finding; a human sets the final
+  status. Rows are only the `scored: true` entries. Add extra `{id, title, status: "fp"}` rows for false
+  positives that match no entry. `score` will not overwrite an existing `triage.json` without `--force`.
+- `stats` counts only human statuses; `pending` shows unfinished triage, so recall is a lower bound.
+
 ## Usage
 
 ```sh
