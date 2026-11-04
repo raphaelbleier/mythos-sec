@@ -15,9 +15,10 @@ wcvs            75159ea557772447a7760184e1f08e3cc3395090
 # apt (Kali rolling, version = snapshot at build): nmap sqlmap nikto commix whatweb
 #   sslscan wafw00f hydra chromium python3 curl jq openssl ... (see Dockerfile)
 #   plus (non-fatal, per package): default-jre-headless php-cli (for ysoserial / phpggc)
-# pip (best-effort): arjun wafw00f semgrep==1.183.0 graphw00f h2spacex==1.2.2 playwright
+# pip (best-effort): arjun wafw00f graphw00f h2spacex==1.2.2 playwright
 #   dropped: paramspider (no distribution on PyPI, "from versions: none"; --break-system-packages does not help).
-#   semgrep: the wheel exists on PyPI (manylinux_2_34); the earlier failure cause is unknown, unverified until next rebuild.
+#   semgrep: dropped. SAST, not used by any skill (Mythos tests black-box), and it dominated
+#     the image size. h2spacex ships no CLI; race.py imports it as a module.
 # git (shallow fetch of the pinned commit, .git removed, wrapper in /usr/local/bin):
 jwt_tool        3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b   (ticarpi/jwt_tool, /opt/jwt_tool)
 smuggler.py     2be871e6151ce85167a277fab21c74c851d8b20b   (defparam/smuggler, /opt/smuggler, no release tags)

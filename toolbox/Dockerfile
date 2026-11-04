@@ -72,7 +72,7 @@ RUN if [ "$INSTALL_METASPLOIT" = "true" ]; then \
 COPY --from=gobuilder /out/ /usr/local/bin/
 
 # --- Python belt (best-effort, each independent) -----------------------
-RUN for pkg in arjun wafw00f semgrep==1.183.0 graphw00f h2spacex==1.2.2 playwright; do \
+RUN for pkg in arjun wafw00f graphw00f h2spacex==1.2.2 playwright; do \
       pip3 install --break-system-packages --no-cache-dir "$pkg" || echo "skip pip:$pkg"; \
     done
 

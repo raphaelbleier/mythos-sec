@@ -35,7 +35,7 @@ writes under `engagements/` appears on the host. Start every engagement with
 
 Recon: `whatweb`, `httpx`, `wafw00f`, `subfinder`, `katana`, `gau`,
 `waybackurls`, `arjun`, `ffuf`, `gobuster`, `feroxbuster`, `gospider`.
-Scanning: `nuclei`, `dalfox`, `sqlmap`, `nikto`, `commix`, `wpscan`, `semgrep`.
+Scanning: `nuclei`, `dalfox`, `sqlmap`, `nikto`, `commix`, `wpscan`.
 Auth/OOB/misc: `jwt_tool`, `interactsh-client` (OOB collaborator for blind
 SQLi/SSRF/RCE/XXE), `qsreplace`, `gf`, `anew`, `curl`, `jq`.
 Browser (DOM XSS / SPA): Playwright + Chromium — prefer the **mythos-browser**
