@@ -30,7 +30,11 @@ RUN for pkg in \
         github.com/tomnomnom/qsreplace@v0.0.3 \
         github.com/tomnomnom/gf@v0.0.0-20200618134122-dcd4c361f9f5 ; do \
       GOBIN=/out go install "$pkg" || echo "skip $pkg"; \
-    done; ls /out
+    done; \
+    # wcvs: upstream tag 2.0.0 has no "v" prefix (invalid for go), so pin the commit.
+    GOBIN=/tmp/wcvs go install github.com/Hackmanit/Web-Cache-Vulnerability-Scanner@75159ea557772447a7760184e1f08e3cc3395090 \
+      && mv /tmp/wcvs/Web-Cache-Vulnerability-Scanner /out/wcvs || echo "skip wcvs"; \
+    ls /out
 
 # ------------------------------------------------------------------- runtime
 FROM kalilinux/kali-rolling@${KALI_DIGEST}
@@ -54,7 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- extras: per-package so one missing name never kills the rest ------
 RUN apt-get update && for p in \
         commix dotdotpwn xsser sslscan testssl.sh wpscan amass masscan feroxbuster \
-        hydra john hashcat nbtscan enum4linux; do \
+        hydra john hashcat nbtscan enum4linux default-jre-headless php-cli; do \
       apt-get install -y --no-install-recommends "$p" || echo "skip apt:$p"; \
     done && rm -rf /var/lib/apt/lists/*
 
@@ -68,15 +72,24 @@ RUN if [ "$INSTALL_METASPLOIT" = "true" ]; then \
 COPY --from=gobuilder /out/ /usr/local/bin/
 
 # --- Python belt (best-effort, each independent) -----------------------
-RUN for pkg in arjun wafw00f semgrep graphw00f paramspider playwright; do \
+RUN for pkg in arjun wafw00f semgrep==1.183.0 graphw00f h2spacex==1.2.2 playwright; do \
       pip3 install --break-system-packages --no-cache-dir "$pkg" || echo "skip pip:$pkg"; \
     done
 
-# --- git-clone tools (jwt_tool) ----------------------------------------
-RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool 2>/dev/null && \
-    pip3 install --break-system-packages --no-cache-dir termcolor cryptography pycryptodomex requests 2>/dev/null && \
-    printf '#!/bin/sh\nexec python3 /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool && \
-    chmod +x /usr/local/bin/jwt_tool || echo "jwt_tool skipped"
+# --- git-clone / jar tools: jwt_tool, smuggler, phpggc, ysoserial (one layer,
+# each independent and non-fatal; clones pinned to a commit, see tools.txt) ----
+RUN pin() { d=/opt/$1; git init -q "$d" && git -C "$d" fetch -q --depth 1 "$2" "$3" && git -C "$d" checkout -q FETCH_HEAD && rm -rf "$d/.git"; } ; \
+    wrap() { printf '#!/bin/sh\nexec %s "$@"\n' "$2" > "/usr/local/bin/$1" && chmod +x "/usr/local/bin/$1"; } ; \
+    { pin jwt_tool https://github.com/ticarpi/jwt_tool 3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b && \
+      pip3 install --break-system-packages --no-cache-dir termcolor cryptography pycryptodomex requests && \
+      wrap jwt_tool "python3 /opt/jwt_tool/jwt_tool.py"; } || echo "jwt_tool skipped"; \
+    { pin smuggler https://github.com/defparam/smuggler 2be871e6151ce85167a277fab21c74c851d8b20b && \
+      wrap smuggler.py "python3 /opt/smuggler/smuggler.py"; } || echo "smuggler skipped"; \
+    { pin phpggc https://github.com/ambionics/phpggc f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c && \
+      wrap phpggc "php /opt/phpggc/phpggc"; } || echo "phpggc skipped"; \
+    { mkdir -p /opt/ysoserial && \
+      curl -fsSL -o /opt/ysoserial/ysoserial-all.jar https://github.com/frohoff/ysoserial/releases/download/v0.0.6/ysoserial-all.jar && \
+      wrap ysoserial "java -jar /opt/ysoserial/ysoserial-all.jar"; } || echo "ysoserial skipped"
 
 # --- non-root user. nmap runs unprivileged (-sT); file caps are useless under
 # no-new-privileges. For raw scans: scripts/mythos with `docker exec -u 0` (NET_RAW is granted).

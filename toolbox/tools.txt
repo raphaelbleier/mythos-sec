@@ -10,7 +10,17 @@ interactsh-client v1.4.1
 gau             v2.2.4
 qsreplace       v0.0.3
 gf              v0.0.0-20200618134122-dcd4c361f9f5
+# wcvs = Hackmanit/Web-Cache-Vulnerability-Scanner, built with go install at a commit (upstream tag 2.0.0 lacks the "v" go needs)
+wcvs            75159ea557772447a7760184e1f08e3cc3395090
 # apt (Kali rolling, version = snapshot at build): nmap sqlmap nikto commix whatweb
 #   sslscan wafw00f hydra chromium python3 curl jq openssl ... (see Dockerfile)
-# pip (best-effort): arjun wafw00f semgrep graphw00f paramspider playwright
-# git: jwt_tool (ticarpi/jwt_tool, shallow clone at build)
+#   plus (non-fatal, per package): default-jre-headless php-cli (for ysoserial / phpggc)
+# pip (best-effort): arjun wafw00f semgrep==1.183.0 graphw00f h2spacex==1.2.2 playwright
+#   dropped: paramspider (no distribution on PyPI, "from versions: none"; --break-system-packages does not help).
+#   semgrep: the wheel exists on PyPI (manylinux_2_34); the earlier failure cause is unknown, unverified until next rebuild.
+# git (shallow fetch of the pinned commit, .git removed, wrapper in /usr/local/bin):
+jwt_tool        3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b   (ticarpi/jwt_tool, /opt/jwt_tool)
+smuggler.py     2be871e6151ce85167a277fab21c74c851d8b20b   (defparam/smuggler, /opt/smuggler, no release tags)
+phpggc          f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c   (ambionics/phpggc, /opt/phpggc, no release tags)
+# jar:
+ysoserial       v0.0.6   (frohoff/ysoserial ysoserial-all.jar, /opt/ysoserial; run via `ysoserial` wrapper)
