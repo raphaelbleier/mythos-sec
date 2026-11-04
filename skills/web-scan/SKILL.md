@@ -16,6 +16,19 @@ If the target has a login, run **auth-session** first and repeat steps 1 to 5
 with the session (`nuclei -sf`, `dalfox --cookie/-H`, `sqlmap --cookie`, see the
 table there). Run `session_check.py` before each step.
 
+## 0. Probe your hypotheses first
+
+Start with what recon actually saw. For each promising parameter, id or form,
+name the bug class it suggests and send one aimed `curl` request for it. The
+host's own `curl` is enough; no container needed.
+
+Keep probing while the evidence moves. One well-aimed request beats a template
+scan on a small app, and it tells you which class to escalate.
+
+Reach for the templated scanners below when the hand probes are exhausted, or
+when the surface is large or unknown. `nuclei` and `dalfox` earn their cost on
+many endpoints, not on four pages.
+
 ## 1. Broad templated scan — nuclei
 
 ```

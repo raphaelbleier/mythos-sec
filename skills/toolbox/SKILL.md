@@ -21,8 +21,19 @@ scripts/mythos down                # stop + remove the container
 ```
 
 The repo is mounted at `/repo` (the container's working dir), so anything a tool
-writes under `engagements/` appears on the host. Start every engagement with
-`scripts/mythos up`.
+writes under `engagements/` appears on the host.
+
+## Start it lazily
+
+Do **not** start the container at the beginning of an engagement. Plain HTTP
+requests — fetching pages, reading headers, probing a parameter — run on the
+host's own `curl`. Run `scripts/mythos up` the first time you actually need a
+tool that only exists in the container (nuclei, sqlmap, dalfox, katana, ffuf,
+subfinder, jwt_tool, ...).
+
+Every `scripts/mythos <tool>` call pays a `docker exec` round trip on top of
+the tool's own runtime. On a small target that latency can outweigh the whole
+check: prefer a host `curl` where one answers the question.
 
 ## Reaching the target
 

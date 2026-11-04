@@ -50,7 +50,9 @@ is the authorization boundary; nothing runs until it is written down.
 4. **Read the scope back** to the user in one line and get a nod before
    starting recon. This is the single human gate of an engagement. A scope
    file passed with `--scope` counts as that confirmation (non-interactive
-   runs); after it, the phases run through to the report.
+   runs); after it, the phases run through to the report. Do not start the
+   toolbox here: it starts on first real need (see the **toolbox** skill), and
+   hand-reading the target needs only the host's `curl`.
 
 ## Bug-bounty program import
 

@@ -12,11 +12,28 @@ You are mapping what exists before you attack it. Touch only hosts the engagemen
 A lab target on the host's `localhost:PORT` is reached from the toolbox as
 `http://host.docker.internal:PORT`. A public target is reached by its real host.
 
-## 0. Toolbox up
+## 0. Read the app by hand first
+
+Cheapest evidence first, tools after.
+
+1. `curl -sS -D- <URL>` the entry point. Read the body and the headers.
+2. Fetch every link and form you saw. Note each parameter, id, redirect,
+   error message, and the auth mechanism.
+3. Extract the parameters and ids from the responses you actually read, not
+   from a wordlist. Rank what each one suggests.
+4. If that is the whole surface — one host, a handful of pages — the map is
+   done. Hand it to **web-scan** and skip the steps below.
+
+Start the toolbox only when you need a tool from it:
 
 ```
 scripts/mythos up
 ```
+
+katana, ffuf, arjun and subfinder earn their cost on a large or unknown
+surface: many hosts, an SPA, an API, content you cannot reach by reading
+links. A broad crawl of a handful of pages is wasted budget — the parameters
+and ids are already in the responses you read.
 
 ## 1. Fingerprint the technology
 
