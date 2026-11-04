@@ -94,6 +94,35 @@ Stop this step and go to Step 4 the moment a probe proves a vulnerability. If
 the engagement names a specific proof to obtain, such as a secret to read or a
 privilege to reach, pursue that objective first and keep breadth for later.
 
+## Never conclude a target is clean early
+
+A short engagement that reports nothing is almost always an engagement that
+stopped too soon. Before you may write "no findings", all of this must be true
+and visible in the report:
+
+1. `scripts/probe` ran and `scripts/verify` worked every aim point it found.
+2. Every quiet aim point got a second, different attempt: another context
+   (header, cookie, path segment, JSON body), another payload shape, or a
+   blind oracle (timing, OOB callback) where the output is not reflected.
+3. The classes the stack suggests were tried by hand, not just by name. A
+   Flask app gets SSTI, a PHP app gets LFI with wrappers, an API gets BOLA
+   with a second identity, a login gets JWT and rate-limit checks.
+4. The deeper playbooks ran: `business-logic` for object access, mass
+   assignment and races, `deep-server` for deserialization, XXE, cache
+   poisoning and smuggling, `auth-session` if anything sits behind a login.
+5. The report names each aim point, what was sent, and the response that ruled
+   it out. "No signal" is not a control; the control is a request whose
+   response proves the input never reaches the sink.
+
+If you are about to finish in under a dozen tool calls, you have not done this.
+
+## Do not thrash either
+
+The opposite failure costs just as much: fifty requests into one parameter
+that two probes already answered. Hold a short ruled-out list, name the control
+that ruled each one out, and move to the next aim point. When a line of attack
+needs a primitive you do not have, record it as `open_proof_gap` and move on.
+
 ## Scale the work to the target
 
 Count the surface after Step 1 and pick the path:
