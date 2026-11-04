@@ -18,8 +18,10 @@ Start with one call: `scripts/probe <target> --depth 2`. It runs on the host,
 needs no container, and returns the pages, forms, interesting headers, weak
 cookie flags, reachable paths like `/.env` or `/graphql`, the technology it
 could fingerprint, and every parameter with the bug class its name suggests.
-Add `--header 'Cookie: ...'` to map the authenticated surface, `--json` to feed
-it to another tool. Then read it and only chase what it could not see.
+When it finds an OpenAPI or Swagger document it reads it too, so on a JSON API
+you get every documented endpoint, query parameter, path parameter and request
+body field as an aim point. Add `--header 'Cookie: ...'` to map the
+authenticated surface, `--json` to feed it to another tool. Then read it and only chase what it could not see.
 
 Cheapest evidence first, tools after.
 

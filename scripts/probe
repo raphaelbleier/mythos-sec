@@ -26,7 +26,8 @@ UA = "mythos-probe/1.0 (authorized security testing)"
 HINTS = [
     (r"^(q|query|s|search|keyword|term|name|title|msg|message|comment|text|body)$",
      "reflected-xss, sqli", "reflected into the page or into a query"),
-    (r"^(id|uid|user|user_id|userid|account|order|order_id|doc|docid|pid|item|num)$",
+    (r"^(id|uid|user|user_id|userid|username|user_name|email|account|order|order_id|doc|"
+     r"docid|pid|item|num|uuid|guid|slug|handle)$",
      "idor/bola, sqli", "object reference: try another principal's value"),
     (r"(url|uri|link|next|redirect|redirect_uri|return|returnto|returnurl|dest|"
      r"destination|continue|callback|target|to|goto|r)$",
@@ -114,6 +115,32 @@ def fetch(url, headers, timeout, insecure):
         return None, {}, f"{type(e).__name__}: {e}", url
 
 
+def from_openapi(doc, params):
+    """Add every documented parameter and request-body field as an aim point."""
+    endpoints = []
+    for path, methods in (doc.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in ("get", "post", "put", "patch", "delete") \
+                    or not isinstance(op, dict):
+                continue
+            endpoints.append(f"{method.upper()} {path}")
+            for prm in op.get("parameters") or []:
+                name = (prm or {}).get("name")
+                if name:
+                    params.setdefault(name, {"name": name, "seen_at": [], "example": "",
+                                             "method": method.upper()})["seen_at"].append(
+                        f"{method.upper()} {path} ({prm.get('in', '?')})")
+            body = (((op.get("requestBody") or {}).get("content") or {})
+                    .get("application/json") or {}).get("schema") or {}
+            for field in (body.get("properties") or {}):
+                params.setdefault(field, {"name": field, "seen_at": [], "example": "",
+                                          "method": method.upper()})["seen_at"].append(
+                    f"{method.upper()} {path} (body)")
+    return endpoints
+
+
 def probe(url, depth, max_pages, timeout, headers, insecure):
     origin = urllib.parse.urlsplit(url)
     base = f"{origin.scheme}://{origin.netloc}"
@@ -188,20 +215,33 @@ def probe(url, depth, max_pages, timeout, headers, insecure):
         pages.append(page)
 
     # cheap common-path sweep on the origin
-    extra = []
+    extra, endpoints = [], []
     for path in COMMON_PATHS:
         status, hdrs, body, _ = fetch(base + path, headers, timeout, insecure)
         if status and status not in (404, 405, 501) and not (status == 400 and path == "/graphql"):
             row = {"path": path, "status": status, "bytes": len(body)}
             if SECRET_RE.search(body):
                 row["secret_like"] = True
+            if path in ("/openapi.json", "/swagger.json"):
+                try:
+                    doc = json.loads(body)
+                    if isinstance(doc, dict) and (doc.get("openapi") or doc.get("swagger")):
+                        endpoints = from_openapi(doc, params)
+                        row["endpoints"] = len(endpoints)
+                except ValueError:
+                    pass
             extra.append(row)
 
     for info in params.values():
         info["hypotheses"], info["why"] = hypotheses(info["name"])
+        if info["hypotheses"] == "unknown" and any("(path)" in x for x in info["seen_at"]):
+            # a value in the path addresses an object: that is an access-control question
+            info["hypotheses"] = "idor/bola"
+            info["why"] = "path segment addressing an object: try another principal's value"
         info["seen_at"] = sorted(set(info["seen_at"]))[:4]
     return {"target": url, "origin": base, "pages": pages, "parameters": list(params.values()),
-            "reachable_paths": extra, "technology": sorted(tech), "notes": notes}
+            "reachable_paths": extra, "api_endpoints": endpoints,
+            "technology": sorted(tech), "notes": notes}
 
 
 def render(result):
@@ -223,14 +263,23 @@ def render(result):
         out += [f"{r['status']} {r['path']}  {r['bytes']}B"
                 + ("  SECRET-LIKE" if r.get("secret_like") else "")
                 for r in result["reachable_paths"]]
+    if result.get("api_endpoints"):
+        out += ["", f"## documented API endpoints ({len(result['api_endpoints'])})"]
+        out += result["api_endpoints"][:60]
+        if len(result["api_endpoints"]) > 60:
+            out.append(f"... and {len(result['api_endpoints']) - 60} more")
     if result["technology"]:
         out += ["", "## technology", ", ".join(result["technology"])]
     if result["parameters"]:
         out += ["", "## parameters, ranked hypothesis first", ""]
         known = [p for p in result["parameters"] if p["hypotheses"] != "unknown"]
         rest = [p for p in result["parameters"] if p["hypotheses"] == "unknown"]
+        verbs = ("GET ", "POST ", "PUT ", "PATCH ", "DELETE ")
         for p in known + rest:
-            out.append(f"- `{p['name']}` ({p['method']}) -> {p['hypotheses']}")
+            # the location line already carries the verb for spec-derived parameters
+            spec = p["seen_at"] and p["seen_at"][0].startswith(verbs)
+            method = "" if spec else f" ({p['method']})"
+            out.append(f"- `{p['name']}`{method} -> {p['hypotheses']}")
             out.append(f"  {p['why']}")
             out.append(f"  at {p['seen_at'][0] if p['seen_at'] else '?'}")
     if result["notes"]:
