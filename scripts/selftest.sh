@@ -21,7 +21,9 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-T="http://host.docker.internal:5001"
+# The lab binds to loopback only, so the toolbox reaches vulnapp over the lab
+# network by service name. The probe runs on the host and uses the published port.
+T="${MYTHOS_SELFTEST_TARGET:-http://vulnapp:5000}"
 PASS=0; FAIL=0
 HOST=claude
 [ "${1:-}" = "--host" ] && HOST="${2:-claude}"
@@ -39,10 +41,19 @@ echo "== Mythos self-test (host: $HOST) =="
 echo "-- starting toolbox + lab --"
 scripts/mythos up >/dev/null 2>&1
 docker compose -f lab/docker-compose.yml up -d vulnapp >/dev/null 2>&1
+scripts/mythos net mythos-lab >/dev/null 2>&1
 for i in $(seq 1 20); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/ 2>/dev/null)" = "200" ] && break
   sleep 1
 done
+
+echo "-- fast probe (deterministic, no model) --"
+pr=$(timeout 120 scripts/probe "http://127.0.0.1:5001" --depth 2 2>&1)
+assert_has "probe maps the search form"      "form GET /search"              "$pr"
+assert_has "probe reaches /.env"             "/.env"                         "$pr"
+assert_has "probe ranks q as xss/sqli"       "reflected-xss"                 "$pr"
+assert_has "probe ranks file as traversal"   "path-traversal"                "$pr"
+assert_has "probe flags missing headers"     "missing_headers"               "$pr"
 
 if [ "$HOST" = "opencode" ]; then
   echo "-- running the mythos agent through opencode --"
@@ -82,14 +93,6 @@ YAML
   fp=$(printf '%s' "$corpus" | grep -iF "/safe" | grep -iE "xss|cross-site" \
        | grep -viE "not |no |false|escaped|negative")
   if [ -z "$fp" ]; then ok "no false-positive XSS on /safe"; else bad "no false-positive XSS on /safe (claimed: $fp)"; fi
-
-  echo "-- fast probe (deterministic, no model) --"
-  pr=$(timeout 120 scripts/probe "http://127.0.0.1:5001" --depth 2 2>&1)
-  assert_has "probe maps the search form"      "form GET /search"              "$pr"
-  assert_has "probe reaches /.env"             "/.env"                         "$pr"
-  assert_has "probe ranks q as xss/sqli"       "reflected-xss"                 "$pr"
-  assert_has "probe ranks file as traversal"   "path-traversal"                "$pr"
-  assert_has "probe flags missing headers"     "missing_headers"               "$pr"
 
   echo "-- scope-guard core (what the OpenCode plugin calls) --"
   out=$(MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py --check "nuclei -u https://out-of-scope.example")
