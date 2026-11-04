@@ -206,7 +206,15 @@ is in [`docs/poster/poster.md`](docs/poster/poster.md). Limits:
 python3 bench/xben.py check --out <build_results.tsv>
 python3 bench/run.py --frameworks mythos,control --model <id> --sample 30 --seed 1 --runs 3 --dry-run
 python3 bench/stats.py <results>/results.jsonl --compare mythos,control
+python3 bench/labs.py list                       # flagless targets + ground truth
 ```
+
+The four flagless real apps (crAPI, Vuln Bank, DVGA, VAmPI) are scored by recall
+against their upstream documented vulnerability lists in
+`bench/data/ground_truth/`, driven by `bench/labs.py`; VAmPI's secure instance
+serves as a false-positive control. Build lists for the 104 XBOW challenges are
+in `bench/data/`: 39 of 104 build from a clean clone, 102 of 104 once the harness
+repoints the dead Debian apt mirrors (`--no-apt-fix` disables that).
 
 **Earlier manual engagements** (single runs, no control arm, from the earlier
 skill-driven flow; evidence, not a measured advantage). Details:
@@ -258,7 +266,7 @@ hooks/             scope-guard (Claude Code PreToolUse hook + shared --check log
 toolbox/           two-stage Kali toolbox Dockerfile
 .github/           toolbox image CI (GHCR, amd64 + arm64)
 lab/               vulnerable targets, OAST catcher, admin bot
-bench/             XBOW benchmark harness and statistics
+bench/             XBOW harness, flagless-lab runner, ground truth, build lists
 scripts/           mythos (toolbox shim) · selftest.sh · build-hosts.py
 knowledge/         per-class confirmation playbooks + CVE technique notes
 docs/              architecture, research, plan, poster/benchmark evidence

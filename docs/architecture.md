@@ -77,8 +77,10 @@ generates `CLAUDE.md`, `agents/` and `commands/` for Claude Code
   smuggling) read by the agents at runtime.
 - **Lab** (`lab/`): ground-truth vuln app, Juice Shop, DVWA, VAmPI, DVGA, Vuln
   Bank, plus an OAST catcher and an admin bot (see `lab/README.md`).
-- **Benchmark harness** (`bench/`): XBOW validation-benchmarks runner and
-  statistics; protocol in `bench/README.md`.
+- **Benchmark harness** (`bench/`): XBOW validation-benchmarks runner, a
+  flagless-lab runner (`labs.py`) scoring recall against the documented
+  vulnerability lists in `bench/data/ground_truth/`, and the statistics; protocol
+  in `bench/README.md`.
 - **Engagements** (`engagements/`): per-target workspaces, git-ignored.
 
 ## Single human gate
