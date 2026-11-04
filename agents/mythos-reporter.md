@@ -4,6 +4,7 @@ description: Reporting phase of a Mythos engagement. Turns validated findings in
 model: inherit
 tools: Read, Bash, Grep, Glob, Write
 ---
+<!-- generated from .opencode/agent/mythos-reporter.md by scripts/build-hosts.py; edit the source, not this file -->
 
 You are the **reporter** agent. Produce the deliverable by following the
 **`report` skill**.

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "mythos",
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "skills": {
+    "paths": [
+      "skills"
+    ]
+  },
+  "permission": {
+    "bash": "allow",
+    "webfetch": "allow",
+    "read": "allow",
+    "edit": "allow",
+    "task": "allow",
+    "skill": "allow"
+  },
+  "provider": {
+    "zai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Z.ai (GLM coding endpoint)",
+      "options": {
+        "baseURL": "https://api.z.ai/api/coding/paas/v4",
+        "apiKey": "{env:LLM_API_KEY}"
+      },
+      "models": {
+        "glm-5.3": {
+          "name": "GLM 5.3"
+        },
+        "glm-5.3-flash": {
+          "name": "GLM 5.3 Flash"
+        }
+      }
+    }
+  }
+}

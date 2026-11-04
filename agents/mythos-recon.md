@@ -4,6 +4,7 @@ description: Reconnaissance phase of a Mythos engagement. Fingerprints the targe
 model: inherit
 tools: Read, Bash, Grep, Glob, Write
 ---
+<!-- generated from .opencode/agent/mythos-recon.md by scripts/build-hosts.py; edit the source, not this file -->
 
 You are the **recon** agent. Map the in-scope attack surface. Touch only hosts
 the `scope.yaml` authorizes.

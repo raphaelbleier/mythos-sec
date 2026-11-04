@@ -14,6 +14,14 @@ Finding the active scope, in order:
 
 This is a safety net, not the primary control: the engine's HttpClient enforces
 scope itself, independently of this hook.
+
+It is also the single scope-check implementation for every agent host. The
+OpenCode plugin (.opencode/plugin/scope-guard.ts) calls
+
+  python3 hooks/scope-guard.py --check '<command or url>'
+
+which prints {"offenders": [...], "scope": path|null, "in_scope": [...],
+"message": str|null} and always exits 0; the caller decides warn vs block.
 """
 
 from __future__ import annotations
@@ -107,34 +115,45 @@ def extract_hosts(command: str) -> set[str]:
     return {h for h in hosts if h and h not in SAFE_HOSTS and HOSTLIKE.match(h)}
 
 
+def check(command: str) -> dict:
+    """Shared core: which hosts in `command` are out of the active scope."""
+    result = {"offenders": [], "scope": None, "in_scope": [], "message": None}
+    loaded = load_scope()
+    if not loaded:
+        return result  # no active engagement scope; nothing to check
+    scope_file, in_list, out_list = loaded
+    result.update(scope=str(scope_file), in_scope=list(in_list))
+    if not in_list:
+        return result
+    hosts = extract_hosts(str(command))
+    offenders = sorted(h for h in hosts if not in_scope(h, in_list, out_list))
+    if offenders:
+        result["offenders"] = offenders
+        result["message"] = (
+            "⚠️  MYTHOS SCOPE GUARD: this command targets host(s) that are "
+            f"OUT OF SCOPE: {', '.join(offenders)}\n"
+            f"    Active scope: {scope_file}\n"
+            f"    In-scope: {', '.join(in_list)}\n"
+            "    Only test what the engagement authorizes.")
+    return result
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--check"]:
+        print(json.dumps(check(" ".join(sys.argv[2:]))))
+        return 0
     try:
         event = json.load(sys.stdin)
     except Exception:
         return 0
-    tool = event.get("tool_name", "")
     tool_input = event.get("tool_input", {}) or {}
     command = tool_input.get("command") or tool_input.get("url") or ""
     if not command:
         return 0
 
-    loaded = load_scope()
-    if not loaded:
-        return 0  # no active engagement scope; nothing to check
-    scope_file, in_list, out_list = loaded
-    if not in_list:
+    msg = check(str(command))["message"]
+    if not msg:
         return 0
-
-    hosts = extract_hosts(str(command))
-    offenders = [h for h in hosts if not in_scope(h, in_list, out_list)]
-    if not offenders:
-        return 0
-
-    msg = ("⚠️  MYTHOS SCOPE GUARD: this command targets host(s) that are "
-           f"OUT OF SCOPE: {', '.join(sorted(offenders))}\n"
-           f"    Active scope: {scope_file}\n"
-           f"    In-scope: {', '.join(in_list)}\n"
-           "    Only test what the engagement authorizes.")
 
     if os.environ.get("MYTHOS_SCOPE_ENFORCE") == "block":
         # exit code 2 blocks the tool call and feeds stderr back to Claude

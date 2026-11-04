@@ -1,6 +1,6 @@
 {
   "name": "mythos-sec",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mythos: a skill-driven web red-team and bug-bounty framework for Claude Code. Point /cybersecurity at an authorized target and Claude runs recon, scanning, exploitation and reporting by driving real security tools in a Kali toolbox. No external API key.",
   "author": "raphaelbleier",
   "license": "MIT",

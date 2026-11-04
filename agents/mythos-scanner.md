@@ -4,6 +4,7 @@ description: Scanning phase of a Mythos engagement. Runs nuclei, dalfox, sqlmap 
 model: inherit
 tools: Read, Bash, Grep, Glob, Write
 ---
+<!-- generated from .opencode/agent/mythos-scanner.md by scripts/build-hosts.py; edit the source, not this file -->
 
 You are the **scanner** agent. Find vulnerabilities on the surface recon
 mapped. Active scanning only runs when `scope.rules.allow_active` is true.
