@@ -12,6 +12,20 @@ on the harness side. Stdlib Python 3 only.
 | `score.py` | per-cell scoring (`result.json`), aggregate `results.jsonl`, rescoring |
 | `stats.py` | markdown tables: Wilson CI, pass@k, paired McNemar |
 
+## Flagless real-app targets (ground truth)
+
+`data/ground_truth/` holds the documented-vulnerability lists for targets that
+ship no flag (and therefore no flag oracle): **crAPI** (15 scored of 21 listed;
+chatbot challenges excluded pending a fixed LLM provider, 3 secret challenges
+out), **Vuln Bank** (76/78), **DVGA** (21/23, two recon milestones unscored by
+default) and **VAmPI** (9/9, with its secure `:5001` compose instance as a free
+false-positive control). Each file records the upstream doc URL it was filled
+from, per-entry proof rules (races/DoS/brute-force are shown lightly or by
+absence, never run hard) and the recall-denominator rules; the schema and edit
+rules are in `data/ground_truth/README.md`. Which frameworks are actual harness
+arms vs. interactive-only is in `data/frameworks.json` — PentestGPT and CAI are
+interactive-only, refused by `run.py`, and not part of any sweep.
+
 ## Usage
 
 ```sh

@@ -1,0 +1,20 @@
+{
+  "note": "Framework/runner status for bench/. Interactive-only frameworks are NOT harness arms: run.py refuses them before any target comes up (they raise NotImplementedError in their adapter on purpose) and they are excluded from every sweep and comparison. They may still be exercised interactively outside the harness, e.g. by a human driving their own CLI.",
+  "frameworks": {
+    "mythos": { "kind": "harness", "harness": true, "adapter": "bench/runners/mythos.py", "note": "opencode run --agent mythos --auto; shared model id, scope.guard enforces the per-cell scope" },
+    "control": { "kind": "harness", "harness": true, "adapter": "bench/runners/control.py", "note": "opencode run --pure --agent build, bash+read only; measures what the Mythos scaffolding adds" },
+    "strix": { "kind": "harness", "harness": true, "adapter": "bench/runners/strix.py", "api_keys": ["STRIX_LLM", "LLM_API_KEY"] },
+    "pentestgpt": {
+      "kind": "interactive_only",
+      "harness": false,
+      "adapter": "bench/runners/pentestgpt.py",
+      "reason": "PentestGPT's autonomous v1.0 pipeline drives only Claude Code or Codex as its backend, so it cannot run the shared model; with any other model only the interactive legacy mode (next/more/todo commands) is available, which is a different system type and needs a human in the loop. Interactive-only comparison, not a harness arm."
+    },
+    "cai": {
+      "kind": "interactive_only",
+      "harness": false,
+      "adapter": "bench/runners/cai.py",
+      "reason": "The open-source CAI line is an interactive REPL frozen at 0.5.10, repository archived 2026-08-28 with known unpatched prompt-injection issues; there is no supported headless mode for unattended runs. Interactive-only comparison, not a harness arm."
+    }
+  }
+}
