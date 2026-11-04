@@ -167,6 +167,7 @@ Useful sub-commands:
 Everything runs in the `mythos-toolbox` Kali container via `scripts/mythos`:
 
 ```bash
+scripts/probe <url> --depth 2          # surface map in one call, on the host, no container
 scripts/mythos up                      # build (first run) + start the container
 scripts/mythos <tool> [args]           # run one tool,  e.g. scripts/mythos nuclei -u URL
 scripts/mythos sh '<pipeline>'         # run a shell pipeline in the toolbox
@@ -268,7 +269,8 @@ toolbox/           two-stage Kali toolbox Dockerfile
 .github/           toolbox image CI (GHCR, amd64 + arm64)
 lab/               vulnerable targets, OAST catcher, admin bot
 bench/             XBOW harness, flagless-lab runner, ground truth, build lists
-scripts/           mythos (toolbox shim) · selftest.sh · build-hosts.py
+scripts/           mythos (toolbox shim) · probe (fast surface map) · selftest.sh
+                   · build-hosts.py
 knowledge/         per-class confirmation playbooks + CVE technique notes
 docs/              architecture, research, plan, poster/benchmark evidence
 ```

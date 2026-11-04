@@ -83,6 +83,14 @@ YAML
        | grep -viE "not |no |false|escaped|negative")
   if [ -z "$fp" ]; then ok "no false-positive XSS on /safe"; else bad "no false-positive XSS on /safe (claimed: $fp)"; fi
 
+  echo "-- fast probe (deterministic, no model) --"
+  pr=$(timeout 120 scripts/probe "http://127.0.0.1:5001" --depth 2 2>&1)
+  assert_has "probe maps the search form"      "form GET /search"              "$pr"
+  assert_has "probe reaches /.env"             "/.env"                         "$pr"
+  assert_has "probe ranks q as xss/sqli"       "reflected-xss"                 "$pr"
+  assert_has "probe ranks file as traversal"   "path-traversal"                "$pr"
+  assert_has "probe flags missing headers"     "missing_headers"               "$pr"
+
   echo "-- scope-guard core (what the OpenCode plugin calls) --"
   out=$(MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py --check "nuclei -u https://out-of-scope.example")
   assert_has "scope-guard warns out-of-scope" "OUT OF SCOPE" "$out"

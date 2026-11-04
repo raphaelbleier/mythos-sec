@@ -18,6 +18,10 @@ table there). Run `session_check.py` before each step.
 
 ## 0. Probe your hypotheses first
 
+The ranked parameter list from `scripts/probe` is your work queue: each entry
+names the parameter, where it was seen, and the class to try. Work it top down,
+one request per hypothesis.
+
 Start with what recon actually saw. For each promising parameter, id or form,
 name the bug class it suggests and send one aimed `curl` request for it. The
 host's own `curl` is enough; no container needed.

@@ -25,6 +25,9 @@ writes under `engagements/` appears on the host.
 
 ## Start it lazily
 
+`scripts/probe` is not a toolbox tool: it is stdlib Python on the host, so it
+costs one process, not a container round trip. Use it before anything here.
+
 Do **not** start the container at the beginning of an engagement. Plain HTTP
 requests — fetching pages, reading headers, probing a parameter — run on the
 host's own `curl`. Run `scripts/mythos up` the first time you actually need a

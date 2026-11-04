@@ -14,6 +14,13 @@ A lab target on the host's `localhost:PORT` is reached from the toolbox as
 
 ## 0. Read the app by hand first
 
+Start with one call: `scripts/probe <target> --depth 2`. It runs on the host,
+needs no container, and returns the pages, forms, interesting headers, weak
+cookie flags, reachable paths like `/.env` or `/graphql`, the technology it
+could fingerprint, and every parameter with the bug class its name suggests.
+Add `--header 'Cookie: ...'` to map the authenticated surface, `--json` to feed
+it to another tool. Then read it and only chase what it could not see.
+
 Cheapest evidence first, tools after.
 
 1. `curl -sS -D- <URL>` the entry point. Read the body and the headers.

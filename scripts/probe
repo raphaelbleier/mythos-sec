@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Mythos fast probe — read a target by hand, in one tool call.
+
+The triage step of an engagement is mostly mechanical: fetch the entry point,
+read the links and forms, collect the parameters, and say which bug class each
+one suggests. Done through an agent that is many model round trips, and each
+one costs latency the engagement does not get back. This does the mechanical
+part deterministically and prints a compact surface map the agent can reason
+about immediately.
+
+  scripts/probe <url> [--depth 1] [--max 40] [--timeout 10] [--json]
+                      [--header 'Cookie: a=b'] [--insecure]
+
+It only issues GET requests to the host of <url> (and, with --depth 2, to links
+on that same host). It sends no payloads: it reports where a payload would go.
+Scope still applies — the caller passes a URL that scope.yaml authorizes.
+"""
+import argparse, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request
+from collections import OrderedDict
+from html.parser import HTMLParser
+
+UA = "mythos-probe/1.0 (authorized security testing)"
+
+# Parameter-name hints. A name is a hypothesis, never a finding: the probe says
+# where to aim, the agent proves or drops it.
+HINTS = [
+    (r"^(q|query|s|search|keyword|term|name|title|msg|message|comment|text|body)$",
+     "reflected-xss, sqli", "reflected into the page or into a query"),
+    (r"^(id|uid|user|user_id|userid|account|order|order_id|doc|docid|pid|item|num)$",
+     "idor/bola, sqli", "object reference: try another principal's value"),
+    (r"(url|uri|link|next|redirect|redirect_uri|return|returnto|returnurl|dest|"
+     r"destination|continue|callback|target|to|goto|r)$",
+     "open-redirect, ssrf", "takes a location: off-site redirect or server-side fetch"),
+    (r"(file|filename|path|template|page|view|doc|include|load|download|attachment)$",
+     "path-traversal, lfi, ssti", "names something on disk or a template"),
+    (r"^(cmd|command|exec|run|ping|host|ip|domain|lookup|dns)$",
+     "command-injection, ssrf", "looks like it reaches a shell or the network"),
+    (r"(token|jwt|auth|session|sig|signature|hmac|key|secret|password|passwd|pwd)$",
+     "auth/jwt", "credential material: check algorithm, signature, expiry"),
+    (r"(amount|price|qty|quantity|total|balance|discount|coupon|role|admin|is_admin|"
+     r"status|state|level)$",
+     "business-logic, mass-assignment", "value the server should own, not the client"),
+    (r"(lang|locale|theme|format|type|sort|order_by|dir|debug|test)$",
+     "misc", "low-value unless it reaches a sink"),
+]
+
+SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|secret|passwd|password|token|bearer|aws_access_key_id|"
+    r"private[_-]?key|BEGIN [A-Z ]*PRIVATE KEY)\b")
+VERSION_RE = re.compile(r"(?i)\b([a-z][a-z0-9_.+-]{1,30})[/ ]v?(\d+\.\d+(?:\.\d+)?)")
+INTERESTING_HEADERS = ("server", "x-powered-by", "x-aspnet-version", "via", "x-generator",
+                       "access-control-allow-origin", "access-control-allow-credentials",
+                       "content-security-policy", "strict-transport-security",
+                       "x-content-type-options", "set-cookie", "location", "www-authenticate")
+MISSING_HEADERS = ("content-security-policy", "strict-transport-security",
+                   "x-content-type-options")
+# Paths worth one GET each: cheap, high signal, no payload.
+COMMON_PATHS = ("/robots.txt", "/.env", "/.git/config", "/sitemap.xml", "/openapi.json",
+                "/swagger.json", "/graphql", "/api", "/admin", "/server-status",
+                "/.well-known/security.txt")
+
+
+class Links(HTMLParser):
+    """Collect links, forms with their inputs, scripts and comments."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links, self.scripts, self.comments = [], [], []
+        self.forms, self._form = [], None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif tag == "script" and a.get("src"):
+            self.scripts.append(a["src"])
+        elif tag == "form":
+            self._form = {"action": a.get("action", ""),
+                          "method": (a.get("method") or "get").lower(), "inputs": []}
+        elif tag in ("input", "textarea", "select") and self._form is not None:
+            self._form["inputs"].append({"name": a.get("name", ""),
+                                         "type": a.get("type", tag)})
+        elif tag == "form" and self._form:
+            pass
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._form is not None:
+            self.forms.append(self._form)
+            self._form = None
+
+    def handle_comment(self, data):
+        if data.strip():
+            self.comments.append(data.strip()[:200])
+
+
+def hypotheses(name):
+    for pattern, classes, why in HINTS:
+        if re.search(pattern, name or "", re.I):
+            return classes, why
+    return "unknown", "no name hint: test what the response does with it"
+
+
+def fetch(url, headers, timeout, insecure):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            body = r.read(400_000)
+            return r.status, dict(r.headers), body.decode("utf-8", "replace"), r.geturl()
+    except urllib.error.HTTPError as e:
+        body = e.read(200_000) if e.fp else b""
+        return e.code, dict(e.headers or {}), body.decode("utf-8", "replace"), url
+    except Exception as e:                                  # DNS, TLS, refused, timeout
+        return None, {}, f"{type(e).__name__}: {e}", url
+
+
+def probe(url, depth, max_pages, timeout, headers, insecure):
+    origin = urllib.parse.urlsplit(url)
+    base = f"{origin.scheme}://{origin.netloc}"
+    seen, queue = set(), [url]
+    pages, params, notes = [], OrderedDict(), []
+    tech = set()
+
+    while queue and len(pages) < max_pages:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        status, hdrs, body, final = fetch(current, headers, timeout, insecure)
+        if status is None:
+            notes.append(f"{current}: unreachable ({body})")
+            continue
+        low = {k.lower(): v for k, v in hdrs.items()}
+        page = {"url": current, "status": status, "bytes": len(body),
+                "type": low.get("content-type", "").split(";")[0],
+                "headers": {k: low[k] for k in INTERESTING_HEADERS if k in low}}
+        if final != current:
+            page["redirected_to"] = final
+
+        for key, value in low.items():
+            for m in VERSION_RE.finditer(value if key in ("server", "x-powered-by") else ""):
+                tech.add(f"{m.group(1)}/{m.group(2)}")
+        if SECRET_RE.search(body):
+            page["secret_like"] = sorted({m.group(0).lower()
+                                          for m in SECRET_RE.finditer(body)})[:6]
+        missing = [h for h in MISSING_HEADERS if h not in low]
+        if missing and page["type"].startswith("text/html"):
+            page["missing_headers"] = missing
+        cookie = low.get("set-cookie", "")
+        if cookie:
+            weak = [f for f in ("httponly", "secure", "samesite") if f not in cookie.lower()]
+            if weak:
+                page["weak_cookie_flags"] = weak
+
+        # parameters already in the URL
+        for name, values in urllib.parse.parse_qs(urllib.parse.urlsplit(current).query).items():
+            params.setdefault(name, {"name": name, "seen_at": [], "method": "GET",
+                                     "example": values[0][:40]})["seen_at"].append(current)
+
+        if page["type"].startswith(("text/html", "application/xhtml")):
+            parser = Links()
+            try:
+                parser.feed(body)
+            except Exception:
+                pass
+            page["forms"] = parser.forms
+            for form in parser.forms:
+                action = urllib.parse.urljoin(current, form["action"] or current)
+                for field in form["inputs"]:
+                    if field["name"]:
+                        params.setdefault(field["name"], {
+                            "name": field["name"], "seen_at": [], "example": "",
+                            "method": form["method"].upper()})["seen_at"].append(action)
+            if parser.comments:
+                page["html_comments"] = parser.comments[:5]
+            if parser.scripts:
+                page["scripts"] = parser.scripts[:10]
+            for href in parser.links:
+                target = urllib.parse.urljoin(current, href)
+                if target.startswith(base) and target not in seen and depth > 1:
+                    queue.append(target.split("#")[0])
+                if target.startswith(base):
+                    for name, values in urllib.parse.parse_qs(
+                            urllib.parse.urlsplit(target).query).items():
+                        params.setdefault(name, {"name": name, "seen_at": [], "method": "GET",
+                                                 "example": values[0][:40]})[
+                            "seen_at"].append(target.split("?")[0])
+        pages.append(page)
+
+    # cheap common-path sweep on the origin
+    extra = []
+    for path in COMMON_PATHS:
+        status, hdrs, body, _ = fetch(base + path, headers, timeout, insecure)
+        if status and status not in (404, 405, 501) and not (status == 400 and path == "/graphql"):
+            row = {"path": path, "status": status, "bytes": len(body)}
+            if SECRET_RE.search(body):
+                row["secret_like"] = True
+            extra.append(row)
+
+    for info in params.values():
+        info["hypotheses"], info["why"] = hypotheses(info["name"])
+        info["seen_at"] = sorted(set(info["seen_at"]))[:4]
+    return {"target": url, "origin": base, "pages": pages, "parameters": list(params.values()),
+            "reachable_paths": extra, "technology": sorted(tech), "notes": notes}
+
+
+def render(result):
+    out = [f"# surface of {result['target']}", ""]
+    for page in result["pages"]:
+        line = f"{page['status']} {page['url']}  {page['bytes']}B {page['type']}"
+        out.append(line)
+        for key in ("redirected_to", "secret_like", "missing_headers", "weak_cookie_flags",
+                    "html_comments", "scripts"):
+            if page.get(key):
+                out.append(f"    {key}: {page[key]}")
+        for header, value in page.get("headers", {}).items():
+            out.append(f"    {header}: {value[:120]}")
+        for form in page.get("forms", []):
+            fields = ", ".join(f"{i['name']}:{i['type']}" for i in form["inputs"] if i["name"])
+            out.append(f"    form {form['method'].upper()} {form['action'] or '(self)'} [{fields}]")
+    if result["reachable_paths"]:
+        out += ["", "## reachable common paths"]
+        out += [f"{r['status']} {r['path']}  {r['bytes']}B"
+                + ("  SECRET-LIKE" if r.get("secret_like") else "")
+                for r in result["reachable_paths"]]
+    if result["technology"]:
+        out += ["", "## technology", ", ".join(result["technology"])]
+    if result["parameters"]:
+        out += ["", "## parameters, ranked hypothesis first", ""]
+        known = [p for p in result["parameters"] if p["hypotheses"] != "unknown"]
+        rest = [p for p in result["parameters"] if p["hypotheses"] == "unknown"]
+        for p in known + rest:
+            out.append(f"- `{p['name']}` ({p['method']}) -> {p['hypotheses']}")
+            out.append(f"  {p['why']}")
+            out.append(f"  at {p['seen_at'][0] if p['seen_at'] else '?'}")
+    if result["notes"]:
+        out += ["", "## notes"] + result["notes"]
+    out += ["", "Hypotheses are aim points, not findings. Prove each one with a single "
+            "request and keep the request/response pair as evidence."]
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("url")
+    ap.add_argument("--depth", type=int, default=1, help="1 = entry point only, 2 = follow links")
+    ap.add_argument("--max", type=int, default=40, dest="max_pages")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--header", action="append", default=[], help="'Name: value', repeatable")
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    headers = dict(h.split(":", 1) for h in a.header) if a.header else {}
+    headers = {k.strip(): v.strip() for k, v in headers.items()}
+    result = probe(a.url, a.depth, a.max_pages, a.timeout, headers, a.insecure)
+    print(json.dumps(result, indent=1) if a.json else render(result))
+    return 0 if result["pages"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

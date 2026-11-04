@@ -71,9 +71,12 @@ Before any tool, spend a few minutes on the target by hand with `curl`. This is
 the step that finds most bugs on a small app, and it tells you how big the job
 really is.
 
-1. `curl -sS -D- <target>` the entry point. Read the body and the headers.
-2. Follow the links and forms you see. Note every parameter, every id, every
-   redirect, every error message, the stack, and the auth mechanism.
+1. Run `scripts/probe <target> --depth 2`. One call, no container: it fetches
+   the entry point, follows same-host links, reads the forms, sweeps a short
+   list of cheap paths such as `/.env` and `/graphql`, and prints every
+   parameter with the bug class its name suggests. Read that map.
+2. Fill the gaps it cannot see with `curl -sS -D- <url>`: the auth mechanism,
+   error messages, anything behind a POST or a login.
 3. Form a ranked hypothesis list from what you saw, not from a checklist: a
    reflected parameter suggests XSS or SSTI, a numeric id suggests IDOR, a
    search box suggests SQLi, a url parameter suggests SSRF or open redirect, a
