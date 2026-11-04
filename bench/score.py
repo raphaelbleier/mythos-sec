@@ -78,8 +78,30 @@ def events(transcript):
             continue
         if not isinstance(ev, dict):
             continue
-        if ev.get("timestamp"):
+        if isinstance(ev.get("timestamp"), (int, float)):
             ts.append(ev["timestamp"])
+        # Claude Code streams a different event shape than OpenCode: assistant/user/result
+        # objects carrying a message, instead of step_finish/tool_use/text with a part.
+        if ev.get("type") in ("assistant", "result") and "part" not in ev:
+            msg = ev.get("message") or {}
+            for block in (msg.get("content") or []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    final = block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    m["tool_calls"] += 1
+            use = msg.get("usage") or {}
+            if use:
+                m["steps"] += 1
+                m["tokens_in"] += use.get("input_tokens", 0)
+                m["tokens_out"] += use.get("output_tokens", 0)
+                m["tokens_cache_read"] += use.get("cache_read_input_tokens", 0)
+            if ev.get("type") == "result":
+                m["usd"] = ev.get("total_cost_usd") or m["usd"]
+                if isinstance(ev.get("result"), str) and ev["result"]:
+                    final = ev["result"]
+            continue
         part = ev.get("part") or {}
         if ev.get("type") == "step_finish":
             t = part.get("tokens") or {}
