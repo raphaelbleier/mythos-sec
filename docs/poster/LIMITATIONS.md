@@ -34,7 +34,8 @@ as such.
   challenge tag) is a weaker, alias-based signal.
 - **Not compared:** PentestGPT (autonomous mode only drives Claude Code or
   Codex) and CAI (archived, interactive REPL) are refused by the harness.
-  Strix needs its own LLM key and sandbox image; its arm is not yet run.
+  Strix ran on a shared GLM 5.3 endpoint and solved 4 of 5 valid cells in a
+  12-challenge pilot; its remaining cells were lost to the provider's quota.
 
 ## Capability limits
 
@@ -73,5 +74,7 @@ as such.
   template sets are scoped.
 - Windows and macOS: the shim is stdlib Python and avoids path rewriting for Git
   Bash, but only Linux (and WSL) has been exercised. Native tests: pending.
-- GHCR image provenance and SBOM are attached by CI; signature verification
-  and pull-rate behavior are unverified.
+- The GHCR image is published for amd64 and arm64 (tag v0.2.0, both platforms
+  in the merged manifest, pullable without credentials). Provenance and SBOM are
+  attached by CI; cosign signature verification and pull-rate behavior are
+  unverified.
