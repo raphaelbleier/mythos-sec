@@ -55,6 +55,17 @@ assert_has "probe ranks q as xss/sqli"       "reflected-xss"                 "$p
 assert_has "probe ranks file as traversal"   "path-traversal"                "$pr"
 assert_has "probe flags missing headers"     "missing_headers"               "$pr"
 
+echo "-- hypothesis verifier (deterministic, no model) --"
+vf=$(timeout 300 bash -c 'scripts/probe "http://127.0.0.1:5001" --depth 2 --json | scripts/verify --from-probe' 2>&1)
+assert_has "verify proves XSS on q"          "xss via \`q\`"                   "$vf"
+assert_has "verify proves SQLi on id"        "sqli via \`id\`"                 "$vf"
+assert_has "verify proves traversal on file" "traversal via \`file\`"          "$vf"
+assert_has "verify proves redirect on next"  "redirect via \`next\`"           "$vf"
+assert_has "verify proves cmd injection"     "cmdi via \`host\`"               "$vf"
+# negative control: /safe escapes its output, so the canary must not answer there
+sf=$(timeout 90 scripts/verify "http://127.0.0.1:5001/safe" --param q --classes xss 2>&1)
+assert_not "verify silent on escaped /safe"  "xss via"                        "$sf"
+
 if [ "$HOST" = "opencode" ]; then
   echo "-- running the mythos agent through opencode --"
   MODEL="${MYTHOS_MODEL:-opencode/glm-5.3-flash-free}"

@@ -121,7 +121,7 @@ scripts/mythos net mythos-lab     # let the toolbox reach lab targets by service
 **5. Verify** end to end:
 
 ```bash
-scripts/selftest.sh                   # 15 checks: probe, 7 vuln classes, no-FP control, scope-guard
+scripts/selftest.sh                   # 21 checks: probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard
 scripts/selftest.sh --host opencode   # same checks, scored from the mythos agent's report
 ```
 
@@ -168,6 +168,7 @@ Everything runs in the `mythos-toolbox` Kali container via `scripts/mythos`:
 
 ```bash
 scripts/probe <url> --depth 2          # surface map in one call, on the host, no container
+scripts/probe <url> --depth 2 --json | scripts/verify --from-probe   # prove the aim points
 scripts/mythos up                      # build (first run) + start the container
 scripts/mythos <tool> [args]           # run one tool,  e.g. scripts/mythos nuclei -u URL
 scripts/mythos sh '<pipeline>'         # run a shell pipeline in the toolbox
@@ -224,7 +225,7 @@ skill-driven flow; evidence, not a measured advantage). Details:
 
 | Target                  | Stack                        | Headline confirmed findings                                                                                                             |
 | ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **Self-test** (vulnapp) | Flask                        | probe map, 7 classes, no-FP control, scope-guard — **15/15** automated                                                                           |
+| **Self-test** (vulnapp) | Flask                        | probe map, canary proofs, 7 classes, 2 no-FP controls, scope-guard — **21/21** automated                                                                           |
 | **OWASP Juice Shop**    | Node SPA + REST              | UNION SQLi (Users dump), `/ftp` disclosure, poison-null-byte filter bypass, open redirect, config leak, **DOM XSS** (browser-confirmed) |
 | **DVGA**                | Python GraphQL               | **unauth RCE** (introspection → SSRF → command injection), broken access control, introspection                                         |
 | **VAmPI**               | Python REST                  | `_debug` plaintext-password dump; a BOLA **tested and disproven** (not over-claimed)                                                    |
@@ -269,8 +270,8 @@ toolbox/           two-stage Kali toolbox Dockerfile
 .github/           toolbox image CI (GHCR, amd64 + arm64)
 lab/               vulnerable targets, OAST catcher, admin bot
 bench/             XBOW harness, flagless-lab runner, ground truth, build lists
-scripts/           mythos (toolbox shim) · probe (fast surface map) · selftest.sh
-                   · build-hosts.py
+scripts/           mythos (toolbox shim) · probe (surface map) · verify (canary proofs)
+                   · selftest.sh · build-hosts.py
 knowledge/         per-class confirmation playbooks + CVE technique notes
 docs/              architecture, research, plan, poster/benchmark evidence
 ```

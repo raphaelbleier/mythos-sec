@@ -19,8 +19,19 @@ table there). Run `session_check.py` before each step.
 ## 0. Probe your hypotheses first
 
 The ranked parameter list from `scripts/probe` is your work queue: each entry
-names the parameter, where it was seen, and the class to try. Work it top down,
-one request per hypothesis.
+names the parameter, where it was seen, and the class to try.
+
+Work the whole queue in one call:
+
+```
+scripts/probe <target> --depth 2 --json | scripts/verify --from-probe
+```
+
+`scripts/verify` sends one benign canary per aim point (GET only, rate-limited,
+nothing destructive) and prints the request/response pair for every class that
+answered, plus the aim points that stayed quiet. Use its output as evidence,
+then work the quiet ones and anything behind a POST or a login by hand.
+`scripts/verify <url> --param <name> --classes xss,sqli` targets one point.
 
 Start with what recon actually saw. For each promising parameter, id or form,
 name the bug class it suggests and send one aimed `curl` request for it. The

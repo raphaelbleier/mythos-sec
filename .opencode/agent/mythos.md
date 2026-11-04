@@ -81,8 +81,15 @@ really is.
    reflected parameter suggests XSS or SSTI, a numeric id suggests IDOR, a
    search box suggests SQLi, a url parameter suggests SSRF or open redirect, a
    file parameter suggests traversal.
-4. Probe the top hypotheses directly, one request each. A single well-aimed
-   request beats a template scan on a small app.
+4. Prove the hypotheses. `scripts/probe <target> --depth 2 --json |
+   scripts/verify --from-probe` sends one benign canary per aim point and
+   prints the request and response of whatever answered: reflected XSS, SQL
+   errors, traversal, off-site redirect, template evaluation, shell echo,
+   server-side fetch, header injection. It sends GET only and nothing
+   destructive. Chase the rest by hand with `curl`, one request per idea.
+5. Read its evidence critically. A canary in the response is a reflection, not
+   an exploit, and "no signal" is not proof of safety. Finish each one under
+   the closure rules in the `exploit` skill.
 
 Stop this step and go to Step 4 the moment a probe proves a vulnerability. If
 the engagement names a specific proof to obtain, such as a secret to read or a

