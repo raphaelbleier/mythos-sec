@@ -6,17 +6,17 @@ digraph mythos {
         color="#6d5efc", fillcolor="#f3f1ff", fontcolor="#1f2430"];
   edge [color="#6d7086", fontname="Helvetica", fontsize=9, fontcolor="#6d7086"];
 
-  user [label="operator\n/cybersecurity <target>", fillcolor="#e0f7fb", color="#22d3ee"];
+  user [label="operator\n/cybersecurity <target> --scope file", fillcolor="#e0f7fb", color="#22d3ee"];
 
-  cc [label="Claude Code\n= the agent\n(reason → run tool → observe)", fillcolor="#efeaff", color="#6d5efc"];
+  cc [label="agent host (OpenCode first,\nClaude Code second)\n= the agent\n(reason → run tool → observe)", fillcolor="#efeaff", color="#6d5efc"];
 
   subgraph cluster_skills {
     label="phase skills (playbooks)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
-    setup   [label="engagement-setup\nscope.yaml"];
+    setup   [label="engagement-setup\nscope.yaml (single human gate)"];
     recon   [label="recon\nwhatweb · subfinder\nkatana · arjun · ffuf"];
-    scan    [label="web-scan\nnuclei · dalfox · sqlmap\nmanual checks · passive"];
+    scan    [label="web-scan\nnuclei · dalfox · sqlmap\nmanual checks · passive\n+ auth-session · business-logic\nstored-xss-oast · deep-server"];
     exploit [label="exploit\nminimal PoC · OOB\n(if allow_exploit)"];
-    report  [label="report\nbounty-format report.md"];
+    report  [label="report\nclosure states\nbounty-format report.md"];
   }
 
   subgraph cluster_agents {
@@ -25,15 +25,17 @@ digraph mythos {
     browser [label="browser\nPlaywright + Chromium\nDOM-XSS · auth flows"];
   }
 
+  gen [label="build-hosts.py\nAGENTS.md + .opencode/ canonical,\nagents/ commands/ generated", fillcolor="#fff7e6", color="#e0a800"];
   know [label="knowledge base\nper-class playbooks\nCVE triage · chaining", fillcolor="#eafff0", color="#1faa59"];
 
   shim    [label="scripts/mythos\n(docker exec shim)", fillcolor="#fff7e6", color="#e0a800"];
-  toolbox [label="mythos-toolbox (Kali, Docker)\nnuclei · sqlmap · dalfox · ffuf · katana\nsubfinder · httpx · commix · interactsh · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
-  hook    [label="scope-guard hook\nPreToolUse: warn/block\nout-of-scope hosts", fillcolor="#eafff0", color="#1faa59"];
+  toolbox [label="mythos-toolbox (Kali, Docker; ghcr.io image or local build)\nnuclei · sqlmap · dalfox · ffuf · katana\nsubfinder · httpx · commix · interactsh · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
+  hook    [label="scope-guard\nClaude Code hook / OpenCode plugin\nwarn (default) or block", fillcolor="#eafff0", color="#1faa59"];
   target  [label="target\n(authorized web app / API)", fillcolor="#fff0f0", color="#e03131"];
   out     [label="engagements/<dir>\nrecon · scan · findings · report.md", fillcolor="#f3f1ff", color="#6d5efc"];
 
   user -> cc;
+  gen -> cc [label="generates host files", style=dashed];
   know -> cc [label="informs", style=dashed];
   cc -> planner [label="delegates", style=dashed];
   cc -> setup; cc -> recon; cc -> scan; cc -> exploit; cc -> report;

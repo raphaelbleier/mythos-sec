@@ -1,54 +1,43 @@
-# Mythos — Roadmap
+# Mythos Roadmap
 
-Status of the **skill-driven** Mythos framework: Claude Code is the agent, phase
-skills are the playbooks, and real security tools run in the Kali toolbox. No
-Python engine, no external API key, no second LLM runtime.
+Status of the skill-driven Mythos framework. The agent host (OpenCode first,
+Claude Code second) is the agent; phase skills are the playbooks; real security
+tools run in the Kali toolbox. No Python engine, no external API key of its own.
 
-Legend: ✅ done · 🚧 in progress · ⏳ planned
+The phase plan comes from `docs/research/2026-11-ausbau-red-team-suite.md`
+(measurability first: harness before capability work). Durations there are
+single-developer estimates, not sourced figures. Status below reflects the
+working tree; "done" means implemented, not that the benchmark result exists.
 
-## Architecture pivot (current)
+Legend: done / in progress / partly / planned
 
-Mythos was rebuilt from a deterministic Python engine + standalone LLM agent into
-a pure skill-driven plugin, in the spirit of how CAI/Strix/HexStrike let the
-model drive — but native to Claude Code and keyless.
-
-- ✅ **`/cybersecurity` orchestrator** drives the engagement through phase skills.
-- ✅ **Phase skills**: `engagement-setup`, `recon`, `web-scan`, `exploit`,
-  `report`, `toolbox` — each naming the exact tools + techniques.
-- ✅ **Sub-agents** (planner/recon/scanner/browser/exploiter/reporter) follow the
-  skills, `model: inherit`.
-- ✅ **Toolbox shim** (`scripts/mythos`): thin `docker exec` driver over the Kali
-  container. `up` / `down` / `tools` / `run` / `sh` / `<tool>`.
-- ✅ **Kali toolbox** image: full web/API tool belt (nuclei, sqlmap, dalfox,
-  ffuf, katana, subfinder, httpx, nikto, commix, interactsh-client, jwt_tool,
-  gf/qsreplace/gau) + headless Chromium.
-- ✅ **Scope-guard hook** retained as the authorization safety net (warn/block).
-- ✅ **Removed**: `engine/` (Python engine + standalone `mythos_agent` runtime)
-  and `scripts/eval/` — superseded by the skill-driven model.
-
-## Validated
-
-- ✅ **Regression self-test** (`scripts/selftest.sh`): 10/10 — 7 ground-truth
-  classes + a no-false-positive control + 2 scope-guard checks, all through the
-  toolbox. Repeatable automated suite for the skill-driven architecture.
-- ✅ **Live benchmark — OWASP Juice Shop** (Angular SPA + REST): 6 classes
-  surfaced, 5 confirmed unauthenticated with tool evidence (critical UNION SQLi
-  → Users dump, `/ftp` disclosure, poison-null-byte filter bypass, open-redirect
-  allowlist bypass, config leak), 1 DOM-XSS candidate flagged for the browser
-  agent. See `docs/poster/benchmark-skill-driven.md`.
+| Phase | Content | Status | Notes |
+|---|---|---|---|
+| 0 Verification | pinned OpenCode versions, hook behavior, XBEN build list | done | OpenCode 1.x >= 1.18.29 and 2.x. XBEN build check with apt fix: `bench/xben.py check`. Open item: whether the scope guard fires inside OpenCode sub-agents is not confirmed. |
+| 1 Port | `AGENTS.md` canonical, `scripts/build-hosts.py` (+ `--check`), `.opencode/` agents/command/plugin, `opencode.json`, single-gate orchestrator | done | Self-test also runs through OpenCode (`scripts/selftest.sh --host opencode`). |
+| 2 Toolbox and harness | two-stage Kali image, GHCR multi-arch CI, Python shim; `bench/` harness with compose isolation, harness-side scoring, bare-model control | done | Image workflow `.github/workflows/toolbox.yml`. Cosign signing, GHCR pull limits and Docker Hub rate limits for the base image: unverified. Native Windows and macOS tests: not yet run. |
+| 3 Capabilities 1 and 2 | `auth-session` (two accounts), `business-logic` (BOLA, mass assignment, race), closure states and evidence gating in `exploit` / `report` | done | Skills exist. Measured gain against the phase-2 baseline and the gating on/off ablation: not yet measured. |
+| 4 Main comparison | stage-2 benchmarks: mythos vs bare control (same model), Strix; 3 runs, Wilson CIs, McNemar | in progress | Harness and stats exist; the full sweep and its raw data are pending. PentestGPT and CAI are refused by the harness (see `bench/README.md`). |
+| 5 Capabilities 3 and 4 | `stored-xss-oast` with `lab/oast` and `lab/admin-bot`, `deep-server`; knowledge notes for cache poisoning, request smuggling, race conditions | partly | Skills, lab services and notes exist. Deserialization / XXE coverage and the re-measurement (per-class delta, the four classes Strix missed) are pending. |
+| 6 Publication | README, per-OS install guide, responsible-use notice, poster, paper, tagged release with pinned image tag | in progress | README and poster text rewritten; results table and paper PDF pending; no release tag yet. |
 
 ## Backlog
 
-- ⏳ A `knowledge/`-backed per-class cheat-sheet the scanner reads inline.
-- ⏳ Authenticated-SPA recipe in the `recon`/`browser` skills (Playwright login +
-  cookie reuse for authenticated scanning).
-- ⏳ OOB exfil recipe hardening in `exploit` (interactsh templates for blind
-  SQLi/RCE/SSRF/XXE, filter-evasion payload library).
-- ⏳ GHCR-published toolbox image for one-pull setup (no local build).
-- ⏳ Extend the live benchmark set beyond Juice Shop (DVWA authenticated, VAmPI
-  API/BOLA) and record each in `docs/poster/`.
+- Fill the poster results table from `bench/stats.py` output (phase 4).
+- Ablation: evidence gating on/off; skills on/off beyond the bare control.
+- Windows and macOS smoke test of `scripts/mythos` and the GHCR image.
+- Verify scope-guard coverage in OpenCode sub-agents.
+- Per-agent model assignment (cheap for recon, strong for exploit) via a small
+  `models.json`: planned in the report, not implemented.
+- Extend targets beyond XBOW (crAPI needs more RAM than the current host).
 
-## Design references
+## Superseded
 
-`docs/research/frameworks-analysis.md` — the CAI/Strix/HexStrike/PentestGPT
-analysis that drives these choices. `docs/architecture.md` — the current design.
+The earlier engine-based design and its `scripts/eval/` harness were removed in
+the skill-driven pivot. Numbers from that era are not carried forward.
+
+## References
+
+`docs/research/2026-11-ausbau-red-team-suite.md` (roadmap source),
+`docs/research/frameworks-analysis.md`, `docs/architecture.md`,
+`bench/README.md`, `lab/README.md`.
