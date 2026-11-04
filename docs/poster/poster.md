@@ -87,7 +87,7 @@ Single manual engagements through the toolbox flow, no repeats, no control arm.
 They show the flow works on real targets, not a measured advantage:
 `benchmark-skill-driven.md` (Juice Shop), `benchmark-hard-targets.md` (DVGA
 GraphQL chain, VAmPI, Vuln Bank), `benchmark-xbow.md`. A regression self-test
-(`scripts/selftest.sh`, 10 checks: 7 vulnerability classes, a no-false-positive
+(`scripts/selftest.sh`, 15 checks: the deterministic surface probe, 7 vulnerability classes, a no-false-positive
 control, scope-guard) runs on both hosts.
 
 ## Contribution

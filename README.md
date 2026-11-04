@@ -121,7 +121,7 @@ scripts/mythos net mythos-lab     # let the toolbox reach lab targets by service
 **5. Verify** end to end:
 
 ```bash
-scripts/selftest.sh                   # 7 vuln classes + no-false-positive control + scope-guard
+scripts/selftest.sh                   # 15 checks: probe, 7 vuln classes, no-FP control, scope-guard
 scripts/selftest.sh --host opencode   # same checks, scored from the mythos agent's report
 ```
 
@@ -224,7 +224,7 @@ skill-driven flow; evidence, not a measured advantage). Details:
 
 | Target                  | Stack                        | Headline confirmed findings                                                                                                             |
 | ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **Self-test** (vulnapp) | Flask                        | 7 classes + no-FP control + scope-guard — **10/10** automated                                                                           |
+| **Self-test** (vulnapp) | Flask                        | probe map, 7 classes, no-FP control, scope-guard — **15/15** automated                                                                           |
 | **OWASP Juice Shop**    | Node SPA + REST              | UNION SQLi (Users dump), `/ftp` disclosure, poison-null-byte filter bypass, open redirect, config leak, **DOM XSS** (browser-confirmed) |
 | **DVGA**                | Python GraphQL               | **unauth RCE** (introspection → SSRF → command injection), broken access control, introspection                                         |
 | **VAmPI**               | Python REST                  | `_debug` plaintext-password dump; a BOLA **tested and disproven** (not over-claimed)                                                    |
