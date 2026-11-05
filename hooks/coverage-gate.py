@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 MAX_NUDGES = 3
@@ -32,7 +33,10 @@ def engagement():
     dirs = [d for r in roots for d in r.glob("*") if d.is_dir()]
     mapped = [d for d in dirs if (d / "surface.json").exists()]
     pool = mapped or dirs
-    return max(pool, key=lambda d: d.stat().st_mtime) if pool else None
+    if pool:
+        return max(pool, key=lambda d: d.stat().st_mtime)
+    f = os.environ.get("MYTHOS_SCOPE")      # no engagement dir: the run's own workspace
+    return Path(f).parent if f and Path(f).exists() else None
 
 
 def scope_target():
@@ -67,9 +71,38 @@ def ensure_map(d):
     return True
 
 
-def main():
+def assistant_text(transcript):
+    """What the agent actually said. An engagement may report in the conversation and never
+    write report.md, and then a file-only check sees no coverage at all."""
+    out = []
     try:
-        json.load(sys.stdin)
+        lines = Path(transcript).read_text(errors="replace").splitlines()
+    except Exception:
+        return None
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("message") or {}
+        for block in (msg.get("content") or []):
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                out.append(block["text"])
+    if not out:
+        return None
+    f = Path(tempfile.gettempdir()) / "mythos-coverage-said.txt"
+    f.write_text("\n\n".join(out))
+    return str(f)
+
+
+def main():
+    said = None
+    try:
+        event = json.load(sys.stdin)
+        if event.get("transcript_path"):
+            said = assistant_text(event["transcript_path"])
     except Exception:
         pass
     d = engagement()
@@ -79,8 +112,10 @@ def main():
     fired = int(counter.read_text().strip() or 0) if counter.exists() else 0
     if fired >= MAX_NUDGES:
         return 0
-    p = subprocess.run([sys.executable, str(REPO / "scripts" / "coverage"), str(d), "--list", "15"],
-                       capture_output=True, text=True)
+    argv = [sys.executable, str(REPO / "scripts" / "coverage"), str(d), "--list", "15"]
+    if said:
+        argv += ["--text", said]
+    p = subprocess.run(argv, capture_output=True, text=True)
     if p.returncode != 1:
         return 0
     counter.write_text(str(fired + 1))

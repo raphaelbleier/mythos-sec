@@ -2,10 +2,13 @@
 """Which parts of the mapped surface the engagement has not accounted for yet.
 
   scripts/probe <target> --json > engagements/<dir>/surface.json
-  scripts/coverage engagements/<dir>            # OPEN lines, exit 1 while any remain
-  scripts/coverage engagements/<dir> --list 15  # cap the listing
+  scripts/coverage engagements/<dir>              # OPEN lines, exit 1 while any remain
+  scripts/coverage engagements/<dir> --list 15    # cap the listing
+  scripts/coverage engagements/<dir> --text FILE  # also count this text as the report
 
-An item counts as covered when its path appears in `report.md` or under `findings/`,
+An item counts as covered when its path appears in `report.md`, under `findings/`, or in the
+text passed with `--text` (the gate passes the agent's own transcript, since an engagement
+may report in the conversation and never write a file),
 whether as a finding or as an explicit "tested, not vulnerable". That is a text check,
 not proof: it stops the engagement from silently skipping a whole surface, which is the
 failure this exists for (on Vuln Bank both benchmark arms never sent one request to the
@@ -15,6 +18,8 @@ mention, so it is a floor on coverage, never evidence of it.
 import json
 import sys
 from pathlib import Path
+
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 def surface(d):
@@ -31,7 +36,10 @@ def surface(d):
         for form in page.get("forms", []):
             items.append(form.get("action") or "")
     items += [r["path"] if isinstance(r, dict) else str(r) for r in m.get("reachable_paths", [])]
-    items += [str(e).split()[-1] if " " in str(e) else str(e) for e in m.get("api_endpoints", [])]
+    # OpenAPI entries read "POST /register"; GraphQL entries read "mutation importPaste(a, b)"
+    # and must stay whole, since splitting on spaces would leave a fragment of the argument list.
+    items += [str(e).split()[-1] if str(e).split()[0] in HTTP_METHODS else str(e)
+              for e in m.get("api_endpoints", []) if str(e).strip()]
     # A GraphQL-only app maps to a handful of pages, so its parameters are the real surface.
     items += [f"param:{p['name']}" for p in m.get("parameters", []) if p.get("name")]
     out = []
@@ -42,9 +50,9 @@ def surface(d):
     return out
 
 
-def covered(d):
+def covered(d, extra=None):
     d = Path(d)
-    text = ""
+    text = Path(extra).read_text(errors="replace") if extra and Path(extra).exists() else ""
     r = d / "report.md"
     if r.exists():
         text += r.read_text(errors="replace")
@@ -54,10 +62,22 @@ def covered(d):
     return text
 
 
-def open_items(d):
-    text = covered(d)
-    return [i for i in surface(d)
-            if (i[len("param:"):] if i.startswith("param:") else i) not in text]
+def match_key(item):
+    """What to look for in the report. An item is printed as mapped, e.g. `param:redirect_to` or
+    `mutation importPaste(host, path, port, scheme)`; the report will name `redirect_to` and
+    `importPaste`, never the decorated form."""
+    if item.startswith("param:"):
+        return item[len("param:"):]
+    for prefix in ("query ", "mutation ", "POST ", "GET ", "PUT ", "PATCH ", "DELETE "):
+        if item.startswith(prefix):
+            item = item[len(prefix):]
+            break
+    return item.split("(")[0].strip()
+
+
+def open_items(d, extra=None):
+    text = covered(d, extra)
+    return [i for i in surface(d) if match_key(i) not in text]
 
 
 def main():
@@ -65,7 +85,8 @@ def main():
         raise SystemExit(__doc__)
     d = sys.argv[1]
     cap = int(sys.argv[sys.argv.index("--list") + 1]) if "--list" in sys.argv else 40
-    items, total = open_items(d), len(surface(d))
+    extra = sys.argv[sys.argv.index("--text") + 1] if "--text" in sys.argv else None
+    items, total = open_items(d, extra), len(surface(d))
     if not total:
         print(f"no surface map: run scripts/probe <target> --json > {d}/surface.json")
         return 0

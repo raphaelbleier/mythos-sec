@@ -162,7 +162,7 @@ cov=$(mktemp -d)
 mkdir -p "$cov/eng"
 cat > "$cov/eng/surface.json" <<'JSON'
 {"origin": "http://t", "pages": [{"url": "http://t/login", "forms": []}],
- "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge"],
+ "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge", "query systemDebug(arg)"],
  "parameters": [{"name": "redirect_to"}]}
 JSON
 printf '# report\nSQLi on /login proven.\n' > "$cov/eng/report.md"
@@ -171,8 +171,9 @@ assert_has "coverage names the untested GraphQL surface" "OPEN /graphql"      "$
 assert_has "coverage names the untested payment API"     "OPEN /api/v1/charge" "$out"
 assert_not "coverage clears a path the report covers"    "OPEN /login"        "$out"
 assert_has "coverage names an untested parameter"        "OPEN param:redirect_to" "$out"
+assert_has "coverage names an untested GraphQL field"    "OPEN query systemDebug" "$out"
 [ "$rc" -eq 1 ] && ok "coverage exits 1 while paths are open" || bad "coverage exits 1 while paths are open (got $rc)"
-printf '# report\nSQLi on /login. /graphql tested, introspection disabled. POST /api/v1/charge tested, authz enforced. redirect_to is not reflected.\n' > "$cov/eng/report.md"
+printf '# report\nSQLi on /login. /graphql tested, introspection disabled. /api/v1/charge tested, authz enforced. redirect_to is not reflected. systemDebug runs shell commands.\n' > "$cov/eng/report.md"
 out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
 assert_not "coverage silent once everything is accounted for" "OPEN" "$out"
 [ "$rc" -eq 0 ] && ok "coverage exits 0 when nothing is open" || bad "coverage exits 0 when nothing is open (got $rc)"
@@ -189,6 +190,11 @@ printf 'target: http://127.0.0.1:5001\nin_scope: [127.0.0.1]\n' > "$cov/scope.ya
 out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" MYTHOS_SCOPE="$cov/scope.yaml" python3 hooks/coverage-gate.py)
 assert_has "gate maps the surface itself when recon did not" "OPEN /search" "$out"
 rm -rf "$cov/eng2"
+printf '# report\n' > "$cov/eng/report.md"; rm -f "$cov/eng/.coverage-gate"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"I tested /login, /graphql, /api/v1/charge, systemDebug and redirect_to."}]}}\n' > "$cov/said.jsonl"
+out=$(printf '{"transcript_path":"%s"}' "$cov/said.jsonl" | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
+assert_not "gate counts what the agent said, not only report.md" "COVERAGE GATE" "$out"
+rm -f "$cov/eng/.coverage-gate"
 echo 3 > "$cov/eng/.coverage-gate"
 out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
 assert_not "gate gives up after its nudge limit" "COVERAGE GATE" "$out"
