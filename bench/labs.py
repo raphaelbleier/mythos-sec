@@ -13,7 +13,7 @@ Ground truth: data/ground_truth/*.json. There is no flag oracle: a human sets ea
 status to found|missed|fp. Labs only ever bind loopback (lab/docker-compose.yml, crAPI LISTEN_IP);
 `run` refuses any endpoint that is not loopback or the docker0 gateway.
 """
-import argparse, importlib, json, os, subprocess, sys, tempfile, time, urllib.request
+import argparse, fcntl, importlib, json, os, subprocess, sys, tempfile, time, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,6 +113,11 @@ def cmd_run(a):
         raise SystemExit(2)
     if not reachable(url):
         raise SystemExit(f"{url} is not up: labs.py up {a.target}")
+    lock = open(Path(tempfile.gettempdir()) / f"mythos-lab-{a.target}.lock", "w")
+    try:  # one arm at a time: a lab target is a single shared instance, and two arms on it
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # see each other's writes and outages
+    except OSError:
+        raise SystemExit(f"another run holds {a.target}: labs targets are not parallel-safe")
     d = Path(a.out) / a.framework / a.target / f"run{a.run}"
     d.mkdir(parents=True, exist_ok=True)
     bench_run.write_scope(d / "scope.yaml", url)
