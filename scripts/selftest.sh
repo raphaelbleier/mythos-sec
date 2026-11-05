@@ -161,15 +161,18 @@ echo "-- coverage gate --"
 cov=$(mktemp -d)
 mkdir -p "$cov/eng"
 cat > "$cov/eng/surface.json" <<'JSON'
-{"pages": [{"path": "/login", "forms": []}], "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge"]}
+{"origin": "http://t", "pages": [{"url": "http://t/login", "forms": []}],
+ "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge"],
+ "parameters": [{"name": "redirect_to"}]}
 JSON
 printf '# report\nSQLi on /login proven.\n' > "$cov/eng/report.md"
 out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
 assert_has "coverage names the untested GraphQL surface" "OPEN /graphql"      "$out"
 assert_has "coverage names the untested payment API"     "OPEN /api/v1/charge" "$out"
 assert_not "coverage clears a path the report covers"    "OPEN /login"        "$out"
+assert_has "coverage names an untested parameter"        "OPEN param:redirect_to" "$out"
 [ "$rc" -eq 1 ] && ok "coverage exits 1 while paths are open" || bad "coverage exits 1 while paths are open (got $rc)"
-printf '# report\nSQLi on /login. /graphql tested, introspection disabled. POST /api/v1/charge tested, authz enforced.\n' > "$cov/eng/report.md"
+printf '# report\nSQLi on /login. /graphql tested, introspection disabled. POST /api/v1/charge tested, authz enforced. redirect_to is not reflected.\n' > "$cov/eng/report.md"
 out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
 assert_not "coverage silent once everything is accounted for" "OPEN" "$out"
 [ "$rc" -eq 0 ] && ok "coverage exits 0 when nothing is open" || bad "coverage exits 0 when nothing is open (got $rc)"

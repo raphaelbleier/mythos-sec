@@ -18,18 +18,22 @@ from pathlib import Path
 
 
 def surface(d):
-    """Paths worth accounting for, from the probe's JSON map."""
+    """Paths and parameters worth accounting for, from the probe's JSON map."""
     f = Path(d) / "surface.json"
     if not f.exists():
         return []
     m = json.loads(f.read_text())
+    origin = m.get("origin") or m.get("target") or ""
     items = []
     for page in m.get("pages", []):
-        items.append(page.get("path") or "/")
+        url = page.get("url") or page.get("path") or ""
+        items.append(url[len(origin):] if origin and url.startswith(origin) else url)
         for form in page.get("forms", []):
-            items.append(form.get("action") or page.get("path") or "/")
+            items.append(form.get("action") or "")
     items += [r["path"] if isinstance(r, dict) else str(r) for r in m.get("reachable_paths", [])]
     items += [str(e).split()[-1] if " " in str(e) else str(e) for e in m.get("api_endpoints", [])]
+    # A GraphQL-only app maps to a handful of pages, so its parameters are the real surface.
+    items += [f"param:{p['name']}" for p in m.get("parameters", []) if p.get("name")]
     out = []
     for i in items:                      # keep order, drop duplicates and bare roots
         i = i.strip()
@@ -52,7 +56,8 @@ def covered(d):
 
 def open_items(d):
     text = covered(d)
-    return [i for i in surface(d) if i not in text]
+    return [i for i in surface(d)
+            if (i[len("param:"):] if i.startswith("param:") else i) not in text]
 
 
 def main():
