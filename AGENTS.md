@@ -41,8 +41,14 @@ mounted at `/repo`, so tool output lands under `engagements/`. A lab target on
   hook and as the OpenCode plugin `.opencode/plugin/scope-guard.ts`) warns on
   out-of-scope hosts in bash/webfetch calls. It is warn-only by design
   (`MYTHOS_SCOPE_ENFORCE` picks the mode: `warn` default, `ask` to refuse
-  pending the user's decision, `block` to refuse outright). A warning means: do
-  not run that command.
+  pending the user's decision, `block` to refuse outright). In `warn` mode the
+  warning reaches you with the tool result, so the command has already run by
+  the time you read it: treat a warning as a slip that already happened, stop,
+  report it, and do not send that request again. Only `ask` and `block` can
+  prevent the call, so set `MYTHOS_SCOPE_ENFORCE=ask` for any engagement where
+  one out-of-scope request is unacceptable. Never widen the scope to silence a
+  warning. A request the target makes on your behalf, for example an SSRF
+  probe, counts as yours: the destination must be in scope too.
 - Honor `rules.rate_limit_rps` and `rules.max_requests`.
 - Keep all engagement artifacts under `engagements/<dir>/` (git-ignored).
 

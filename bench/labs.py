@@ -162,6 +162,7 @@ def cmd_run(a):
         {"framework": a.framework, "model": a.model, "target": a.target, "target_url": url,
          "budget_s": a.budget, "run": a.run, "transcript": str(t), "status": status,
          "target_restarts": len(restarts.read_text().splitlines()) if restarts.exists() else 0,
+         "scope_warnings": score.scope_warnings(t, d / "scope.yaml"),
          "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1))
     print(f"transcript: {t}")
     if status == "target_failed":
