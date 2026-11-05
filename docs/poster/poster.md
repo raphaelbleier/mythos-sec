@@ -295,9 +295,28 @@ dass das Gate auf einem breiten Ziel mit dokumentierter Liste wirkt, und nicht,
 dass das Gerüst allgemein überlegen ist; auf den kleinen Zielen (VAmPI, neun
 Einträge) bleibt nichts zu holen.
 
+**Befund zur Wirkungsgrenze: das Gate hilft nur, soweit die Karte das Ziel
+trifft.** Auf DVGA kehrte dieselbe Mechanik das Ergebnis um: 6 von 21 gegen 12
+ohne Gate und 11 in der Kontrolle, bei 0,77 statt 0,27 USD. Die Ursache liegt
+nicht im Gate, sondern in der Karte. DVGA ist eine GraphQL-Anwendung; die
+Oberflächenkarte bestand aus elf HTML-Seiten, während jede der 21
+dokumentierten Schwachstellen hinter `/graphql` liegt. Der Agent arbeitete die
+elf Seiten pflichtgemäß ab und kam nicht mehr zu den Feldern, die zählen. Auf
+Vuln Bank war die Karte deshalb brauchbar, weil die Anwendung ihre
+OpenAPI-Beschreibung veröffentlicht und daraus 39 Endpunkte entstehen.
+
+`scripts/probe` stellt seit dem 5. November 2026 eine Introspektionsabfrage an
+`/graphql` und gibt jedes Query- und Mutationsfeld mit seinen Argumenten aus;
+auf DVGA sind das 19 Felder, darunter `systemDebug`, `systemDiagnostics`,
+`pastes(filter:)`, `importPaste` und `uploadPaste`, also genau die Einstiege
+der dokumentierten Liste. Ein GraphQL-Endpunkt antwortet auf GET mit 400,
+weshalb die Abfrage vor dem Statusfilter laufen muss. Die Messung mit dieser
+Karte steht noch aus; der bedingte Befund bleibt: das Gate wirkt, soweit die
+Karte die tatsächliche Oberfläche enthält, und schadet, wo sie sie verfehlt.
+
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
-offen. Der Recall auf crAPI steht noch aus, ebenso das Gate auf DVGA und
-VAmPI.
+offen. Der Recall auf crAPI steht noch aus, ebenso das Gate auf VAmPI und auf
+den Flag-Challenges.
 
 ## Earlier, uncontrolled evidence
 

@@ -102,6 +102,17 @@ as such.
   stop, not the target. That is what the coverage gate addresses, and it is
   also the one lever the control cannot have, since a bare model has no place
   to put a surface map.
+- **The coverage gate only helps where the surface map is right.** The same
+  mechanism inverted the result on DVGA: 6 of 21 against 12 without the gate
+  and 11 for the control, at $0.77 instead of $0.27. DVGA is a GraphQL app and
+  its map was eleven HTML pages, while all 21 documented vulnerabilities sit
+  behind `/graphql`; the agent closed out the eleven pages and never got to the
+  fields that matter. Vuln Bank worked because that app publishes an OpenAPI
+  document, which yields 39 endpoints. The probe now introspects `/graphql` and
+  emits all 19 fields with their arguments, which are exactly the documented
+  entry points, but the measurement with that map is still outstanding. The
+  conditional stands: the gate works to the extent the map captures the real
+  surface, and hurts where it does not.
 - **The scope guard cannot stop a call in its default mode.** On the Claude Code
   host a PreToolUse hook's `additionalContext` reaches the agent together with
   the tool result, so in `warn` mode the request is already out when the warning

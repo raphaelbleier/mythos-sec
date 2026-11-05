@@ -26,8 +26,12 @@ Legend: done / in progress / partly / planned
 - Ablation: evidence gating on/off; skills on/off beyond the bare control.
 - Recall on the remaining flagless target: crAPI (needs more RAM than the current host).
 - Repeats per cell (the one-run-per-cell design cannot separate variance).
-- Run the coverage gate on DVGA and VAmPI, and on the flag challenges, to see
-  whether the Vuln Bank separation is specific to a broad surface.
+- Re-measure the coverage gate on DVGA with the schema-aware map. The first
+  attempt scored 6 of 21 against 12 ungated because the map was eleven HTML
+  pages and the whole surface sits behind /graphql; the probe now enumerates
+  the schema, so the question is whether recall recovers past 12.
+- Run the coverage gate on VAmPI and on the flag challenges, to see whether the
+  Vuln Bank separation needs a broad surface.
 - Enforce the non-destructive rule in code, not only in the prompt: on DVGA both
   arms modified seed data (the control deleted another user's paste) and
   reported it afterwards.
