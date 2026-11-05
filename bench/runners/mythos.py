@@ -21,7 +21,7 @@ def run(target_url, workdir, model, budget_s):
             (cwd / name).symlink_to(REPO / name)
     (cwd / "engagements").mkdir(exist_ok=True)
     scope = workdir / "scope.yaml"
-    text = f"{target_url} --scope {scope}\n\n{base.prompt(target_url)}"
+    text = f"{target_url} --scope {scope}\n\n{base.objective(target_url)}"
     env = dict(base.clean_env(home), MYTHOS_SCOPE=str(scope))
     argv = base.opencode_argv("mythos", model, cwd, text, pure=False)
     return base.run_proc(argv, cwd, env, budget_s, workdir)

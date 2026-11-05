@@ -3,7 +3,8 @@
 
   labs.py list
   labs.py up|down TARGET
-  labs.py run TARGET --framework mythos|control --model M --budget S --out DIR --scope-confirmed
+  labs.py run TARGET --framework claude_mythos|claude_control|mythos|control --model M \
+                     --budget S --out DIR --scope-confirmed
   labs.py score TARGET RUNDIR      # writes RUNDIR/triage.json (candidates pre-filled, human finalises)
   labs.py stats TARGET RUNDIR...   # recall / precision from the human-finalised triage.json files
   labs.py selftest
@@ -115,6 +116,8 @@ def cmd_run(a):
     d = Path(a.out) / a.framework / a.target / f"run{a.run}"
     d.mkdir(parents=True, exist_ok=True)
     bench_run.write_scope(d / "scope.yaml", url)
+    # flagless target: ask for coverage with evidence, not a flag
+    os.environ["BENCH_OBJECTIVE"] = "survey"
     runner = importlib.import_module(f"runners.{a.framework}")
     t = runner.run(url, d, a.model, a.budget)
     (d / "result.json").write_text(json.dumps(
@@ -208,7 +211,8 @@ def main():
         sub.add_parser(n).set_defaults(f=f)
         sub.choices[n].add_argument("target")
     p = sub.add_parser("run"); p.set_defaults(f=cmd_run)
-    p.add_argument("target"); p.add_argument("--framework", required=True, choices=("mythos", "control", "strix", "pentestgpt", "cai"))
+    p.add_argument("target"); p.add_argument("--framework", required=True, choices=("mythos", "control", "claude_mythos", "claude_control", "strix",
+                                     "pentestgpt", "cai"))
     p.add_argument("--model", default="opencode/glm-5.3-flash-free"); p.add_argument("--budget", type=int, default=1800)
     p.add_argument("--out", required=True); p.add_argument("--run", type=int, default=0)
     p.add_argument("--scope-confirmed", action="store_true")

@@ -27,7 +27,7 @@ def run(target_url, workdir, model, budget_s):
             (cwd / name).symlink_to(REPO / name)
     (cwd / "engagements").mkdir(exist_ok=True)
     scope = workdir / "scope.yaml"
-    text = (f"/cybersecurity {target_url} --scope {scope}\n\n{base.prompt(target_url)}")
+    text = (f"/cybersecurity {target_url} --scope {scope}\n\n{base.objective(target_url)}")
     env = dict(base.claude_env(home), MYTHOS_SCOPE=str(scope))
     argv = ["claude", "-p", text, "--model", model, "--output-format", "stream-json", "--verbose",
             "--dangerously-skip-permissions", "--plugin-dir", str(REPO),

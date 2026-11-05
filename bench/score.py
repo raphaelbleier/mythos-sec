@@ -138,7 +138,8 @@ def score(flag, transcript, tags, workdir):
     # Harness-written text (the prompt, the run's scope.yaml) is echoed back into the transcript
     # by the agent host. Scanning it would flag every cell, so score only the agent's own output.
     scan = text
-    harness = list(runners_base.PROMPT.split("\n")) if runners_base else []
+    harness = ((runners_base.PROMPT + "\n" + runners_base.SURVEY_PROMPT).split("\n")
+               if runners_base else [])
     scope = workdir / "scope.yaml"
     if scope.exists():
         harness += scope.read_text(errors="replace").split("\n")

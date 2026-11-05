@@ -11,7 +11,7 @@ ALLOWED = ["Bash", "Read", "Glob", "Grep"]
 
 def run(target_url, workdir, model, budget_s):
     workdir, cwd, home = base.dirs(workdir)
-    argv = ["claude", "-p", base.prompt(target_url), "--model", model,
+    argv = ["claude", "-p", base.objective(target_url), "--model", model,
             "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
             "--allowed-tools", *ALLOWED,
             "--disallowed-tools", "Task", "WebFetch", "WebSearch", "Edit", "Write"]

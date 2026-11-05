@@ -13,5 +13,5 @@ CONFIG = {"$schema": "https://opencode.ai/config.json",
 def run(target_url, workdir, model, budget_s):
     workdir, cwd, home = base.dirs(workdir)
     (cwd / "opencode.json").write_text(json.dumps(CONFIG, indent=1))
-    argv = base.opencode_argv("build", model, cwd, base.prompt(target_url), pure=True)
+    argv = base.opencode_argv("build", model, cwd, base.objective(target_url), pure=True)
     return base.run_proc(argv, cwd, base.clean_env(home), budget_s, workdir)
