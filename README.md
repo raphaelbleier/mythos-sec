@@ -121,7 +121,7 @@ scripts/mythos net mythos-lab     # let the toolbox reach lab targets by service
 **5. Verify** end to end:
 
 ```bash
-scripts/selftest.sh                   # 21 checks: probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard
+scripts/selftest.sh                   # 31 checks: probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard, coverage gate
 scripts/selftest.sh --host opencode   # same checks, scored from the mythos agent's report
 ```
 
