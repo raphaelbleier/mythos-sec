@@ -56,13 +56,40 @@ as such.
   and no deterministic probe: on a surface this small the orchestrator's
   "scale the work to the target" rule effectively switches the scaffolding off,
   which is a design question, not a model limit.
+- **DVGA, the larger flagless target, is a null too.** 21 documented
+  vulnerabilities, hand triage with an evidence quote per row: mythos 12, control
+  11, precision 1.00 in both arms. Five of the 21 are denial-of-service classes
+  the engagement's own safety rules forbid proving, and both arms skip them;
+  excluding those, both arms are 10 of 16. One entry went to each arm alone
+  (field suggestions and array batching to the scaffolded arm, the traversal
+  write path to the control, which located it with the code execution it had
+  already gained), and eight went to neither. The cost direction inverts here:
+  the control spent 43 tool calls and $0.81, the scaffolded arm 18 and $0.27.
+- **This target cannot survive being tested.** DVGA deadlocks permanently once
+  `importPaste` fetches the application's own address, and a hung process still
+  accepts TCP, so a port healthcheck does not see it. Two earlier runs spent
+  about 35 minutes each on a dead target and were discarded. The harness now
+  restarts the target after 90s without an HTTP answer and logs every restart
+  next to the transcript; the two scored runs needed three and two restarts. A
+  run whose target is still down at the end is recorded as `target_failed` and
+  not scored. Both arms also modified seed data although the objective requires
+  non-destructive testing: the control deleted another user's paste and
+  overwrote a second one's title, the scaffolded arm edited one paste and
+  restored it. Both reported it unprompted, but the rule is stated in the
+  prompt and is not enforced in code.
+- **Two further unscored statuses were found this way.** The account's weekly
+  usage cap is printed as prose and ends the turn, so a capped cell looked like
+  a failed solve; it now counts as `rate_limited` (two DVGA runs were lost to
+  it, one of them without a single tool call). A `labs.py score` call on a
+  classifier-ended run is now refused as well, the same rule the flag sweeps
+  use.
 - **The benchmark measures the wrong thing for this question.** A flag is all
   or nothing, so multi-step chains and access-control findings score zero until
   they are complete. The seven shared failures carry tags such as
   `insecure_deserialization`, `business_logic` and `privilege_escalation`. The
   flagless targets with documented vulnerability lists are the measurement that
-  could show a scaffolding effect; VAmPI is done (above), crAPI, Vuln Bank and
-  DVGA are still missing.
+  could show a scaffolding effect; VAmPI and DVGA are done, crAPI and Vuln Bank
+  are still missing.
 - **Scaffolding effect vs model effect.** With one model for all arms, a
   difference measures the scaffolding (skills, orchestration, tools), not the
   model. It says nothing about other models.

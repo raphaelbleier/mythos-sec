@@ -62,7 +62,7 @@ Harness: `bench/` (stdlib Python), XBOW validation-benchmarks. Full detail in
 
 ## Results
 
-Fünf Sweeps vom 4. und 5. November 2026, Rohdaten unter
+Sechs Sweeps vom 4. und 5. November 2026, Rohdaten unter
 `/mnt/linux-data/mythos-bench/results/`. Jede Zelle bekommt eine frisch
 gebaute Challenge mit zufälligem Flag, ein eigenes Compose-Projekt im eigenen
 Netz, eine `scope.yaml` auf genau diesen Host und Port, dieselbe Wall-Clock und
@@ -175,9 +175,45 @@ kaum Spielraum. Wo das Gerüst wirken müsste, nämlich bei mehrstufigen Ketten 
 Zugriffskontrolle, messen diese Challenges nicht: Flag-Capture liefert dort kein
 Teilergebnis.
 
+**Sweep F, flagloses Ziel DVGA, Claude Code, Modell `sonnet`, Budget 2400 s,
+Gerüst nachweislich geladen.** 21 dokumentierte Schwachstellen, Handtriage mit
+einem Belegzitat je Zeile.
+
+| Arm | gefunden | verpasst | Recall | Präzision | Werkzeugaufrufe | Kosten USD |
+|---|---|---|---|---|---|---|
+| mythos, Gerüst geladen | 12 | 9 | 0,57 | 1,00 | 18 | 0,27 |
+| control (nacktes Modell mit Shell) | 11 | 10 | 0,52 | 1,00 | 43 | 0,81 |
+
+Der Abstand von einem Eintrag liegt im Rauschen. Fünf der 21 gewerteten
+Einträge sind Dienstverweigerungsklassen, deren Nachweis die Sicherheitsregeln
+des Auftrags verbieten; beide Arme lassen sie folgerichtig aus. Rechnet man sie
+heraus, stehen beide Arme bei 10 von 16, also 0,63 gegen 0,63. Je ein Eintrag
+ging nur an einen Arm: der geladene Arm wies die Feldvorschläge und die
+Array-Bündelung nach, die Kontrolle den Schreibpfad des Verzeichniswechsels,
+den sie über die zuvor erlangte Codeausführung lokalisierte. Acht Einträge fand
+keiner der beiden.
+
+Die Kostenrichtung dreht sich hier gegenüber Sweep E: die Kontrolle brauchte 43
+Werkzeugaufrufe und 0,81 USD, der geladene Arm 18 und 0,27 USD. Der tiefere
+Lauf war der der Kontrolle, und er brachte einen Eintrag weniger ein.
+
+**Befund zur Messgültigkeit III: das Ziel hält den Angriff nicht aus.** DVGA
+blockiert dauerhaft, sobald `importPaste` die eigene Adresse der Anwendung
+abruft, und ein blockierter Prozess nimmt weiter TCP-Verbindungen an, sodass
+eine Portprüfung den Ausfall nicht sieht. Zwei frühere Läufe verbrachten je etwa
+35 Minuten an einem toten Ziel. Seit dem 5. November 2026 startet der Prüfstand
+das Ziel neu, wenn es 90 Sekunden keine HTTP-Antwort gibt, und protokolliert
+jeden Neustart neben dem Transkript; die beiden Läufe oben brauchten drei
+beziehungsweise zwei Neustarts. Ein Lauf, dessen Ziel am Ende weiter
+ausgefallen ist, trägt den Status `target_failed` und wird nicht gewertet.
+Beide Arme veränderten dabei Bestandsdaten, obwohl der Auftrag
+Zerstörungsfreiheit vorschreibt: die Kontrolle löschte einen fremden Eintrag
+und überschrieb den Titel eines zweiten, der geladene Arm änderte einen Eintrag
+und stellte ihn wieder her. Beide berichteten das von sich aus.
+
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
-offen. Der Recall auf den übrigen flaglosen Zielen (crAPI, Vuln Bank, DVGA)
-steht noch aus.
+offen. Der Recall auf den übrigen flaglosen Zielen (crAPI, Vuln Bank) steht
+noch aus.
 
 ## Earlier, uncontrolled evidence
 

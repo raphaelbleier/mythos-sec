@@ -17,15 +17,18 @@ Legend: done / in progress / partly / planned
 | 1 Port | `AGENTS.md` canonical, `scripts/build-hosts.py` (+ `--check`), `.opencode/` agents/command/plugin, `opencode.json`, single-gate orchestrator | done | Self-test also runs through OpenCode (`scripts/selftest.sh --host opencode`). |
 | 2 Toolbox and harness | two-stage Kali image, GHCR multi-arch CI, Python shim; `bench/` harness with compose isolation, harness-side scoring, bare-model control | done | Image workflow `.github/workflows/toolbox.yml`. Cosign signing, GHCR pull limits and Docker Hub rate limits for the base image: unverified. Native Windows and macOS tests: not yet run. |
 | 3 Capabilities 1 and 2 | `auth-session` (two accounts), `business-logic` (BOLA, mass assignment, race), closure states and evidence gating in `exploit` / `report` | done | Skills exist. Measured gain against the phase-2 baseline and the gating on/off ablation: not yet measured. |
-| 4 Main comparison | stage-2 benchmarks: mythos vs bare control (same model), Strix; Wilson CIs, McNemar | done, null result | Five sweeps. 2026-11-04: 40 challenges on Claude Sonnet, 12 on GLM 5.3, a rerun of the seven shared failures. 2026-11-05: VAmPI recall against its nine documented vulnerabilities, and the 40 challenges again after an invalid plugin manifest was found to have kept the Claude Code mythos arm unscaffolded. The mythos arm never separates from the control, scaffolded or not (every paired p = 1.0, VAmPI recall 0.89 in both arms); numbers in `docs/poster/poster.md`. Open: repeats per cell, crAPI/Vuln Bank/DVGA recall, and Strix kept only 2 of 12 valid cells. PentestGPT and CAI are refused by the harness (see `bench/README.md`). |
+| 4 Main comparison | stage-2 benchmarks: mythos vs bare control (same model), Strix; Wilson CIs, McNemar | done, null result | Six sweeps. 2026-11-04: 40 challenges on Claude Sonnet, 12 on GLM 5.3, a rerun of the seven shared failures. 2026-11-05: VAmPI recall against its nine documented vulnerabilities, and the 40 challenges again after an invalid plugin manifest was found to have kept the Claude Code mythos arm unscaffolded. The mythos arm never separates from the control, scaffolded or not (every paired p = 1.0, VAmPI recall 0.89 in both arms); numbers in `docs/poster/poster.md`. Also 2026-11-05: DVGA recall against its 21 documented vulnerabilities (mythos 12, control 11, precision 1.00 in both arms; tied at 10 of 16 once the five denial-of-service classes the safety rules forbid proving are excluded). Open: repeats per cell, crAPI/Vuln Bank recall, and Strix kept only 2 of 12 valid cells. PentestGPT and CAI are refused by the harness (see `bench/README.md`). |
 | 5 Capabilities 3 and 4 | `stored-xss-oast` with `lab/oast` and `lab/admin-bot`, `deep-server`; knowledge notes for cache poisoning, request smuggling, race conditions | partly | Skills, lab services and notes exist. Deserialization / XXE coverage and the re-measurement (per-class delta, the four classes Strix missed) are pending. |
 | 6 Publication | README, per-OS install guide, responsible-use notice, poster, paper, tagged release with pinned image tag | in progress | README and poster written, results table filled. Release `v0.2.0` is tagged and the GHCR image is published for amd64 and arm64. Paper PDF pending. |
 
 ## Backlog
 
 - Ablation: evidence gating on/off; skills on/off beyond the bare control.
-- Recall on the remaining flagless targets: crAPI, Vuln Bank, DVGA.
+- Recall on the remaining flagless targets: crAPI, Vuln Bank.
 - Repeats per cell (the one-run-per-cell design cannot separate variance).
+- Enforce the non-destructive rule in code, not only in the prompt: on DVGA both
+  arms modified seed data (the control deleted another user's paste) and
+  reported it afterwards.
 - Enforce the anti-give-up rule in code, not only in the orchestrator prompt:
   four cells in the verified-scaffolding sweep still ended unsolved after
   15-24 seconds.
