@@ -62,24 +62,74 @@ Harness: `bench/` (stdlib Python), XBOW validation-benchmarks. Full detail in
 
 ## Results
 
-**Placeholder: not yet run. Fill from the output of**
-`python3 bench/stats.py <results>/results.jsonl --compare mythos,control`
-**Do not edit numbers by hand; record the model id, date and sample parameters.**
+Drei Sweeps, alle vom 4. November 2026, Rohdaten unter
+`/mnt/linux-data/mythos-bench/results/`. Jede Zelle bekommt eine frisch
+gebaute Challenge mit zufälligem Flag, ein eigenes Compose-Projekt im eigenen
+Netz, eine `scope.yaml` auf genau diesen Host und Port, dieselbe Wall-Clock und
+ein sauberes HOME. Gewertet wird nur, was die Harness selbst nachweist; Zellen,
+in denen der Anbieter die Quote verweigerte, stehen gelassen hat oder der
+Runner scheiterte, zählen nicht.
 
-Run parameters: model = `TBD`, date = `TBD`, challenges = `TBD` (seed `TBD`),
-runs per cell = `TBD`, budget = `TBD` s, apt_fix = `TBD`.
+**Sweep A, Claude Code, Modell `sonnet`, 40 Challenges (seed 7), ein Lauf je
+Zelle, Budget 1800 s, apt_fix an.**
 
-| Arm | n cells | solved | solve rate | Wilson 95% CI | pass@k |
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s |
 |---|---|---|---|---|---|
-| control (bare model) | TBD | TBD | TBD | TBD | TBD |
-| mythos | TBD | TBD | TBD | TBD | TBD |
-| strix (if run) | TBD | TBD | TBD | TBD | TBD |
+| control (nacktes Modell mit Shell) | 39 | 27 | 0,69 | 0,54 bis 0,81 | 23 |
+| mythos | 40 | 28 | 0,70 | 0,55 bis 0,82 | 28 |
 
-Paired comparison mythos vs control: discordant pairs b = TBD, c = TBD,
-McNemar p = TBD.
+Gepaart über 39 Challenges: 23 lösen beide, 5 nur mythos, 4 nur die Kontrolle,
+7 keiner. McNemar exakt, p = 1,0.
 
-Per-class breakdown (stored XSS, auth/BOLA, mass assignment, race, SSTI,
-smuggling, deserialization): TBD. Ablation, evidence gating on/off: TBD.
+**Sweep B, OpenCode, Modell `zai/glm-5.3`, 12 Challenges (seed 1), Budget
+5400 s.** Strix lief im selben Sweep auf `openai/glm-5.3` über seine eigene
+CLI und Sandbox.
+
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s |
+|---|---|---|---|---|---|
+| control | 10 | 10 | 1,00 | 0,72 bis 1,00 | 177 |
+| mythos | 10 | 10 | 1,00 | 0,72 bis 1,00 | 135 |
+| strix | 2 | 2 | 1,00 | 0,34 bis 1,00 | 438 |
+
+Gepaart über 10 Challenges: alle zehn lösen beide, keine abweichenden Paare.
+Von Strix' zwölf Zellen blieben nur zwei verwertbar, acht endeten im
+Stillstand des Anbieters und zwei im Runner-Fehler.
+
+**Sweep C, Claude Code, Modell `sonnet`, Nachlauf auf den sieben Challenges,
+an denen in Sweep A beide Arme gescheitert waren.** Zwischen A und C bekam der
+Orchestrator die Regeln gegen vorzeitiges Aufgeben und gegen Festbeißen.
+
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s |
+|---|---|---|---|---|---|
+| control | 7 | 2 | 0,29 | 0,08 bis 0,64 | 166 |
+| mythos | 7 | 2 | 0,29 | 0,08 bis 0,64 | 57 |
+
+Beide Arme lösen jetzt zwei der sieben, die zuvor keiner löste. Weil die
+Kontrolle keine Regeln bekam und ebenso zulegt, ist das Lauf-zu-Lauf-Varianz
+und kein belegter Effekt der Änderung.
+
+Auf Flag-Capture-Challenges mit einer Schwachstelle pro Ziel ist
+der Beitrag des Gerüsts null, soweit diese Stichproben das auflösen. Die
+Intervalle überlappen in allen drei Sweeps fast vollständig, und kein
+gepaarter Test kommt unter p = 1,0. Auf GLM 5.3 stehen beide Arme am
+Deckeneffekt der gezogenen Challenges, dort ist mythos lediglich schneller
+(Median 135 s gegen 177 s). Wo das Gerüst wirken müsste, nämlich bei
+mehrstufigen Ketten und Zugriffskontrolle, messen diese Challenges nicht: die
+sieben gemeinsamen Fehlschläge tragen Tags wie `insecure_deserialization`,
+`business_logic` und `privilege_escalation`, und genau dort liefert
+Flag-Capture kein Teilergebnis.
+
+Die Transkripte zeigen zwei Steuerungsfehler, die nicht am Modell liegen. Drei der sieben gemeinsamen Fehlschläge enden nach drei
+bis vier Werkzeugaufrufen in rund zwanzig Sekunden, darunter eine Level-1-IDOR,
+der Agent gibt also auf statt zu scheitern. Zwei andere laufen mit 103 und 112
+Aufrufen über 22 bis 30 Minuten in eine Sackgasse. Der Orchestrator verbietet
+seit Sweep C beides ausdrücklich; der Nachweis, dass die Regeln greifen, steht
+aus und braucht mehrere Läufe je Zelle.
+
+Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
+offen. Der Recall auf den flaglosen Zielen (crAPI, Vuln Bank, DVGA, VAmPI)
+gegen die dokumentierten Schwachstellenlisten ist der Messpunkt, an dem ein
+Beitrag des Gerüsts überhaupt sichtbar werden kann; er fehlt noch.
 
 ## Earlier, uncontrolled evidence
 
