@@ -13,7 +13,7 @@ Ground truth: data/ground_truth/*.json. There is no flag oracle: a human sets ea
 status to found|missed|fp. Labs only ever bind loopback (lab/docker-compose.yml, crAPI LISTEN_IP);
 `run` refuses any endpoint that is not loopback or the docker0 gateway.
 """
-import argparse, fcntl, importlib, json, os, subprocess, sys, tempfile, time, urllib.request
+import argparse, fcntl, importlib, json, os, subprocess, sys, tempfile, threading, time, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -98,6 +98,30 @@ def cmd_down(a):
     print(f"{a.target} down")
 
 
+def watchdog(target, url, log, stop):
+    """Restart the target when it stops answering HTTP.
+
+    These apps can be hung by ordinary testing: DVGA deadlocks when `importPaste` fetches the
+    app's own address, and a hung process still accepts TCP, so a docker healthcheck on the port
+    does not see it. Without this the cell measures a dead target instead of the agent.
+    """
+    down = 0
+    while not stop.wait(30):
+        if reachable(url):
+            down = 0
+            continue
+        down += 1
+        if down < 3:
+            continue
+        down = 0
+        with log.open("a") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} down 90s, restarting\n")
+        try:
+            dc(target, "restart", *(TARGETS[target][1] or []))
+        except SystemExit:
+            pass
+
+
 def cmd_run(a):
     if a.framework in ("pentestgpt", "cai"):
         raise SystemExit("interactive-only, not a harness arm")
@@ -124,12 +148,25 @@ def cmd_run(a):
     # flagless target: ask for coverage with evidence, not a flag
     os.environ["BENCH_OBJECTIVE"] = "survey"
     runner = importlib.import_module(f"runners.{a.framework}")
-    t = runner.run(url, d, a.model, a.budget)
+    stop = threading.Event()
+    wd = threading.Thread(target=watchdog, args=(a.target, url, d / "target-restarts.log", stop),
+                          daemon=True)
+    wd.start()
+    try:
+        t = runner.run(url, d, a.model, a.budget)
+    finally:
+        stop.set()
+    restarts = (d / "target-restarts.log")
+    status = "ok" if reachable(url) else "target_failed"
     (d / "result.json").write_text(json.dumps(
         {"framework": a.framework, "model": a.model, "target": a.target, "target_url": url,
-         "budget_s": a.budget, "run": a.run, "transcript": str(t),
+         "budget_s": a.budget, "run": a.run, "transcript": str(t), "status": status,
+         "target_restarts": len(restarts.read_text().splitlines()) if restarts.exists() else 0,
          "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1))
-    print(f"transcript: {t}\nnext: labs.py score {a.target} {d}")
+    print(f"transcript: {t}")
+    if status == "target_failed":
+        raise SystemExit(f"{url} is down at the end of the run: unscored (target_failed)")
+    print(f"next: labs.py score {a.target} {d}")
 
 
 def make_triage(target, rundir):
@@ -145,6 +182,9 @@ def make_triage(target, rundir):
 
 
 def cmd_score(a):
+    res = Path(a.rundir) / "result.json"
+    if res.exists() and json.loads(res.read_text()).get("status") == "target_failed":
+        raise SystemExit(f"{a.rundir} is target_failed: the target died mid-run, nothing to triage")
     out = Path(a.rundir) / "triage.json"
     if out.exists() and not a.force:
         raise SystemExit(f"{out} exists (human triage?); --force to overwrite")
