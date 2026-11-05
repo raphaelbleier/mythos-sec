@@ -29,12 +29,22 @@ as such.
   separated from any effect. The rerun shows how much that matters: both arms
   converted two of the seven previously failed challenges, although only the
   mythos arm had changed in between.
+- **The flagless measurement is in, and it is also a null.** VAmPI, coverage
+  objective instead of a flag hunt, Claude Sonnet: control 8 of 9 documented
+  vulnerabilities, mythos 8 of 9 with the plugin verified loaded, precision
+  1.00 in both arms, the same single miss (RegexDOS, declined in both arms to
+  avoid a denial of service). The scaffolded arm reported one extra true
+  finding outside the documented list. It also used no sub-agent, no toolbox
+  and no deterministic probe: on a surface this small the orchestrator's
+  "scale the work to the target" rule effectively switches the scaffolding off,
+  which is a design question, not a model limit.
 - **The benchmark measures the wrong thing for this question.** A flag is all
   or nothing, so multi-step chains and access-control findings score zero until
   they are complete. The seven shared failures carry tags such as
   `insecure_deserialization`, `business_logic` and `privilege_escalation`. The
   flagless targets with documented vulnerability lists are the measurement that
-  could show a scaffolding effect, and that run is still missing.
+  could show a scaffolding effect; VAmPI is done (above), crAPI, Vuln Bank and
+  DVGA are still missing.
 - **Scaffolding effect vs model effect.** With one model for all arms, a
   difference measures the scaffolding (skills, orchestration, tools), not the
   model. It says nothing about other models.

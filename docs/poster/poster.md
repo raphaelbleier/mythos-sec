@@ -126,10 +126,46 @@ Aufrufen über 22 bis 30 Minuten in eine Sackgasse. Der Orchestrator verbietet
 seit Sweep C beides ausdrücklich; der Nachweis, dass die Regeln greifen, steht
 aus und braucht mehrere Läufe je Zelle.
 
+**Befund zur Messgültigkeit.** Die Arme auf dem Claude-Code-Host der Sweeps A
+und C trugen das Gerüst nicht. Das Plugin-Manifest deklarierte `author` als
+Zeichenkette und `agents` als Pfadangabe; Claude Code verwirft ein solches
+Manifest ohne Meldung, also lud `claude -p --plugin-dir` weder den Befehl
+`/cybersecurity` noch die Sub-Agenten noch die Plugin-Hooks. Der Arm las
+lediglich `CLAUDE.md` und `AGENTS.md` aus seinem Arbeitsverzeichnis. Die
+Sweeps A und C vergleichen damit zwei nahezu gleiche Kontrollen; Sweep B auf
+OpenCode ist nicht betroffen, weil `opencode run --agent mythos` bei fehlendem
+Agenten abbricht. Das Manifest ist korrigiert, und der Bench-Arm bricht eine
+Zelle ab, deren `init`-Ereignis keinen Befehl `:cybersecurity` führt.
+
+**Sweep D, flagloses Ziel VAmPI, Claude Code, Modell `sonnet`, Deckungsauftrag
+statt Flag-Suche, Budget 1500 bzw. 1800 s.** Gewertet wird der Recall gegen die
+neun dokumentierten Schwachstellen; Präzision ergibt sich aus der
+Handtriage der Berichte.
+
+| Arm | gefunden | verpasst | Recall | Präzision | Werkzeugaufrufe | Laufzeit s |
+|---|---|---|---|---|---|---|
+| control | 8 | 1 | 0,89 | 1,00 | 7 | 54 |
+| mythos (Plugin nachweislich geladen) | 8 | 1 | 0,89 | 1,00 | 6 | 53 |
+| mythos (erster Lauf, Plugin nicht geladen) | 8 | 1 | 0,89 | 1,00 | 6 | 55 |
+
+Alle drei Läufe verfehlen genau denselben Eintrag, den RegexDOS, und zwar in
+beiden Armen mit derselben Begründung: der Nachweis hätte eine
+Dienstverweigerung riskiert. Falsch-positive Befunde traten nicht auf. Der
+geladene Arm nannte elf Schwachstellen, die Kontrolle zehn; die zusätzlichen
+Treffer, der freiliegende Werkzeug-Debugger und das unauthentifizierte
+`GET /createdb`, stehen nicht auf der dokumentierten Liste und gehen daher in
+keinen Recall ein. Auch auf dem Ziel, an dem ein Beitrag des Gerüsts sichtbar
+werden müsste, ist er nicht messbar.
+
+Bemerkenswert ist, wie der geladene Arm arbeitete: sechs gebündelte
+Shell-Aufrufe, kein delegierter Sub-Agent, kein Werkzeugkasten, kein
+deterministischer Surface-Probe. Das entspricht der Regel des Orchestrators,
+die Arbeit an der Größe des Ziels zu bemessen, führt bei einer kleinen API aber
+dazu, dass sich das Gerüst praktisch selbst abschaltet.
+
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
-offen. Der Recall auf den flaglosen Zielen (crAPI, Vuln Bank, DVGA, VAmPI)
-gegen die dokumentierten Schwachstellenlisten ist der Messpunkt, an dem ein
-Beitrag des Gerüsts überhaupt sichtbar werden kann; er fehlt noch.
+offen. Der Recall auf den übrigen flaglosen Zielen (crAPI, Vuln Bank, DVGA)
+steht noch aus.
 
 ## Earlier, uncontrolled evidence
 
@@ -137,8 +173,8 @@ Single manual engagements through the toolbox flow, no repeats, no control arm.
 They show the flow works on real targets, not a measured advantage:
 `benchmark-skill-driven.md` (Juice Shop), `benchmark-hard-targets.md` (DVGA
 GraphQL chain, VAmPI, Vuln Bank), `benchmark-xbow.md`. A regression self-test
-(`scripts/selftest.sh`, 21 checks: the deterministic surface probe and canary verifier, 7 vulnerability classes, a no-false-positive
-control, scope-guard) runs on both hosts.
+(`scripts/selftest.sh`, 22 checks: the deterministic surface probe and canary verifier, 7 vulnerability classes, a no-false-positive
+control, scope-guard, plugin manifest) runs on both hosts.
 
 ## Contribution
 
