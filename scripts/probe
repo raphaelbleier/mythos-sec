@@ -57,7 +57,8 @@ MISSING_HEADERS = ("content-security-policy", "strict-transport-security",
                    "x-content-type-options")
 # Paths worth one GET each: cheap, high signal, no payload.
 COMMON_PATHS = ("/robots.txt", "/.env", "/.git/config", "/sitemap.xml", "/openapi.json",
-                "/swagger.json", "/graphql", "/api", "/admin", "/server-status",
+                "/swagger.json", "/static/openapi.json", "/api/openapi.json", "/v1/openapi.json",
+                "/api-docs", "/graphql", "/api", "/admin", "/server-status",
                 "/.well-known/security.txt")
 
 
@@ -222,7 +223,7 @@ def probe(url, depth, max_pages, timeout, headers, insecure):
             row = {"path": path, "status": status, "bytes": len(body)}
             if SECRET_RE.search(body):
                 row["secret_like"] = True
-            if path in ("/openapi.json", "/swagger.json"):
+            if path.endswith(("openapi.json", "swagger.json")):
                 try:
                     doc = json.loads(body)
                     if isinstance(doc, dict) and (doc.get("openapi") or doc.get("swagger")):

@@ -23,6 +23,11 @@ you get every documented endpoint, query parameter, path parameter and request
 body field as an aim point. Add `--header 'Cookie: ...'` to map the
 authenticated surface, `--json` to feed it to another tool. Then read it and only chase what it could not see.
 
+Keep the map: `scripts/probe <target> --depth 2 --json >
+engagements/<dir>/surface.json`. That file is what `scripts/coverage` and the
+coverage gate check the report against at the end, so a whole surface cannot be
+skipped without the report saying so.
+
 Cheapest evidence first, tools after.
 
 1. `curl -sS -D- <URL>` the entry point. Read the body and the headers.

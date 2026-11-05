@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Which parts of the mapped surface the engagement has not accounted for yet.
+
+  scripts/probe <target> --json > engagements/<dir>/surface.json
+  scripts/coverage engagements/<dir>            # OPEN lines, exit 1 while any remain
+  scripts/coverage engagements/<dir> --list 15  # cap the listing
+
+An item counts as covered when its path appears in `report.md` or under `findings/`,
+whether as a finding or as an explicit "tested, not vulnerable". That is a text check,
+not proof: it stops the engagement from silently skipping a whole surface, which is the
+failure this exists for (on Vuln Bank both benchmark arms never sent one request to the
+GraphQL, merchant, bill-payment and card endpoints). It cannot tell a real test from a
+mention, so it is a floor on coverage, never evidence of it.
+"""
+import json
+import sys
+from pathlib import Path
+
+
+def surface(d):
+    """Paths worth accounting for, from the probe's JSON map."""
+    f = Path(d) / "surface.json"
+    if not f.exists():
+        return []
+    m = json.loads(f.read_text())
+    items = []
+    for page in m.get("pages", []):
+        items.append(page.get("path") or "/")
+        for form in page.get("forms", []):
+            items.append(form.get("action") or page.get("path") or "/")
+    items += [r["path"] if isinstance(r, dict) else str(r) for r in m.get("reachable_paths", [])]
+    items += [str(e).split()[-1] if " " in str(e) else str(e) for e in m.get("api_endpoints", [])]
+    out = []
+    for i in items:                      # keep order, drop duplicates and bare roots
+        i = i.strip()
+        if i and i != "/" and i not in out:
+            out.append(i)
+    return out
+
+
+def covered(d):
+    d = Path(d)
+    text = ""
+    r = d / "report.md"
+    if r.exists():
+        text += r.read_text(errors="replace")
+    for f in sorted((d / "findings").glob("*")) if (d / "findings").is_dir() else []:
+        if f.is_file():
+            text += f.read_text(errors="replace")
+    return text
+
+
+def open_items(d):
+    text = covered(d)
+    return [i for i in surface(d) if i not in text]
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit(__doc__)
+    d = sys.argv[1]
+    cap = int(sys.argv[sys.argv.index("--list") + 1]) if "--list" in sys.argv else 40
+    items, total = open_items(d), len(surface(d))
+    if not total:
+        print(f"no surface map: run scripts/probe <target> --json > {d}/surface.json")
+        return 0
+    for i in items[:cap]:
+        print(f"OPEN {i}")
+    if len(items) > cap:
+        print(f"... and {len(items) - cap} more")
+    print(f"{total - len(items)}/{total} mapped paths accounted for in the report")
+    return 1 if items else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

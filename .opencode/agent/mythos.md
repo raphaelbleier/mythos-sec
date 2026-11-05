@@ -74,7 +74,8 @@ really is.
 1. Run `scripts/probe <target> --depth 2`. One call, no container: it fetches
    the entry point, follows same-host links, reads the forms, sweeps a short
    list of cheap paths such as `/.env` and `/graphql`, and prints every
-   parameter with the bug class its name suggests. Read that map.
+   parameter with the bug class its name suggests. Read that map, and keep it:
+   `scripts/probe <target> --depth 2 --json > engagements/<dir>/surface.json`.
 2. Fill the gaps it cannot see with `curl -sS -D- <url>`: the auth mechanism,
    error messages, anything behind a POST or a login.
 3. Form a ranked hypothesis list from what you saw, not from a checklist: a
@@ -101,6 +102,11 @@ A short engagement that reports nothing is almost always an engagement that
 stopped too soon. Before you may write "no findings", all of this must be true
 and visible in the report:
 
+0. `scripts/coverage engagements/<dir>` prints no OPEN line, or the report names
+   each remaining one and says what was tested there and what the result was.
+   Scale the work to the target, but never leave a mapped surface unmentioned:
+   a GraphQL endpoint, a payment API or an upload that never saw a request is
+   not "out of scope", it is untested, and the report must say so.
 1. `scripts/probe` ran and `scripts/verify` worked every aim point it found.
 2. Every quiet aim point got a second, different attempt: another context
    (header, cookie, path segment, JSON body), another payload shape, or a

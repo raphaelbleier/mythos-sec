@@ -9,7 +9,7 @@
 #
 #   scripts/selftest.sh                  # full run (starts + stops the lab)
 #   KEEP_LAB=1 scripts/selftest.sh       # leave the lab running afterwards
-#   scripts/selftest.sh --host opencode  # same 10 checks, but the mythos agent
+#   scripts/selftest.sh --host opencode  # same checks, but the mythos agent
 #                                        # does the work via `opencode run` and
 #                                        # its report is scored
 #
@@ -154,6 +154,34 @@ out=$(echo '{"tool_name":"Bash","tool_input":{"command":"httpx -u http://host.do
 assert_not "scope-guard silent in-scope" "OUT OF SCOPE" "$out"
 rm -rf "$tmp"
 fi
+
+echo "-- coverage gate --"
+# Stopping early with whole surfaces untested was the measured failure on Vuln Bank
+# (both arms never requested the GraphQL, merchant, bill-payment or card endpoints).
+cov=$(mktemp -d)
+mkdir -p "$cov/eng"
+cat > "$cov/eng/surface.json" <<'JSON'
+{"pages": [{"path": "/login", "forms": []}], "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge"]}
+JSON
+printf '# report\nSQLi on /login proven.\n' > "$cov/eng/report.md"
+out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
+assert_has "coverage names the untested GraphQL surface" "OPEN /graphql"      "$out"
+assert_has "coverage names the untested payment API"     "OPEN /api/v1/charge" "$out"
+assert_not "coverage clears a path the report covers"    "OPEN /login"        "$out"
+[ "$rc" -eq 1 ] && ok "coverage exits 1 while paths are open" || bad "coverage exits 1 while paths are open (got $rc)"
+printf '# report\nSQLi on /login. /graphql tested, introspection disabled. POST /api/v1/charge tested, authz enforced.\n' > "$cov/eng/report.md"
+out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
+assert_not "coverage silent once everything is accounted for" "OPEN" "$out"
+[ "$rc" -eq 0 ] && ok "coverage exits 0 when nothing is open" || bad "coverage exits 0 when nothing is open (got $rc)"
+out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
+assert_not "gate silent when the report accounts for the surface" "COVERAGE GATE" "$out"
+printf '# report\n' > "$cov/eng/report.md"; rm -f "$cov/eng/.coverage-gate"
+out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
+assert_has "gate hands the open list back on Stop" "COVERAGE GATE" "$out"
+echo 3 > "$cov/eng/.coverage-gate"
+out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
+assert_not "gate gives up after its nudge limit" "COVERAGE GATE" "$out"
+rm -rf "$cov"
 
 echo "-- plugin manifest --"
 # Claude Code rejects an invalid manifest silently: a string `author` or a string `agents`

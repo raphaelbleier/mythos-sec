@@ -10,6 +10,14 @@ can reproduce in under a minute. Each finding carries a closure state (see the
 **exploit** skill): `candidate`, `reproduced`, `validated(proof)` or
 `rejected(reason)`. **Only `validated` findings enter the main report.**
 
+## Before you write: close out the surface
+
+Run `scripts/coverage engagements/<dir>`. Every `OPEN` line is a mapped path the
+report does not mention yet. Test it, or write it into the **Coverage** section
+with what you sent and what came back. A path that was never requested is
+reported as untested, never silently dropped. The gate nudges at most three
+times, after that it lets you finish, so the honest listing is yours to write.
+
 ## Per finding, in this order
 
 1. **Title** — concise, specific. e.g. "Reflected XSS in `q` on `/search`".
