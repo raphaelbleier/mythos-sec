@@ -2,11 +2,17 @@
   "name": "mythos-sec",
   "version": "0.2.0",
   "description": "Mythos: a skill-driven web red-team and bug-bounty framework for Claude Code. Point /cybersecurity at an authorized target and Claude runs recon, scanning, exploitation and reporting by driving real security tools in a Kali toolbox. No external API key.",
-  "author": "raphaelbleier",
+  "author": {
+    "name": "Raphael Bleier"
+  },
   "license": "MIT",
-  "keywords": ["security", "pentest", "red-team", "bug-bounty", "web", "recon"],
-  "commands": "./commands",
-  "agents": "./agents",
-  "skills": "./skills",
+  "keywords": [
+    "security",
+    "pentest",
+    "red-team",
+    "bug-bounty",
+    "web",
+    "recon"
+  ],
   "hooks": "./hooks/hooks.json"
 }

@@ -155,6 +155,20 @@ assert_not "scope-guard silent in-scope" "OUT OF SCOPE" "$out"
 rm -rf "$tmp"
 fi
 
+echo "-- plugin manifest --"
+# Claude Code rejects an invalid manifest silently: a string `author` or a string `agents`
+# path cost every claude_mythos cell its scaffolding before 2026-11-05.
+out=$(python3 - <<'PYCHK'
+import json
+d = json.load(open(".claude-plugin/plugin.json"))
+bad = [k for k in ("commands", "agents", "skills") if isinstance(d.get(k), str)]
+if not isinstance(d.get("author", {}), dict):
+    bad.append("author")
+print("manifest ok" if not bad else "invalid fields: " + ", ".join(bad))
+PYCHK
+)
+assert_has "plugin manifest loadable by claude --plugin-dir" "manifest ok" "$out"
+
 if [ "${KEEP_LAB:-0}" != "1" ]; then
   docker compose -f lab/docker-compose.yml down >/dev/null 2>&1
 fi

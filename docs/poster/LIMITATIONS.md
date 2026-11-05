@@ -7,6 +7,18 @@ as such.
 
 ## What the evaluation can and cannot show
 
+- **The Claude Code mythos arm was not scaffolded before 5 November 2026.**
+  `.claude-plugin/plugin.json` declared `author` as a string and `agents` as a
+  string path. Claude Code rejects such a manifest silently, so
+  `claude -p --plugin-dir <repo>` loaded no `/cybersecurity` command, no
+  sub-agents and no plugin hooks. The arm still read `CLAUDE.md`/`AGENTS.md`
+  from its working directory and had the full default tool set, so it was a
+  bare model with project instructions, not the framework. Every Claude-host
+  number below (sweeps A and C and the first VAmPI lab pair) therefore
+  compares two near-identical controls; the OpenCode sweep B is unaffected
+  (`opencode run --agent mythos` fails loudly on a missing agent). The manifest
+  is fixed and `bench/runners/claude_mythos.py` now aborts a cell whose `init`
+  event lists no `:cybersecurity` command.
 - **Measured, and the result is a null.** Three sweeps are in: 40 challenges on
   Claude Sonnet, 12 on GLM 5.3, and a rerun of the seven challenges both arms
   had failed. The mythos arm never separates from the bare-model control
