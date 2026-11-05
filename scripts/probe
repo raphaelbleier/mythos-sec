@@ -116,6 +116,42 @@ def fetch(url, headers, timeout, insecure):
         return None, {}, f"{type(e).__name__}: {e}", url
 
 
+INTROSPECT = ('{"query":"{__schema{queryType{fields{name args{name}}}'
+              'mutationType{fields{name args{name}}}}}"}')
+
+
+def from_graphql(url, headers, timeout, insecure, params):
+    """Schema fields as aim points, when the endpoint answers introspection.
+
+    A GraphQL app maps to a handful of HTML pages while its whole surface sits behind one path.
+    Without this the surface map misses everything that matters: on DVGA it listed 11 pages and
+    none of the 21 documented vulnerabilities' entry points.
+    """
+    req = urllib.request.Request(url, data=INTROSPECT.encode(),
+                                 headers={"User-Agent": UA, "Content-Type": "application/json",
+                                          **headers})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            doc = json.loads(r.read(400_000))
+    except Exception:
+        return []
+    schema = ((doc.get("data") or {}).get("__schema") or {})
+    out = []
+    for kind in ("queryType", "mutationType"):
+        for field in ((schema.get(kind) or {}).get("fields") or []):
+            name = field.get("name")
+            if not name:
+                continue
+            args = [a["name"] for a in (field.get("args") or []) if a.get("name")]
+            out.append(f"{'query' if kind == 'queryType' else 'mutation'} {name}"
+                       + (f"({', '.join(args)})" if args else ""))
+            for a in args:
+                params.setdefault(a, {"name": a, "seen_at": [], "example": "", "method": "POST"})
+                params[a]["seen_at"].append(f"graphql {name} (arg)")
+    return out
+
+
 def from_openapi(doc, params):
     """Add every documented parameter and request-body field as an aim point."""
     endpoints = []
@@ -219,10 +255,19 @@ def probe(url, depth, max_pages, timeout, headers, insecure):
     extra, endpoints = [], []
     for path in COMMON_PATHS:
         status, hdrs, body, _ = fetch(base + path, headers, timeout, insecure)
-        if status and status not in (404, 405, 501) and not (status == 400 and path == "/graphql"):
+        # A GraphQL endpoint answers GET with 400 ("must provide a query string"), so introspect
+        # it before the status filter drops the row: the schema is the whole surface of such an app.
+        gql = (from_graphql(base + path, headers, timeout, insecure, params)
+               if path == "/graphql" and status else [])
+        if gql:
+            endpoints += gql
+        if status and status not in (404, 405, 501) and not (status == 400 and path == "/graphql"
+                                                            and not gql):
             row = {"path": path, "status": status, "bytes": len(body)}
             if SECRET_RE.search(body):
                 row["secret_like"] = True
+            if gql:
+                row["graphql_fields"] = len(gql)
             if path.endswith(("openapi.json", "swagger.json")):
                 try:
                     doc = json.loads(body)
