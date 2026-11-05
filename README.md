@@ -202,8 +202,24 @@ random flag per run, scoring on the harness side, Wilson intervals and paired
 McNemar tests. Protocol, usage and isolation rules:
 [`bench/README.md`](bench/README.md).
 
-The result so far is a null. Across three sweeps on 2026-11-04 the Mythos arm
-does not separate from the control:
+On flag-capture challenges the result is a null: across every sweep the Mythos
+arm does not separate from the control. On the one broad target with a
+documented vulnerability list, Vuln Bank, it does separate, but only after a
+coverage gate was added that makes the agent account for every mapped path
+before it stops (two repeats per condition, ranges that do not overlap):
+
+| Vuln Bank, 76 documented vulnerabilities | found | recall | precision | tool calls | USD |
+|---|---|---|---|---|---|
+| Mythos + coverage gate | 34, 33 | 0.45, 0.43 | 1.00 | 32, 31 | 0.61, 0.67 |
+| Mythos without the gate | 28, 29 | 0.37, 0.38 | 1.00 | 18, 20 | 0.42, 0.39 |
+| control (bare model with a shell) | 30, 29 | 0.39, 0.38 | 1.00 | 15, 14 | 0.29, 0.25 |
+
+The gate costs about twice the control's tool calls and money for four to five
+extra entries. It is one target and one condition, so it says the gate works on
+a broad surface, not that the scaffolding is better in general: on the small
+targets there is nothing left to gain.
+
+The flag-capture sweeps:
 
 | sweep | model | Mythos | control | paired p |
 |---|---|---|---|---|
@@ -213,7 +229,7 @@ does not separate from the control:
 | earlier shared failures | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 1.0 |
 | VAmPI, recall against 9 documented vulnerabilities | Claude Sonnet | 8/9 = 0.89 | 8/9 = 0.89 | - |
 | DVGA, recall against 21 documented vulnerabilities | Claude Sonnet | 12/21 = 0.57 | 11/21 = 0.52 | - |
-| Vuln Bank, recall against 76 documented vulnerabilities | Claude Sonnet | 27/76 = 0.36 | 29/76 = 0.38 | - |
+| Vuln Bank, recall against 76 documented vulnerabilities (no gate) | Claude Sonnet | 28/76 = 0.37 | 30/76 = 0.39 | - |
 
 Cells a safety classifier ended mid-run are unscored (`classifier_blocked`),
 like a provider refusal: that was 7-9 of the 12 unsolved cells per arm on the
@@ -223,8 +239,9 @@ On challenges with one planted vulnerability and a flag, the scaffolding adds
 nothing these samples can detect, and all three flagless recall measurements
 agree: the arms tie on VAmPI, sit one entry apart on DVGA (and tie at 10 of 16
 once the five denial-of-service classes the safety rules forbid proving are
-excluded) and two apart on Vuln Bank, where neither arm ever reached the
-target's GraphQL, merchant, bill-payment or card surfaces. Mythos is faster on GLM 5.3 (median 135 s against 177 s) and, with the
+excluded) and one apart on Vuln Bank until the coverage gate, which lifts the scaffolded
+arm clear of the control (table above) by making it reach the GraphQL, merchant
+and card surfaces both arms had skipped entirely. Mythos is faster on GLM 5.3 (median 135 s against 177 s) and, with the
 framework loaded on Claude Sonnet, 2.4x more expensive than the control for the
 same solve rate. An invalid plugin manifest had kept the Claude Code mythos arm
 unscaffolded until 5 November 2026; the rerun is the first row. Full parameters and the diagnosis from the transcripts:

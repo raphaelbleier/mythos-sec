@@ -83,16 +83,25 @@ as such.
   it, one of them without a single tool call). A `labs.py score` call on a
   classifier-ended run is now refused as well, the same rule the flag sweeps
   use.
-- **Vuln Bank, the broadest flagless target, is the third null.** 76 documented
-  vulnerabilities: mythos 27, control 29, precision 1.00 in both arms, 25
-  entries found by both. The scaffolded arm had the second SQL injection point
+- **Vuln Bank is the third null, and then the first separation.** 76 documented
+  vulnerabilities, two repeats per condition: mythos without the coverage gate
+  28 and 29, control 30 and 29, mythos with the gate 34 and 33, precision 1.00
+  in all six runs. The gate was built because of what the ungated runs showed
+  (below), so it is a response to this measurement, not an independent
+  prediction confirmed by it; one target, one condition, two repeats. It costs
+  about twice the control's tool calls and money (31-32 calls and $0.61-0.67
+  against 14-15 and $0.25-0.29) for four to five extra entries. The two gated
+  runs reach different extra surfaces, so the gate does not dictate findings,
+  it stops a mapped surface from being skipped silently. The scaffolded arm had the second SQL injection point
   and the debug headers, the control had the missing token expiry, the card
   details and the API keys in responses. What matters more than the two-entry
   gap is that neither arm ever sent a request to the target's GraphQL surface
   (6 entries), its merchant APIs (6), its bill payments (9) or its card logic
   beyond freezing a card (10). Both reported 13-15 findings and stopped after a
-  few minutes of a 3600s budget. This is the first sweep where the ceiling is
-  the agent's decision to stop, not the target.
+  few minutes of a 3600s budget: the ceiling here is the agent's decision to
+  stop, not the target. That is what the coverage gate addresses, and it is
+  also the one lever the control cannot have, since a bare model has no place
+  to put a surface map.
 - **The scope guard cannot stop a call in its default mode.** On the Claude Code
   host a PreToolUse hook's `additionalContext` reaches the agent together with
   the tool result, so in `warn` mode the request is already out when the warning

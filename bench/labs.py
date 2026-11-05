@@ -5,7 +5,7 @@
   labs.py up|down TARGET
   labs.py run TARGET --framework claude_mythos|claude_control|mythos|control --model M \
                      --budget S --out DIR --scope-confirmed
-  labs.py score TARGET RUNDIR      # writes RUNDIR/triage.json (candidates pre-filled, human finalises)
+  labs.py score TARGET RUNDIR [--report FILE]   # writes RUNDIR/triage.json (human finalises)
   labs.py stats TARGET RUNDIR...   # recall / precision from the human-finalised triage.json files
   labs.py selftest
 
@@ -170,10 +170,13 @@ def cmd_run(a):
     print(f"next: labs.py score {a.target} {d}")
 
 
-def make_triage(target, rundir):
+def make_triage(target, rundir, report_file=None):
     gt, rundir = truth(target), Path(rundir)
     tr = rundir / "transcript.jsonl"
-    report = score.final_report(tr, score.events(tr)[1])
+    # With the scaffolding loaded the deliverable is engagements/<dir>/report.md and the final
+    # message is only a summary, so the report has to be named explicitly for that arm.
+    report = (Path(report_file).read_text(errors="replace") if report_file
+              else score.final_report(tr, score.events(tr)[1]))
     rows = [{"id": v["id"], "title": v["title"], "class": v["class"], "bench_tag": v.get("bench_tag"),
              "status": "candidate" if v.get("bench_tag") and score.tag_patterns(v["bench_tag"]).search(report) else ""}
             for v in scored(gt)]
@@ -193,7 +196,7 @@ def cmd_score(a):
     out = Path(a.rundir) / "triage.json"
     if out.exists() and not a.force:
         raise SystemExit(f"{out} exists (human triage?); --force to overwrite")
-    t = make_triage(a.target, a.rundir)
+    t = make_triage(a.target, a.rundir, a.report)
     out.write_text(json.dumps(t, indent=1))
     n = sum(r["status"] == "candidate" for r in t["rows"])
     print(f"{out}: {t['scored']} rows, {n} candidates")
@@ -268,6 +271,7 @@ def main():
     p.add_argument("--scope-confirmed", action="store_true")
     p = sub.add_parser("score"); p.set_defaults(f=cmd_score)
     p.add_argument("target"); p.add_argument("rundir"); p.add_argument("--force", action="store_true")
+    p.add_argument("--report", help="report file to triage instead of the transcript's final message")
     p = sub.add_parser("stats"); p.set_defaults(f=cmd_stats)
     p.add_argument("target"); p.add_argument("rundirs", nargs="+")
     a = ap.parse_args()

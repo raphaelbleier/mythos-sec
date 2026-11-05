@@ -62,7 +62,7 @@ Harness: `bench/` (stdlib Python), XBOW validation-benchmarks. Full detail in
 
 ## Results
 
-Sieben Sweeps vom 4. und 5. November 2026, Rohdaten unter
+Acht Sweeps vom 4. und 5. November 2026, Rohdaten unter
 `/mnt/linux-data/mythos-bench/results/`. Jede Zelle bekommt eine frisch
 gebaute Challenge mit zufälligem Flag, ein eigenes Compose-Projekt im eigenen
 Netz, eine `scope.yaml` auf genau diesen Host und Port, dieselbe Wall-Clock und
@@ -251,8 +251,53 @@ Anfrage des Agenten gilt. Der Prüfstand zählt die Treffer des Guards seither
 selbst (`scope_warnings` je Lauf), statt sich auf das Eingeständnis des Agenten
 zu verlassen.
 
+**Sweep H, Vuln Bank mit und ohne Deckungs-Gate, Claude Code, Modell `sonnet`,
+Budget 3600 s, je zwei Wiederholungen.** Das Gate ist die Antwort auf den
+Befund aus Sweep G: `scripts/probe` schreibt die Oberflächenkarte nach
+`engagements/<dir>/surface.json`, `scripts/coverage` listet jeden kartierten
+Pfad, den der Bericht nicht erwähnt, und ein `Stop`-Hook gibt diese Liste
+zurück, wenn der Agent aufhören will, höchstens dreimal je Engagement. Läuft
+die Recon-Phase nicht, kartiert der Hook die Oberfläche selbst aus der
+Scope-Datei; genau das war nötig, weil der Agent `scripts/probe` in jedem
+Benchmark-Lauf übersprang.
+
+| Arm | gefunden | Recall | Präzision | Werkzeugaufrufe | Kosten USD |
+|---|---|---|---|---|---|
+| mythos mit Gate, Lauf 1 | 34 | 0,45 | 1,00 | 32 | 0,61 |
+| mythos mit Gate, Lauf 2 | 33 | 0,43 | 1,00 | 31 | 0,67 |
+| mythos ohne Gate, Lauf 1 | 28 | 0,37 | 1,00 | 18 | 0,42 |
+| mythos ohne Gate, Lauf 2 | 29 | 0,38 | 1,00 | 20 | 0,39 |
+| control, Lauf 1 | 30 | 0,39 | 1,00 | 15 | 0,29 |
+| control, Lauf 2 | 29 | 0,38 | 1,00 | 14 | 0,25 |
+
+Das ist die erste Messung dieser Reihe, in der sich das Gerüst vom nackten
+Modell trennt. Die Wertebereiche überschneiden sich nicht: 33 bis 34 mit Gate
+gegen 28 bis 30 in den vier Läufen ohne Gate, bei Präzision 1,00 in allen sechs
+Läufen. Die Wiederholungen liegen je Bedingung einen Eintrag auseinander, der
+Abstand zwischen den Bedingungen beträgt vier bis sechs.
+
+Die beiden Läufe mit Gate erreichen unterschiedliche Zusatzflächen: Lauf 1 die
+GraphQL-Introspektion samt der Admin-Auswertung über ein gefälschtes Token und
+den Token im `localStorage`, Lauf 2 die negative Händlerbelastung auf
+`/api/v1/payments/charge` und die freiliegende Werkzeug-Konsole. Das Gate
+schreibt also keine Befunde vor, es verhindert, dass eine kartierte Fläche
+stillschweigend ausfällt: beide Läufe weisen am Ende alle 42 kartierten Pfade
+aus und benennen die drei, die sie bewusst nicht angefasst haben.
+
+Bezahlt wird das mit Aufwand. Mit Gate liegen die Läufe bei 31 bis 32
+Werkzeugaufrufen und 0,61 bis 0,67 USD, die Kontrolle bei 14 bis 15 und 0,25
+bis 0,29 USD. Das Gerüst kostet hier also gut das Doppelte und findet vier bis
+fünf Einträge mehr, während es in den Flag-Sweeps das 2,4-Fache kostete und
+nichts hinzufügte.
+
+Einschränkung: eine Bedingung, ein Ziel, zwei Wiederholungen. Der Befund sagt,
+dass das Gate auf einem breiten Ziel mit dokumentierter Liste wirkt, und nicht,
+dass das Gerüst allgemein überlegen ist; auf den kleinen Zielen (VAmPI, neun
+Einträge) bleibt nichts zu holen.
+
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
-offen. Der Recall auf crAPI steht noch aus.
+offen. Der Recall auf crAPI steht noch aus, ebenso das Gate auf DVGA und
+VAmPI.
 
 ## Earlier, uncontrolled evidence
 
