@@ -178,6 +178,14 @@ assert_not "gate silent when the report accounts for the surface" "COVERAGE GATE
 printf '# report\n' > "$cov/eng/report.md"; rm -f "$cov/eng/.coverage-gate"
 out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
 assert_has "gate hands the open list back on Stop" "COVERAGE GATE" "$out"
+# the gate must not depend on the agent having run recon: in the benchmark runs it skipped
+# scripts/probe, which left the gate with nothing to check
+mkdir -p "$cov/eng2"
+printf '# report\n' > "$cov/eng2/report.md"
+printf 'target: http://127.0.0.1:5001\nin_scope: [127.0.0.1]\n' > "$cov/scope.yaml"
+out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" MYTHOS_SCOPE="$cov/scope.yaml" python3 hooks/coverage-gate.py)
+assert_has "gate maps the surface itself when recon did not" "OPEN /search" "$out"
+rm -rf "$cov/eng2"
 echo 3 > "$cov/eng/.coverage-gate"
 out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
 assert_not "gate gives up after its nudge limit" "COVERAGE GATE" "$out"

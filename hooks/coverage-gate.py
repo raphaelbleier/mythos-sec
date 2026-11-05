@@ -23,14 +23,48 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def engagement():
-    """The newest engagement directory that has a surface map.
+    """The newest engagement directory, preferring one that already has a surface map.
 
     The agent may write under the working directory or under the repo, so check both.
     """
     roots = ([Path(os.environ["MYTHOS_ENGAGEMENTS"])] if os.environ.get("MYTHOS_ENGAGEMENTS")
              else [Path.cwd() / "engagements", REPO / "engagements"])
-    dirs = [d for r in roots for d in r.glob("*") if (d / "surface.json").exists()]
-    return max(dirs, key=lambda d: d.stat().st_mtime) if dirs else None
+    dirs = [d for r in roots for d in r.glob("*") if d.is_dir()]
+    mapped = [d for d in dirs if (d / "surface.json").exists()]
+    pool = mapped or dirs
+    return max(pool, key=lambda d: d.stat().st_mtime) if pool else None
+
+
+def scope_target():
+    """The engagement's target, from the active scope file."""
+    f = os.environ.get("MYTHOS_SCOPE")
+    if not f or not Path(f).exists():
+        return None
+    for line in Path(f).read_text(errors="replace").splitlines():
+        if line.startswith("target:"):
+            return line.split(":", 1)[1].strip().strip('"\'')
+    return None
+
+
+def ensure_map(d):
+    """Map the surface here if the engagement has not.
+
+    The gate cannot depend on the agent having run the recon step: in the benchmark runs it
+    skipped `scripts/probe` and went straight to curl, which left the gate with nothing to
+    check. One probe at stop time costs under a minute and is cached.
+    """
+    f = d / "surface.json"
+    if f.exists():
+        return True
+    target = scope_target()
+    if not target:
+        return False
+    p = subprocess.run([sys.executable, str(REPO / "scripts" / "probe"), target,
+                        "--depth", "2", "--json"], capture_output=True, text=True, timeout=300)
+    if p.returncode != 0 or not p.stdout.strip():
+        return False
+    f.write_text(p.stdout)
+    return True
 
 
 def main():
@@ -39,7 +73,7 @@ def main():
     except Exception:
         pass
     d = engagement()
-    if d is None:
+    if d is None or not ensure_map(d):
         return 0
     counter = d / ".coverage-gate"
     fired = int(counter.read_text().strip() or 0) if counter.exists() else 0
