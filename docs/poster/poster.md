@@ -163,6 +163,25 @@ deterministischer Surface-Probe. Das entspricht der Regel des Orchestrators,
 die Arbeit an der Größe des Ziels zu bemessen, führt bei einer kleinen API aber
 dazu, dass sich das Gerüst praktisch selbst abschaltet.
 
+**Sweep E, dieselben 40 Challenges wie Sweep A, Claude Code, Modell `sonnet`,
+Budget 1800 s, Gerüst nachweislich geladen.** Gepaart gegen den Kontrollarm aus
+Sweep A, der von dem Manifest-Fehler nicht betroffen war.
+
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s | Werkzeugaufrufe | Kosten USD |
+|---|---|---|---|---|---|---|---|
+| control (nacktes Modell mit Shell) | 39 | 27 | 0,69 | 0,54 bis 0,81 | 23 | 390 | 8,63 |
+| mythos, Gerüst geladen | 40 | 28 | 0,70 | 0,55 bis 0,82 | 30 | 928 | 20,88 |
+
+Gepaart über 39 Challenges: 22 lösen beide, 6 nur mythos, 5 nur die Kontrolle,
+6 keiner. McNemar exakt, p = 1,0. Das geladene Gerüst löst genau so viele
+Challenges wie der Arm, der es nicht geladen hatte, verschiebt aber, welche:
+elf Paare weichen ab. Es kostet dafür das 2,4-Fache an Geld und 2,4-mal so
+viele Werkzeugaufrufe.
+
+Auch in diesem Sweep enden vier Fehlschläge nach 15 bis 24 Sekunden, obwohl der
+Orchestrator das vorzeitige Aufgeben ausdrücklich verbietet. Die Regel als
+Anweisung im Prompt genügt dafür offenkundig nicht.
+
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
 offen. Der Recall auf den übrigen flaglosen Zielen (crAPI, Vuln Bank, DVGA)
 steht noch aus.

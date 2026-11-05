@@ -19,6 +19,12 @@ as such.
   (`opencode run --agent mythos` fails loudly on a missing agent). The manifest
   is fixed and `bench/runners/claude_mythos.py` now aborts a cell whose `init`
   event lists no `:cybersecurity` command.
+- **Rerun with the scaffolding verified loaded: still a null.** The same 40
+  challenges, Claude Sonnet, paired against the unaffected control arm:
+  28/40 = 0.70 vs 27/39 = 0.69, McNemar exact p = 1.0 over 39 pairs (6 only
+  mythos, 5 only control). The loaded framework solves the same count as the
+  arm that failed to load it, shifts which challenges are solved, and costs
+  2.4x the money and 2.4x the tool calls ($20.88 vs $8.63, 928 vs 390 calls).
 - **Measured, and the result is a null.** Three sweeps are in: 40 challenges on
   Claude Sonnet, 12 on GLM 5.3, and a rerun of the seven challenges both arms
   had failed. The mythos arm never separates from the bare-model control
