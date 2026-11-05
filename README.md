@@ -213,16 +213,18 @@ does not separate from the control:
 | earlier shared failures | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 1.0 |
 | VAmPI, recall against 9 documented vulnerabilities | Claude Sonnet | 8/9 = 0.89 | 8/9 = 0.89 | - |
 | DVGA, recall against 21 documented vulnerabilities | Claude Sonnet | 12/21 = 0.57 | 11/21 = 0.52 | - |
+| Vuln Bank, recall against 76 documented vulnerabilities | Claude Sonnet | 27/76 = 0.36 | 29/76 = 0.38 | - |
 
 Cells a safety classifier ended mid-run are unscored (`classifier_blocked`),
 like a provider refusal: that was 7-9 of the 12 unsolved cells per arm on the
 Claude Code host.
 
 On challenges with one planted vulnerability and a flag, the scaffolding adds
-nothing these samples can detect, and both flagless recall measurements agree:
-on VAmPI the arms tie, on DVGA they are one entry apart, and excluding the five
-denial-of-service classes the safety rules forbid proving they tie there too (10
-of 16 each). Mythos is faster on GLM 5.3 (median 135 s against 177 s) and, with the
+nothing these samples can detect, and all three flagless recall measurements
+agree: the arms tie on VAmPI, sit one entry apart on DVGA (and tie at 10 of 16
+once the five denial-of-service classes the safety rules forbid proving are
+excluded) and two apart on Vuln Bank, where neither arm ever reached the
+target's GraphQL, merchant, bill-payment or card surfaces. Mythos is faster on GLM 5.3 (median 135 s against 177 s) and, with the
 framework loaded on Claude Sonnet, 2.4x more expensive than the control for the
 same solve rate. An invalid plugin manifest had kept the Claude Code mythos arm
 unscaffolded until 5 November 2026; the rerun is the first row. Full parameters and the diagnosis from the transcripts:
