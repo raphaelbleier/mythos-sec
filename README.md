@@ -207,13 +207,18 @@ does not separate from the control:
 
 | sweep | model | Mythos | control | paired p |
 |---|---|---|---|---|
-| 40 challenges | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
+| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
+| 40 challenges (plugin silently not loaded) | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
 | 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 1.0 |
 | 7 earlier shared failures | Claude Sonnet | 2/7 = 0.29 | 2/7 = 0.29 | 1.0 |
+| VAmPI, recall against 9 documented vulnerabilities | Claude Sonnet | 8/9 = 0.89 | 8/9 = 0.89 | - |
 
 On challenges with one planted vulnerability and a flag, the scaffolding adds
-nothing these samples can detect. Mythos is faster on GLM 5.3 (median 135 s
-against 177 s). Full parameters and the diagnosis from the transcripts:
+nothing these samples can detect, and the flagless recall measurement on VAmPI
+agrees. Mythos is faster on GLM 5.3 (median 135 s against 177 s) and, with the
+framework loaded on Claude Sonnet, 2.4x more expensive than the control for the
+same solve rate. An invalid plugin manifest had kept the Claude Code mythos arm
+unscaffolded until 5 November 2026; the rerun is the first row. Full parameters and the diagnosis from the transcripts:
 [`docs/poster/poster.md`](docs/poster/poster.md). What the numbers do not cover:
 [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
 
