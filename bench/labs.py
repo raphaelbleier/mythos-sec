@@ -185,6 +185,10 @@ def cmd_score(a):
     res = Path(a.rundir) / "result.json"
     if res.exists() and json.loads(res.read_text()).get("status") == "target_failed":
         raise SystemExit(f"{a.rundir} is target_failed: the target died mid-run, nothing to triage")
+    tr = Path(a.rundir) / "transcript.jsonl"
+    if score.CLASSIFIER_BLOCK.search(score.final_report(tr, score.events(tr)[1])) and not a.force:
+        raise SystemExit(f"{a.rundir} ended on a safety classifier: unscored like a provider refusal "
+                         "(--force to triage the partial report anyway)")
     out = Path(a.rundir) / "triage.json"
     if out.exists() and not a.force:
         raise SystemExit(f"{out} exists (human triage?); --force to overwrite")
