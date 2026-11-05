@@ -7,9 +7,22 @@ as such.
 
 ## What the evaluation can and cannot show
 
-- **Results pending.** The main comparison (mythos vs bare-model control vs
-  Strix, same model) has not been completed. No performance claim is made until
-  the table in `poster.md` is filled from `bench/stats.py` output.
+- **Measured, and the result is a null.** Three sweeps are in: 40 challenges on
+  Claude Sonnet, 12 on GLM 5.3, and a rerun of the seven challenges both arms
+  had failed. The mythos arm never separates from the bare-model control
+  (0.70 vs 0.69, 1.00 vs 1.00, 0.29 vs 0.29; every paired McNemar p = 1.0). On
+  single-vulnerability flag-capture challenges the scaffolding adds nothing this
+  sample can detect. Numbers and parameters: `poster.md`.
+- **One run per cell.** Nothing is repeated, so run-to-run variance is not
+  separated from any effect. The rerun shows how much that matters: both arms
+  converted two of the seven previously failed challenges, although only the
+  mythos arm had changed in between.
+- **The benchmark measures the wrong thing for this question.** A flag is all
+  or nothing, so multi-step chains and access-control findings score zero until
+  they are complete. The seven shared failures carry tags such as
+  `insecure_deserialization`, `business_logic` and `privilege_escalation`. The
+  flagless targets with documented vulnerability lists are the measurement that
+  could show a scaffolding effect, and that run is still missing.
 - **Scaffolding effect vs model effect.** With one model for all arms, a
   difference measures the scaffolding (skills, orchestration, tools), not the
   model. It says nothing about other models.
@@ -34,15 +47,16 @@ as such.
   challenge tag) is a weaker, alias-based signal.
 - **Not compared:** PentestGPT (autonomous mode only drives Claude Code or
   Codex) and CAI (archived, interactive REPL) are refused by the harness.
-  Strix ran on a shared GLM 5.3 endpoint and solved 4 of 5 valid cells in a
-  12-challenge pilot; its remaining cells were lost to the provider's quota.
+  Strix ran on a shared GLM 5.3 endpoint. Across two sweeps only a handful of
+  its cells stayed valid (2 of 12 in the final run; eight ended in a provider
+  stall, two in a runner error), so its rate carries no weight.
 
 ## Capability limits
 
 - **Business logic is hard.** Multi-step object ownership, mass assignment and
   race conditions are not reliably solved by any scanner. The `auth-session` and
   `business-logic` skills give the agent a method; no autonomous success rate is
-  claimed. Measured effect: pending (roadmap phase 3, ablation not run).
+  claimed, and no flag-capture sweep so far isolates these classes.
 - **Stored XSS and server-side classes.** `stored-xss-oast` (OAST catcher +
   admin bot) and `deep-server` exist with lab support; re-measurement on the
   classes Strix missed (SSTI, smuggling, race, deserialization) is pending.
