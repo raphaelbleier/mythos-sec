@@ -196,12 +196,25 @@ import; CVE triage (KEV/EPSS, patch-diff); nuclei templated scanning.
 
 ## Benchmarks
 
-**Controlled evaluation (in progress).** `bench/` runs mythos and a bare-model
-control on the XBOW validation-benchmarks with the same model, prompt, budget
-and sandbox; per-run random flags; harness-side scoring; Wilson intervals and
-paired McNemar tests. Protocol, usage and isolation rules:
-[`bench/README.md`](bench/README.md). **Results are pending**; the table to fill
-is in [`docs/poster/poster.md`](docs/poster/poster.md). Limits:
+**Controlled evaluation.** `bench/` runs Mythos and a bare-model control on the
+XBOW validation-benchmarks with the same model, prompt, budget and sandbox, a
+random flag per run, scoring on the harness side, Wilson intervals and paired
+McNemar tests. Protocol, usage and isolation rules:
+[`bench/README.md`](bench/README.md).
+
+The result so far is a null. Across three sweeps on 2026-11-04 the Mythos arm
+does not separate from the control:
+
+| sweep | model | Mythos | control | paired p |
+|---|---|---|---|---|
+| 40 challenges | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
+| 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 1.0 |
+| 7 earlier shared failures | Claude Sonnet | 2/7 = 0.29 | 2/7 = 0.29 | 1.0 |
+
+On challenges with one planted vulnerability and a flag, the scaffolding adds
+nothing these samples can detect. Mythos is faster on GLM 5.3 (median 135 s
+against 177 s). Full parameters and the diagnosis from the transcripts:
+[`docs/poster/poster.md`](docs/poster/poster.md). What the numbers do not cover:
 [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
 
 ```bash
