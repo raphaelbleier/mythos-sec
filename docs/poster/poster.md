@@ -62,24 +62,25 @@ Harness: `bench/` (stdlib Python), XBOW validation-benchmarks. Full detail in
 
 ## Results
 
-Drei Sweeps, alle vom 4. November 2026, Rohdaten unter
+Fünf Sweeps vom 4. und 5. November 2026, Rohdaten unter
 `/mnt/linux-data/mythos-bench/results/`. Jede Zelle bekommt eine frisch
 gebaute Challenge mit zufälligem Flag, ein eigenes Compose-Projekt im eigenen
 Netz, eine `scope.yaml` auf genau diesen Host und Port, dieselbe Wall-Clock und
 ein sauberes HOME. Gewertet wird nur, was die Harness selbst nachweist; Zellen,
-in denen der Anbieter die Quote verweigerte, stehen gelassen hat oder der
-Runner scheiterte, zählen nicht.
+in denen der Anbieter die Quote verweigerte, stehen gelassen hat, der Runner
+scheiterte oder ein Sicherheitsklassifikator die Antwort abbrach, zählen nicht.
 
 **Sweep A, Claude Code, Modell `sonnet`, 40 Challenges (seed 7), ein Lauf je
-Zelle, Budget 1800 s, apt_fix an.**
+Zelle, Budget 1800 s, apt_fix an.** Die Arme dieses Sweeps trugen das Gerüst
+nicht (siehe Befund zur Messgültigkeit unten).
 
-| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s |
-|---|---|---|---|---|---|
-| control (nacktes Modell mit Shell) | 39 | 27 | 0,69 | 0,54 bis 0,81 | 23 |
-| mythos | 40 | 28 | 0,70 | 0,55 bis 0,82 | 28 |
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | vom Klassifikator abgebrochen | Median s |
+|---|---|---|---|---|---|---|
+| control (nacktes Modell mit Shell) | 30 | 27 | 0,90 | 0,74 bis 0,97 | 9 | 32 |
+| mythos (Gerüst nicht geladen) | 33 | 28 | 0,85 | 0,69 bis 0,93 | 7 | 30 |
 
-Gepaart über 39 Challenges: 23 lösen beide, 5 nur mythos, 4 nur die Kontrolle,
-7 keiner. McNemar exakt, p = 1,0.
+Gepaart über 25 Challenges: 23 lösen beide, keine abweichenden Paare, 2 keiner.
+McNemar exakt, p = 1,0.
 
 **Sweep B, OpenCode, Modell `zai/glm-5.3`, 12 Challenges (seed 1), Budget
 5400 s.** Strix lief im selben Sweep auf `openai/glm-5.3` über seine eigene
@@ -96,66 +97,54 @@ Von Strix' zwölf Zellen blieben nur zwei verwertbar, acht endeten im
 Stillstand des Anbieters und zwei im Runner-Fehler.
 
 **Sweep C, Claude Code, Modell `sonnet`, Nachlauf auf den sieben Challenges,
-an denen in Sweep A beide Arme gescheitert waren.** Zwischen A und C bekam der
-Orchestrator die Regeln gegen vorzeitiges Aufgeben und gegen Festbeißen.
+an denen in Sweep A beide Arme gescheitert waren.**
 
 | Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s |
 |---|---|---|---|---|---|
-| control | 7 | 2 | 0,29 | 0,08 bis 0,64 | 166 |
-| mythos | 7 | 2 | 0,29 | 0,08 bis 0,64 | 57 |
+| control | 5 | 2 | 0,40 | 0,12 bis 0,77 | 872 |
+| mythos | 5 | 2 | 0,40 | 0,12 bis 0,77 | 88 |
 
-Beide Arme lösen jetzt zwei der sieben, die zuvor keiner löste. Weil die
-Kontrolle keine Regeln bekam und ebenso zulegt, ist das Lauf-zu-Lauf-Varianz
-und kein belegter Effekt der Änderung.
+Beide Arme lösen zwei der fünf verwertbaren Zellen, gepaart bleiben drei
+Challenges ohne abweichendes Paar.
 
-Auf Flag-Capture-Challenges mit einer Schwachstelle pro Ziel ist
-der Beitrag des Gerüsts null, soweit diese Stichproben das auflösen. Die
-Intervalle überlappen in allen drei Sweeps fast vollständig, und kein
-gepaarter Test kommt unter p = 1,0. Auf GLM 5.3 stehen beide Arme am
-Deckeneffekt der gezogenen Challenges, dort ist mythos lediglich schneller
-(Median 135 s gegen 177 s). Wo das Gerüst wirken müsste, nämlich bei
-mehrstufigen Ketten und Zugriffskontrolle, messen diese Challenges nicht: die
-sieben gemeinsamen Fehlschläge tragen Tags wie `insecure_deserialization`,
-`business_logic` und `privilege_escalation`, und genau dort liefert
-Flag-Capture kein Teilergebnis.
+**Befund zur Messgültigkeit I: das Gerüst war nicht geladen.** Die Arme auf dem
+Claude-Code-Host der Sweeps A und C trugen es nicht. Das Plugin-Manifest
+deklarierte `author` als Zeichenkette und `agents` als Pfadangabe; Claude Code
+verwirft ein solches Manifest ohne Meldung, also lud
+`claude -p --plugin-dir` weder den Befehl `/cybersecurity` noch die Sub-Agenten
+noch die Plugin-Hooks. Der Arm las lediglich `CLAUDE.md` und `AGENTS.md` aus
+seinem Arbeitsverzeichnis. Sweep B auf OpenCode ist nicht betroffen, weil
+`opencode run --agent mythos` bei fehlendem Agenten abbricht. Das Manifest ist
+korrigiert, und der Bench-Arm bricht eine Zelle ab, deren `init`-Ereignis
+keinen Befehl `:cybersecurity` führt.
 
-Die Transkripte zeigen zwei Steuerungsfehler, die nicht am Modell liegen. Drei der sieben gemeinsamen Fehlschläge enden nach drei
-bis vier Werkzeugaufrufen in rund zwanzig Sekunden, darunter eine Level-1-IDOR,
-der Agent gibt also auf statt zu scheitern. Zwei andere laufen mit 103 und 112
-Aufrufen über 22 bis 30 Minuten in eine Sackgasse. Der Orchestrator verbietet
-seit Sweep C beides ausdrücklich; der Nachweis, dass die Regeln greifen, steht
-aus und braucht mehrere Läufe je Zelle.
-
-**Befund zur Messgültigkeit.** Die Arme auf dem Claude-Code-Host der Sweeps A
-und C trugen das Gerüst nicht. Das Plugin-Manifest deklarierte `author` als
-Zeichenkette und `agents` als Pfadangabe; Claude Code verwirft ein solches
-Manifest ohne Meldung, also lud `claude -p --plugin-dir` weder den Befehl
-`/cybersecurity` noch die Sub-Agenten noch die Plugin-Hooks. Der Arm las
-lediglich `CLAUDE.md` und `AGENTS.md` aus seinem Arbeitsverzeichnis. Die
-Sweeps A und C vergleichen damit zwei nahezu gleiche Kontrollen; Sweep B auf
-OpenCode ist nicht betroffen, weil `opencode run --agent mythos` bei fehlendem
-Agenten abbricht. Das Manifest ist korrigiert, und der Bench-Arm bricht eine
-Zelle ab, deren `init`-Ereignis keinen Befehl `:cybersecurity` führt.
+**Befund zur Messgültigkeit II: ein Sicherheitsklassifikator beendet Zellen.**
+In etwa der Hälfte aller Zellen auf dem Claude-Code-Host griff ein
+Klassifikator in eine Antwort ein. Endet eine Zelle darauf, hält der Agent
+richtigerweise an und berichtet den Abbruch, gemessen wird dann aber der
+Klassifikator und nicht der Agent. Sieben bis neun der zwölf ungelösten Zellen
+je Arm endeten so. Diese Zellen tragen seit dem 5. November 2026 den Status
+`classifier_blocked` und gehen wie eine Anbieterverweigerung nicht in die
+Lösungsrate ein; alle Zahlen oben sind entsprechend neu ausgewertet. Die
+OpenCode-Arme sind davon nicht betroffen.
 
 **Sweep D, flagloses Ziel VAmPI, Claude Code, Modell `sonnet`, Deckungsauftrag
 statt Flag-Suche, Budget 1500 bzw. 1800 s.** Gewertet wird der Recall gegen die
-neun dokumentierten Schwachstellen; Präzision ergibt sich aus der
-Handtriage der Berichte.
+neun dokumentierten Schwachstellen; die Präzision ergibt sich aus der Handtriage
+der Berichte.
 
 | Arm | gefunden | verpasst | Recall | Präzision | Werkzeugaufrufe | Laufzeit s |
 |---|---|---|---|---|---|---|
 | control | 8 | 1 | 0,89 | 1,00 | 7 | 54 |
-| mythos (Plugin nachweislich geladen) | 8 | 1 | 0,89 | 1,00 | 6 | 53 |
-| mythos (erster Lauf, Plugin nicht geladen) | 8 | 1 | 0,89 | 1,00 | 6 | 55 |
+| mythos, Gerüst nachweislich geladen | 8 | 1 | 0,89 | 1,00 | 6 | 53 |
+| mythos, Gerüst nicht geladen | 8 | 1 | 0,89 | 1,00 | 6 | 55 |
 
-Alle drei Läufe verfehlen genau denselben Eintrag, den RegexDOS, und zwar in
-beiden Armen mit derselben Begründung: der Nachweis hätte eine
-Dienstverweigerung riskiert. Falsch-positive Befunde traten nicht auf. Der
-geladene Arm nannte elf Schwachstellen, die Kontrolle zehn; die zusätzlichen
-Treffer, der freiliegende Werkzeug-Debugger und das unauthentifizierte
-`GET /createdb`, stehen nicht auf der dokumentierten Liste und gehen daher in
-keinen Recall ein. Auch auf dem Ziel, an dem ein Beitrag des Gerüsts sichtbar
-werden müsste, ist er nicht messbar.
+Alle drei Läufe verfehlen genau denselben Eintrag, den RegexDOS, und zwar mit
+derselben Begründung: der Nachweis hätte eine Dienstverweigerung riskiert.
+Falsch-positive Befunde traten nicht auf. Der geladene Arm nannte elf
+Schwachstellen, die Kontrolle zehn; die zusätzlichen Treffer, der freiliegende
+Werkzeug-Debugger und das unauthentifizierte `GET /createdb`, stehen nicht auf
+der dokumentierten Liste und gehen daher in keinen Recall ein.
 
 Bemerkenswert ist, wie der geladene Arm arbeitete: sechs gebündelte
 Shell-Aufrufe, kein delegierter Sub-Agent, kein Werkzeugkasten, kein
@@ -165,22 +154,26 @@ dazu, dass sich das Gerüst praktisch selbst abschaltet.
 
 **Sweep E, dieselben 40 Challenges wie Sweep A, Claude Code, Modell `sonnet`,
 Budget 1800 s, Gerüst nachweislich geladen.** Gepaart gegen den Kontrollarm aus
-Sweep A, der von dem Manifest-Fehler nicht betroffen war.
+Sweep A, der vom Manifest-Fehler nicht betroffen war.
 
-| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Median s | Werkzeugaufrufe | Kosten USD |
-|---|---|---|---|---|---|---|---|
-| control (nacktes Modell mit Shell) | 39 | 27 | 0,69 | 0,54 bis 0,81 | 23 | 390 | 8,63 |
-| mythos, Gerüst geladen | 40 | 28 | 0,70 | 0,55 bis 0,82 | 30 | 928 | 20,88 |
+| Arm | gewertete Zellen | gelöst | Lösungsrate | Wilson 95 % CI | Werkzeugaufrufe | Kosten USD |
+|---|---|---|---|---|---|---|
+| control (nacktes Modell mit Shell) | 30 | 27 | 0,90 | 0,74 bis 0,97 | 390 | 8,63 |
+| mythos, Gerüst geladen | 33 | 28 | 0,85 | 0,69 bis 0,93 | 928 | 20,88 |
 
-Gepaart über 39 Challenges: 22 lösen beide, 6 nur mythos, 5 nur die Kontrolle,
-6 keiner. McNemar exakt, p = 1,0. Das geladene Gerüst löst genau so viele
-Challenges wie der Arm, der es nicht geladen hatte, verschiebt aber, welche:
-elf Paare weichen ab. Es kostet dafür das 2,4-Fache an Geld und 2,4-mal so
-viele Werkzeugaufrufe.
+Gepaart über 26 Challenges: 22 lösen beide, keine nur mythos, eine nur die
+Kontrolle, drei keiner. McNemar exakt, p = 1,0. Das geladene Gerüst löst
+dieselbe Anzahl Challenges wie der Arm, der es nicht geladen hatte, und kostet
+dafür das 2,4-Fache an Geld und 2,4-mal so viele Werkzeugaufrufe.
 
-Auch in diesem Sweep enden vier Fehlschläge nach 15 bis 24 Sekunden, obwohl der
-Orchestrator das vorzeitige Aufgeben ausdrücklich verbietet. Die Regel als
-Anweisung im Prompt genügt dafür offenkundig nicht.
+Auf Flag-Capture-Challenges mit einer Schwachstelle pro Ziel ist der Beitrag
+des Gerüsts null, soweit diese Stichproben das auflösen, und auf dem flaglosen
+Ziel mit dokumentierter Liste ebenso. Beide Arme stehen nach dem Ausschluss der
+abgebrochenen Zellen bei 0,85 bis 0,90, also nahe am Deckeneffekt der gezogenen
+Challenges; drei bis fünf ungelöste Zellen je Arm lassen für einen Unterschied
+kaum Spielraum. Wo das Gerüst wirken müsste, nämlich bei mehrstufigen Ketten und
+Zugriffskontrolle, messen diese Challenges nicht: Flag-Capture liefert dort kein
+Teilergebnis.
 
 Per-Klassen-Aufschlüsselung und die Ablation mit und ohne Evidenz-Gating sind
 offen. Der Recall auf den übrigen flaglosen Zielen (crAPI, Vuln Bank, DVGA)

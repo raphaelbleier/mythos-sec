@@ -207,11 +207,15 @@ does not separate from the control:
 
 | sweep | model | Mythos | control | paired p |
 |---|---|---|---|---|
-| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
-| 40 challenges (plugin silently not loaded) | Claude Sonnet | 28/40 = 0.70 | 27/39 = 0.69 | 1.0 |
+| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 1.0 |
+| 40 challenges (plugin silently not loaded) | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 1.0 |
 | 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 1.0 |
-| 7 earlier shared failures | Claude Sonnet | 2/7 = 0.29 | 2/7 = 0.29 | 1.0 |
+| earlier shared failures | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 1.0 |
 | VAmPI, recall against 9 documented vulnerabilities | Claude Sonnet | 8/9 = 0.89 | 8/9 = 0.89 | - |
+
+Cells a safety classifier ended mid-run are unscored (`classifier_blocked`),
+like a provider refusal: that was 7-9 of the 12 unsolved cells per arm on the
+Claude Code host.
 
 On challenges with one planted vulnerability and a flag, the scaffolding adds
 nothing these samples can detect, and the flagless recall measurement on VAmPI

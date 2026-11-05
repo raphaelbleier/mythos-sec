@@ -19,16 +19,28 @@ as such.
   (`opencode run --agent mythos` fails loudly on a missing agent). The manifest
   is fixed and `bench/runners/claude_mythos.py` now aborts a cell whose `init`
   event lists no `:cybersecurity` command.
+- **A safety classifier ends cells, and that dominated the raw rates.** On the
+  Claude Code host a classifier interrupted an assistant turn in about half of
+  all cells. Where a cell ends on that, the agent correctly stops and says so,
+  which measures the classifier rather than the agent: 7 to 9 of the 12
+  unsolved cells per arm ended that way. Such cells now carry the status
+  `classifier_blocked` and are unscored like a provider refusal, and every
+  number here is rescored accordingly. Earlier drafts reported the raw rates
+  (0.70 vs 0.69); they were floors set by the classifier, not by capability.
+  The OpenCode arms are unaffected.
 - **Rerun with the scaffolding verified loaded: still a null.** The same 40
   challenges, Claude Sonnet, paired against the unaffected control arm:
-  28/40 = 0.70 vs 27/39 = 0.69, McNemar exact p = 1.0 over 39 pairs (6 only
-  mythos, 5 only control). The loaded framework solves the same count as the
-  arm that failed to load it, shifts which challenges are solved, and costs
-  2.4x the money and 2.4x the tool calls ($20.88 vs $8.63, 928 vs 390 calls).
-- **Measured, and the result is a null.** Three sweeps are in: 40 challenges on
-  Claude Sonnet, 12 on GLM 5.3, and a rerun of the seven challenges both arms
-  had failed. The mythos arm never separates from the bare-model control
-  (0.70 vs 0.69, 1.00 vs 1.00, 0.29 vs 0.29; every paired McNemar p = 1.0). On
+  28/33 = 0.85 vs 27/30 = 0.90, McNemar exact p = 1.0 over 26 pairs (0 only
+  mythos, 1 only control). The loaded framework solves the same count as the
+  arm that failed to load it and costs 2.4x the money and 2.4x the tool calls
+  ($20.88 vs $8.63, 928 vs 390 calls). With both arms at 0.85-0.90 and three
+  to five unsolved cells each, this sample has almost no headroom left in which
+  a difference could appear.
+- **Measured, and the result is a null.** Five sweeps are in: 40 challenges on
+  Claude Sonnet (twice, before and after the plugin fix), 12 on GLM 5.3, a
+  rerun of the challenges both arms had failed, and VAmPI recall. The mythos
+  arm never separates from the bare-model control (0.85 vs 0.90, 1.00 vs 1.00,
+  0.40 vs 0.40, recall 0.89 vs 0.89; every paired McNemar p = 1.0). On
   single-vulnerability flag-capture challenges the scaffolding adds nothing this
   sample can detect. Numbers and parameters: `poster.md`.
 - **One run per cell.** Nothing is repeated, so run-to-run variance is not
