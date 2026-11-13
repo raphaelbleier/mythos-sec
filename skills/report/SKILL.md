@@ -51,11 +51,54 @@ missing`. `reproduced` items say what the validator pass did not confirm,
 reason (false positive, by design, out of scope, not reproducible). Severity is
 not assigned to appendix items.
 
+## Machine-readable output
+
+Run `scripts/findings engagements/<dir>` before you write the prose. It reads
+the front matter of every `findings/<id>.md` and writes `findings.json`:
+
+```bash
+scripts/findings engagements/<dir> --sarif engagements/<dir>/findings.sarif
+```
+
+Do not skip this and do not hand-write the JSON. The script does four things
+you must not do by eye:
+
+- **It computes the CVSS 3.1 base score from the vector** instead of trusting
+  the severity word. If it reports `severity says critical but the vector
+  computes medium (6.1)`, fix one of the two before writing the report. A
+  severity nobody can derive from the vector is an inflated report.
+- **It deduplicates** on class plus endpoint template plus parameter, with
+  numeric and UUID path segments collapsed, so the same flaw on `/users/1`
+  and `/users/9823` is one finding with two affected assets. Use its merged
+  list as the report's structure.
+- **It redacts credentials** out of the evidence: cookies, bearer tokens,
+  JWTs, API keys, passwords. `findings.json` leaves the engagement directory
+  and must not carry a session.
+- **It refuses to let `validated` stand without a proof path and a negative
+  control**, and lists every such finding under `problems`. Resolve all of
+  them: either supply the evidence or drop the state back.
+
+A retest against a previous engagement compares the two runs:
+
+```bash
+scripts/findings engagements/<dir> --diff <previous>/findings.json
+```
+
+That prints fixed, still present and new, keyed by fingerprint, which is what
+a program's retest request actually asks for. `--fail-on high` exits non-zero
+when a validated finding is high or above, for a CI gate.
+
 ## Output
 
 Write `engagements/<dir>/report.md` and give the user a one-line summary: counts
 of validated findings by severity, the count per other state, and the single top
-finding.
+finding. `findings.json` and, when asked for, `findings.sarif` sit beside it.
+
+The front matter each finding needs for all of this: `id`, `title`, `class`
+(the knowledge-base class name, so the CWE maps), `status`, `asset`, `param`,
+`severity`, `cvss`, `proof`, `negative_control`, and `reason` for a rejected
+one. A class with no CWE mapping is reported as a problem rather than guessed;
+add it to the table in `scripts/findings` if the class is real.
 
 If the user wants a German university lab report as `.docx`, invoke the
 `security-lab` skill and pass it the findings; do not write the `.docx` yourself.

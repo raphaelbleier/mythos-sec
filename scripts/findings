@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Turn an engagement's findings into machine-readable output.
+
+`report.md` is for a human triager. Nothing could read it back, which meant no
+deduplication across runs, no retest, no CI gate, and no way to score a report
+except by reading it. The front matter in `findings/<id>.md` already carried
+everything needed; nothing parsed it.
+
+This does. It emits:
+
+  findings.json   the canonical record: one entry per finding, with its state,
+                  class, asset, CWE, computed CVSS score and a stable
+                  fingerprint.
+  findings.sarif  SARIF 2.1.0, so the result drops into a CI annotation or any
+                  tool that reads static-analysis output.
+
+Three things it does beyond reformatting:
+
+  It computes the CVSS 3.1 base score from the vector instead of trusting the
+  severity word next to it. A model types both, and they drift. A mismatch is
+  reported as a problem with the finding, because a severity nobody can derive
+  from the vector is how an inflated report gets written.
+
+  It fingerprints each finding as class + endpoint template + parameter, with
+  numeric and UUID-shaped path segments collapsed, so the same flaw on
+  /users/1/avatar and /users/9823/avatar is one finding and not two. `--diff`
+  compares against a previous run's findings.json, which is what a retest
+  needs: fixed, still-present, and new.
+
+  It redacts credentials out of the evidence before writing anything. The
+  report skill requires pasting raw requests and responses, and those carry
+  session cookies and bearer tokens. A file that leaves the engagement
+  directory must not carry them.
+
+Only `validated` findings are reported as results by default, matching the
+report skill. `--all` includes every state, each labelled.
+
+Stdlib only, no network. `--selftest` runs the asserts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+FRONT = re.compile(r"^---\s*$")
+FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
+VECTOR_RE = re.compile(r"CVSS:3\.[01]/((?:[A-Z]+:[A-Z]+/?)+)")
+
+# Metric weights from the CVSS v3.1 specification, section 7.
+W_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+W_AC = {"L": 0.77, "H": 0.44}
+W_PR_U = {"N": 0.85, "L": 0.62, "H": 0.27}
+W_PR_C = {"N": 0.85, "L": 0.68, "H": 0.50}
+W_UI = {"N": 0.85, "R": 0.62}
+W_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+# The class names the knowledge base uses, mapped to the CWE a triager expects.
+# A missing entry is reported rather than guessed: a wrong CWE is worse than none.
+CWE = {
+    "xss": 79, "reflected-xss": 79, "stored-xss": 79, "dom-xss": 79,
+    "sql-injection": 89, "sqli": 89, "nosql-injection": 943,
+    "command-injection": 78, "argument-injection": 88,
+    "ssti": 1336, "ssrf": 918, "xxe": 611,
+    "path-traversal": 22, "client-side-path-traversal": 22,
+    "file-upload": 434, "deserialization": 502,
+    "access-control": 284, "idor": 639, "bola": 639, "bfla": 285,
+    "mass-assignment": 915, "bopla": 915,
+    "race-conditions": 362, "race-condition": 362,
+    "cache-poisoning": 524, "cache-deception": 524,
+    "request-smuggling": 444, "csrf": 352, "clickjacking": 1021,
+    "open-redirect": 601, "cors": 942, "headers-cors": 942,
+    "jwt": 347, "oauth-oidc": 287, "saml": 347, "auth-flows-ato": 287,
+    "session-fixation": 384, "2fa-bypass": 287,
+    "graphql-api": 1176, "business-logic": 840,
+    "multi-tenant-isolation": 1230, "subdomain-takeover": 350,
+    "prototype-pollution": 1321, "dom-clobbering": 1321,
+    "secrets-exposure": 540, "information-disclosure": 200,
+    "prompt-injection": 1427, "llm-output-handling": 79,
+    "client-side-supply-chain": 1357, "gateway-bypass": 290,
+    "webhooks": 345, "baas-cloud-storage": 1230,
+}
+
+# Anything shaped like a credential, replaced before the evidence is written.
+REDACTIONS = [
+    (re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(cookie\s*:\s*).*"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(set-cookie\s*:\s*)[^;\r\n]*"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(x-api-key|x-auth-token|api[_-]?key|apikey|access[_-]?token|"
+                r"refresh[_-]?token|id[_-]?token|bearer|token|client[_-]?secret|"
+                r"password|passwd|pwd|"
+                r"secret|private[_-]?key)(\"?\s*[:=]\s*\"?)[^\s\"',&}]+"),
+     r"\1\2[REDACTED]"),
+    # A JWT's payload segment can be as short as "e30" ({}), so the middle
+    # segment must not demand a long run of characters.
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{2,}\.[A-Za-z0-9_\-]*"),
+     "[REDACTED-JWT]"),
+    (re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+     "[REDACTED-TOKEN]"),
+    (re.compile(r"\b(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,})\b"),
+     "[REDACTED-TOKEN]"),
+]
+
+# Path segments that identify an instance rather than a route.
+SEG_NUM = re.compile(r"^\d+$")
+SEG_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+SEG_HEX = re.compile(r"^[0-9a-f]{12,}$", re.I)
+
+REPORTED_STATES = {"validated"}
+
+
+def roundup(value: float) -> float:
+    """The CVSS v3.1 Appendix A rounding: up to one decimal, exactly."""
+    i = int(round(value * 100000))
+    if i % 10000 == 0:
+        return i / 100000.0
+    return (math.floor(i / 10000) + 1) / 10.0
+
+
+def cvss31(vector: str) -> tuple[float | None, str | None, str | None]:
+    """(base score, severity rating, error) for a CVSS 3.1 vector string."""
+    m = VECTOR_RE.search(vector or "")
+    if not m:
+        return None, None, "not a CVSS:3.x vector"
+    metrics = {}
+    for part in m.group(1).strip("/").split("/"):
+        if ":" in part:
+            key, _, value = part.partition(":")
+            metrics[key] = value
+    need = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
+    missing = [k for k in need if k not in metrics]
+    if missing:
+        return None, None, f"vector is missing {', '.join(missing)}"
+    try:
+        scope_changed = metrics["S"] == "C"
+        pr = (W_PR_C if scope_changed else W_PR_U)[metrics["PR"]]
+        expl = 8.22 * W_AV[metrics["AV"]] * W_AC[metrics["AC"]] * pr * W_UI[metrics["UI"]]
+        iss = 1 - ((1 - W_CIA[metrics["C"]]) * (1 - W_CIA[metrics["I"]])
+                   * (1 - W_CIA[metrics["A"]]))
+        if scope_changed:
+            impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        else:
+            impact = 6.42 * iss
+    except KeyError as exc:
+        return None, None, f"vector has an invalid metric value: {exc}"
+    if impact <= 0:
+        score = 0.0
+    elif scope_changed:
+        score = roundup(min(1.08 * (impact + expl), 10))
+    else:
+        score = roundup(min(impact + expl, 10))
+    return score, rating(score), None
+
+
+def rating(score: float) -> str:
+    if score == 0:
+        return "none"
+    if score < 4.0:
+        return "low"
+    if score < 7.0:
+        return "medium"
+    if score < 9.0:
+        return "high"
+    return "critical"
+
+
+def redact(text: str) -> str:
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def route(asset: str) -> str:
+    """The endpoint template: instance ids collapsed, so one flaw is one finding."""
+    path = asset or ""
+    path = re.sub(r"^[a-z][a-z0-9+.\-]*://[^/]+", "", path, flags=re.I)
+    path = path.split("?")[0].split("#")[0]
+    segments = []
+    for seg in path.split("/"):
+        if SEG_NUM.match(seg):
+            segments.append("{id}")
+        elif SEG_UUID.match(seg) or SEG_HEX.match(seg):
+            segments.append("{uuid}")
+        else:
+            segments.append(seg)
+    return "/".join(segments) or "/"
+
+
+def fingerprint(klass: str, asset: str, param: str) -> str:
+    key = f"{klass.lower()}|{route(asset).lower()}|{(param or '').lower()}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def parse(path: Path) -> dict:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    fm, body_at = {}, 0
+    if lines and FRONT.match(lines[0]):
+        for i, line in enumerate(lines[1:], start=1):
+            if FRONT.match(line):
+                body_at = i + 1
+                break
+            m = FIELD.match(line)
+            if m:
+                fm[m.group(1).lower()] = m.group(2).strip().strip("'\"")
+    body = "\n".join(lines[body_at:])
+
+    problems = []
+    # `validated(proof)` and `rejected(reason)` are written with the reason in
+    # parentheses, so take the bare state and keep the rest.
+    raw_state = (fm.get("status") or fm.get("state") or "").strip()
+    state = raw_state.split("(")[0].strip().lower() or "unknown"
+    if state == "unknown":
+        problems.append("no status in front matter")
+    klass = (fm.get("class") or fm.get("vuln_class") or fm.get("category") or "").lower()
+    if not klass:
+        problems.append("no class in front matter")
+    asset = fm.get("asset") or fm.get("url") or fm.get("endpoint") or ""
+    param = fm.get("param") or fm.get("parameter") or ""
+    title = fm.get("title") or path.stem
+
+    vector = fm.get("cvss") or fm.get("cvss_vector") or ""
+    score, derived, err = cvss31(vector)
+    stated = (fm.get("severity") or "").strip().lower()
+    if state in REPORTED_STATES:
+        if err:
+            problems.append(f"cvss: {err}")
+        elif stated and stated != derived:
+            problems.append(f"severity says {stated} but the vector computes "
+                            f"{derived} ({score})")
+        if not fm.get("proof"):
+            problems.append("validated without a proof path")
+        if not fm.get("negative_control"):
+            problems.append("validated without a negative control")
+    cwe = CWE.get(klass)
+    if klass and cwe is None:
+        problems.append(f"no CWE mapping for class '{klass}'")
+
+    return {
+        "id": fm.get("id") or path.stem,
+        "file": path.name,
+        "title": title,
+        "class": klass or None,
+        "state": state,
+        "state_detail": raw_state if "(" in raw_state else None,
+        "asset": asset or None,
+        "param": param or None,
+        "route": route(asset) if asset else None,
+        "cwe": cwe,
+        "cvss_vector": vector or None,
+        "cvss_score": score,
+        "severity": derived or (stated or None),
+        "severity_stated": stated or None,
+        "proof": fm.get("proof") or None,
+        "negative_control": fm.get("negative_control") or None,
+        "reason": fm.get("reason") or None,
+        "playbook": fm.get("playbook") or fm.get("knowledge") or None,
+        "fingerprint": fingerprint(klass, asset, param),
+        "problems": problems,
+        "evidence": redact(body).strip() or None,
+    }
+
+
+def collect(engagement: Path) -> list[dict]:
+    d = engagement / "findings"
+    if not d.is_dir():
+        return []
+    return [parse(f) for f in sorted(d.glob("*.md"))]
+
+
+def dedupe(findings: list[dict]) -> list[dict]:
+    """One entry per fingerprint, keeping the strongest state and every asset."""
+    order = ["validated", "reproduced", "candidate", "unconfirmed", "rejected", "unknown"]
+    rank = {s: i for i, s in enumerate(order)}
+    merged: dict[str, dict] = {}
+    for f in findings:
+        key = f["fingerprint"]
+        if key not in merged:
+            entry = dict(f)
+            entry["assets"] = [f["asset"]] if f["asset"] else []
+            entry["ids"] = [f["id"]]
+            merged[key] = entry
+            continue
+        entry = merged[key]
+        if f["asset"] and f["asset"] not in entry["assets"]:
+            entry["assets"].append(f["asset"])
+        entry["ids"].append(f["id"])
+        if rank.get(f["state"], 9) < rank.get(entry["state"], 9):
+            keep = {"assets": entry["assets"], "ids": entry["ids"]}
+            entry = dict(f)
+            entry.update(keep)
+            merged[key] = entry
+    return sorted(merged.values(),
+                  key=lambda e: (rank.get(e["state"], 9),
+                                 -(e["cvss_score"] or 0), e["id"]))
+
+
+def sarif(findings: list[dict], engagement: str) -> dict:
+    """SARIF 2.1.0. A finding's asset becomes the artifact, since there is no
+    source file to point at: the subject is a live endpoint, not a line."""
+    rules, results = {}, []
+    for f in findings:
+        rule_id = f["class"] or "unclassified"
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": rule_id.replace("-", " ").title().replace(" ", ""),
+                "shortDescription": {"text": rule_id.replace("-", " ")},
+                "properties": {"tags": ["security"],
+                               **({"cwe": f"CWE-{f['cwe']}"} if f["cwe"] else {})},
+            }
+        level = {"critical": "error", "high": "error", "medium": "warning",
+                 "low": "note", "none": "note"}.get(f["severity"] or "", "warning")
+        results.append({
+            "ruleId": rule_id,
+            "level": level,
+            "message": {"text": f["title"]},
+            "locations": [{"physicalLocation": {"artifactLocation": {
+                "uri": f["asset"] or engagement}}}],
+            "partialFingerprints": {"mythosFingerprint/v1": f["fingerprint"]},
+            "properties": {
+                "state": f["state"],
+                "cvssScore": f["cvss_score"],
+                "cvssVector": f["cvss_vector"],
+                "severity": f["severity"],
+                "assets": f.get("assets") or ([f["asset"]] if f["asset"] else []),
+                **({"problems": f["problems"]} if f["problems"] else {}),
+            },
+        })
+    return {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "Mythos", "informationUri":
+                                "https://github.com/raphaelbleier/mythos-sec",
+                                "rules": list(rules.values())}},
+            "results": results,
+            "properties": {"engagement": engagement},
+        }],
+    }
+
+
+def diff(current: list[dict], previous: list[dict]) -> dict:
+    """What a retest needs: fixed, still present, newly found."""
+    def index(rows):
+        return {r["fingerprint"]: r for r in rows
+                if r.get("state") in REPORTED_STATES}
+    now, before = index(current), index(previous)
+    return {
+        "fixed": sorted(before.keys() - now.keys()),
+        "still_present": sorted(now.keys() & before.keys()),
+        "new": sorted(now.keys() - before.keys()),
+        "titles": {k: v["title"] for k, v in {**before, **now}.items()},
+    }
+
+
+def _selftest() -> int:
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # Scores checked against the published CVSS v3.1 calculator values.
+    want(cvss31("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H")[0], 10.0, "log4shell shape")
+    want(cvss31("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N")[0], 6.1, "reflected xss shape")
+    want(cvss31("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N")[0], 7.5, "unauth read")
+    want(cvss31("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N")[0], 0.0, "no impact")
+    want(cvss31("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N")[1], "high", "rating")
+    want(cvss31("high")[2] is not None, True, "not a vector")
+    want(cvss31("CVSS:3.1/AV:N/AC:L")[2] is not None, True, "incomplete vector")
+
+    want(roundup(6.0067), 6.1, "roundup up")
+    want(roundup(7.5), 7.5, "roundup exact")
+
+    # instance ids collapse so one flaw is one finding
+    want(route("https://h.test/users/42/avatar?x=1"), "/users/{id}/avatar", "numeric id")
+    want(route("/o/3f2504e0-4f89-11d3-9a0c-0305e82c3301/x"), "/o/{uuid}/x", "uuid")
+    want(fingerprint("idor", "https://h/users/1/a", "id"),
+         fingerprint("idor", "https://h/users/9823/a", "id"), "same flaw dedupes")
+    if fingerprint("idor", "/users/1", "id") == fingerprint("xss", "/users/1", "id"):
+        failures.append("different classes must not share a fingerprint")
+
+    red = redact("Authorization: Bearer abc.def.ghi\nCookie: session=zzz\n"
+                 '"password": "hunter2"\ntoken=eyJhbGciOiJIUzI1NiJ9.e30.sig')
+    for leak in ("abc.def.ghi", "session=zzz", "hunter2", "eyJhbGciOiJIUzI1NiJ9"):
+        if leak in red:
+            failures.append(f"redaction missed {leak!r}")
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "findings"
+        d.mkdir()
+        (d / "f1.md").write_text(
+            "---\nid: f1\ntitle: IDOR on avatar\nclass: idor\nstatus: validated(proof)\n"
+            "asset: https://h.test/users/1/avatar\nparam: id\nseverity: high\n"
+            "cvss: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N\n"
+            "proof: poc/f1.sh\nnegative_control: same request as the owner\n---\n"
+            "Cookie: session=secret\n")
+        (d / "f2.md").write_text(
+            "---\nid: f2\ntitle: IDOR on avatar, other user\nclass: idor\n"
+            "status: candidate\nasset: https://h.test/users/777/avatar\nparam: id\n---\nbody\n")
+        (d / "f3.md").write_text(
+            "---\nid: f3\ntitle: Bad severity\nclass: xss\nstatus: validated\n"
+            "asset: https://h.test/s\nparam: q\nseverity: critical\n"
+            "cvss: CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N\n"
+            "proof: poc/f3.sh\nnegative_control: no payload\n---\nbody\n")
+        rows = collect(Path(td))
+        want(len(rows), 3, "three findings parsed")
+        f1 = next(r for r in rows if r["id"] == "f1")
+        want(f1["cwe"], 639, "idor cwe")
+        want(f1["severity"], "medium", "severity computed from the vector")
+        want("session=secret" in (f1["evidence"] or ""), False, "evidence redacted")
+        f3 = next(r for r in rows if r["id"] == "f3")
+        want(any("severity says critical" in p for p in f3["problems"]), True,
+             "severity mismatch flagged")
+        merged = dedupe(rows)
+        want(len(merged), 2, "the two IDOR entries merge")
+        idor = next(r for r in merged if r["class"] == "idor")
+        want(idor["state"], "validated", "strongest state wins")
+        want(len(idor["assets"]), 2, "both assets kept")
+
+        doc = sarif([r for r in merged if r["state"] in REPORTED_STATES], "t")
+        want(doc["version"], "2.1.0", "sarif version")
+        want(len(doc["runs"][0]["results"]), 2, "validated results only")
+
+        delta = diff(merged, [{"fingerprint": "deadbeefdeadbeef", "title": "old",
+                               "state": "validated"}])
+        want(delta["fixed"], ["deadbeefdeadbeef"], "fixed detected")
+        want(len(delta["new"]), 2, "new detected")
+
+    for f in failures:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"findings selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Parse an engagement's findings into findings.json and SARIF.")
+    ap.add_argument("engagement", nargs="?", help="engagements/<dir>")
+    ap.add_argument("--all", action="store_true",
+                    help="include every state, not only validated")
+    ap.add_argument("--sarif", metavar="PATH", help="also write SARIF here")
+    ap.add_argument("--out", metavar="PATH", help="write findings.json here "
+                                                  "(default: inside the engagement)")
+    ap.add_argument("--diff", metavar="PREVIOUS.JSON",
+                    help="compare against a previous run: fixed / still present / new")
+    ap.add_argument("--fail-on", metavar="SEVERITY", default=None,
+                    choices=["critical", "high", "medium", "low"],
+                    help="exit 1 if a validated finding is at or above this "
+                         "severity (for a CI gate)")
+    ap.add_argument("--json", action="store_true", help="print the JSON to stdout")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    if args.selftest:
+        return _selftest()
+    if not args.engagement:
+        ap.error("engagement directory is required")
+
+    d = Path(args.engagement)
+    if not d.is_dir():
+        print(f"findings: not a directory: {d}", file=sys.stderr)
+        return 2
+    rows = dedupe(collect(d))
+    reported = rows if args.all else [r for r in rows if r["state"] in REPORTED_STATES]
+    problems = [(r["id"], p) for r in rows for p in r["problems"]]
+
+    doc = {"engagement": d.name, "findings": reported,
+           "counts": {s: sum(1 for r in rows if r["state"] == s)
+                      for s in sorted({r["state"] for r in rows})},
+           "problems": [{"id": i, "problem": p} for i, p in problems]}
+
+    if args.diff:
+        try:
+            previous = json.loads(Path(args.diff).read_text()).get("findings", [])
+        except Exception as exc:
+            print(f"findings: cannot read {args.diff}: {exc}", file=sys.stderr)
+            return 2
+        doc["retest"] = diff(rows, previous)
+
+    out = Path(args.out) if args.out else d / "findings.json"
+    out.write_text(json.dumps(doc, indent=2) + "\n")
+    if args.sarif:
+        Path(args.sarif).write_text(json.dumps(sarif(reported, d.name), indent=2) + "\n")
+
+    if args.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        counts = ", ".join(f"{k} {v}" for k, v in doc["counts"].items()) or "none"
+        print(f"{out}: {len(reported)} reported finding(s) ({counts})")
+        for i, p in problems:
+            print(f"  problem  {i}: {p}", file=sys.stderr)
+        if args.diff:
+            r = doc["retest"]
+            print(f"  retest: {len(r['fixed'])} fixed, "
+                  f"{len(r['still_present'])} still present, {len(r['new'])} new")
+
+    if args.fail_on:
+        bar = ["low", "medium", "high", "critical"].index(args.fail_on)
+        for r in reported:
+            if r["state"] in REPORTED_STATES and r["severity"] in \
+                    ["low", "medium", "high", "critical"][bar:]:
+                return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
