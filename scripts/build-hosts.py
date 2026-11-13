@@ -72,6 +72,12 @@ def claude_tools(perm: dict) -> str:
     return ", ".join(tools)
 
 
+def need(fm: dict, key: str, src: Path):
+    if key not in fm:
+        sys.exit(f"build-hosts: {src.relative_to(ROOT)}: missing frontmatter key '{key}'")
+    return fm[key]
+
+
 def render() -> dict[Path, str]:
     out: dict[Path, str] = {}
     for src in sorted((OC / "agent").glob("*.md")):
@@ -81,16 +87,16 @@ def render() -> dict[Path, str]:
         out[ROOT / "agents" / src.name] = (
             "---\n"
             f"name: {src.stem}\n"
-            f"description: {fm['description']}\n"
+            f"description: {need(fm, 'description', src)}\n"
             "model: inherit\n"
             f"tools: {claude_tools(fm.get('permission', {}))}\n"
             "---\n"
             + NOTE.format(src=src.relative_to(ROOT)) + body)
     for src in sorted((OC / "command").glob("*.md")):
         fm, body = parse(src)
-        agent_src = OC / "agent" / f"{fm['agent']}.md"
+        agent_src = OC / "agent" / f"{need(fm, 'agent', src)}.md"
         _, agent_body = parse(agent_src)
-        head = f"---\ndescription: {fm['description']}\n"
+        head = f"---\ndescription: {need(fm, 'description', src)}\n"
         if "argument-hint" in fm:
             head += f"argument-hint: {fm['argument-hint']}\n"
         out[ROOT / "commands" / src.name] = (

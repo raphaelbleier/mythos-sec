@@ -151,7 +151,12 @@ def main():
     waves = ["seq", "par"] * a.repeats if a.setup else [a.mode]
     out, summary = open(a.out, "a"), []
     for w in waves:
-        r = subprocess.run(a.setup, shell=True, capture_output=True, text=True).stdout.strip() if a.setup else ""
+        r = ""
+        if a.setup:
+            sp = subprocess.run(a.setup, shell=True, capture_output=True, text=True)
+            if sp.returncode:
+                sys.exit(f"race: --setup exited {sp.returncode}, no resource to race:\n{sp.stderr.strip()}")
+            r = sp.stdout.strip()
         url, body = a.url.replace("{{R}}", r), a.data.replace("{{R}}", r) if a.data else None
         before = state(a, headers, r)
         if w == "seq":

@@ -110,7 +110,10 @@ def main():
     if d is None or not ensure_map(d):
         return 0
     counter = d / ".coverage-gate"
-    fired = int(counter.read_text().strip() or 0) if counter.exists() else 0
+    try:
+        fired = int(counter.read_text().strip() or 0) if counter.exists() else 0
+    except (ValueError, OSError):
+        fired = 0                        # a corrupt counter must not crash the Stop hook
     if fired >= MAX_NUDGES:
         return 0
     argv = [sys.executable, str(REPO / "scripts" / "coverage"), str(d), "--list", "15"]

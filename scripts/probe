@@ -12,7 +12,9 @@ about immediately.
                       [--header 'Cookie: a=b'] [--insecure]
 
 It only issues GET requests to the host of <url> (and, with --depth 2, to links
-on that same host). It sends no payloads: it reports where a payload would go.
+on that same host), with one exception: GraphQL introspection sends a POST of the
+fixed introspection query to /graphql. It sends no other body and no payloads: it
+reports where a payload would go.
 Scope still applies — the caller passes a URL that scope.yaml authorizes.
 """
 import argparse, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request
@@ -272,8 +274,9 @@ def probe(url, depth, max_pages, timeout, headers, insecure):
                 try:
                     doc = json.loads(body)
                     if isinstance(doc, dict) and (doc.get("openapi") or doc.get("swagger")):
-                        endpoints = from_openapi(doc, params)
-                        row["endpoints"] = len(endpoints)
+                        spec = from_openapi(doc, params)
+                        endpoints += [e for e in spec if e not in endpoints]
+                        row["endpoints"] = len(spec)
                 except ValueError:
                     pass
             extra.append(row)
@@ -346,8 +349,12 @@ def main():
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    headers = dict(h.split(":", 1) for h in a.header) if a.header else {}
-    headers = {k.strip(): v.strip() for k, v in headers.items()}
+    headers = {}
+    for h in a.header:
+        name, sep, value = h.partition(":")
+        if not sep or not name.strip():
+            raise SystemExit(f"probe: bad --header {h!r}: expected 'Name: value'")
+        headers[name.strip()] = value.strip()
     result = probe(a.url, a.depth, a.max_pages, a.timeout, headers, a.insecure)
     print(json.dumps(result, indent=1) if a.json else render(result))
     return 0 if result["pages"] else 1

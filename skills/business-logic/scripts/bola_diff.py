@@ -10,8 +10,9 @@ Classification of B (and anon) against A's baseline, Auth Analyzer style:
   DIFFERENT anything else
 Verdict:
   candidate  B/anon got 2xx SAME/SIMILAR and (an A-only --marker is in the body, or no markers given)
-  enforced   B/anon got 401/403/404, or an empty body
-  review     everything else (e.g. 200 with B's own data = silent enforcement; compare by hand)
+  enforced   B/anon got 401/403/404 (or another non-2xx status with an empty body)
+  review     everything else (e.g. 200 with B's own data = silent enforcement, or a 2xx with an
+             empty body such as a 204 write = access granted, check the state by hand)
 This is triage only (status + length, no semantics). A candidate becomes a finding only via the
 exploit skill's proof pair. Read-only by default: non-GET/HEAD lines are skipped unless --allow-write,
 which you may set only when every write line targets a resource the agent itself created.
@@ -55,13 +56,18 @@ def compare(base, other):
 
 def verdict(base, other, markers):
     s, b = other
-    if s in (401, 403, 404) or not b.strip():
+    if s in (401, 403, 404):
         return "enforced"
-    if 200 <= s < 300 and compare(base, other) in ("SAME", "SIMILAR"):
-        text = b.decode(errors="replace")
-        if not markers or any(m in text for m in markers):
-            return "candidate"
-    return "review"
+    if 200 <= s < 300:
+        # An empty body is no sign of enforcement: a 204 write by B means access was granted.
+        if not b.strip():
+            return "review"
+        if compare(base, other) in ("SAME", "SIMILAR"):
+            text = b.decode(errors="replace")
+            if not markers or any(m in text for m in markers):
+                return "candidate"
+        return "review"
+    return "enforced" if not b.strip() else "review"
 
 
 def ev(resp):
@@ -102,7 +108,8 @@ def main():
         resp = {}
         for r, h in roles.items():
             resp[r] = send(method, url, h, body)
-            time.sleep(1 / a.rps)
+            if a.rps > 0:
+                time.sleep(1 / a.rps)
         rec = {"method": method, "url": url, "A": ev(resp["A"])}
         if not 200 <= resp["A"][0] < 300:
             rec["note"] = "A baseline not 2xx; fix the session or the id before judging"

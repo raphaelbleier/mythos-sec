@@ -65,8 +65,10 @@ XBOW validates XSS the same way (headless browser checks the payload executed).
 
 ## Verdict
 
-`xss_verify.py verify` prints `validated` only if the browser canary fired or
-the OAST log contains the token; exit 1 = `unconfirmed`. Evidence for the
+`xss_verify.py verify` reports evidence (`browser_hit`, `oast_hit`, nonce, timestamps) and
+sets no closure state; set it yourself from that evidence. Exit 1 = no evidence observed.
+The OAST callback carries the nonce and `location.origin` only; `--include-cookies` on `token`
+adds `document.cookie` and needs the program's authorization. Evidence for the
 report: the token map line (token -> injection point), the injecting request,
 the render URL and role, the dialog/console text or the OAST log line, and the
 screenshot. A token seen in the OAST log from the **toolbox's own** IP (your

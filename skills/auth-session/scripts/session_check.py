@@ -53,8 +53,13 @@ def main():
         ok, why = alive(a.check_url, load_headers(d / f"{role}.headers"), a.dead_regex)
         if not ok:
             recipe = d / f"{role}.login.json"
-            if recipe.exists():
-                auth_login.main(json.loads(recipe.read_text()))
+            argv = json.loads(recipe.read_text()) if recipe.exists() else None
+            if argv and "REDACTED" in " ".join(argv):
+                # auth_login.py never stores credential values, so the recipe cannot log in alone.
+                print(f"session_check: {recipe} has redacted credentials; re-run auth_login.py by hand",
+                      file=sys.stderr)
+            elif argv:
+                auth_login.main(argv)
                 ok, why = alive(a.check_url, load_headers(d / f"{role}.headers"), a.dead_regex)
             print(json.dumps({"role": role, "relogin": True, "valid": ok, "status": why}))
         else:

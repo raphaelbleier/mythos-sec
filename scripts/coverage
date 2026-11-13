@@ -16,6 +16,7 @@ GraphQL, merchant, bill-payment and card endpoints). It cannot tell a real test 
 mention, so it is a floor on coverage, never evidence of it.
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -75,12 +76,52 @@ def match_key(item):
     return item.split("(")[0].strip()
 
 
+def is_covered(item, text):
+    """Whether the report names this item as its own token, not as a fragment of another.
+
+    Plain substring search let "identified" cover `param:id` and a report on `/api/v1/charge`
+    cover `/api`, which inflated every coverage number. A path must be a whole path: not the
+    tail of a longer path (`/v2/api`) and not the head of one (`/api/v1`). A bare name (a
+    parameter or GraphQL field) must sit on word boundaries and is case-sensitive, since
+    `Id` and `id` are different parameters. A scheme and host are stripped from the report
+    first so that `https://host/api` still counts as `/api`."""
+    key = match_key(item)
+    if not key:
+        return False
+    if key.startswith("/"):
+        text = re.sub(r"https?://[^/\s]+", "", text)
+        pat = r"(?<![\w/.-])" + re.escape(key.rstrip("/")) + r"(?![\w-]|[/.]\w)"
+    else:
+        pat = r"(?<!\w)" + re.escape(key) + r"(?!\w)"
+    return re.search(pat, text) is not None
+
+
 def open_items(d, extra=None):
     text = covered(d, extra)
-    return [i for i in surface(d) if match_key(i) not in text]
+    return [i for i in surface(d) if not is_covered(i, text)]
+
+
+def _selftest():
+    text = "We reviewed the /api/v1/charge endpoint thoroughly and identified nothing"
+    assert is_covered("/api/v1/charge", text)
+    assert not is_covered("/api", text), "head of a longer path"
+    assert not is_covered("/admin", text)
+    assert not is_covered("param:r", text), "substring of a word"
+    assert not is_covered("param:id", text), "inside 'identified'"
+    assert not is_covered("param:to", text)
+    assert is_covered("param:id", "tested id for IDOR, not vulnerable")
+    assert not is_covered("param:id", "tested Id only"), "params are case-sensitive"
+    assert is_covered("/api", "GET /api returned 200") and is_covered("/api", "see `/api`.")
+    assert is_covered("/api", "https://host.example/api was tested")
+    assert not is_covered("/api", "the /v2/api route") and not is_covered("/api", "/apiary")
+    assert is_covered("mutation importPaste(a, b)", "importPaste is injectable")
+    assert not is_covered("mutation importPaste(a, b)", "reimportPasted")
+    print("selftest ok")
 
 
 def main():
+    if "--selftest" in sys.argv:
+        return _selftest()
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
     d = sys.argv[1]

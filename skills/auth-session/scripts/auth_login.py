@@ -11,13 +11,14 @@ Writes into --out (e.g. engagements/<dir>/sessions/):
   <role>.state.json            Playwright storage_state (cookies + localStorage)
   <role>.headers               one "Name: value" per line (Cookie, Authorization)
   <role>.nuclei-secrets.yaml   nuclei -sf file (static header secret scoped to the host)
-  <role>.login.json            the argv of this login, replayed by session_check.py
+  <role>.login.json            the argv of this login with credential values redacted, replayed by
+                               session_check.py (supply the secrets again when replaying)
   <role>.session_storage.json  browser mode only: sessionStorage dump (Playwright cannot persist it)
 
 Stdlib only, except --mode browser (playwright). Run inside the toolbox:
   scripts/mythos python3 skills/auth-session/scripts/auth_login.py --role userA ...
 """
-import argparse, http.cookiejar, json, re, sys, urllib.parse, urllib.request
+import argparse, http.cookiejar, json, re, sys, urllib.error, urllib.parse, urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -70,6 +71,32 @@ class FormParser(HTMLParser):
             self.forms.append(self.cur); self.cur = None
 
 
+SECRET_FLAGS = ("--password", "--pass", "--token", "--secret", "--api-key", "--cookie")
+
+
+def redact(argv):
+    """argv with the value of every credential-style flag replaced, so no secret reaches disk."""
+    out, hide = [], False
+    for x in argv:
+        if hide:
+            out.append("REDACTED"); hide = False
+        elif x in SECRET_FLAGS:
+            out.append(x); hide = True
+        elif x.split("=", 1)[0] in SECRET_FLAGS and "=" in x:
+            out.append(x.split("=", 1)[0] + "=REDACTED")
+        else:
+            out.append(x)
+    return out
+
+
+def check_login_status(status, a):
+    """A failed login still answers with a pre-login session cookie, which would be saved as valid."""
+    if not 200 <= status < 300 and status not in a.allow_login_status:
+        sys.exit(f"auth_login: login answered HTTP {status}, treating it as failed (wrong creds?). "
+                 "If this target legitimately returns that status on success (e.g. a 302 redirect), "
+                 f"re-run with --allow-login-status {status}")
+
+
 def opener(jar):
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
@@ -78,8 +105,12 @@ def login_json(a, jar):
     body = {a.user_field: a.user, a.pass_field: a.password, **json.loads(a.extra or "{}")}
     req = urllib.request.Request(urllib.parse.urljoin(a.base, a.login_url), json.dumps(body).encode(),
                                  {"Content-Type": "application/json", "Accept": "application/json"})
-    with opener(jar).open(req, timeout=20) as r:
-        raw = r.read()
+    try:
+        with opener(jar).open(req, timeout=20) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    check_login_status(status, a)
     try:
         return find_token(json.loads(raw), a.token_path)
     except ValueError:
@@ -100,8 +131,13 @@ def login_form(a, jar):
     fields[form["password"] if a.pass_field == "password" else a.pass_field] = a.password
     fields.update(json.loads(a.extra or "{}"))
     data = urllib.parse.urlencode(fields).encode()
-    with op.open(urllib.request.Request(urllib.parse.urljoin(page, form["action"] or page), data), timeout=20):
-        pass
+    try:
+        with op.open(urllib.request.Request(urllib.parse.urljoin(page, form["action"] or page), data),
+                     timeout=20) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    check_login_status(status, a)
     return None
 
 
@@ -186,6 +222,8 @@ def parse(argv):
     ap.add_argument("--user-selector", default="input[type=email], input[name*=user i], input[type=text]")
     ap.add_argument("--pass-selector", default="input[type=password]")
     ap.add_argument("--submit-selector", default="button[type=submit], input[type=submit], form button")
+    ap.add_argument("--allow-login-status", type=int, action="append", default=[],
+                    help="HTTP status of the login response to accept as success besides 2xx, repeatable")
     ap.add_argument("--out", required=True, help="sessions dir, e.g. engagements/<dir>/sessions")
     return ap.parse_args(argv)
 
@@ -209,7 +247,7 @@ def main(argv=None):
                              for k, _, v in (p.partition("=") for p in (a.cookie or "").split(";") if "=" in p)],
                  "origins": []}
     write_outputs(a, out, token, state or jar_state(jar))
-    (out / f"{a.role}.login.json").write_text(json.dumps(argv))  # contains lab creds; engagements/ is git-ignored
+    (out / f"{a.role}.login.json").write_text(json.dumps(redact(argv)))
     return 0
 
 
