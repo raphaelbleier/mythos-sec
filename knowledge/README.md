@@ -38,6 +38,8 @@ Cross-cutting methodology used by the `cve-deep-dive` skill and by the web notes
 - [Auth matrix](techniques/auth-matrix.md) - read before authorization testing: tenants x roles x objects x actions, filled from `scripts/probe`, OpenAPI, GraphQL, HAR and WebSocket.
 - [State-machine abuse](techniques/state-machine-abuse.md) - read for any multi-step flow: skip, repeat, reorder, replay, tamper, parallel.
 
+Read [`techniques/source-to-sink.md`](techniques/source-to-sink.md) when the engagement has the source as well as the target: how to trace a request-derived value to a sink by hand when `scripts/sourcemap` reports low confidence, and how to turn a source hypothesis into a live probe. A line of code is never a finding.
+
 ## cve/
 
 `cve/` is not a playbook. It holds the committed CVE snapshot that

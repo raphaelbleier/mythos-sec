@@ -158,6 +158,19 @@ Count the surface after Step 1 and pick the path:
 Do not run a phase whose output you cannot use. Broad recon on a four-page app
 is wasted budget; the same minutes spent on targeted probes find the bug.
 
+## Step 1.5 — source review (only when `scope.yaml` names a `source:` path)
+
+With the source available, follow the **`source-review` skill** and delegate to
+**mythos-source**: `scripts/sourcemap <path> --probe engagements/<dir>/surface.json`
+lists routes, state-changing routes with no guard, sinks, and the routes the
+probe never reached. That last set is the valuable one, because it is untested
+by construction.
+
+Everything it returns is a hypothesis. A line of code is not a finding: a
+source-derived candidate enters at `candidate` and reaches `validated` only
+through a live request with its oracle and negative control, exactly like a
+black-box one. Without a `source:` path, skip this step and say nothing about it.
+
 ## Step 2 — recon (large surface only)
 
 Delegate to **mythos-recon** (follows the `recon` skill). It fingerprints the

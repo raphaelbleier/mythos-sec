@@ -4,7 +4,7 @@ Mythos is a skill-driven web red-team / bug-bounty framework for **authorized**
 testing only (bug-bounty programs in scope, systems the user owns or may test,
 lab targets). The agent host's model is the agent: there is no separate engine
 and no external API key. Mythos supplies the methodology (skills), the
-orchestration (one orchestrator, six sub-agents), a Kali tool belt in Docker,
+orchestration (one orchestrator, seven sub-agents), a Kali tool belt in Docker,
 a knowledge base and a scope guard.
 
 Supported hosts: **OpenCode first** (1.x >= 1.18.29 and 2.x), Claude Code
@@ -108,11 +108,13 @@ models without them did not. So reach for these before writing a paragraph.
 | Script | What it is for |
 |---|---|
 | `scripts/probe` | map the surface, GET only except the GraphQL introspection POST |
+| `scripts/sourcemap` | routes, missing guards and sinks from a source tree, correlated with the probe's surface. Grey-box only, and its output is a hypothesis list |
 | `scripts/verify` | re-send one aim point and judge it against an oracle |
 | `scripts/cvefeed` | KEV, EPSS, NVD, nuclei templates, GHSA and OSV, ranked for this stack |
 | `scripts/coverage` | which mapped paths the report still does not account for |
 | `scripts/findings` | `findings.json` and SARIF, CVSS computed from the vector, dedup, redaction, `--diff` for retest |
 | `scripts/lessons` | class priors from past engagements; see its own caveat, it is an untested hypothesis |
+| `scripts/watch` | what changed on a tested target since last time, and what that makes worth re-testing |
 
 Every one of them has a `--selftest`. Run it after changing one.
 

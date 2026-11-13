@@ -3,7 +3,7 @@
 Mythos is a skill-driven framework, not a standalone agent runtime and not a
 Python engine. **The agent host is the agent loop**: OpenCode first (1.x >=
 1.18.29 and 2.x), Claude Code second. Mythos supplies the methodology
-(skills), the orchestration (one orchestrator, six sub-agents), a Kali tool belt
+(skills), the orchestration (one orchestrator, seven sub-agents), a Kali tool belt
 (Docker), a scope guard, and a knowledge base. There is no external API key of
 its own and no second LLM; the host's configured model is the model. On
 OpenCode, `models.json` may give each agent a different model from that host, so

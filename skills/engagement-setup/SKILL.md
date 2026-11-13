@@ -34,6 +34,7 @@ is the authorization boundary; nothing runs until it is written down.
      allow_publish: false # never publish a package to a public registry
      allow_claim_resources: false # never claim a dangling subdomain or bucket
      allow_secret_verification: false # never use a credential you found
+   source: "" # optional: path to a source tree the program authorized you to read
    identities: [] # optional: two accounts for BOLA/IDOR testing
    notes: "" # paste the program's testing rules verbatim
    ```
@@ -62,6 +63,10 @@ is the authorization boundary; nothing runs until it is written down.
      package to a public registry (dependency-confusion testing), claiming a
      dangling subdomain or bucket, and using a credential you discovered.
      Each of those affects a third party, not just the target.
+   - `source`: a local path, only when the program or client gave you the code. Having
+     the source does not widen the scope: the live target is still bounded by
+     `in_scope`, and reading a repository you were not given is out of scope. Leave it
+     empty for a black-box engagement.
    - `notes`: paste the program's testing rules (e.g. "no DoS, no automated
      testing of the login form, no social engineering").
 
