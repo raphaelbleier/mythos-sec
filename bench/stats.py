@@ -175,6 +175,148 @@ def compare(rows, a, b):
     return "\n".join(out)
 
 
+def paired_by_vuln(arms):
+    """Pair on the documented vulnerability instead of the target.
+
+    The sweeps so far paired per target, which gave four units and could not
+    reject anything: with 26 paired challenges the smallest detectable
+    difference is 0.293, against a scaffold effect the literature puts at 5 to
+    10 points. Pairing on each ground-truth entry instead takes the same runs
+    from 4 units to the 131 entries the four targets document, which is the
+    first design in this project that reaches into the range where the effect
+    could show.
+
+    `arms` maps an arm name to a list of triage documents (one per run). An
+    entry counts as found for an arm when any of that arm's runs found it, so
+    repeats raise sensitivity rather than splitting the unit. That is a
+    deliberate choice and it inflates both arms equally; the alternative,
+    requiring every run to find it, is stricter and is reported alongside.
+    """
+    names = sorted(arms)
+    if len(names) != 2:
+        raise ValueError("paired_by_vuln compares exactly two arms")
+    a, b = names
+
+    def index(docs, mode):
+        """entry id -> found, per target, from the triage `truth` rows."""
+        hits, seen = {}, {}
+        for doc in docs:
+            target = doc.get("target") or doc.get("target_id") or "?"
+            for row in doc.get("truth", []):
+                eid = row.get("id")
+                if not eid or not row.get("scored", True):
+                    continue
+                key = (target, eid)
+                found = str(row.get("status", "")).lower() == "found"
+                seen[key] = seen.get(key, 0) + 1
+                if mode == "any":
+                    hits[key] = hits.get(key, False) or found
+                else:
+                    hits[key] = found if key not in hits else (hits[key] and found)
+        return hits, seen
+
+    out = {}
+    for mode in ("any", "all"):
+        ha, sa = index(arms[a], mode)
+        hb, sb = index(arms[b], mode)
+        shared = sorted(set(ha) & set(hb))
+        both = sum(ha[k] and hb[k] for k in shared)
+        only_a = sum(ha[k] and not hb[k] for k in shared)
+        only_b = sum(hb[k] and not ha[k] for k in shared)
+        neither = len(shared) - both - only_a - only_b
+        out[mode] = {
+            "arms": [a, b], "pairs": len(shared), "both": both,
+            "only_" + a: only_a, "only_" + b: only_b, "neither": neither,
+            "discordant": only_a + only_b,
+            "p_mcnemar_exact": mcnemar(only_a, only_b),
+            "recall_" + a: (both + only_a) / len(shared) if shared else 0.0,
+            "recall_" + b: (both + only_b) / len(shared) if shared else 0.0,
+            "mdd": mdd(len(shared)) if shared else None,
+            "need_discordant": mde_discordant(len(shared)),
+            "targets": sorted({t for t, _ in shared}),
+            "per_target": {t: sum(1 for tt, _ in shared if tt == t)
+                           for t in sorted({t for t, _ in shared})},
+            "_pairs": shared, "_a": ha, "_b": hb,
+        }
+    return out
+
+
+def cluster_bootstrap(cell, iters=10000, seed=20261114):
+    """A confidence interval for the recall difference, resampling TARGETS.
+
+    Entries within one target are not independent: one missed authentication
+    bug can hide a dozen of them, and an arm that never reaches a surface
+    misses every entry behind it at once. Resampling entries would treat those
+    as independent observations and give an interval that is too narrow. So the
+    resampling unit is the target, which is also why four targets is the real
+    limit on this design and why the interval below is wide.
+    """
+    import random
+    rng = random.Random(seed)
+    pairs, ha, hb = cell["_pairs"], cell["_a"], cell["_b"]
+    by_target = defaultdict(list)
+    for key in pairs:
+        by_target[key[0]].append(key)
+    targets = sorted(by_target)
+    if len(targets) < 2:
+        return None
+    diffs = []
+    for _ in range(iters):
+        drawn = [by_target[rng.choice(targets)] for _ in targets]
+        keys = [k for group in drawn for k in group]
+        if not keys:
+            continue
+        ra = sum(ha[k] for k in keys) / len(keys)
+        rb = sum(hb[k] for k in keys) / len(keys)
+        diffs.append(ra - rb)
+    diffs.sort()
+    lo = diffs[int(0.025 * len(diffs))]
+    hi = diffs[min(len(diffs) - 1, int(0.975 * len(diffs)))]
+    return {"lo": lo, "hi": hi, "clusters": len(targets), "iters": len(diffs)}
+
+
+def vuln_table(result):
+    """Render both the any-run and every-run reading, with the arithmetic."""
+    lines = []
+    for mode, label in (("any", "found in any run"), ("all", "found in every run")):
+        c = result[mode]
+        a, b = c["arms"]
+        ci = cluster_bootstrap(c)
+        lines += [f"### paired on the documented vulnerability, {label}", "",
+                  f"| pairs | both | only {a} | only {b} | neither | discordant | "
+                  f"recall {a} | recall {b} | McNemar exact p |",
+                  "|---|---|---|---|---|---|---|---|---|",
+                  f"| {c['pairs']} | {c['both']} | {c['only_' + a]} | {c['only_' + b]} | "
+                  f"{c['neither']} | {c['discordant']} | {c['recall_' + a]:.2f} | "
+                  f"{c['recall_' + b]:.2f} | {c['p_mcnemar_exact']:.4f} |", ""]
+        if c["pairs"]:
+            lines.append("Entries per target: " + ", ".join(
+                f"{t} {n}" for t, n in c["per_target"].items()) + ".")
+        if c["need_discordant"] is None:
+            lines.append(f"No number of discordant pairs reaches p < 0.05 with "
+                         f"{c['pairs']} pairs.")
+        else:
+            lines.append(f"The test needs {c['need_discordant']} discordant pairs in one "
+                         f"direction to reach p < 0.05. Observed: {c['discordant']}.")
+        if c["mdd"] is not None:
+            lines.append(f"Smallest true difference detectable at 80% power with "
+                         f"{c['pairs']} pairs and a discordance rate of 0.3: "
+                         f"{c['mdd']:.2f}, i.e. {c['mdd'] * 100:.0f} percentage points.")
+        if ci:
+            lines.append(f"Recall difference ({a} minus {b}), 95% bootstrap interval "
+                         f"resampling {ci['clusters']} targets: "
+                         f"[{ci['lo']:+.3f}, {ci['hi']:+.3f}]. The clusters are targets, "
+                         f"not entries, because entries behind one unreached surface fail "
+                         f"together. With {ci['clusters']} clusters this interval is wide "
+                         f"and that is the honest width, not a defect of the method.")
+        else:
+            lines.append("No clustered interval: fewer than two targets in this comparison, "
+                         "so there is nothing to resample. The McNemar p above treats "
+                         "entries as independent, which they are not.")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _selftest():
     lo, hi = wilson(5, 10)
     assert abs(lo - 0.2366) < 1e-3 and abs(hi - 0.7634) < 1e-3
@@ -208,14 +350,79 @@ def _selftest():
     print("stats selftest ok")
 
 
+def _selftest_vuln():
+    """The paired-by-vulnerability path, on hand-built triage documents."""
+    def doc(target, found, missed, scored=True):
+        return {"target": target,
+                "truth": [{"id": i, "status": "found", "scored": scored} for i in found]
+                         + [{"id": i, "status": "missed", "scored": scored} for i in missed]}
+
+    # one target, gate finds two the control misses, control finds one back
+    res = paired_by_vuln({"gate_on": [doc("vb", ["a", "b", "c"], ["d"])],
+                          "gate_off": [doc("vb", ["a", "d"], ["b", "c"])]})
+    any_cell = res["any"]
+    assert any_cell["pairs"] == 4, any_cell["pairs"]
+    assert any_cell["both"] == 1 and any_cell["only_gate_on"] == 2, any_cell
+    assert any_cell["only_gate_off"] == 1 and any_cell["neither"] == 0, any_cell
+    assert any_cell["discordant"] == 3
+    assert abs(any_cell["recall_gate_on"] - 0.75) < 1e-9
+
+    # repeats: "any" is more generous than "all", by construction
+    two = paired_by_vuln({
+        "gate_on": [doc("vb", ["a"], ["b"]), doc("vb", ["b"], ["a"])],
+        "gate_off": [doc("vb", [], ["a", "b"]), doc("vb", [], ["a", "b"])]})
+    assert two["any"]["recall_gate_on"] == 1.0, two["any"]
+    assert two["all"]["recall_gate_on"] == 0.0, two["all"]
+
+    # unscored entries never become pairs
+    skip = paired_by_vuln({"gate_on": [doc("vb", ["a"], [], scored=False)],
+                           "gate_off": [doc("vb", ["a"], [], scored=False)]})
+    assert skip["any"]["pairs"] == 0
+
+    # the same id in two targets is two units, and the interval resamples targets
+    multi = paired_by_vuln({
+        "gate_on": [doc("vb", ["x"], []), doc("dvga", ["x"], [])],
+        "gate_off": [doc("vb", [], ["x"]), doc("dvga", [], ["x"])]})
+    assert multi["any"]["pairs"] == 2, multi["any"]["pairs"]
+    ci = cluster_bootstrap(multi["any"], iters=500)
+    # The arms are ordered by name, so the difference is the first minus the
+    # second. Here that is gate_off minus gate_on, which is -1.0, and the
+    # interval has to contain the difference that was actually observed.
+    cell = multi["any"]
+    first, second = cell["arms"]
+    observed = cell["recall_" + first] - cell["recall_" + second]
+    assert observed == -1.0, observed
+    assert ci and ci["clusters"] == 2 and ci["lo"] <= observed <= ci["hi"], (ci, observed)
+    assert cluster_bootstrap(res["any"], iters=100) is None  # one target, no clusters
+
+    # the table renders without the private keys leaking into it
+    text = vuln_table(res)
+    assert "_pairs" not in text and "McNemar exact p" in text
+    assert "paired on the documented vulnerability" in text
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("results", nargs="?", help="results.jsonl")
     ap.add_argument("--compare", help="A,B: paired McNemar between two frameworks")
+    ap.add_argument("--vuln", nargs="+", metavar="ARM=TRIAGE.JSON",
+                    help="pair on each documented vulnerability instead of on the "
+                         "target: ARM=path, repeatable, exactly two arm names. "
+                         "This is the design that reaches a detectable sample size.")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         return _selftest()
+    if a.vuln:
+        arms = defaultdict(list)
+        for spec in a.vuln:
+            if "=" not in spec:
+                ap.error(f"--vuln takes ARM=path, got {spec!r}")
+            arm, _, path = spec.partition("=")
+            arms[arm].append(json.loads(open(path).read()))
+        print(vuln_table(paired_by_vuln(dict(arms))))
+        return 0
     if not a.results:
         ap.error("results.jsonl required")
     rows = [json.loads(l) for l in open(a.results) if l.strip()]
