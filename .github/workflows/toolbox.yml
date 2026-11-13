@@ -2,15 +2,83 @@ name: toolbox
 on:
   push:
     tags: ['v*']
+  # Build only (no push, no signing): a Dockerfile change that breaks the build
+  # must show up in the PR, not on the next release.
+  pull_request:
+    paths:
+      - 'toolbox/**'
+      - '.github/workflows/toolbox.yml'
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   IMAGE: ghcr.io/raphaelbleier/mythos-toolbox
 
 jobs:
+  pr-build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: toolbox/Dockerfile
+          platforms: linux/amd64
+          push: false
+          # Read-only: a PR must not write into the cache that release builds read.
+          cache-from: type=gha,scope=amd64
+
+  # The weekly rebuild publishes without a human looking at it, so the candidate
+  # image has to pass the self-test first. Built here, loaded into the local daemon
+  # and tested via MYTHOS_IMAGE; a failure blocks `build` and therefore the push.
+  selftest:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: toolbox/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: mythos-toolbox:candidate
+          cache-from: type=gha,scope=amd64
+      - name: self-test the candidate image
+        env:
+          MYTHOS_IMAGE: mythos-toolbox:candidate
+        run: scripts/selftest.sh
+
   build:
+    # Runs for tags and dispatch (selftest skipped) and for the schedule once the
+    # self-test passed; !failure() lets a skipped selftest through.
+    if: ${{ !cancelled() && !failure() && github.event_name != 'pull_request' }}
+    needs: selftest
     strategy:
       fail-fast: false   # an amd64 failure must not cancel the arm64 build
       matrix:
@@ -20,9 +88,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write
+      packages: write   # push the per-arch image by digest to GHCR
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # The Kali image plus the Go toolchain overrun a stock runner's ~14 GB of
       # free disk. Reclaim the preinstalled SDKs we never use.
       - name: free disk
@@ -30,14 +100,14 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: toolbox/Dockerfile
@@ -53,7 +123,7 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ matrix.pair }}
           path: /tmp/digests/*
@@ -64,22 +134,22 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: write
-      id-token: write
+      packages: write   # push the merged manifest list tags to GHCR
+      id-token: write   # keyless cosign signing via the workflow's OIDC identity
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -93,8 +163,12 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${IMAGE}@sha256:%s " *)
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       - name: sign (keyless)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')
           cosign sign --yes "${IMAGE}@${DIGEST}"
+          # scripts/mythos pins this digest; a release updates toolbox/IMAGE_DIGEST with it.
+          echo "toolbox/IMAGE_DIGEST: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Digest and tag bumps for everything pinned by SHA or digest. The 7-day cooldown
+  # keeps a freshly compromised release (tj-actions style) from being proposed at once.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker
+    directories:
+      - /toolbox
+      - /lab/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker-compose
+    directory: /lab
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: pip
+    directories:
+      - /toolbox
+      - /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
