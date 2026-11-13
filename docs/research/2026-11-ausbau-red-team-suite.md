@@ -1,5 +1,11 @@
 # Mythos wird zur benchmark-validierten Red-Team-Suite
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+> The notes in this file are in German.
+
 **Kernaussage:** mythos-sec trägt als öffentliche Red-Team-Suite und als Paper-Thema, wenn der Beitrag nicht "noch ein Agent mit 96 %" lautet, sondern ein **fair kontrollierter, reproduzierbarer Vergleich bei identischem Modell** samt einer Fähigkeitslücke, die die Konkurrenz nicht schließt: Multi-Account-Auth, Business-Logic (BOLA, Mass Assignment, Race) und Stored XSS mit OAST. Die Recherche zeigt drei Dinge. Erstens sind alle veröffentlichten XBOW-Zahlen (Strix 100/104, Shannon 100/104, PentestGPT 90/104) selbstberichtet, nicht unabhängig repliziert und methodisch nicht vergleichbar; XBOW nennt das Set selbst veraltet und gesättigt ([XBOW validation-benchmarks](https://github.com/xbow-engineering/validation-benchmarks)). Zweitens gibt es für Multi-Account-BOLA, Admin-Bot-XSS und Races bei keinem der gesichteten Frameworks eine dokumentierte First-Class-Methode, und explizite Closure-States samt Coverage-Matrix hat die Community nicht veröffentlicht; das ist die Differenzierung. Drittens wird der Fairness-Anspruch "gleiches Modell für alle" durch zwei Fakten eingeschränkt: Der autonome PentestGPT-v1.0-Modus läuft nur über Claude Code oder Codex, und CAI ist seit dem 28.08.2026 archiviert. Empfohlen wird ein OpenCode-first Repo mit einer kanonischen Quelle und generierten Claude-Artefakten, ein schlankes eigenes Kali-Image auf GHCR, ein gestuftes Benchmark-Programm (Sanity, Hauptvergleich, Fähigkeitsziele) auf bezahlten Billigmodellen statt Free-Tier, und eine Roadmap in sechs Phasen, in der die Benchmark-Harness vor den Capability-Erweiterungen steht, damit jede Erweiterung messbar ist.
 
 ## Die Konkurrenzzahlen sind schwach, die Lücke ist real

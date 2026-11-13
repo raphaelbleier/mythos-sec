@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/assets/logo.svg" alt="Mythos" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" alt="Mythos" width="420">
+  </picture>
 </p>
 
 <p align="center">
@@ -19,11 +22,39 @@
   <a href="#responsible-use">Responsible use</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/raphaelbleier/mythos-sec/actions/workflows/check.yml"><img src="https://github.com/raphaelbleier/mythos-sec/actions/workflows/check.yml/badge.svg" alt="check"></a>
+  <a href="https://github.com/raphaelbleier/mythos-sec/actions/workflows/toolbox.yml"><img src="https://github.com/raphaelbleier/mythos-sec/actions/workflows/toolbox.yml/badge.svg" alt="toolbox image"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f0a52a" alt="MIT"></a>
+</p>
+
 ---
 
 > **For authorized testing only** — bug-bounty programs in scope, systems you
 > own, or lab targets. Scope is a hard boundary, stated up front and watched by a
 > hook. Never point it at a host you are not permitted to test.
+
+## Results at a glance
+
+On single-flag CTF challenges the scaffolding adds nothing this evaluation can
+measure. Across every XBOW sweep the Mythos arm ties with a bare model that has a
+shell: 85% against 90% on 40 challenges, paired p = 1.0. That is a null result and
+it is reported as one.
+
+On a broad target it does separate, but only once a coverage gate forces the agent
+to account for every mapped path before it stops. Against Vuln Bank's 76 documented
+vulnerabilities, Mythos with the gate finds 34 and 33 where the control finds 30 and
+29. The gate costs roughly twice the tool calls and twice the money. Precision stays
+at 1.00 in every arm, because a finding is either proven with a canary or reported
+as unconfirmed.
+
+The scope guard is a safety net, not a sandbox. In its default `warn` mode it reports
+an out-of-scope request after the request has already gone out. Set
+`MYTHOS_SCOPE_ENFORCE=ask` when a single such request is unacceptable.
+
+Full tables, parameters and what the numbers do not cover: [Benchmarks](#benchmarks),
+[`docs/poster/poster.md`](docs/poster/poster.md),
+[`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
 
 ## What it is
 
@@ -318,9 +349,16 @@ scripts/           mythos (toolbox shim) · probe (surface map) · verify (canar
                    · selftest.sh · build-hosts.py
 knowledge/         per-class confirmation playbooks + CVE technique notes
 docs/              architecture, research, plan, poster/benchmark evidence
+CONTRIBUTING.md    how to change the canonical files and run the self-test
+SECURITY.md        how to report a vulnerability in Mythos itself
 ```
 
 ## License
 
 MIT. See `LICENSE`. Built by raphaelbleier for Security Engineering research
 into AI pentest agents.
+
+Pull requests are welcome; read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, since
+the files in `agents/` and `commands/` are generated and must not be hand-edited.
+To report a vulnerability in Mythos itself, follow
+[`SECURITY.md`](SECURITY.md).

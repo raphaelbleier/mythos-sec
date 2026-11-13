@@ -1,5 +1,10 @@
 # Auth and business-logic automation for an LLM pentest agent (Kali container)
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 Note on method: ~28 fetches/searches. Findings below are only what fetched pages stated. Items I know from general tool knowledge but could not verify in this session are listed under Gaps or flagged "unverified" in Inferences. Repos seen: usestrix/strix, KeygraphHQ/shannon, aliasrobotics/cai.
 
 ## 1. Auth flows: login, session capture, reuse across CLI tools, two accounts

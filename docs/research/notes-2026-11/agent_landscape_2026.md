@@ -1,5 +1,10 @@
 # AI-driven web pentest / red-team agents: landscape as of November 2026
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 Scope note: ~17 tool calls; mostly READMEs (fetched via summarizer, so wording is paraphrase) plus secondary blogs. Many headline numbers are vendor/maintainer-reported. Dates marked where known. Model names (GLM-5.3, DeepSeek V4, Kimi K3.1, Opus 5.5, GPT-6.1, Gemini 4) are as listed in the READMEs fetched.
 
 ## Q1. Which frameworks are actively maintained in 2026 and what are their headline results on XBOW validation-benchmarks or similar?

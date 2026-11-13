@@ -1,5 +1,10 @@
 # Packaging and distributing a Kali-based toolbox container for a pentest agent (status Nov 2026)
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 Method note: ~20 tool calls. Many doc pages did not contain the details asked for (marked in Gaps). Snippets under "Inferences" are my own design recommendations built on the cited facts, not copied from a source, and are untested.
 
 ## 1. Image build (base, multi-arch, size, pinning, browser, non-root)

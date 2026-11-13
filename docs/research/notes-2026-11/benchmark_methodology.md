@@ -1,5 +1,10 @@
 # Benchmark methodology for AI web-pentest agents (status Nov 2026)
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 ## 1. XBOW validation-benchmarks: structure, scoring, published rates, pitfalls, license
 
 ### Takeaway
@@ -77,7 +82,7 @@ Published comparisons mostly use flag-capture solve rate from single runs with v
 
 ### Gaps
 - No primary-source paper found that reports pass@k with CIs on XBOW; the protocol above is a synthesis.
-- Mako paper (arXiv 2607.11288) methodology could not be read (PDF unparseable by fetch); saved at `/home/bleier/.claude/projects/-home-bleier-Documents-Programming-mythos-sec/c5dd8a1f-d2ba-46dd-a24f-4dd82dc73542/tool-results/webfetch-1793796342182-ugngzm.pdf` for local extraction.
+- Mako paper (arXiv 2607.11288) methodology could not be read (PDF unparseable by fetch); a local copy was kept for offline extraction.
 
 ## 4. Practical rig: N frameworks x M challenges on 31 GB / 16 cores
 

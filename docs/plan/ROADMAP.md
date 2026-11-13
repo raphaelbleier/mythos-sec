@@ -1,5 +1,10 @@
 # Mythos Roadmap
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 Status of the skill-driven Mythos framework. The agent host (OpenCode first,
 Claude Code second) is the agent; phase skills are the playbooks; real security
 tools run in the Kali toolbox. No Python engine, no external API key of its own.

@@ -1,5 +1,10 @@
 # Mythos Agent v2 — Architecture (SUPERSEDED)
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 > **Historical.** This documents the earlier standalone Python agent runtime
 > (`mythos_agent`) and the scope-aware engine, both since removed. Mythos is now
 > skill-driven: Claude Code is the agent and runs real tools in the Kali toolbox.

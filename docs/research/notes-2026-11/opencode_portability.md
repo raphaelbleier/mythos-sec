@@ -1,5 +1,10 @@
 # OpenCode-first portability of a Claude Code plugin agent framework (state: 2026-11-04)
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 IMPORTANT VERSION CORRECTION: the brief assumed "OpenCode 1.18.x". The GitHub releases show the 1.x line ended at v1.19.5 (2026-10-28) and OpenCode 2 is released (latest v2.2.5, 2026-10-30; v2.2.0 exists). OpenCode 1.18.x ran roughly 2026-08-24 to 2026-10-06 (v1.18.22 to v1.18.35). So "OpenCode" is now two live generations. Config files, agents, commands and skills are cross-compatible; the PLUGIN API is not. This drives the whole design. Source: [GitHub releases](https://github.com/anomalyco/opencode/releases) (queried via `gh api repos/anomalyco/opencode/releases`). Repo is `anomalyco/opencode` (formerly sst/opencode).
 
 Docs caveat: opencode.ai/docs (fetched) documents V1 (text says "In OpenCode 1 ..."); V2 docs live in the repo at `services/www/src/docs/content/*.mdx` and at v2.opencode.ai. Both are cited below and labelled V1/V2.

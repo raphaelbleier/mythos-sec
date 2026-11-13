@@ -1,5 +1,10 @@
 # Prior-art analysis: CAI, Strix, HexStrike, PentestGPT
 
+> **Working notes, not documentation.** This file belongs to the research
+> trail behind Mythos. It records what was true when it was written and is not
+> kept in sync with the code. For maintained documentation see `README.md`,
+> `AGENTS.md` and `docs/architecture.md`.
+
 Source analysis of four AI-driven offensive-security frameworks, read from their
 repositories in October 2026. These shaped the Mythos design. Each section
 states what the project does and what Mythos takes from it.
