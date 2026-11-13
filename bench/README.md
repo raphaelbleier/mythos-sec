@@ -139,7 +139,7 @@ scores, tokens, times, `trace_sha256`). Compose state lives in `OUT/.targets/<pr
 ## apt_fix
 
 Many upstream Dockerfiles no longer build unpatched (the partial local pre-check
-`build_results.tsv`, 85 of 104, has 49 fail; a secondary report claims 39 of 104): Debian buster/stretch/jessie left
+`bench/data/xben-build-raw-20261104.tsv`: 43 of 104 ok, 61 fail): Debian buster/stretch/jessie left
 `deb.debian.org`, and `bullseye-security` lost packages. `xben.py` injects a `RUN` after every
 `FROM` (via `dockerfile_inline`, the checkout stays untouched) that points those releases at
 `archive.debian.org`. This changes the build, not the vulnerable app; it is on by default,

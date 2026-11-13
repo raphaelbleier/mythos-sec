@@ -6,6 +6,7 @@
     "name": "Raphael Bleier"
   },
   "license": "MIT",
+  "icon": "./docs/assets/mark.png",
   "keywords": [
     "security",
     "pentest",

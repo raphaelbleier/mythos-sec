@@ -2,9 +2,9 @@
 
 ## Reporting a vulnerability in Mythos itself
 
-Use GitHub's private vulnerability reporting: open the
-[Security tab](https://github.com/raphaelbleier/mythos-sec/security/advisories)
-and choose "Report a vulnerability". The report stays private until a fix is
+Use GitHub's private vulnerability reporting:
+[report a vulnerability](https://github.com/raphaelbleier/mythos-sec/security/advisories/new).
+It is enabled on this repository. The report stays private until a fix is
 published. Please do not open a public issue for it.
 
 What is useful in a report: the version or commit, what an attacker can do, and

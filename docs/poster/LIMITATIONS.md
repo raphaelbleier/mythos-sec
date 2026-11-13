@@ -36,7 +36,7 @@ as such.
   ($20.88 vs $8.63, 928 vs 390 calls). With both arms at 0.85-0.90 and three
   to five unsolved cells each, this sample has almost no headroom left in which
   a difference could appear.
-- **Measured, and the result is a null.** Five sweeps are in: 40 challenges on
+- **Measured, and the result is a null.** Eight sweeps are in (A to H below): 40 challenges on
   Claude Sonnet (twice, before and after the plugin fix), 12 on GLM 5.3, a
   rerun of the challenges both arms had failed, and VAmPI recall. The mythos
   arm never separates from the bare-model control (0.85 vs 0.90, 1.00 vs 1.00,

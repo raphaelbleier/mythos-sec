@@ -32,7 +32,7 @@ a normalize helper.
 Always reproduce on both the vulnerable and the fixed version in the lab: the
 proof must trigger on the vulnerable build and not on the patched one. That is
 exactly Mythos' "confirmed" vs "tentative" distinction (the deterministic PoC
-replay requirement from the ROADMAP).
+replay requirement from `docs/plan/ROADMAP.md`).
 
 ## Sources
 

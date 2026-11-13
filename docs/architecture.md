@@ -49,7 +49,8 @@ generates `CLAUDE.md`, `agents/` and `commands/` for Claude Code
   - `auth-session`, `business-logic`, `stored-xss-oast`, `deep-server`:
     capability skills for multi-account auth, BOLA / mass assignment / races,
     stored XSS with an out-of-band catcher, and server-side classes. Their
-    measured effect is not yet established (see ROADMAP, phases 3 and 5).
+    measured effect is not yet established (see
+    [`docs/plan/ROADMAP.md`](plan/ROADMAP.md), phases 3 and 5).
   - `exploit`: minimal, non-destructive proof of concept, with closure states.
   - `report`: bug-bounty-format deliverable; findings carry a closure state.
   - `toolbox`: how to run tools in the Kali container.
@@ -114,5 +115,8 @@ Scope is the authorization boundary and rests on two things:
 - A new technique is a few lines in a skill, not a code change.
 - Reasoning (filter evasion, chaining, triage) is the model's job. Whether the
   skills add measurable value over the bare model is exactly what `bench/`
-  tests with a bare-model control arm; results are pending (see
-  `docs/poster/poster.md`).
+  tests with a bare-model control arm. The results are in: a null on flag-capture
+  challenges and one separation on Vuln Bank with the coverage gate, which the
+  same gate reversed on DVGA. See the Benchmarks section of `README.md`,
+  [`../docs/poster/poster.md`](poster/poster.md) (German) and
+  [`poster/LIMITATIONS.md`](poster/LIMITATIONS.md).
