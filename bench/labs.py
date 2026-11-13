@@ -392,14 +392,32 @@ def tally(target, rundir, rater=None):
     c["rater"] = t.get("rater", "?")
     unset = sum(1 for r in t["reported"] if r.get("status") not in REPORTED_STATUSES)
     found_ids = {r["id"] for r in t["truth"] if r.get("status") == "found"}
-    mapped = {r.get("maps_to") for r in t["reported"] if r.get("status") == "tp" and r.get("maps_to")}
+    # One request can prove two documented entries, and the rubric tells the
+    # rater to record that as one row. So maps_to takes an id, a list, or a
+    # comma-separated string. Refusing precision because the rater followed the
+    # rubric is the harness contradicting its own rule.
+    mapped = set()
+    for r in t["reported"]:
+        if r.get("status") != "tp":
+            continue
+        raw = r.get("maps_to") or ""
+        if isinstance(raw, (list, tuple)):
+            mapped.update(str(x).strip() for x in raw if str(x).strip())
+        else:
+            mapped.update(x.strip() for x in str(raw).split(",") if x.strip())
+    # A tp pointing at an entry the rater did not mark found is a contradiction
+    # inside one triage, so precision is refused. The reverse is not: an entry
+    # can be demonstrated inside another section of a report without getting a
+    # heading of its own, and recall is computed from the truth rows while
+    # precision is computed from the reported rows. Refusing precision because a
+    # found entry has no heading conflated the two measures and rejected a
+    # triage that had followed the rubric exactly.
     c["precision_refused"] = (
         f"{unset} reported finding(s) unclassified" if unset else
         "no reported findings recorded" if not t["reported"] else
         f"tp rows map to {sorted(mapped - found_ids)}, which are not marked found"
-        if mapped - found_ids else
-        f"found entries {sorted(found_ids - mapped)} have no tp row mapping to them"
-        if found_ids - mapped else "")
+        if mapped - found_ids else "")
+    c["found_without_reported_row"] = sorted(found_ids - mapped)
     return c
 
 
@@ -413,7 +431,7 @@ def row(name, c):
             f"{c['scored']} | {rec} | {c['tp']} | {c['fp']} | {c['duplicate']} | {prec} |")
 
 
-def table(target, rundirs, rater=None):
+def table(target, rundirs, rater=None, unseal_labels=False):
     lines = ["| run | rater | found | missed | pending | scored | recall | tp | fp | dup | precision |",
              "|---|---|---|---|---|---|---|---|---|---|---|"]
     tot = {k: 0 for k in TRUTH_STATUSES + REPORTED_STATUSES + ("pending", "scored", "reported")}
@@ -424,7 +442,7 @@ def table(target, rundirs, rater=None):
         for k in tot:
             if isinstance(tot[k], int):
                 tot[k] += c.get(k, 0) or 0
-        label, _ = unseal(d)
+        label, _ = (unseal(d) if unseal_labels else (Path(d).name, None))
         lines.append(row(label, c))
         if c.get("precision_refused"):
             refused.append(f"{label}: {c['precision_refused']}")
@@ -457,7 +475,7 @@ def agreement(target, rundir):
 
 def cmd_stats(a):
     print(f"## {a.target}: recall = found / scored, precision = tp / (tp + fp)\n")
-    t, refused = table(a.target, a.rundirs, a.rater)
+    t, refused = table(a.target, a.rundirs, a.rater, a.unseal)
     print(t)
     print("\n`recall` with a `+` is a lower bound: triage unfinished.")
     if refused:
@@ -470,7 +488,8 @@ def cmd_stats(a):
     for d in a.rundirs:
         ag = agreement(a.target, d)
         if ag:
-            print(f"\nInter-rater, {unseal(d)[0]}: {ag['raters']}, {ag['rows']} rows, "
+            shown = unseal(d)[0] if a.unseal else Path(d).name
+            print(f"\nInter-rater, {shown}: {ag['raters']}, {ag['rows']} rows, "
                   f"agreement {ag['agreement']}, Cohen's kappa {ag['cohens_kappa']}")
 
 
@@ -534,11 +553,34 @@ def cmd_selftest(a):
         tbl, refused = table("vampi", [d])
         assert "0.33" in tbl and "0.75" in tbl and not refused, tbl
 
-        # a found entry no reported row accounts for is an inconsistency, not a precision of 1.00
+        # A found entry with no reported row of its own is recorded, not a
+        # reason to refuse precision: a report can demonstrate an entry inside
+        # another section without giving it a heading, and recall comes from the
+        # truth rows while precision comes from the reported rows.
         t2 = json.loads(json.dumps(t))
         t2["reported"] = t2["reported"][:1]
         (d / "triage-r1.json").write_text(json.dumps(t2))
-        assert "have no tp row" in tally("vampi", d)["precision_refused"]
+        c2 = tally("vampi", d)
+        assert not c2["precision_refused"], c2["precision_refused"]
+        assert c2["found_without_reported_row"], c2
+
+        # A tp pointing at an entry the rater did not mark found IS a
+        # contradiction inside one triage, and still refuses.
+        t3 = json.loads(json.dumps(t))
+        for truth_row in t3["truth"]:
+            truth_row["status"] = "missed"
+        (d / "triage-r1.json").write_text(json.dumps(t3))
+        assert "not marked found" in tally("vampi", d)["precision_refused"]
+
+        # maps_to may name several entries, because one request can prove two
+        t4 = json.loads(json.dumps(t))
+        ids = [r["id"] for r in t4["truth"] if r.get("status") == "found"]
+        if len(ids) >= 2:
+            tps = [r for r in t4["reported"] if r.get("status") == "tp"]
+            t4["reported"] = [tps[0]] + [r for r in t4["reported"] if r.get("status") != "tp"]
+            t4["reported"][0]["maps_to"] = ",".join(ids)
+            (d / "triage-r1.json").write_text(json.dumps(t4))
+            assert not tally("vampi", d)["precision_refused"], tally("vampi", d)
         (d / "triage-r1.json").write_text(json.dumps(t))
 
         # a second rater gives an agreement figure
@@ -590,6 +632,11 @@ def main():
     p = sub.add_parser("stats"); p.set_defaults(f=cmd_stats)
     p.add_argument("target"); p.add_argument("rundirs", nargs="+")
     p.add_argument("--rater", help="only this rater's triage files")
+    p.add_argument("--unseal", action="store_true",
+                   help="print the arm each run came from. Off by default: a rater who "
+                        "runs stats to check their own numbers would otherwise learn the "
+                        "condition, which is how the blinding broke the first time this "
+                        "was used. Pass it only once every rater is finished.")
     a = ap.parse_args()
     if a.cmd not in ("list", "selftest", "rubric", "seal"):
         truth(a.target)
