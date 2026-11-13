@@ -20,3 +20,6 @@ nuclei-output/
 # OS
 .DS_Store
 .venv-agent/
+
+# code-intelligence index (local only)
+.gitnexus/
