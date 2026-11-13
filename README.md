@@ -551,9 +551,15 @@ scope they state.
 Practical points a first run should know:
 
 - Requests the toolbox sends come from your own IP and are attributable to you.
-  There is no proxying and none is planned.
-- `engagements/audit.jsonl` logs every toolbox command, before and after. It is
-  your record of what was sent. Keep it.
+  `scripts/traffic` records them locally and forwards from your own address; it
+  is a recorder, not an anonymizing proxy, and nothing here hides where a
+  request came from.
+- `engagements/audit.jsonl` logs every toolbox command's argv and exit code,
+  before and after. It is not a record of the requests: host `curl`,
+  `scripts/probe`, `scripts/verify` and the agent host's own fetches never
+  appear in it. `scripts/traffic` records the requests themselves, as HAR, and
+  `scripts/traffic replay <id>` re-sends one byte for byte and diffs the
+  response. Keep both.
 - A request the target makes on your behalf, such as an SSRF probe, counts as
   yours. The destination has to be in scope too.
 - The scope guard and rate limits reduce risk but do not grant permission, and in

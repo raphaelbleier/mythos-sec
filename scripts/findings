@@ -88,7 +88,17 @@ CWE = {
 
 # Anything shaped like a credential, replaced before the evidence is written.
 REDACTIONS = [
-    (re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+"), r"\1[REDACTED]"),
+    # On a line of its own the whole value goes, because Digest, NTLM and AWS4
+    # put comma-separated parameters after the scheme and a token-shaped rule
+    # stops at the first space. Found when scripts/traffic recorded a real
+    # Digest exchange and the response hash survived redaction.
+    (re.compile(r"(?im)^([ \t]*(?:proxy-)?authorization[ \t]*:[ \t]*(?:[A-Za-z0-9\-]+[ \t]+)?)"
+                r".*$"), r"\1[REDACTED]"),
+    # Inline, inside a JSON or shell blob, only the token itself: redacting to
+    # the end of the line there would eat the fields next to it.
+    (re.compile(r"(?i)\b((?:proxy-)?authorization\\?[\"']?\s*[:=]\s*\\?[\"']?"
+                r"(?:bearer|basic|token|digest|ntlm|negotiate|aws4-hmac-sha256|hawk|sso)\s+)"
+                r"[^\s\"',}]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(cookie\s*:\s*).*"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(set-cookie\s*:\s*)[^;\r\n]*"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(x-api-key|x-auth-token|api[_-]?key|apikey|access[_-]?token|"

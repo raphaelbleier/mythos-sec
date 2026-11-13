@@ -123,6 +123,8 @@ EXPLOIT_FLAGS = re.compile(r"\bsqlmap\b.*--(technique|risk\s*[=\s]*[23]|level\s*
 
 URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'\"<>|;`)]+")
 MAX_SLEEP = 30.0
+# `scripts/traffic exec -- curl ...`: the form that sends through the engagement's recording proxy.
+TRAFFIC_EXEC = re.compile(r"scripts/traffic\s+(?:--dir\s+\S+\s+)?exec\b")
 
 
 def _scope_file() -> Path | None:
@@ -183,6 +185,13 @@ def _bool(rules, key):
         if value.strip().lower() in {"false", "no", "0"}:
             return False
     return None
+
+
+def _tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return command.split()
 
 
 def classify(command: str) -> tuple[str | None, int]:
@@ -284,6 +293,18 @@ def check(command: str, charge: bool = False) -> dict:
 
     tool, estimate = classify(command)
     limit = _num(rules, "rate_limit_rps")
+
+    # When this engagement records its traffic (scripts/traffic start), a bare host curl or wget
+    # would send a request that no record shows. Refuse it and name the form that is recorded.
+    if (scope_file.parent / "traffic" / "proxy.json").exists() and not TRAFFIC_EXEC.search(command) \
+            and any(Path(t).name in SINGLE_SHOT for t in _tokens(command)):
+        out.update(action="warn" if mode != "block" else "block", message=(
+            "⛔ MYTHOS BUDGET GUARD: unrecorded request.\n"
+            "    This engagement records its traffic, and a bare curl/wget would not appear in it.\n"
+            "    Run it as: scripts/traffic exec -- curl ...\n"
+            f"    Active scope: {scope_file}"))
+        if out["action"] == "block":
+            return out
 
     if tool and limit:
         ok, why = _paced(command, tool, limit)

@@ -54,7 +54,20 @@ def docker(*a, check=False, quiet=True):
 def audit(**kw):
     AUDIT.parent.mkdir(exist_ok=True)
     with AUDIT.open("a") as f:
-        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **kw}) + "\n")
+        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "t": round(time.time(), 3), **kw}) + "\n")
+
+
+def capture_env():
+    """-e arguments for the proxy and CA variables when this engagement records its traffic
+    (scripts/traffic). Nothing when it does not. When it does and the proxy is down this exits:
+    an unrecorded request would make the record lie by omission."""
+    if not os.environ.get("MYTHOS_SCOPE"):
+        return []
+    r = subprocess.run([sys.executable, str(REPO / "scripts" / "traffic"), "env", "--container", "--json"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr.strip())
+    return [x for k, v in json.loads(r.stdout or "{}").items() for x in ("-e", f"{k}={v}")]
 
 
 def running():
@@ -121,11 +134,12 @@ def up():
 def exec_(argv):
     if not running():
         up()
+    env = capture_env()
     t = time.time()
     audit(phase="start", argv=argv, timeout=TIMEOUT)
     tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
     limit = ["timeout", "--signal=TERM", "--kill-after=5", str(TIMEOUT)] if TIMEOUT > 0 else []
-    rc = subprocess.run(["docker", "exec", "-i", *tty, "-w", "/repo", NAME, *limit, *argv], env=ENV).returncode
+    rc = subprocess.run(["docker", "exec", "-i", *tty, *env, "-w", "/repo", NAME, *limit, *argv], env=ENV).returncode
     audit(phase="end", argv=argv, exit=rc, seconds=round(time.time() - t, 2))
     if limit and rc in (124, 137):
         print(f"mythos: exit {rc}, probably the {TIMEOUT}s limit; rerun with --timeout N (0 = none).", file=sys.stderr)
