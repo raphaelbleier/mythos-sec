@@ -1,4 +1,5 @@
 {
+  "_superseded": "SUPERSEDED, not a result. Produced before 4 November 2026 by the project's own evaluation engine (scripts/eval/*), which no longer exists, against this repo's seeded lab app and the flagless labs with no control arm, no repeats and no blinding. The recall/precision/f1 of 1.00 below is a self-scored engine marking its own lab fixture, not a measurement of capability: a false positive had no way to be recorded. Nothing cites this file. The current protocol is bench/METHODOLOGY.md.",
   "target": "http://mythos-vulnapp:5000 (lab)",
   "mode": "standard",
   "tools_available": [

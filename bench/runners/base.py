@@ -61,6 +61,82 @@ def objective(target_url):
             else prompt(target_url))
 
 
+def stage_assets(assets, commit=None):
+    """A copy of the repo's agent assets outside the repo, reused across cells.
+
+    An arm must not be handed a root from which the scoring key is reachable. Pointing
+    `--plugin-dir`/`--add-dir` at the repo did exactly that: `bench/data/ground_truth/*.json` is
+    the key the flagless targets are scored against, and `scripts/mythos` additionally mounted the
+    whole repo into the toolbox at `/repo`. Symlinking the assets into the cell does not help,
+    because `scripts/mythos` resolves its root through the link and lands back in the repo.
+
+    So the assets are copied once per (commit, asset list) into `xben.ASSET_ROOT/<key>/`, which
+    holds nothing else. `scripts/mythos` inside that copy resolves its root to the copy, so the
+    toolbox mounts the copy. The copy is content-addressed by the repo commit, so a sweep records
+    which tree its arms ran.
+    """
+    import hashlib
+    import xben
+    repo = Path(__file__).resolve().parent.parent.parent
+    commit = commit or repo_commit(repo)
+    key = commit + "-" + hashlib.sha256(",".join(assets).encode()).hexdigest()[:8]
+    dest = xben.ASSET_ROOT / key
+    done = dest / ".staged"
+    if done.exists():
+        return dest
+    tmp = dest.with_name(dest.name + f".tmp{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    for name in assets:
+        src = repo / name
+        if not src.exists():
+            continue
+        if src.is_dir():
+            shutil.copytree(src, tmp / name, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, tmp / name)
+    (tmp / "engagements").mkdir(exist_ok=True)
+    (tmp / ".staged").write_text(commit + "\n")
+    try:
+        tmp.rename(dest)
+    except OSError:                      # another cell won the race
+        shutil.rmtree(tmp, ignore_errors=True)
+    return dest
+
+
+def coverage_gate_wired(root):
+    """Whether the coverage gate is wired as a Stop hook in the assets this cell will load.
+
+    The gate is switched by the presence of its entry in `hooks/hooks.json`, so until this was
+    recorded the condition behind the project's one positive result existed only as the name of
+    the output directory. `run.py`/`labs.py` write it into the run record and refuse a cell whose
+    declared condition disagrees with what is actually wired.
+    """
+    f = Path(root) / "hooks" / "hooks.json"
+    return bool(f.exists() and "coverage-gate.py" in f.read_text())
+
+
+def repo_commit(repo=None):
+    repo = Path(repo or Path(__file__).resolve().parent.parent.parent)
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, check=True)
+        dirty = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip()
+        return r.stdout.strip() + ("-dirty" if dirty else "")
+    except (subprocess.SubprocessError, OSError):
+        return "unknown"
+
+
+def host_version(cmd):
+    """`<cmd> --version` or None, recorded per sweep so a cell says which host ran it."""
+    try:
+        r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=60)
+        return (r.stdout or r.stderr).strip() or None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
 def dirs(workdir):
     workdir = Path(workdir)
     cwd, home = workdir / "cwd", workdir / "home"

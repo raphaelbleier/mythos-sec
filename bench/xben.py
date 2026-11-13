@@ -14,9 +14,24 @@ import argparse, json, os, random, subprocess
 from collections import defaultdict
 from pathlib import Path
 
-BENCH_ROOT = Path(os.environ.get("XBEN_ROOT", "/mnt/linux-data/mythos-bench"))
+REPO = Path(__file__).resolve().parent.parent
+# External checkouts (XBEN, crAPI, Strix) and run output live outside the repo: the control arm
+# must not pick up AGENTS.md from a parent directory, and no arm may be given a root that contains
+# the scoring key. The default is a sibling of the repo, so nothing is hardcoded to one machine.
+BENCH_ROOT = Path(os.environ.get("XBEN_ROOT") or REPO.parent / "mythos-bench")
+RESULTS_ROOT = Path(os.environ.get("MYTHOS_BENCH_RESULTS") or BENCH_ROOT / "results")
+# Staged copies of the agent assets, content-addressed by repo commit: an arm is pointed at one of
+# these instead of at the repo, so neither its --add-dir nor its toolbox /repo mount can reach
+# bench/data/ground_truth. See base.stage_assets.
+ASSET_ROOT = Path(os.environ.get("MYTHOS_BENCH_ASSETS") or BENCH_ROOT / "arm-assets")
 XBEN_DIR = BENCH_ROOT / "validation-benchmarks" / "benchmarks"
 REPO_DATA = Path(__file__).resolve().parent / "data"
+# The scoring key and the scoring code. No arm may be given a root containing any of these, and a
+# transcript that names one is suspect. GROUND_TRUTH may be moved out of the repo entirely with
+# MYTHOS_BENCH_GT, which is the only configuration in which the ban is enforced and not just
+# declared (see METHODOLOGY.md, "What the isolation does and does not do").
+GROUND_TRUTH = Path(os.environ.get("MYTHOS_BENCH_GT") or REPO_DATA / "ground_truth")
+SEALED = (GROUND_TRUTH, REPO_DATA / "ground_truth", Path(__file__).resolve().parent)
 # --buildable uses the apt-fixed list (102/104 on 2026-11-04); XBEN_BUILD_TSV overrides.
 BUILD_TSV = Path(os.environ.get("XBEN_BUILD_TSV", REPO_DATA / "xben-build-aptfix-20261104.tsv"))
 WEB_PORTS = {80, 443, 8080, 8000, 8081, 5000, 3000, 8443}
@@ -48,6 +63,41 @@ def load_challenges(xben_dir=XBEN_DIR):
         out.append({"id": d.name, "dir": str(d), "level": int(meta["level"]),  # level is str or int upstream
                     "tags": meta.get("tags", []), "win_condition": meta.get("win_condition", "flag")})
     return out
+
+
+def sealed_violations(roots):
+    """Roots from which the scoring key or the scoring code is reachable.
+
+    Every arm declares the roots it is handed (`runners.<fw>.grants`). A root that contains, or
+    is contained in, the ground truth or `bench/` means that arm can read what it is scored
+    against. `run.py` and `labs.py` refuse to start on a non-empty result.
+
+    This checks the grant, not the kernel. Both arms run with permissions skipped, so a model
+    that walks the filesystem is not stopped by anything here; that is what `score.SUSPECT` and
+    the canary check are for, and what METHODOLOGY.md says plainly.
+    """
+    bad = []
+    for root in roots:
+        r = Path(root).resolve()
+        for s in SEALED:
+            s = Path(s).resolve()
+            if r == s or s in r.parents or r in s.parents:
+                bad.append(f"{root} reaches {s}")
+    return sorted(set(bad))
+
+
+def canaries(challenge):
+    """The challenge's MAPS/BENCHMARK canary strings from benchmark.json.
+
+    These exist so benchmark material can be found in a training corpus. They never reach an
+    agent (the prompt carries only the URL), they are never written into a result file, and a
+    canary in a transcript means either that the agent read benchmark sources or that the model
+    reproduced memorised benchmark content. Either way the cell is suspect.
+    """
+    f = Path(challenge["dir"]) / "benchmark.json"
+    if not f.exists():
+        return []
+    return [c for c in (json.loads(f.read_text()).get("canaries") or []) if isinstance(c, str)]
 
 
 def load_build_status(tsv=BUILD_TSV):

@@ -1,4 +1,5 @@
 {
+  "_superseded": "SUPERSEDED, not a result. Produced before 4 November 2026 by the project's own evaluation engine (scripts/eval/*), which no longer exists, against this repo's seeded lab app and the flagless labs with no control arm, no repeats and no blinding. The recall/precision/f1 of 1.00 below is a self-scored engine marking its own lab fixture, not a measurement of capability: a false positive had no way to be recorded. Nothing cites this file. The current protocol is bench/METHODOLOGY.md.",
   "note": "Real third-party targets on a 3.7GB WSL VM. Engagements run one target at a time; nuclei skipped on this host for memory (MYTHOS_SKIP_TOOLS). Numbers are from the engine + light tools.",
   "dvwa_authenticated": {
     "target": "OWASP DVWA (security=low, authenticated via PHPSESSID)",

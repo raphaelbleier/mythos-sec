@@ -1,16 +1,31 @@
 # bench: XBOW validation-benchmarks harness
 
-Runs coding/pentest agents against the local XBOW challenges in
-`/mnt/linux-data/mythos-bench/validation-benchmarks` (override with `XBEN_ROOT`) and scores them
-on the harness side. Stdlib Python 3 only.
+Runs coding/pentest agents against the local XBOW challenges and scores them on the harness
+side. Stdlib Python 3 only.
+
+**[`METHODOLOGY.md`](METHODOLOGY.md) is the authoritative document**: the design, the scoring
+rules, every exclusion, the blinding procedure, the statistics and their power, which artifacts
+are published, and the known limitations. This file is the operator's guide. An audit on
+13 November 2026 found four faults that made the previously published figures indefensible;
+METHODOLOGY.md records what they were and what changed, and no figure from before that date
+should be read as a measurement.
+
+Paths are configurable with a relative default. `XBEN_ROOT` points at the external checkouts
+(XBEN, crAPI, Strix) and defaults to a `mythos-bench` directory beside the repo;
+`MYTHOS_BENCH_RESULTS` and `MYTHOS_BENCH_ASSETS` default below it, and `MYTHOS_BENCH_GT` can move
+the ground truth off the repo tree entirely. The published sweeps ran with
+`XBEN_ROOT=/mnt/linux-data/mythos-bench`. Results must stay outside the repo tree, or the control
+arm picks up `AGENTS.md` from a parent directory and stops being a control.
 
 | File | Role |
 |---|---|
-| `xben.py` | challenge catalog, stratified subset, build check, per-run target lifecycle |
+| `METHODOLOGY.md` | the protocol: design, scoring, exclusions, blinding, power, artifact policy |
+| `xben.py` | challenge catalog, stratified subset, build check, per-run target lifecycle, sealed-root check |
 | `run.py` | sweep driver: (framework x challenge x run) cells, scope gate, teardown |
 | `runners/` | one adapter per framework: `run(target_url, workdir, model, budget_s) -> transcript` |
 | `score.py` | per-cell scoring (`result.json`), aggregate `results.jsonl`, rescoring |
-| `stats.py` | markdown tables: Wilson CI, pass@k, paired McNemar |
+| `stats.py` | markdown tables: Wilson CI, pass@k, paired McNemar, power and minimum detectable difference |
+| `data/triage-rubric.md` | the rule a human rates the flagless runs against |
 
 ## Flagless real-app targets (ground truth)
 
@@ -32,23 +47,30 @@ interactive-only, refused by `run.py`, and not part of any sweep.
 python3 bench/labs.py list                     # targets, scored/total from the ground-truth JSONs
 python3 bench/labs.py up vampi                 # also: crapi, vulnbank, dvga; `down` removes it again
 python3 bench/labs.py run vampi --framework mythos --model opencode/glm-5.3-flash-free \
-    --budget 1800 --out /mnt/linux-data/mythos-bench/results/labs --scope-confirmed
-python3 bench/labs.py score vampi /mnt/linux-data/mythos-bench/results/labs/mythos/vampi/run0
-#   -> triage.json next to the transcript; edit each row's status to found|missed|fp
-python3 bench/labs.py stats vampi <rundir>...  # markdown: recall = found/scored, precision = found/(found+fp)
+    --budget 1800 --out $XBEN_ROOT/results/labs --scope-confirmed
+python3 bench/labs.py score vampi $XBEN_ROOT/results/labs/mythos/vampi/run0
+#   -> triage-<rater>.json next to the transcript; complete BOTH lists (see data/triage-rubric.md)
+python3 bench/labs.py seal $XBEN_ROOT/results/labs   # blind the runs before rating them
+python3 bench/labs.py stats vampi <rundir>...  # recall = found/scored, precision = tp/(tp+fp)
+python3 bench/labs.py rubric                   # the rating rule
 python3 bench/labs.py selftest
 ```
 
 - `up`/`down` use `lab/docker-compose.yml` (VAmPI :5002, DVGA :5013, Vuln Bank :5003, all bound to
-  127.0.0.1) and the crAPI checkout under `/mnt/linux-data/mythos-bench/crAPI` (`LISTEN_IP=127.0.0.1`,
+  127.0.0.1) and the crAPI checkout under `$XBEN_ROOT/crAPI` (`LISTEN_IP=127.0.0.1`,
   web :8888). Vuln Bank deliberately runs from the lab file: its own compose publishes
   `0.0.0.0:5000`, `:80` and Postgres `:5432`. `up vampi` also calls `/createdb`.
 - `run` uses the same adapters, prompt, budget and local-only gate as `run.py` (loopback or the docker0
   gateway only; exits 2 without `--scope-confirmed`). Output: `OUT/<fw>/<target>/run<N>/`.
-- `score` pre-fills `candidate` when the final report matches a row's `bench_tag` via `score.py`
-  ALIASES. That is a coarse hint (one tag covers many rows), not a finding; a human sets the final
-  status. Rows are only the `scored: true` entries. Add extra `{id, title, status: "fp"}` rows for false
-  positives that match no entry. `score` will not overwrite an existing `triage.json` without `--force`.
+- `seal` writes a blinded copy of every run to `OUT/blind/<id>/` with the arm's name removed from
+  the deliverable, and keeps the mapping in `OUT/sealed-map.json` for `stats` to read afterwards.
+  Rate from the blinded directory, not from the named one.
+- `score` writes a skeleton with two lists that must both be completed: every ground-truth entry
+  found or missed, and every finding the arm reported tp, fp or duplicate. The `hint` field is a
+  coarse keyword match, not a status. Precision is refused unless the reported list is complete
+  and consistent with the found rows, which is why every precision of 1.00 published before
+  13 November 2026 was meaningless. `--rater NAME` writes `triage-<rater>.json`; two raters give
+  an agreement figure and Cohen's kappa.
 - `stats` counts only human statuses; `pending` shows unfinished triage, so recall is a lower bound.
 
 ## Hosts and arms
@@ -68,24 +90,24 @@ instructions, skills, hooks and MCP servers cannot distort either side.
 
 ```sh
 # 1. once: which challenges build (with the apt fix), written to a TSV
-python3 bench/xben.py check --out /mnt/linux-data/mythos-bench/build_results_fixed.tsv
+python3 bench/xben.py check --out $XBEN_ROOT/build_results_fixed.tsv
 python3 bench/xben.py list --buildable --sample 30 --seed 1
 
 # 2. plan (no Docker), then run. Without --scope-confirmed run.py prints the plan and exits 2.
 python3 bench/run.py --frameworks mythos,control --model opencode/glm-5.3-flash-free \
-    --build-tsv /mnt/linux-data/mythos-bench/build_results_fixed.tsv \
+    --build-tsv $XBEN_ROOT/build_results_fixed.tsv \
     --sample 30 --seed 1 --runs 3 --parallel 3 --budget 1800 --dry-run
-python3 bench/run.py ...same args... --scope-confirmed --out /mnt/linux-data/mythos-bench/results/<name>
+python3 bench/run.py ...same args... --scope-confirmed --out $XBEN_ROOT/results/<name>
 
 # 3. evaluate
-python3 bench/score.py /mnt/linux-data/mythos-bench/results/<name>     # optional rescore
-python3 bench/stats.py /mnt/linux-data/mythos-bench/results/<name>/results.jsonl --compare mythos,control
+python3 bench/score.py $XBEN_ROOT/results/<name>     # optional rescore
+python3 bench/stats.py $XBEN_ROOT/results/<name>/results.jsonl --compare mythos,control
 python3 bench/score.py --selftest && python3 bench/stats.py --selftest
 ```
 
 `--challenges XBEN-001-24,...` skips the build TSV. A sweep is resumable: cells with a
 `result.json` are skipped (target failures are not written unless `--keep-failed`, so they retry).
-Results default to `/mnt/linux-data/mythos-bench/results/`, outside the repo, so the control
+Results default to `$XBEN_ROOT/results/` (see the top of this file), outside the repo, so the control
 arm cannot pick up the repo's `AGENTS.md`/`opencode.json` from a parent directory.
 
 Per cell, `OUT/<fw>/<challenge>/run<N>/` holds `scope.yaml`, `cwd/` (agent working dir),
@@ -132,7 +154,7 @@ scores, tokens, times, `trace_sha256`). Compose state lives in `OUT/.targets/<pr
   need the provider set up via `opencode auth login`.
 - strix: `STRIX_LLM` (LiteLLM id, or `--strix-model`), `LLM_API_KEY`, optionally
   `LLM_API_BASE`. Runs the checkout at `$STRIX_DIR` (default
-  `/mnt/linux-data/mythos-bench/strix`) via `uv run`; it pulls its own sandbox image.
+  `$XBEN_ROOT/strix`) via `uv run`; it pulls its own sandbox image.
 - pentestgpt and cai are refused: PentestGPT's autonomous mode drives only Claude Code or Codex
   (other models get only the interactive legacy mode), CAI is an archived interactive REPL.
 

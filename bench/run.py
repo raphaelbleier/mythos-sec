@@ -65,6 +65,44 @@ def model_for(fw, a):
     return (a.strix_model or os.environ.get("STRIX_LLM", "")) if fw == "strix" else a.model
 
 
+def sha256_file(path):
+    p = Path(path)
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+
+
+def arm_grants(fw, workdir, model=None):
+    """`grants()` of one runner, or a placeholder for an arm that does not implement it."""
+    mod = importlib.import_module(f"runners.{fw}")
+    return mod.grants(workdir, model) if hasattr(mod, "grants") else {"roots": [], "treatment": {}}
+
+
+def check_grants(fws, a):
+    """Refuse the sweep if any arm is handed a root from which it could read the scoring key.
+
+    Until 13 November 2026 the mythos arm ran with `--plugin-dir <repo> --add-dir <repo>`, which
+    contains `bench/data/ground_truth/*.json`, while the control arm got an empty directory.
+    Nothing checked it and nothing would have detected it. This is that check.
+    """
+    bad, declared = [], {}
+    with __import__("tempfile").TemporaryDirectory() as probe:
+        for fw in fws:
+            g = arm_grants(fw, probe)
+            declared[fw] = g
+            bad += [f"{fw}: {v}" for v in xben.sealed_violations(g["roots"])]
+    if bad:
+        raise SystemExit("refusing: an arm could read what it is scored against\n  " + "\n  ".join(bad))
+    if a.coverage_gate != "auto":
+        want = a.coverage_gate == "on"
+        for fw, g in declared.items():
+            if "coverage_gate" in g["treatment"] and bool(g["treatment"]["coverage_gate"]) != want \
+                    and g["treatment"].get("scaffolding") is True:
+                raise SystemExit(f"refusing: --coverage-gate {a.coverage_gate} but the gate is "
+                                 f"{'wired' if not want else 'not wired'} in {fw}'s assets "
+                                 "(hooks/hooks.json). Fix one of the two; the condition must be "
+                                 "recorded, not implied by the output directory name.")
+    return declared
+
+
 def run_cell(fw, chal, run_idx, a):
     run_dir = Path(a.out) / fw / chal["id"] / f"run{run_idx}"
     res_path = run_dir / "result.json"
@@ -73,9 +111,18 @@ def run_cell(fw, chal, run_idx, a):
     run_dir.mkdir(parents=True, exist_ok=True)
     project = f"bench_{fw}_{chal['id']}_{run_idx}".lower().replace("-", "_")
     flag = "FLAG{" + secrets.token_hex(32) + "}"  # same shape as upstream sha256 flags, not derivable
+    grants = arm_grants(fw, run_dir, model_for(fw, a))
     res = {"framework": fw, "model": model_for(fw, a), "challenge": chal["id"], "level": chal["level"],
            "tags": chal["tags"], "run": run_idx, "project": project, "apt_fix": not a.no_apt_fix,
            "budget_s": a.timeout, "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           # everything needed to place this cell in a condition without reading the directory name
+           "treatment": grants["treatment"], "readable_roots": grants["roots"],
+           # the model of every agent, not just the orchestrator's alias
+           "per_agent_models": grants.get("per_agent_models"),
+           "per_agent_models_source": grants.get("per_agent_models_source"),
+           "coverage_gate": bool(grants["treatment"].get("coverage_gate")),
+           "repo_commit": a.repo_commit, "host_versions": a.host_versions,
+           "toolbox_image": a.toolbox_image, "objective": os.environ.get("BENCH_OBJECTIVE", "flag"),
            "status": "ok"}
     tdir = Path(a.out) / ".targets" / project  # compose.json/target.log: outside the agent's workdir
     tdir.mkdir(parents=True, exist_ok=True)
@@ -96,15 +143,18 @@ def run_cell(fw, chal, run_idx, a):
             return res
         res["target_url"] = url
         write_scope(run_dir / "scope.yaml", url)
+        res["scope_sha256"] = sha256_file(run_dir / "scope.yaml")
+        res["compose_sha256"] = sha256_file(tdir / "compose.json")  # pins the resolved build inputs
         runner = importlib.import_module(f"runners.{fw}")
         try:
             transcript = runner.run(url, run_dir, res["model"], a.timeout)
         except (NotImplementedError, RuntimeError, OSError) as e:
             res.update(status="runner_failed", error=str(e)[:500], solved=False)
             return res
-        res.update(score.score(flag, transcript, chal["tags"], run_dir))
-        if res["suspect"]:
-            res["status"] = "suspect"  # review the trace before counting it
+        # Canaries are read here and never stored: the result row carries only the hit count.
+        res.update(score.score(flag, transcript, chal["tags"], run_dir, xben.canaries(chal), url))
+        res["status"], res["status_reason"] = score.classify(res)
+        res["excluded"] = res["status"] in score.EXCLUDED
     finally:
         target.down()
         if res["status"] != "target_failed" or a.keep_failed:
@@ -114,6 +164,18 @@ def run_cell(fw, chal, run_idx, a):
         print(f"{fw:8} {chal['id']} run{run_idx} {res['status']:13} solved={res.get('solved')} "
               f"detected={res.get('detected')} {res.get('wall_s', '-')}s", flush=True)
     return res
+
+
+def toolbox_image_id():
+    """The toolbox image the mythos arms will drive, so a sweep pins its tool versions."""
+    for ref in ("mythos-toolbox:local", "ghcr.io/raphaelbleier/mythos-toolbox:latest"):
+        try:
+            r = subprocess.run(["docker", "image", "inspect", ref, "-f", "{{.Id}}"],
+                               capture_output=True, text=True, check=True)
+            return {"ref": ref, "id": r.stdout.strip()}
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    return None
 
 
 def print_plan(cells, a, bind):
@@ -142,7 +204,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the plan, touch no Docker")
     ap.add_argument("--scope-confirmed", action="store_true",
                     help="required to run: confirms the planned local targets are authorized")
-    ap.add_argument("--out", default=str(xben.BENCH_ROOT / "results" / datetime.now().strftime("%Y%m%d-%H%M")),
+    ap.add_argument("--coverage-gate", choices=("on", "off", "auto"), default="auto",
+                    help="the condition you intend to run; checked against hooks/hooks.json and "
+                         "recorded per cell (default: record whatever is wired)")
+    ap.add_argument("--out", default=str(xben.RESULTS_ROOT / datetime.now().strftime("%Y%m%d-%H%M")),
                     help="outside the repo, so the control arm cannot pick up AGENTS.md from a parent dir")
     a = ap.parse_args()
 
@@ -150,6 +215,8 @@ def main():
     for fw in fws:
         if fw not in FRAMEWORKS:
             raise SystemExit(f"unknown framework {fw} (choose from {', '.join(FRAMEWORKS)})")
+    grants = check_grants([f for f in fws if f not in ("pentestgpt", "cai")], a)
+    for fw in fws:
         if fw in ("pentestgpt", "cai"):
             try:
                 importlib.import_module(f"runners.{fw}").run(None, None, None, None)
@@ -183,9 +250,17 @@ def main():
         raise SystemExit(2)
 
     Path(a.out).mkdir(parents=True, exist_ok=True)
-    oc = subprocess.run(["opencode", "--version"], capture_output=True, text=True).stdout.strip()
+    from runners import base as runners_base
+    a.repo_commit = runners_base.repo_commit()
+    a.host_versions = {h: runners_base.host_version(h) for h in ("opencode", "claude", "docker", "uv")}
+    a.toolbox_image = toolbox_image_id()
     (Path(a.out) / "sweep.json").write_text(json.dumps(
-        {**vars(a), "opencode_version": oc, "challenges": [c["id"] for c in chals]}, indent=1))
+        {**{k: v for k, v in vars(a).items() if k != "grants"},
+         "challenges": [c["id"] for c in chals],
+         "arms": {fw: grants[fw] for fw in fws},
+         "ground_truth_dir": str(xben.GROUND_TRUTH),
+         "xben_dir": str(xben.XBEN_DIR),
+         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1))
     with ThreadPoolExecutor(a.parallel) as pool:
         list(pool.map(lambda cell: run_cell(*cell, a), cells))
     rows = score.write_jsonl(a.out)

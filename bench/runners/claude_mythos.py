@@ -10,7 +10,15 @@ transcript for progress, and a single trailing object would look like a stalled 
 
 Permissions are skipped for the run (`--dangerously-skip-permissions`): the cell is the
 single human gate, the target is a local throwaway container, and an interactive prompt would
-hang an unattended sweep. The scope guard still runs as a PreToolUse hook.
+hang an unattended sweep. The scope guard still runs as a PreToolUse hook. Both arms skip
+permissions in the same way, so the grant is symmetric; what it means for the ground truth is
+in METHODOLOGY.md.
+
+The plugin is loaded from a staged copy of the agent assets outside the repo, not from the repo
+itself. Until 13 November 2026 this arm ran with `--plugin-dir <repo> --add-dir <repo>`, which
+put `bench/data/ground_truth/*.json` inside a root it was invited to read while the control arm
+got an empty directory, and mounted the same repo into the toolbox at `/repo`. `grants()`
+publishes the roots so `run.py` can refuse a cell whose roots reach the key.
 """
 import json
 from pathlib import Path
@@ -21,18 +29,30 @@ ASSETS = ["AGENTS.md", "CLAUDE.md", ".claude-plugin", "agents", "commands", "hoo
           "knowledge", "scripts", "skills", "toolbox"]
 
 
+def grants(workdir, model=None):
+    """The roots this arm is handed and the treatments it carries, for the run record."""
+    workdir, stage = Path(workdir), base.stage_assets(ASSETS)
+    return {"roots": [str(workdir / "cwd"), str(stage)],
+            "treatment": {"scaffolding": True, "plugin": True, "skills": True,
+                          "subagents": True, "toolbox": True, "scope_guard": True,
+                          "coverage_gate": base.coverage_gate_wired(stage),
+                          "skip_permissions": True, "tools": "host default",
+                          "assets": sorted(ASSETS)}}
+
+
 def run(target_url, workdir, model, budget_s):
     workdir, cwd, home = base.dirs(workdir)
+    stage = base.stage_assets(ASSETS)
     for name in ASSETS:
-        if not (cwd / name).exists():
-            (cwd / name).symlink_to(REPO / name)
+        if not (cwd / name).exists() and (stage / name).exists():
+            (cwd / name).symlink_to(stage / name)
     (cwd / "engagements").mkdir(exist_ok=True)
     scope = workdir / "scope.yaml"
     text = (f"/mythos-sec:cybersecurity {target_url} --scope {scope}\n\n{base.objective(target_url)}")
     env = dict(base.claude_env(home), MYTHOS_SCOPE=str(scope))
     argv = ["claude", "-p", text, "--model", model, "--output-format", "stream-json", "--verbose",
-            "--dangerously-skip-permissions", "--plugin-dir", str(REPO),
-            "--add-dir", str(REPO)]
+            "--dangerously-skip-permissions", "--plugin-dir", str(stage),
+            "--add-dir", str(stage)]
     t = base.run_proc(argv, cwd, env, budget_s, workdir)
     if not plugin_loaded(t):
         raise RuntimeError(f"mythos plugin did not load in {t}: the cell measures a bare model, not the "

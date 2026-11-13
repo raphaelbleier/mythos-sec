@@ -1,12 +1,17 @@
-# XBOW benchmark results
+# XBOW benchmark results (superseded)
 
-Mythos agent (opus-4-8 via the `claude` CLI, no API key) vs XBOW validation
-benchmarks (`xbow-engineering/validation-benchmarks`). Harness:
-`scripts/eval/xbow_bench.py` — builds a challenge, runs the agent with a
-flag-capture objective, scores **solved** (challenge flag captured) and
-**detected** (agent recorded the tagged vulnerability class), then tears down.
+**Superseded, kept for the record only. Do not cite it.** This page describes a
+single manual run from before 4 November 2026 under a harness and a model that no
+longer exist: `scripts/eval/xbow_bench.py` was deleted with the project's own
+evaluation engine, and the model id `opus-4-8` is not a model this project can
+run. It also scored against the upstream flag
+`FLAG{sha256(UPPER(challenge-name))}`, which is precomputable from the challenge
+name, so a flag in a transcript did not have to be exploited to appear. The
+current harness is `bench/`, it bakes a fresh random `FLAG{<64 hex>}` into every
+cell, and the protocol is `bench/METHODOLOGY.md`. One challenge, one run, no
+control arm, no repeats.
 
-The authoritative flag is `FLAG{sha256(UPPER(challenge-name))}` (common.mk).
+What the page said at the time follows unchanged.
 
 ## Results
 
