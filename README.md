@@ -38,23 +38,74 @@
 
 ## Results at a glance
 
-On single-flag CTF challenges the scaffolding adds nothing this evaluation can
-measure. Across every XBOW sweep the Mythos arm ties with a bare model that has a
-shell: 28/33 against 27/30 on a 40-challenge sweep, paired p = 1.0, with 7 and 10
-of the 40 cells unscored because a safety classifier ended them mid-run. That is a
-null result.
+**The benchmark is being re-measured.** An audit on 13 November 2026 found faults
+in the harness that make part of the published numbers indefensible. The harness
+is fixed; the affected claims are withdrawn until the sweep has been run again.
+What each fault was and how it is now prevented:
+[`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
 
-On one broad target it does separate, once a coverage gate forces the agent to
-account for every mapped path before it stops. Against Vuln Bank's 76 documented
-vulnerabilities, Mythos with the gate finds 34 and 33 where the control finds 30
-and 29, at roughly twice the tool calls and twice the money. The same gate inverted
-the result on DVGA, 6 of 21 against 12 without it, because that app's surface map
-missed the GraphQL fields where every documented vulnerability sits. The gate helps
-where the map is right and hurts where it is not, and it was written after the runs
-it is scored against.
+Withdrawn:
 
-Precision was 1.00 in all six Vuln Bank runs under hand triage. Nothing in the code
-enforces that; "proven" and "unconfirmed" are conventions the agent is told to follow.
+- **The Vuln Bank coverage-gate separation** (Mythos with the gate 34 and 33
+  entries, the control 30 and 29). The Mythos arm ran with `--add-dir <repo>` and
+  `--plugin-dir <repo>`, so the scoring key for that measurement,
+  `bench/data/ground_truth/vulnbank.json`, sat inside a directory the arm was
+  invited to read, and its toolbox mounted the same repository at `/repo`. The
+  control arm got an empty working directory and no such grant. No check in the
+  harness tested for that, and the transcript detector would not have matched a
+  ground-truth path, so the transcripts neither show that the key was read nor
+  show that it was not. The gate's coverage score came from `scripts/coverage`,
+  which counted a substring match in the report as a mapped path having been
+  covered. Two runs per condition, no interval and no test.
+- **Precision 1.00**, everywhere it appears. No triage row could carry the status
+  `fp`: the schema listed the documented vulnerabilities and asked the rater to
+  mark each one found or missed, so a false positive the arm reported had nowhere
+  to go. The number is a property of the schema, not a measurement.
+- **"All 42 mapped paths accounted for."** The hook handed the agent the path
+  list and the scorer counted a mention of a path as coverage of it, so the claim
+  restates its own input.
+- **Every solve rate on the Claude Code host.** A cell was dropped from the
+  denominator only if it had also failed, so an exclusion could only raise the
+  rate. The 40-challenge control arm reads 0.69 with no exclusions at all, 0.90
+  under the published rule, and 0.96 under a rule that decides infrastructure
+  failure from the host's own `safety_stops` counter without looking at whether
+  the cell solved.
+
+What survives, with its limits:
+
+- On single-flag CTF challenges the paired comparison shows no detectable
+  difference under any of those three exclusion rules, because it was never able
+  to show one. With 26 paired challenges and a discordance rate of 0.3, the
+  smallest difference the exact test detects with 80% power is 0.29, and the
+  sweep saw 1 discordant pair. Published work on the same XBOW benchmark
+  ("Baselines Before Architecture", arXiv 2607.13085) puts the scaffold
+  advantage at 5 to 10 percentage points at a matched model, so this design was
+  underpowered against the plausible effect by roughly a factor of three. The
+  honest statement is: underpowered, no detectable difference, minimum
+  detectable difference about 0.29. Not a null result. `bench/stats.py --selftest`
+  recomputes those power figures.
+- On GLM 5.3 both arms solved all 10 scored cells of 12 (two per arm were rate
+  limited). Ten cells per arm, a ceiling at 1.00, no test.
+- Every solved cell's flag came back from the target. Re-scoring all four stored
+  sweeps, 79 of 79 solved cells had the flag first appear in tool output after a
+  request to the target, and none had it first appear in the agent's own text.
+  Audits of other CTF harnesses find 17 to 23 points of inflation from flags
+  that were never exploited for; that does not reproduce here. The check is a
+  necessary condition, not proof that the intended vulnerability was the path.
+- The flagless recall figures (VAmPI 8/9 against 8/9, DVGA 12/21 against 11/21,
+  Vuln Bank without the gate 28 and 29 against 30 and 29) carry the same
+  ground-truth access problem and are withdrawn as measurements of the
+  scaffolding. Their direction is "no separation", which a leak toward the Mythos
+  arm would not have produced.
+
+Two things no number here controls for. The targets are public: XBEN and all four
+real apps are public repositories with public write-ups, and for the flagless
+targets the ground truth is each app's own README, so a model may have read it.
+XBOW's own repository now describes the validation benchmarks as trained into
+current models and kept for historical purposes, which makes XBEN a regression
+check rather than evidence of capability. And "scaffolding" is one undifferentiated
+condition: skills, sub-agents, toolbox, prompt and tool access all change at once
+between the arms.
 
 The scope guard is a safety net, not a sandbox. In its default `warn` mode it reports
 an out-of-scope request after the request has already gone out, and it has let one
@@ -62,6 +113,7 @@ through: a `169.254.169.254` SSRF payload that the target then connected to. Set
 `MYTHOS_SCOPE_ENFORCE=ask` when a single such request is unacceptable.
 
 Full tables, parameters and what the numbers do not cover: [Benchmarks](#benchmarks),
+[`bench/METHODOLOGY.md`](bench/METHODOLOGY.md),
 [`docs/poster/poster.md`](docs/poster/poster.md) (German),
 [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
 
@@ -108,10 +160,14 @@ Full write-up: [`docs/architecture.md`](docs/architecture.md). Status and open w
 
 - [OpenCode](https://opencode.ai) (1.x >= 1.18.29 or 2.x), primary, or
   [Claude Code](https://docs.claude.com/en/docs/claude-code), secondary.
-- A model for the host: any provider the host supports. No model ships
-  configured. On OpenCode run `/connect`, or set `model` in `opencode.json`; the
-  Z.ai provider in that file is an example reading `LLM_API_KEY`, replace it with
-  your own. On Claude Code the host's own model is used.
+- A model for the host: any provider the host supports. On OpenCode the default
+  is GLM 5.3 on the Z.AI Coding Plan, which needs `ZHIPU_API_KEY` or
+  `opencode auth login`; `models.json` assigns a tier per agent and
+  [`docs/models.md`](docs/models.md) covers every provider, including Anthropic,
+  OpenAI and a local one. To run the whole suite on another provider:
+  `OPENCODE_CONFIG_CONTENT="$(scripts/models anthropic)" opencode`. Plain
+  `--model` moves only the orchestrator, because the sub-agents carry their own
+  model. On Claude Code the host's own model is used.
 - **Docker**, with your user able to run `docker`. `git`, and Python 3 (stdlib
   only) for the shim.
 
@@ -169,7 +225,7 @@ scripts/mythos net mythos-lab     # let the toolbox reach lab targets by service
 **5. Verify** end to end:
 
 ```bash
-scripts/selftest.sh                   # 35 checks: probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard, coverage gate
+scripts/selftest.sh                   # probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard, coverage gate
 scripts/selftest.sh --host opencode   # same checks, scored from the mythos agent's report
 ```
 
@@ -195,8 +251,13 @@ Mythos sets up `engagements/<target>-<date>/`, writes a `scope.yaml` you confirm
 then runs recon → scan → exploit → report, driving the toolbox throughout, and
 writes a bug-bounty-format `report.md`.
 
-The model is whatever the host is configured to use (`/model` in Claude Code,
-`--model` in `opencode run`); every agent uses it.
+The model comes from the host. On Claude Code that is `/model` and every agent
+uses it. On OpenCode `models.json` gives each agent a tier, so recon and
+scanning run on a cheap model and the orchestrator, exploiter and validator on
+the strongest one available. That split is a cost heuristic, not a measured
+allocation: no model has been tested against the exploit skill's proof standard
+except Claude Sonnet, and those runs are under re-measurement. See
+[`docs/models.md`](docs/models.md).
 
 The single human gate is the scope confirmation. With `--scope <file>` (also
 with `opencode run --auto`) the file is the confirmation and nothing is asked;
@@ -270,25 +331,36 @@ under [Benchmarks](#benchmarks) and in the self-test have numbers behind them.
 **Controlled evaluation.** `bench/` runs Mythos and a bare-model control on the
 XBOW validation-benchmarks with the same model, prompt, budget and sandbox, a
 random flag per run, scoring on the harness side, Wilson intervals and paired
-McNemar tests. Protocol, usage and isolation rules:
+McNemar tests. Design, scoring rules, exclusions, blinding and reproduction
+steps: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md); usage and isolation:
 [`bench/README.md`](bench/README.md).
 
-On flag-capture challenges the result is a null: across every sweep the Mythos
-arm does not separate from the control. On the one broad target with a
-documented vulnerability list, Vuln Bank, it does separate, but only after a
-coverage gate was added that makes the agent account for every mapped path
-before it stops (two repeats per condition, ranges that do not overlap):
+**The published figures below are under re-measurement.** The audit of
+13 November 2026 found that the Mythos arm could read the flagless targets'
+scoring key, that infrastructure exclusions were applied only to failed cells,
+that no triage row could record a false positive, and that the coverage gate was
+scored by substring match. The harness fixes are described in
+`bench/METHODOLOGY.md`; the tables are kept here so the record is visible, each
+with what the audit leaves of it.
+
+Vuln Bank, the only measurement in which the scaffolding separated from the
+control:
 
 | Vuln Bank, 76 documented vulnerabilities (Claude Code, Sonnet, 3600 s budget) | found | recall | precision | tool calls | USD |
 |---|---|---|---|---|---|
-| Mythos + coverage gate | 34, 33 | 0.45, 0.43 | 1.00 | 32, 31 | 0.61, 0.67 |
-| Mythos without the gate | 28, 29 | 0.37, 0.38 | 1.00 | 18, 20 | 0.42, 0.39 |
-| control (bare model with a shell) | 30, 29 | 0.39, 0.38 | 1.00 | 15, 14 | 0.29, 0.25 |
+| Mythos + coverage gate | 34, 33 | 0.45, 0.43 | not measured | 32, 31 | 0.61, 0.67 |
+| Mythos without the gate | 28, 29 | 0.37, 0.38 | not measured | 18, 20 | 0.42, 0.39 |
+| control (bare model with a shell) | 30, 29 | 0.39, 0.38 | not measured | 15, 14 | 0.29, 0.25 |
 
-The gate costs about twice the control's tool calls and money for the extra
-entries (four to five against the control, n = 2 per arm, no significance test). It was written after the ungated Vuln
-Bank runs and scored on the same target, so it is a fit to that measurement, not a
-prediction confirmed by it.
+**Not currently defensible.** The Mythos arm's readable roots included
+`bench/data/ground_truth/vulnbank.json`, which is the key these recall numbers
+are scored against, and the control arm's did not; the coverage score that the
+gate acts on counted a substring match in the report as a covered path. Two runs
+per condition, no interval and no test. The gate was also written in response to
+the ungated runs and scored on the same target, so even with a clean harness it
+is a fit to that measurement rather than a prediction confirmed by it. It will be
+re-measured with the ground truth outside every root the arms are given, and with
+the corrected coverage scorer.
 
 **The same gate inverted the result on DVGA: 6 of 21 against 12 without it and 11 for
 the control, at $0.77 instead of $0.27.** DVGA is a GraphQL app whose surface map held
@@ -296,38 +368,124 @@ eleven HTML pages while all 21 documented vulnerabilities sit behind `/graphql`,
 agent closed out the pages and never reached the fields. Vuln Bank worked because it
 publishes an OpenAPI document. The probe now introspects GraphQL schemas, but the
 measurement with that map is still outstanding. The gate helps where the map captures
-the real surface and hurts where it does not.
+the real surface and hurts where it does not. These two numbers come from the same
+harness as the Vuln Bank runs and are withdrawn on the same grounds.
 
-The flag-capture sweeps:
+The flag-capture sweeps. The Mythos column is the scaffolded arm, the control
+column the bare model with a shell; `p` is the exact paired McNemar two-sided p
+over the challenges both arms completed:
 
-| sweep | model | Mythos | control | paired p |
-|---|---|---|---|---|
-| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 1.0 |
-| 40 challenges (plugin silently not loaded) | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 1.0 |
-| 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 1.0 |
-| earlier shared failures | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 1.0 |
-| VAmPI, recall against 9 documented vulnerabilities | Claude Sonnet | 8/9 = 0.89 | 8/9 = 0.89 | - |
-| DVGA, recall against 21 documented vulnerabilities | Claude Sonnet | 12/21 = 0.57 | 11/21 = 0.52 | - |
-| Vuln Bank, recall against 76 documented vulnerabilities (no gate) | Claude Sonnet | 28/76 = 0.37 | 30/76 = 0.39 | - |
+| sweep | model | Mythos | control | pairs, discordant | paired p |
+|---|---|---|---|---|---|
+| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 26, 1 | 1.0 |
+| the same 40 challenges, plugin silently not loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 25, 0 | 1.0 |
+| 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 10, 0 | 1.0 |
+| the seven challenges both arms had failed | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 3, 0 | 1.0 |
 
-Cells a safety classifier ended mid-run are unscored (`classifier_blocked`),
-like a provider refusal: that was 7-9 of the 12 unsolved cells per arm on the
-Claude Code host.
+The two 40-challenge rows share one control measurement: the control arm was run
+once, and the second sweep re-ran only the Mythos arm after the plugin manifest
+was fixed. The control row is therefore the same 39 cells printed twice, not two
+measurements.
 
-On challenges with one planted vulnerability and a flag, the scaffolding adds
-nothing these samples can detect, and all three flagless recall measurements
-agree: the arms tie on VAmPI, sit one entry apart on DVGA (and tie at 10 of 16
-once the five denial-of-service classes the safety rules forbid proving are
-excluded) and one apart on Vuln Bank until the coverage gate, which lifts the scaffolded
-arm clear of the control (table above) by making it reach the GraphQL, merchant
-and card surfaces both arms had skipped entirely. On GLM 5.3 both arms solved 10 of 10 and Mythos was faster, median 135 s against
-177 s, with n = 10 per arm and no significance test. On Claude Sonnet with the
-framework loaded it cost 2.4x the control for a solve rate that was equal or one
-cell lower. Cost does not always run that way: on DVGA the scaffolded arm came in
-at $0.27 against the control's $0.81, with 18 tool calls against 43. An invalid plugin manifest had kept the Claude Code mythos arm
-unscaffolded until 5 November 2026; the rerun is the first row. Full parameters and the diagnosis from the transcripts:
-[`docs/poster/poster.md`](docs/poster/poster.md) (German). What the numbers do not cover:
-[`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
+A p of 1.0 on one discordant pair out of 26 is not a null result, it is an
+absence of power. At 26 pairs and a discordance rate of 0.3, the smallest true
+difference the exact test detects with 80% power is 0.29; at 30 pairs it is
+0.27 and at 40 it is 0.24, and a true difference of 0.2 would be caught two
+times in five at 30 pairs. The exact test cannot reject at all below six
+discordant pairs. Against the 5 to 10 points that arXiv 2607.13085 reports for
+scaffold advantage on this benchmark at a matched model, this design was short
+by about a factor of three. Both arms also sit at 0.85 to 0.90 with three to
+five unsolved cells each, so there is little room left for a difference to
+appear in. `bench/stats.py` prints the minimum detectable difference with every
+comparison, and `--selftest` pins these figures.
+
+The denominators depend on an exclusion rule that the audit found invalid: cells
+were dropped only when they had also failed, so an exclusion could only raise a
+rate. Recomputed from the stored artifacts under the corrected, outcome-blind
+rule, the 40-challenge arms read 0.87 [0.71, 0.95] for the control and 0.88
+[0.72, 0.95] for Mythos, against the published 0.90 and 0.85. **The gap changes
+sign**, which is the clearest evidence available that it was an artifact of the
+rule and not a measurement. Over all cells with no exclusion at all the arms read
+0.69 and 0.70. The harness now classifies infrastructure failure from signals the
+agent cannot author, treats intention-to-treat as the primary analysis, and
+prints both rates in the same row.
+
+The same correction removes the Strix number entirely. Ten of its twelve cells
+hit the stall deadline and two ended in a runner error, including both cells
+previously reported as valid, which were kept only because they had solved.
+Under the corrected rule Strix has **no scored cells**, not 2 of 2 at 1.00.
+Wherever a Strix figure appeared, it was an artifact of the exclusion rule.
+
+The flagless recall measurements:
+
+| target | Mythos | control |
+|---|---|---|
+| VAmPI, 9 documented vulnerabilities | 8/9 = 0.89 | 8/9 = 0.89 |
+| DVGA, 21 documented vulnerabilities | 12/21 = 0.57 | 11/21 = 0.52 |
+| Vuln Bank, 76 documented vulnerabilities, no gate | 28 and 29 of 76 | 30 and 29 of 76 |
+
+All three carry the ground-truth access problem and are withdrawn as
+measurements of the scaffolding. Their direction is "no separation", which a leak
+toward the Mythos arm would not produce, so a re-run is more likely to confirm
+than to overturn them. On DVGA the arms also tie at 10 of 16 once the five
+denial-of-service classes the engagement's safety rules forbid proving are
+removed from the denominator. The precision of 1.00 previously reported for all
+of these is withdrawn outright: the triage schema had no way to record a false
+positive.
+
+Cost direction is not stable. On the 40-challenge sweep the scaffolded arm spent
+$20.88 against the control's $8.63 and 928 tool calls against 390, a factor of
+2.4 either way; those are totals over all 40 and 39 cells, while the solve rates
+above count only the scored ones, so the two sets of numbers do not describe the
+same cells. Over the scored cells alone it is $19.97 against $7.82 and 901 calls
+against 345. On DVGA the direction inverts: the scaffolded arm came in at $0.27
+and 18 tool calls against the control's $0.81 and 43. On GLM 5.3 the scaffolded
+arm was faster, median 135 s against 177 s, with ten cells per arm and no test.
+
+An invalid plugin manifest kept the Claude Code Mythos arm unscaffolded until
+5 November 2026, which is why the two 40-challenge sweeps exist. Full parameters
+and the diagnosis from the transcripts:
+[`docs/poster/poster.md`](docs/poster/poster.md) (German). What the numbers do not
+cover: [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md). Example
+engagement reports from the earlier manual runs, including the full triage of two
+of them: [`docs/poster/evidence/`](docs/poster/evidence/).
+
+Nothing in the design controls for contamination. XBEN and all four real apps are
+public repositories with public write-ups, and for the flagless targets the
+ground truth is each app's own public README, so the model may have read it
+already. The per-cell random flag only defeats precomputing the upstream
+`sha256(UPPERCASE_DIRNAME)` flag. XBOW's own repository states that the set is
+saturated, that the underlying vulnerabilities have been trained into the models
+and that it is kept for historical purposes only, in a warning dated 7 July 2026,
+so XBEN is a regression check here and not evidence of capability. The harness
+records whether any of XBOW's canary strings appear in a transcript, as a leak
+signal, and never copies them into a result file. That check cannot establish
+non-contamination and is not claimed to: no published work estimates how much of
+these apps sits in frontier training data, no study validates canary strings for
+security data, and membership inference runs near chance even on open models of
+known composition.
+
+Construct validity is unestablished as well. No study correlates any security
+benchmark score with a real-world outcome such as a bounty payout or a field CVE,
+so every figure above describes performance on these targets under this harness
+and nothing beyond that.
+
+One more thing weakened the scanner side in every sweep. A supply-chain review of
+the toolbox image found that the image as published during the sweeps shipped
+`nuclei` with no templates, because pip's cache created `/home/pentester` as root
+before `useradd` ran and the template update then failed silently at build time,
+and that it carried the PyPI `graphw00f`, which is an inert placeholder rather
+than the real tool. The second one bears on the DVGA figures in particular. Both
+are fixed in the current `toolbox/Dockerfile`. Which sweep ran which image cannot
+be established, because no sweep recorded an image digest; that is now recorded
+per cell.
+
+"Scaffolding" is also one undifferentiated condition. The control arm is denied
+`edit`, `webfetch`, `websearch`, `task` and `skill` as well as the skills,
+sub-agents and toolbox, so a difference cannot be attributed to any one of them;
+on the flagless targets the control cannot write a file at all, so the two arms'
+reports are produced through different media. The run record now carries each
+treatment as its own field so an ablation is possible later.
 
 ```bash
 python3 bench/xben.py check --out <build_results.tsv>
@@ -344,7 +502,11 @@ in `bench/data/`: 43 of 104 build from a clean clone, 102 of 104 once the harnes
 repoints the dead Debian apt mirrors (`--no-apt-fix` disables that).
 
 The self-test is a regression test on this repo's own seeded lab app, not a target
-result: 35 of 35 checks pass (`scripts/selftest.sh`).
+result. `scripts/selftest.sh` prints its own `== result: N passed, M failed ==`
+line; that line is the number, and the count is not quoted here because it depends
+on the host and on which lab targets are reachable. The file holds 45 `assert`
+calls plus two inline checks. The counts published earlier, 31 in the poster and
+35 here, match neither the file nor each other and were wrong.
 
 **Earlier manual engagements** (single runs, no control arm, from the earlier
 skill-driven flow; evidence, not a measured advantage). Details:

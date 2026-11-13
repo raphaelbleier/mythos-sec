@@ -46,7 +46,10 @@ Legend: done / in progress / partly / planned
 - Windows and macOS smoke test of `scripts/mythos` and the GHCR image.
 - Verify scope-guard coverage in OpenCode sub-agents.
 - Per-agent model assignment (cheap for recon, strong for exploit) via a small
-  `models.json`: planned in the report, not implemented.
+  `models.json`: implemented 2026-11-13. `models.json` maps each of the seven
+  agents to a tier, `scripts/models` emits the host config, and a `validator`
+  tier exists so the proof re-check can run on a model that did not write the
+  finding. The tiering is a cost heuristic with no measurement behind it.
 - Extend targets beyond XBOW (crAPI needs more RAM than the current host).
 
 ## Superseded

@@ -5,7 +5,10 @@ Python engine. **The agent host is the agent loop**: OpenCode first (1.x >=
 1.18.29 and 2.x), Claude Code second. Mythos supplies the methodology
 (skills), the orchestration (one orchestrator, six sub-agents), a Kali tool belt
 (Docker), a scope guard, and a knowledge base. There is no external API key of
-its own and no second LLM; the host's configured model is the model.
+its own and no second LLM; the host's configured model is the model. On
+OpenCode, `models.json` may give each agent a different model from that host, so
+that cheap phases run cheaply and the validator pass can run on a model that did
+not write the finding.
 
 One canonical source feeds both hosts. `AGENTS.md`, `.opencode/agent/`,
 `.opencode/command/` and `skills/` are edited by hand; `scripts/build-hosts.py`

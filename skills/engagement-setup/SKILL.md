@@ -28,26 +28,73 @@ is the authorization boundary; nothing runs until it is written down.
    out_of_scope: [] # every excluded host the program names
    rules:
      rate_limit_rps: 5
-     max_requests: 20000
-     allow_active: false # true only if active scanning is permitted
-     allow_exploit: false # true only if PoC exploitation is permitted
+     ports: [80, 443] # the ports the program authorizes
+     allow_active: true # false only if the program forbids active scanning
+     allow_exploit: true # false only if the program forbids PoC exploitation
+     allow_publish: false # never publish a package to a public registry
+     allow_claim_resources: false # never claim a dangling subdomain or bucket
+     allow_secret_verification: false # never use a credential you found
    identities: [] # optional: two accounts for BOLA/IDOR testing
    notes: "" # paste the program's testing rules verbatim
    ```
 
    Field rules:
    - `in_scope`: only the hosts/CIDRs the program lists. Use `*.example.com`
-     for wildcard programs.
+     for wildcard programs. An empty list authorizes nothing, and the guard
+     treats it that way rather than as "allow everything".
    - `out_of_scope`: every excluded host the program names.
-   - `rules.rate_limit_rps` and `rules.max_requests`: respect the program's
-     limits (default 5 rps / 20000 requests).
-   - `rules.allow_active`: true only if active scanning is permitted.
-   - `rules.allow_exploit`: true only if the program permits proof-of-concept
-     exploitation. Default false.
+   - `rules.rate_limit_rps`: the program's rate limit, enforced by
+     `hooks/budget-guard.py`. Single-shot calls are paced by sleeping, and a
+     batch tool invoked without its own pacing flag is refused with the flag
+     to add. There is no request ceiling: a volume cap only ever stops the run
+     before the finding. If a program states a request limit, put it in
+     `notes` and watch it yourself.
+   - `rules.ports`: the ports the program authorizes. A request to another
+     port on an in-scope host is reported as out of scope.
+   - `rules.allow_active` and `rules.allow_exploit`: both default to true,
+     because this is a pentesting suite and exploitation is the work. Set
+     either to false only when the program's text forbids it. An explicit
+     `allow_exploit: false` makes the guard repeat the rule back once when
+     exploitation tooling runs; honoring it is your judgement, not a block.
+   - `rules.allow_publish`, `rules.allow_claim_resources`,
+     `rules.allow_secret_verification`: keep all three false unless the
+     program's text explicitly authorizes that action. They cover publishing a
+     package to a public registry (dependency-confusion testing), claiming a
+     dangling subdomain or bucket, and using a credential you discovered.
+     Each of those affects a third party, not just the target.
    - `notes`: paste the program's testing rules (e.g. "no DoS, no automated
      testing of the login form, no social engineering").
 
-4. **Read the scope back** to the user in one line and get a nod before
+4. **Pin the scope file** so nothing else can become the authorization
+   boundary:
+
+   ```bash
+   export MYTHOS_SCOPE="$PWD/engagements/<dir>/scope.yaml"
+   ```
+
+   Do this before any other phase runs. Without it both guards fall back to
+   the newest `engagements/*/scope.yaml` by modification time, which means a
+   leftover directory from an older engagement can silently authorize this
+   one. Confirm the pin took effect:
+
+   ```bash
+   python3 hooks/scope-guard.py --check 'curl https://example.invalid/'
+   ```
+
+   The `scope` field in that output must be the file you just wrote.
+
+5. **Read the history** for this target and stack, if there is any:
+
+   ```bash
+   scripts/lessons seen --target <target-host>
+   scripts/lessons prior            # after recon fingerprints the stack
+   ```
+
+   A class this target previously had rejected does not get re-reported
+   without new evidence. With an empty ledger this prints nothing useful and
+   the default phase order stands.
+
+6. **Read the scope back** to the user in one line and get a nod before
    starting recon. This is the single human gate of an engagement. A scope
    file passed with `--scope` counts as that confirmation (non-interactive
    runs); after it, the phases run through to the report. Do not start the
@@ -60,7 +107,21 @@ If the user pastes a program's scope page, extract in-scope and out-of-scope
 assets, the rate limit, and any forbidden techniques into `scope.yaml`. When in
 doubt, exclude rather than include. Record the program name and URL in `notes`.
 
-The scope file is the authorization boundary. It is read by the scope-guard hook
-(warns on out-of-scope hosts in any Bash/WebFetch command) and is the reference
-you (the agent) must honor in every tool invocation — target only in-scope hosts,
-stay under the rate limit, and exploit only when `allow_exploit` is true.
+## What the scope file actually controls
+
+The scope file is the authorization boundary, and two hooks read it on every
+Bash and WebFetch call. Knowing which rule is enforced and which is only
+advice matters, because the two failure modes are different:
+
+| Rule | Enforced by | On a violation |
+|---|---|---|
+| in_scope / out_of_scope / ports | `hooks/scope-guard.py` | **Warns, does not block.** The request has already gone out by the time you read the warning. Treat it as a slip that happened: stop, report it, do not repeat it. `MYTHOS_SCOPE_ENFORCE=ask` or `block` is the only way to prevent the call. |
+| rate_limit_rps | `hooks/budget-guard.py` | Single-shot calls are paced by sleeping. A batch tool without its own pacing flag is refused, with the flag to add. |
+| non-destructive, no brute force, no DoS | `hooks/budget-guard.py` | Refused outright, in every mode. No scope rule makes these acceptable, and a run already deleted another user's data once. |
+| allow_exploit: false | `hooks/budget-guard.py` | Warns once when exploitation tooling runs. Not a block: exploitation is the job. |
+| allow_active, allow_publish, allow_claim_resources, allow_secret_verification | nothing | Your judgement. Honor them as written; the relevant knowledge notes state the non-destructive alternative for each. |
+| request volume | nothing, by design | There is no ceiling. Spend what the finding needs. |
+
+Beyond that, the file is the reference you must honor in every tool
+invocation: target only in-scope hosts, stay under the rate limit, and exploit
+only when `allow_exploit` is true.

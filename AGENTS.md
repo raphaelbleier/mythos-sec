@@ -17,8 +17,14 @@ Start an engagement with `/cybersecurity <target> [--scope scope.yaml]` (or
 orchestrator follows the phase skills in order and delegates the heavy phases:
 
 `engagement-setup` → planner → `recon` (mythos-recon) → `web-scan`
-(mythos-scanner, mythos-browser for SPA/DOM) → `exploit` (mythos-exploiter,
-only if `allow_exploit`) → `report` (mythos-reporter).
+(mythos-scanner, mythos-browser for SPA/DOM) → `exploit` (mythos-exploiter) →
+`report` (mythos-reporter).
+
+`recon` fingerprints the stack and then runs `scripts/cvefeed match`, writing
+`engagements/<dir>/cve-candidates.json`. The planner reads that file and spawns
+work from it. This matters more than it looks: an agent given the CVE
+description reached 87% on a one-day benchmark against 7% without it, so
+knowing what to look for is most of the result.
 
 Load a phase skill when you reach that phase; do not preload them all.
 `knowledge/` holds per-class confirmation playbooks: read the relevant file
@@ -36,7 +42,10 @@ mounted at `/repo`, so tool output lands under `engagements/`. A lab target on
 ## Scope rules
 
 - `engagements/<dir>/scope.yaml` is the hard authorization boundary. Never
-  widen it on your own; default `in_scope` to the target host only.
+  widen it on your own; default `in_scope` to the target host only. Pin it with
+  `export MYTHOS_SCOPE=...` in `engagement-setup`: without that, both guards
+  fall back to the newest `engagements/*/scope.yaml` by modification time, and a
+  leftover directory would authorize the run.
 - The scope guard (`hooks/scope-guard.py`, wired as a Claude Code PreToolUse
   hook and as the OpenCode plugin `.opencode/plugin/scope-guard.ts`) warns on
   out-of-scope hosts in bash/webfetch calls. It is warn-only by design
@@ -49,7 +58,12 @@ mounted at `/repo`, so tool output lands under `engagements/`. A lab target on
   one out-of-scope request is unacceptable. Never widen the scope to silence a
   warning. A request the target makes on your behalf, for example an SSRF
   probe, counts as yours: the destination must be in scope too.
-- Honor `rules.rate_limit_rps` and `rules.max_requests`.
+- Honor `rules.rate_limit_rps`. `hooks/budget-guard.py` enforces it: single
+  calls are paced by sleeping, and a batch tool with no pacing flag is refused
+  with the flag to add. There is no request ceiling and no exploitation gate,
+  because this is a bug-bounty suite and exploitation is the work. The guard
+  does refuse data destruction, brute force and denial of service outright, in
+  every mode, and no scope rule overrides that.
 - Keep all engagement artifacts under `engagements/<dir>/` (git-ignored).
 
 ## Single human gate
@@ -75,6 +89,34 @@ skipped and reported as "unconfirmed".
 Edit only the canonical files, then run `python3 scripts/build-hosts.py`.
 `python3 scripts/build-hosts.py --check` exits 1 on drift (use it in CI).
 Never hand-edit `agents/*.md` or `commands/*.md`.
+
+## Deterministic tools do the work the prompt cannot
+
+The strongest published finding about agents in this domain is that the tool
+layer decides the outcome, not the prose: in one study every model scored zero
+without high-level actions, while small models with them succeeded where large
+models without them did not. So reach for these before writing a paragraph.
+
+| Script | What it is for |
+|---|---|
+| `scripts/probe` | map the surface, GET only except the GraphQL introspection POST |
+| `scripts/verify` | re-send one aim point and judge it against an oracle |
+| `scripts/cvefeed` | KEV, EPSS, NVD, nuclei templates, GHSA and OSV, ranked for this stack |
+| `scripts/coverage` | which mapped paths the report still does not account for |
+| `scripts/findings` | `findings.json` and SARIF, CVSS computed from the vector, dedup, redaction, `--diff` for retest |
+| `scripts/lessons` | class priors from past engagements; see its own caveat, it is an untested hypothesis |
+
+Every one of them has a `--selftest`. Run it after changing one.
+
+## Proof standard
+
+`skills/exploit` holds the rules. Two of them exist because of measurements
+worth repeating here: about 44% of proofs of concept that passed exit-code,
+marker and trace checks were invalid, so a deterministic oracle outranks any
+reading of a transcript; and a model approves its own errors 11.9 percentage
+points more often when it wrote them, so the validator pass wants a different
+model (`models.json` has a `validator` tier) and must say so when it cannot
+have one.
 
 ## Self-test
 

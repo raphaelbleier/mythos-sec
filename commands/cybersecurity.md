@@ -54,7 +54,20 @@ Follow the **`engagement-setup` skill**:
    `engagements/<dir>/scope.yaml` from the template in the `engagement-setup`
    skill, and **fill `in_scope` with exactly what the program authorizes**.
    Default `in_scope` to the target host only. Never widen scope on your own.
-4. State the scope back to the user in one line (in-scope hosts, rate limit,
+4. **Pin the scope file** before anything else runs:
+   `export MYTHOS_SCOPE="$PWD/engagements/<dir>/scope.yaml"`. Without this both
+   guards fall back to the newest `engagements/*/scope.yaml` by modification
+   time, so a leftover directory from an older engagement would authorize this
+   one. Verify with
+   `python3 hooks/scope-guard.py --check 'curl https://example.invalid/'` and
+   check that the `scope` field names the file you just wrote.
+5. **Read the history**, if any: `scripts/lessons seen --target <host>` says
+   whether this target has been tested before and which classes were rejected
+   (do not re-report those without new evidence). After Step 1 fingerprints
+   the stack, `scripts/lessons prior --stack <tokens>` ranks the classes by how
+   often they have actually confirmed on a stack like this. With an empty
+   ledger it says so and your default order stands.
+6. State the scope back to the user in one line (in-scope hosts, rate limit,
    whether exploitation is allowed). Do **not** start the toolbox yet: start it
    with `scripts/mythos up` the first time you actually need a container tool.
    Plain HTTP requests run faster with the host's own `curl`.
@@ -191,6 +204,14 @@ Write it yourself on a small target. On a large one delegate to
 reproduce, evidence, impact, remediation), ranked by severity. If the user asks
 for a German lab `.docx`, hand the findings to the `security-lab` skill.
 
+Run `scripts/findings engagements/<dir>` first, before the prose. It parses the
+front matter of every finding into `findings.json`, computes the CVSS score
+from the vector rather than trusting the severity word, deduplicates the same
+flaw across instance ids, redacts credentials out of the evidence, and lists
+every `validated` finding that lacks a proof path or a negative control under
+`problems`. Resolve every entry in that list: supply the evidence, or drop the
+state back. The merged list it produces is the report's structure.
+
 ## Running tools (the toolbox)
 
 Everything runs in the `mythos-toolbox` Kali container via `scripts/mythos`
@@ -203,8 +224,20 @@ is reached as `http://host.docker.internal:PORT`. No external API key is needed
 ## Rules (hard rules, not stops)
 
 - Respect the scope file as the hard authorization boundary. The scope guard
-  warns on out-of-scope commands; you still must not run them.
-- Honor the rate limit and request budget in `scope.yaml`.
+  **warns and does not block**, so by the time you read a warning the request
+  has already gone out. Treat one as a slip that happened: stop, report it in
+  the engagement, and do not send it again. Never widen the scope to silence
+  it. A request the target makes on your behalf, an SSRF probe for example,
+  counts as yours, so its destination must be in scope too.
+- Honor the rate limit in `scope.yaml`. It is enforced:
+  `hooks/budget-guard.py` paces single-shot calls and refuses a batch tool
+  that carries no pacing flag, naming the flag to add. It also refuses data
+  destruction, brute force and denial of service outright, in every mode. If
+  it refuses a call on those grounds, do not look for a way around it: find a
+  read-only proof, or report the class as unconfirmed.
+- There is no request ceiling and no exploitation gate. Exploitation is the
+  work, so spend what the finding needs. The one hard line is the one above:
+  do not break the target, do not brute-force it, do not take it down.
 - Keep every engagement artifact under `engagements/<dir>/` (git-ignored).
 - Report honestly: say what was tested, what was found, what was skipped and
   why. Mark tentative findings as tentative.
