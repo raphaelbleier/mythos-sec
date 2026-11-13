@@ -76,6 +76,7 @@ jobs:
           python3 scripts/cvefeed --selftest
           python3 scripts/findings --selftest
           python3 scripts/lessons --selftest
+          python3 scripts/watch --selftest
           python3 scripts/models --check
           # TODO: scripts/coverage and scripts/verify are gaining --selftest. Once both
           # have landed, drop the grep guards and run them unconditionally.

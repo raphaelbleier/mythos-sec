@@ -1,0 +1,9 @@
+target: https://app.test
+in_scope:
+  - app.test
+  - '*.app.test'
+out_of_scope:
+  - admin.app.test
+rules:
+  rate_limit_rps: 5
+  ports: [80, 443]

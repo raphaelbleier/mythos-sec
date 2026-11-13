@@ -56,6 +56,8 @@ generates `CLAUDE.md`, `agents/` and `commands/` for Claude Code
     [`docs/plan/ROADMAP.md`](plan/ROADMAP.md), phases 3 and 5).
   - `exploit`: minimal, non-destructive proof of concept, with closure states.
   - `report`: bug-bounty-format deliverable; findings carry a closure state.
+  - `continuous`: acts on a `scripts/watch` work list for an already-tested
+    target: new endpoints and CVEs, replay of stored proofs, fix verification.
   - `toolbox`: how to run tools in the Kali container.
   - `research-ingest`, `cve-deep-dive`: knowledge-base maintenance.
 - **Sub-agents** (`.opencode/agent/mythos-*.md`; generated as `agents/*.md`):
@@ -67,6 +69,10 @@ generates `CLAUDE.md`, `agents/` and `commands/` for Claude Code
   `.github/workflows/toolbox.yml`; `scripts/mythos up` pulls it, or builds
   locally with `MYTHOS_BUILD=1`.
 - **Shim** (`scripts/mythos`): stdlib-only Python driver: `up`, `down`,
+- **Watch** (`scripts/watch`): stdlib-only change detector for a tested target.
+  Surface drift via `scripts/probe`, new CVEs via `scripts/cvefeed`, finding
+  drift via `scripts/findings --diff`. State in `engagements/.watch/`. It applies
+  the scope pin and the rate limit to its own requests, since cron has no hook.
   `tools`, `run <tool>`, `sh '<cmd>'`, `net <network>`, `<tool> ...`. Mounts the
   repo at `/repo`, maps `host.docker.internal`, and logs every exec to
   `engagements/audit.jsonl`.

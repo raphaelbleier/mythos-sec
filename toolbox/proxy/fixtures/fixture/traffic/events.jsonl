@@ -1,0 +1,4 @@
+{"t":1763109999.0,"event":"start","pid":1,"port":8899,"bind":["127.0.0.1"],"tls_intercept":true,"insecure_upstream":false,"max_body":1048576,"started":1763109999.0}
+{"t":1763110000.0,"event":"phase","name":"recon"}
+{"t":1763110008.0,"event":"phase","name":"scan"}
+{"t":1763110040.0,"event":"stop"}

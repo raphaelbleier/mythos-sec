@@ -1,0 +1,1197 @@
+#!/usr/bin/env python3
+"""Mythos watch: what changed on a tested target since last time, and what is worth re-testing.
+
+An engagement is a snapshot. Software keeps changing after it: a developer ships
+a route nobody has tested, a framework is upgraded, a CVE lands on the KEV list
+for the stack, a fixed bug comes back. `watch` is the cheap, deterministic layer
+a cron job or CI step calls between engagements. It sends no payload and calls
+no model. It answers two questions and prints a prioritized work list.
+
+  scripts/watch init   <url> --scope scope.yaml --confirm-authorization 'NOTE' [--from engagements/<dir>]
+  scripts/watch check  <url> [--signals surface,cve,findings] [--offline] [--json]
+  scripts/watch retest <url> [--all] [--json]
+  scripts/watch record <url> engagements/<dir>       # after an engagement or a retest ran
+  scripts/watch verify <url> <fingerprint> (--fixed | --present) --evidence PATH
+  scripts/watch ack    <url> --note TEXT              # accept the current state as the baseline
+  scripts/watch --selftest
+
+Three change signals, all computed against the stored per-target state:
+
+  surface    Re-runs scripts/probe and diffs it against the stored map: new and
+             removed routes, new parameters, a changed authentication mechanism,
+             a gated route that opened, a changed or new technology, and new
+             hosts. A new endpoint on a target already tested is the
+             highest-value event here: it is untested by construction.
+  cve        Takes the stored fingerprint (plus what probe sees now) through
+             scripts/cvefeed match and reports CVEs that were not known at the
+             last engagement. A KEV entry for a stack the target runs is the one
+             event that asks for a human at 3am, once.
+  findings   `record` runs scripts/findings --diff against the last recorded
+             findings.json and keeps a registry per finding fingerprint. A
+             validated finding that is gone is "not reproducible today", never
+             "fixed", until `verify --fixed` names the evidence of a replayed
+             proof of concept. A fixed finding that reappears is a regression.
+             `retest` lists the stored proofs to replay.
+
+SCOPE AND AUTHORIZATION. watch never widens its own authorization.
+  - It needs a pinned scope file (--scope, or $MYTHOS_SCOPE). It does not fall
+    back to the newest engagements/*/scope.yaml, because that is how a stale
+    directory becomes the authorization boundary.
+  - Every request it sends is checked against that scope (host and port, also
+    on redirects) and refused if out of scope, and is paced through
+    hooks/budget-guard.py at rules.rate_limit_rps (0.2 s apart if the scope sets
+    none). Cron and CI have no PreToolUse hook, so this is enforced here, not
+    left to one.
+  - A host that drift discovers is reported and never requested. In scope it is
+    queued for recon; out of scope it is only listed under `not_queued`.
+  - The operator confirms authorization with `init --confirm-authorization`.
+    If the scope file's bytes change, or the confirmation is older than
+    --reconfirm-days (default 30), the run sends NO traffic to the target,
+    marks its target-touching work `held` and exits 3. Re-check the program
+    page, then run init again. watch cannot see the program page: it can only
+    force you to look at it.
+
+EXIT CODES
+  0  nothing outstanding: no drift, no new CVE, nothing to replay
+  1  outstanding work. Idempotent: the same state gives 1 again until `record`
+     or `ack` consumes it
+  2  error or refusal (no pinned scope, no state, target unreachable, feed
+     unusable). Output is still printed with whatever was computed
+  3  a human is needed now: a KEV entry newly matches the known stack (once per
+     CVE), or scope/authorization is out of date and traffic is held.
+     3 wins over 2, 2 wins over 1
+
+State is per target, in engagements/.watch/<host>_<port>/ (git-ignored target
+data, written only by this host-side tool; the toolbox mounts the repo
+read-only and never needs it). Override with --state DIR or $MYTHOS_WATCH_STATE.
+Stdlib only. `--selftest` runs the asserts and needs no network.
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA = 1
+PRIORITY = {1: "urgent", 2: "high", 3: "normal", 4: "low"}
+AUTH_WORDS = re.compile(r"(?i)login|signin|sign-in|auth|sso|oauth|saml|session")
+COOKIE_ATTRS = {"path", "domain", "expires", "max-age", "secure", "httponly", "samesite"}
+FMT = "%Y-%m-%dT%H:%M:%SZ"
+EXIT_MEANING = {0: "nothing outstanding", 1: "outstanding work, queue it",
+                2: "error or refusal, see notes", 3: "a human is needed now"}
+# What a good retest or re-run must not repeat. Static half; the rest is state.
+DO_NOT_RERUN = [
+    {"what": "recon steps 2-5 (subfinder, katana, ffuf, arjun) on routes already in the baseline",
+     "why": "the surface map already covers them and a drift check just compared against it"},
+    {"what": "web-scan and exploit on a route whose class was rejected before",
+     "why": "a rejected class is re-reported only with new evidence (see `rejected` in the state)"},
+    {"what": "cve-deep-dive on CVE ids listed in the baseline",
+     "why": "the last engagement already assessed them; only ids marked new are open"},
+    {"what": "anything on a host listed under not_queued",
+     "why": "it is outside the pinned scope; only the human can widen scope"},
+]
+
+
+class OutOfScope(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f"watch: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+# ------------------------------------------------------------------ small helpers
+
+_mods: dict = {}
+
+
+def mod(name):
+    """Load a sibling script or hook by path, so its logic is called and not copied."""
+    if name not in _mods:
+        rel = {"probe": "scripts/probe", "findings": "scripts/findings",
+               "scope-guard": "hooks/scope-guard.py",
+               "budget-guard": "hooks/budget-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(f"mythos_{name}".replace("-", "_"),
+                                                      str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def now_iso():
+    return time.strftime(FMT, time.gmtime())
+
+
+def days_since(ts):
+    return (time.time() - calendar.timegm(time.strptime(ts, FMT))) / 86400
+
+
+def jload(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except ValueError as e:
+        die(f"{path} is not valid JSON: {e}")
+
+
+def jsave(path, doc):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def origin_of(url):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        die(f"not an http(s) URL: {url}")
+    return f"{u.scheme}://{u.netloc}".lower()
+
+
+def state_dir(a):
+    u = urllib.parse.urlsplit(origin_of(a.target))
+    port = u.port or (443 if u.scheme == "https" else 80)
+    key = re.sub(r"[^a-z0-9.\-]+", "_", f"{u.hostname}_{port}")
+    base = a.state or os.environ.get("MYTHOS_WATCH_STATE") or ROOT / "engagements" / ".watch"
+    return Path(base) / key
+
+
+# --------------------------------------------------------------- scope and guards
+
+def pin_scope(a):
+    """The pinned scope, or a refusal. No fallback to a guessed file."""
+    if getattr(a, "scope", None):
+        os.environ["MYTHOS_SCOPE"] = str(Path(a.scope).resolve())
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path or not Path(path).is_file():
+        die("no pinned scope. Pass --scope FILE or export MYTHOS_SCOPE=<scope.yaml>. watch "
+            "never guesses the newest engagement's scope: a leftover directory would "
+            "silently become the authorization boundary.")
+    sg, bg = mod("scope-guard"), mod("budget-guard")
+    scope_file, ins, outs, ports = sg.load_scope()
+    rules = bg.load_rules()[1]
+    sc = {"path": str(scope_file), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+          "in_scope": [str(x) for x in ins], "out_of_scope": [str(x) for x in outs],
+          "ports": sorted(ports) if ports else None, "rate_limit_rps": bg._num(rules, "rate_limit_rps"),
+          "allow_active": bg._bool(rules, "allow_active")}
+    return sc
+
+
+def host_in_scope(host):
+    return not mod("scope-guard").check(f"https://{host}/")["offenders"]
+
+
+@contextlib.contextmanager
+def guarded(sc, stats):
+    """Route every urllib request probe makes through the scope pin and the rate limit.
+
+    probe is imported, not shelled out to, so this wraps urlopen for the duration
+    of the call: nothing it sends, redirects included, bypasses the check.
+    """
+    sg, bg = mod("scope-guard"), mod("budget-guard")
+    real = urllib.request.urlopen
+
+    def enter(url):
+        offenders = sg.check(url)["offenders"]
+        if offenders:
+            stats["blocked"].append(url)
+            raise OutOfScope(f"refused {url}: not in the pinned scope ({', '.join(offenders)})")
+        wait = bg.check(f"curl {url}", charge=True)["sleep"]
+        time.sleep(wait or (0 if sc["rate_limit_rps"] else 0.2))
+        stats["requests"] += 1
+
+    class Scoped(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            enter(urllib.parse.urljoin(req.full_url, newurl))
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def urlopen(req, timeout=None, context=None, **_):
+        enter(getattr(req, "full_url", req))
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), Scoped)
+        return opener.open(req, timeout=timeout or 10)
+
+    urllib.request.urlopen = urlopen
+    try:
+        yield
+    finally:
+        urllib.request.urlopen = real
+
+
+# ---------------------------------------------------------------- surface signal
+
+def sanitize(m):
+    """Drop cookie values before the map is stored: a Set-Cookie can carry a session."""
+    for p in m.get("pages") or []:
+        raw = (p.get("headers") or {}).pop("set-cookie", None)
+        if raw:
+            p["cookie_names"] = sorted({n for n in re.findall(r"(?:^|[;,])\s*([\w.\-]+)=", raw)
+                                        if n.lower() not in COOKIE_ATTRS})
+    return m
+
+
+def signature(m, origin):
+    """The comparable shape of a probe map: routes, parameters, auth, hosts, tech."""
+    route = mod("findings").route
+    netloc = urllib.parse.urlsplit(origin).netloc
+    routes, params, auth, hosts, tech = {}, set(), set(), set(), {}
+
+    def external(url):
+        n = urllib.parse.urlsplit(url).netloc.lower()
+        if n and n != netloc:
+            hosts.add(n)
+
+    for p in m.get("pages") or []:
+        if p.get("status") not in (404, 410):
+            routes[f"GET {route(p['url'])}"] = p.get("status")
+        for url in [p.get("redirected_to")] + [urllib.parse.urljoin(p["url"], s)
+                                              for s in p.get("scripts") or []]:
+            if url:
+                external(url)
+        if p.get("redirected_to") and AUTH_WORDS.search(route(p["redirected_to"])):
+            auth.add(f"redirect-to:{route(p['redirected_to'])}")
+        challenge = (p.get("headers") or {}).get("www-authenticate")
+        if challenge:
+            auth.add("www-authenticate:" + challenge.split()[0].lower())
+        auth.update(f"cookie:{n}" for n in p.get("cookie_names") or [])
+        for f in p.get("forms") or []:
+            action = urllib.parse.urljoin(p["url"], f.get("action") or p["url"])
+            external(action)
+            routes[f"{f['method'].upper()} {route(action)}"] = None
+            if any(i.get("type") == "password" for i in f.get("inputs") or []):
+                auth.add(f"login-form:{route(action)}")
+    for r in m.get("reachable_paths") or []:
+        routes[f"GET {r['path']}"] = r.get("status")
+    for e in m.get("api_endpoints") or []:
+        routes[e] = None
+    for prm in m.get("parameters") or []:
+        for loc in prm.get("seen_at") or []:
+            loc = route(loc) if loc.startswith("http") else loc
+            params.add(f"{prm['name']} @ {loc}")
+    for t in m.get("technology") or []:
+        name, _, version = t.partition("/")
+        tech[name.lower()] = version
+    return {"routes": routes, "params": sorted(params), "auth": sorted(auth),
+            "hosts": sorted(hosts), "tech": tech}
+
+
+def surface_hash(sig):
+    return hashlib.sha256(json.dumps(sig, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def diff_signature(old, new):
+    gated = lambda s: s in (401, 403)
+    ro, rn = old["routes"], new["routes"]
+    new_routes = sorted(rn.keys() - ro.keys())
+    new_paths = {k.split(" ", 1)[1] for k in new_routes}
+
+    def on_new_route(loc):
+        gql = re.match(r"graphql (\w+) \(arg\)", loc)
+        if gql:
+            return any(r.startswith((f"query {gql[1]}(", f"mutation {gql[1]}(")) for r in new_routes)
+        path = re.search(r"(/\S*)", loc)
+        return bool(path) and path[1] in new_paths
+
+    return {
+        "new_routes": new_routes,
+        "removed_routes": sorted(ro.keys() - rn.keys()),
+        "status_changes": [{"route": k, "was": ro[k], "now": rn[k]}
+                           for k in sorted(ro.keys() & rn.keys())
+                           if ro[k] and rn[k] and gated(ro[k]) != gated(rn[k])],
+        "new_params": [p for p in sorted(set(new["params"]) - set(old["params"]))
+                       if not on_new_route(p.split(" @ ", 1)[1])],
+        "removed_params": sorted(set(old["params"]) - set(new["params"])),
+        "auth_added": sorted(set(new["auth"]) - set(old["auth"])),
+        "auth_removed": sorted(set(old["auth"]) - set(new["auth"])),
+        "tech_added": {k: v for k, v in new["tech"].items() if k not in old["tech"]},
+        "tech_removed": {k: v for k, v in old["tech"].items() if k not in new["tech"]},
+        "tech_changed": {k: [old["tech"][k], v] for k, v in new["tech"].items()
+                         if k in old["tech"] and old["tech"][k] != v},
+        "new_hosts": sorted(set(new["hosts"]) - set(old["hosts"])),
+    }
+
+
+def item(kind, prio, key, summary, why, skill=None, also=(), run=None, touches_target=True,
+         **extra):
+    d = {"id": f"{kind}:{key}", "kind": kind, "priority": prio, "priority_label": PRIORITY[prio],
+         "summary": summary, "why": why,
+         "handled_by": {"skill": skill, "also": list(also), "run": run},
+         "touches_target": touches_target, "held": False}
+    d.update(extra)
+    return d
+
+
+def route_skills(path, params):
+    """web-scan always; add the capability skill the parameter names point at."""
+    also = []
+    for p in params:
+        if any(path in loc for loc in p.get("seen_at") or []):
+            h = p.get("hypotheses") or ""
+            for pattern, skill in (("idor|mass-assignment|business-logic", "business-logic"),
+                                   ("auth/jwt", "auth-session")):
+                if re.search(pattern, h) and skill not in also:
+                    also.append(skill)
+    return also
+
+
+def surface_items(d, m, hosts_in_scope):
+    """Work items from a surface diff, and the hosts that were reported but not queued."""
+    work, not_queued = [], []
+    params = m.get("parameters") or []
+    groups = {}
+    for r in d["new_routes"]:
+        verb, _, path = r.partition(" ")
+        groups.setdefault(path, []).append(verb)
+    for path, verbs in groups.items():
+        work.append(item(
+            "new-endpoint", 2, path, f"new endpoint {'/'.join(verbs)} {path}",
+            "untested by construction: nothing in the last engagement covered it",
+            "web-scan", route_skills(path, params), methods=verbs))
+    for c in d["status_changes"]:
+        opened = c["was"] in (401, 403)
+        work.append(item(
+            "status-change", 2 if opened else 4, c["route"],
+            f"{c['route']} went from {c['was']} to {c['now']}",
+            "a gated route opened: an access-control change or a bug" if opened else
+            "a route became gated: usually a fix, replay any stored proof on it",
+            "auth-session" if opened else "exploit", ["web-scan"] if opened else []))
+    for p in d["new_params"]:
+        name, loc = p.split(" @ ", 1)
+        work.append(item("new-parameter", 3, p, f"new parameter `{name}` on {loc}",
+                         "a known route takes new input: new injection and access-control surface",
+                         "web-scan", route_skills(loc, params)))
+    if d["auth_added"] or d["auth_removed"]:
+        work.append(item(
+            "auth-change", 2, "mechanism",
+            "authentication mechanism changed",
+            "session and token handling is where one change breaks many assumptions",
+            "auth-session", ["oauth-audit"] if any("oauth" in x or "sso" in x
+                                                    for x in d["auth_added"]) else [],
+            added=d["auth_added"], removed=d["auth_removed"]))
+    stack = {**{k: [None, v] for k, v in d["tech_added"].items()}, **d["tech_changed"]}
+    if stack:
+        work.append(item(
+            "stack-change", 3, ",".join(sorted(stack)), "technology or version changed",
+            "the CVE signal already used the new fingerprint; confirm the version at its "
+            "source instead of trusting the banner", "recon", [], "recon skill, steps 1, 1a, 1b",
+            changed=stack, removed=d["tech_removed"]))
+    if d["removed_routes"]:
+        work.append(item(
+            "removed-routes", 4, "list",
+            f"no longer answering: {', '.join(d['removed_routes'][:5])}",
+            "informational. A finding on one of them is listed by retest as a fix to verify",
+            None, [], None, touches_target=False, routes=d["removed_routes"]))
+    for h in d["new_hosts"]:
+        if hosts_in_scope(h):
+            work.append(item("new-host", 3, h, f"new in-scope host {h} referenced by the target",
+                             "inside the pinned scope and never mapped. Not requested by watch",
+                             "recon", [], f"recon skill on {h}, after confirming the program "
+                             "still lists it"))
+        else:
+            not_queued.append({"host": h, "in_scope": False,
+                               "reason": "referenced by the target but outside the pinned scope. "
+                                         "Reported, not requested, not queued. Only a human "
+                                         "widens scope. A new third-party script host is a "
+                                         "supply-chain observation, not a test target."})
+    return work, not_queued
+
+
+# ------------------------------------------------------------------- cve signal
+
+def run_cvefeed(wants, a):
+    cmd = [sys.executable, str(ROOT / "scripts" / "cvefeed"), "match", "--json", "--limit", "200"]
+    for w in wants:
+        flag = {"fingerprint": "--fingerprint", "banner": "--banner"}.get(w.get("source"),
+                                                                           "--product")
+        cmd += [flag, w["name"] + (f"@{w['version']}" if w.get("version") and flag != "--product"
+                                    else "")]
+    if getattr(a, "offline", False):
+        cmd.append("--offline")
+    if getattr(a, "snapshot", None):
+        cmd += ["--snapshot", a.snapshot]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        return None, (r.stderr.strip() or f"cvefeed exited {r.returncode}")[:300]
+    return json.loads(r.stdout), None
+
+
+def merge_wants(stored, tech):
+    """Stored fingerprint, overridden by a banner when the target now shows another version."""
+    wants = {w["name"]: w for w in stored}
+    for name, version in tech.items():
+        if name not in wants or wants[name].get("version") != version:
+            wants[name] = {"name": name, "version": version or None,
+                           "source": "banner" if version else None}
+    return list(wants.values())
+
+
+def cve_items(cands, known, notified, origin, rate):
+    work = []
+    for c in cands:
+        if c["id"] in known:
+            continue
+        exploited = c["kev"] or c["malicious_package"]
+        # A banner match pages a human only when the matched package is the product itself.
+        # cvefeed matches `python@3.14` against a KEV row for node.js, and that is not 3am.
+        same = c["product"].lower() in (c.get("matched_package") or "").lower()
+        if exploited and (c["match_confidence"] == "exact" or
+                          (c["match_confidence"] == "banner" and same)):
+            prio = 1
+        elif exploited or c.get("nuclei_template") or (c.get("epss") or 0) >= 0.1:
+            prio = 2
+        else:
+            prio = 3
+        announced = c["id"] in notified
+        work.append(item(
+            "new-cve", prio, c["id"],
+            f"{c['id']} newly matches {c['product']}"
+            f"{'@' + c['version'] if c.get('version') else ''}: {c.get('title') or ''}".strip(),
+            c["why"], "cve-deep-dive", [],
+            f"scripts/mythos nuclei -id {c['id'].lower()} -u {origin} -rate-limit {int(rate or 5)}"
+            if c.get("nuclei_template") else None,
+            kev=c["kev"], epss=c.get("epss"), match_confidence=c["match_confidence"],
+            kev_date_added=c.get("kev_date_added"), announced=announced,
+            page_human=(prio == 1 and not announced)))
+    return work
+
+
+# --------------------------------------------------------------- findings signal
+
+def retest_items(st, drifted, retest_days, force=False):
+    """Stored proofs worth replaying: unverified gone, regressed, on a drifted route, or stale."""
+    work = []
+    for fp, f in sorted(st["findings"].items()):
+        route = f.get("route") or ""
+        on_drift = bool(route) and any(r.endswith(" " + route) for r in drifted)
+        last = f.get("last_replayed") or f.get("last_seen") or st["created"]
+        if f["status"] == "unverified_gone":
+            prio, why = 2, ("absent from the last recorded engagement. Not reproducible today "
+                            "is not the same as fixed: replay the proof")
+        elif f["status"] == "regressed":
+            prio, why = 2, "was verified fixed, then validated again: a regression to confirm"
+        elif on_drift:
+            prio, why = 2, f"the route {route} changed in the surface diff"
+        elif force or days_since(last) >= retest_days:
+            prio = 4
+            why = ("fixed finding: periodic regression check" if f["status"] == "fixed"
+                   else f"last replayed or validated {int(days_since(last))} day(s) ago")
+        else:
+            continue
+        proof = f.get("proof")
+        pp = None
+        if proof:
+            pp = Path(proof) if Path(proof).is_absolute() else Path(f["engagement"]) / proof
+        work.append(item(
+            "retest", prio, fp, f"replay the proof for {f['title']} ({f['status']})", why,
+            "continuous", ["exploit"], None,
+            finding={"fingerprint": fp, "id": f.get("id"), "title": f["title"], "class": f.get("class"),
+                     "route": route, "param": f.get("param"), "severity": f.get("severity"),
+                     "status": f["status"], "engagement": f.get("engagement")},
+            replay={"proof": str(pp) if pp else None, "proof_exists": bool(pp and pp.exists()),
+                    "negative_control": f.get("negative_control")},
+            verify_with={v: f"scripts/watch verify {st['target']} {fp} --{v} --evidence <replay output>"
+                         for v in ("fixed", "present")}))
+    return work
+
+
+# ---------------------------------------------------------------------- state ops
+
+def load_state(a):
+    sdir = state_dir(a)
+    st = jload(sdir / "state.json")
+    if st is None:
+        die(f"no state for {origin_of(a.target)} in {sdir}. Run `scripts/watch init` first.")
+    return st, sdir
+
+
+def adopt_surface(st, sdir, m, authenticated=None):
+    """The map every later check diffs against, with its hash recorded in the state."""
+    st["surface_hash"] = surface_hash(signature(m, st["origin"]))
+    st["authenticated"] = authenticated if authenticated is not None else st.get("authenticated")
+    jsave(sdir / "surface.json", {"taken_at": now_iso(), "hash": st["surface_hash"],
+                                  "authenticated": st["authenticated"], "map": m})
+
+
+def adopt_last_surface(st, sdir):
+    last = jload(sdir / "last-surface.json")
+    if last:
+        adopt_surface(st, sdir, last["map"], last.get("authenticated"))
+
+
+def ingest(st, sdir, eng):
+    """Fold a finished engagement into the state. The diff itself is scripts/findings --diff."""
+    eng = Path(eng).resolve()
+    nxt, prev = sdir / "findings.next.json", sdir / "findings.json"
+    cmd = [sys.executable, str(ROOT / "scripts" / "findings"), str(eng), "--all", "--out", str(nxt)]
+    if prev.exists():
+        cmd += ["--diff", str(prev)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        die(f"scripts/findings failed on {eng}: {(r.stderr or r.stdout).strip()[:300]}")
+    doc = jload(nxt)
+    cur = {x["fingerprint"]: x for x in doc["findings"] if x["state"] == "validated"}
+    diff = doc.get("retest") or {"fixed": [], "still_present": [], "new": sorted(cur)}
+    reg, out, ts = st["findings"], {k: [] for k in
+                                    ("new", "still_present", "gone_unverified", "regressions",
+                                     "reappeared")}, now_iso()
+
+    def write(fp, status):
+        x, old = cur[fp], reg.get(fp, {})
+        reg[fp] = {**old, "id": x["id"], "title": x["title"], "class": x["class"], "route": x["route"],
+                   "asset": x["asset"], "param": x["param"], "severity": x["severity"],
+                   "proof": x["proof"], "negative_control": x["negative_control"],
+                   "engagement": str(eng), "status": status,
+                   "first_seen": old.get("first_seen", ts), "last_seen": ts}
+
+    for fp in diff["new"]:
+        old = reg.get(fp, {}).get("status")
+        if old == "fixed":
+            out["regressions"].append(fp)
+            write(fp, "regressed")
+        else:
+            out["reappeared" if old == "unverified_gone" else "new"].append(fp)
+            write(fp, "open")
+    for fp in diff["still_present"]:
+        out["still_present"].append(fp)
+        write(fp, reg.get(fp, {}).get("status", "open"))
+    for fp in diff["fixed"]:
+        if fp in reg and reg[fp]["status"] in ("open", "regressed"):
+            reg[fp].update(status="unverified_gone", gone_since=ts)
+            out["gone_unverified"].append(fp)
+    st["rejected"] = {x["fingerprint"]: {"title": x["title"], "route": x["route"],
+                                         "reason": x.get("reason")}
+                      for x in doc["findings"] if x["state"] == "rejected"}
+    os.replace(nxt, prev)
+
+    # the engagement's own artifacts become the new baseline; else adopt what the last check saw
+    m = jload(eng / "surface.json")
+    cc = jload(eng / "cve-candidates.json")
+    if m:
+        adopt_surface(st, sdir, sanitize(m))
+    else:
+        adopt_last_surface(st, sdir)
+    pend = st.get("pending") or {}
+    if cc:
+        st["fingerprint"] = cc.get("requested") or st["fingerprint"]
+        st["cve_known"] = sorted(set(st.get("cve_known") or []) |
+                                 {c["id"] for c in cc.get("candidates") or []})
+    else:
+        st["cve_known"] = sorted(set(st.get("cve_known") or []) | set(pend.get("cve_ids") or []))
+        st["fingerprint"] = pend.get("wants") or st["fingerprint"]
+    st["pending"] = {}
+    st["last_record"] = {"at": ts, "engagement": str(eng)}
+    return out
+
+
+# --------------------------------------------------------------------------- verbs
+
+def new_state(a, sc):
+    return {"schema": SCHEMA, "target": a.target, "origin": origin_of(a.target), "created": now_iso(),
+            "authorization": None, "fingerprint": [], "cve_known": None, "cve_notified": [],
+            "findings": {}, "rejected": {}, "first_seen": {}, "pending": {}, "acks": [],
+            "surface_hash": None, "authenticated": None, "last_check": None, "last_record": None}
+
+
+def cmd_init(a):
+    sc = pin_scope(a)
+    if mod("scope-guard").check(origin_of(a.target))["offenders"]:
+        die(f"{origin_of(a.target)} is not in the pinned scope {sc['path']}")
+    sdir = state_dir(a)
+    sdir.mkdir(parents=True, exist_ok=True)
+    st = jload(sdir / "state.json") or new_state(a, sc)
+    st["authorization"] = {"confirmed_at": now_iso(), "note": a.confirm_authorization,
+                           "scope_path": sc["path"], "scope_sha256": sc["sha256"]}
+    summary = {}
+    if a.from_engagement:
+        summary = ingest(st, sdir, a.from_engagement)
+    jsave(sdir / "state.json", st)
+    print(f"watch: state in {sdir}; authorization confirmed against {sc['path']}. "
+          f"Re-run init within {a.reconfirm_days} days after re-checking the program page.")
+    if summary:
+        print(f"watch: ingested {a.from_engagement}: {len(st['findings'])} validated finding(s), "
+              f"{len(st['cve_known'] or [])} CVE id(s) known")
+    return 0
+
+
+def blockers(st, sc, ttl):
+    auth, out = st.get("authorization"), []
+    why = None
+    if not auth:
+        why = ("authorization-missing", "no authorization was ever confirmed for this target")
+    elif auth["scope_sha256"] != sc["sha256"]:
+        where = (sc["path"] if auth["scope_path"] == sc["path"]
+                 else f"{auth['scope_path']}, now {sc['path']}")
+        why = ("scope-changed", f"the scope file changed since authorization was confirmed "
+               f"({where}). A scope that grew may authorize hosts the program no longer lists, "
+               "and one that shrank may exclude this target")
+    elif days_since(auth["confirmed_at"]) > ttl:
+        why = ("authorization-stale", f"authorization was last confirmed {auth['confirmed_at']}, "
+               f"more than {ttl} days ago. Programs pause, change scope and close")
+    if why:
+        out.append(item(
+            "blocked", 1, why[0], f"traffic to the target is held: {why[0]}",
+            why[1], None, [],
+            "re-check the program page and scope, then: scripts/watch init <url> --scope <file> "
+            "--confirm-authorization '<where and when you checked>'", touches_target=False,
+            page_human=True))
+    return out
+
+
+def cmd_check(a):
+    st, sdir = load_state(a)
+    sc = pin_scope(a)
+    origin = st["origin"]
+    if mod("scope-guard").check(origin)["offenders"]:
+        die(f"{origin} is not in the pinned scope {sc['path']}")
+    want = set(a.signals.split(","))
+    ts, stats, notes, errors = now_iso(), {"requests": 0, "blocked": []}, [], []
+    sig_status, work, not_queued, drifted = {}, [], [], set()
+    work += blockers(st, sc, a.reconfirm_days)
+    held = bool(work)
+    tech, cur_map = {}, None
+
+    if "surface" in want:
+        if held:
+            sig_status["surface"] = {"status": "skipped", "reason": "authorization not current: "
+                                     "no request was sent to the target"}
+        elif sc["allow_active"] is False:
+            sig_status["surface"] = {"status": "skipped", "reason": "scope has allow_active: false"}
+        else:
+            headers = {}
+            for h in a.header:
+                n, sep, v = h.partition(":")
+                if not sep or not n.strip():
+                    die(f"bad --header {h!r}: expected 'Name: value'")
+                headers[n.strip()] = v.strip()
+            with guarded(sc, stats):
+                cur_map = sanitize(mod("probe").probe(a.target, a.depth, a.max_pages, a.timeout,
+                                                      headers, a.insecure))
+            notes += [n for n in cur_map.get("notes") or []]
+            not_queued += [{"host": urllib.parse.urlsplit(u).netloc, "in_scope": False,
+                            "reason": "a request the target's own links or redirects led to was "
+                                      "refused by the scope pin"} for u in stats["blocked"]]
+            if not cur_map["pages"]:
+                errors.append("surface: the target answered nothing, no map to compare")
+                sig_status["surface"] = {"status": "error", "reason": "target unreachable"}
+                cur_map = None
+            else:
+                cur = signature(cur_map, origin)
+                tech = cur["tech"]
+                authenticated = bool(headers)
+                jsave(sdir / "last-surface.json", {"taken_at": ts, "authenticated": authenticated,
+                                                   "map": cur_map})
+                base = jload(sdir / "surface.json")
+                if base is None:
+                    adopt_surface(st, sdir, cur_map, authenticated)
+                    sig_status["surface"] = {"status": "baseline", "routes": len(cur["routes"]),
+                                             "reason": "first observation stored as the baseline"}
+                elif st.get("authenticated") not in (None, authenticated):
+                    sig_status["surface"] = {"status": "skipped", "reason":
+                                             "authenticated and unauthenticated maps do not compare"}
+                else:
+                    d = diff_signature(signature(sanitize(base["map"]), origin), cur)
+                    w, nq = surface_items(d, cur_map, host_in_scope)
+                    work += w
+                    not_queued += nq
+                    drifted = set(d["new_routes"]) | set(d["removed_routes"]) | \
+                        {c["route"] for c in d["status_changes"]}
+                    sig_status["surface"] = {"status": "ok", "baseline_taken": base["taken_at"],
+                                             "baseline_hash": st["surface_hash"],
+                                             "current_hash": surface_hash(cur),
+                                             "diff": {k: v for k, v in d.items() if v}}
+
+    if "cve" in want:
+        wants = merge_wants(st["fingerprint"], tech)
+        if not wants:
+            sig_status["cve"] = {"status": "skipped", "reason": "no fingerprint to match yet"}
+        else:
+            doc, err = run_cvefeed(wants, a)
+            if doc is None:
+                errors.append(f"cve: {err}")
+                sig_status["cve"] = {"status": "error", "reason": err}
+            else:
+                cands = doc["candidates"]
+                ids = [c["id"] for c in cands]
+                st["pending"] = {"cve_ids": ids, "wants": wants}
+                if st["cve_known"] is None:
+                    st["cve_known"] = sorted(ids)
+                    notes.append(f"cve baseline: {len(ids)} candidate id(s) recorded as known, none "
+                                 "reported as new. Run recon 1b and cve-deep-dive if the last "
+                                 "engagement did not.")
+                work += cve_items(cands, set(st["cve_known"]), set(st["cve_notified"]), origin,
+                                  sc["rate_limit_rps"])
+                data = doc["data"]
+                sig_status["cve"] = {"status": "ok", "data_origin": data["origin"],
+                                     "data_age": data["age"], "stale": data["stale"],
+                                     "fingerprint": wants, "candidates_now": len(ids)}
+                if data["stale"]:
+                    notes.append(f"CVE data is STALE ({data['age']}). A quiet cve signal means "
+                                 "little until it is refreshed.")
+
+    if "findings" in want:
+        work += retest_items(st, drifted, a.retest_days)
+        sig_status["findings"] = {"status": "ok", "registry": len(st["findings"]),
+                                  "last_record": st["last_record"],
+                                  "note": "finding drift is computed by `record` (scripts/findings "
+                                          "--diff); check lists what the registry says to replay"}
+
+    for i in work:
+        i["held"] = held and i["touches_target"]
+        i["first_seen"] = st["first_seen"].setdefault(i["id"], ts)
+    st["first_seen"] = {k: v for k, v in st["first_seen"].items() if k in {i["id"] for i in work}}
+    work.sort(key=lambda i: (i["priority"], i["kind"], i["id"]))
+    page = [i for i in work if i.get("page_human")]
+    st["cve_notified"] = sorted(set(st["cve_notified"]) | {i["id"].split(":", 1)[1] for i in page
+                                                           if i["kind"] == "new-cve"})
+    code = 3 if page else 2 if errors else 1 if work else 0
+    st["last_check"] = ts
+    result = {
+        "schema": SCHEMA, "target": origin, "checked_at": ts,
+        "exit": {"code": code, "meaning": EXIT_MEANING[code]},
+        "priorities": {"1": "urgent: a human, now", "2": "high: an agent run today",
+                       "3": "normal: next scheduled run", "4": "low: hygiene"},
+        "scope": {"pinned_file": sc["path"], "in_scope": sc["in_scope"],
+                  "out_of_scope": sc["out_of_scope"], "rate_limit_rps": sc["rate_limit_rps"],
+                  "authorization_confirmed_at": (st["authorization"] or {}).get("confirmed_at")},
+        "signals": sig_status,
+        "cost": {"requests_to_target": stats["requests"], "refused_by_scope": len(stats["blocked"]),
+                 "model_calls": 0},
+        "work": work, "not_queued": not_queued,
+        "do_not_rerun": DO_NOT_RERUN + [
+            {"what": f"{f['title']} on {f['route']}", "why": f"rejected before: {f['reason']}. "
+             "Re-report only with new evidence"} for f in st["rejected"].values()],
+        "notes": notes + errors}
+    jsave(sdir / "last-check.json", result)
+    jsave(sdir / "state.json", st)
+    return result
+
+
+def cmd_retest(a):
+    st, sdir = load_state(a)
+    work = retest_items(st, set(), 0 if a.all else a.retest_days, force=a.all)
+    result = {"schema": SCHEMA, "target": st["origin"], "checked_at": now_iso(),
+              "exit": {"code": 1 if work else 0, "meaning": EXIT_MEANING[1 if work else 0]},
+              "replay_protocol": [
+                  "Replay the stored proof of concept against the target, within the pinned scope "
+                  "and rate limit. Save the full output to a file.",
+                  "Run the negative control. If the oracle no longer discriminates the replay "
+                  "proves nothing in either direction.",
+                  "Only a proof that now fails, with a control that still behaves, is `--fixed`. "
+                  "A replay that still works is `--present`.",
+                  "Nothing replayed means nothing verified: leave the finding alone."],
+              "work": work}
+    return result
+
+
+def cmd_record(a):
+    st, sdir = load_state(a)
+    out = ingest(st, sdir, a.engagement)
+    jsave(sdir / "state.json", st)
+    result = {"engagement": str(Path(a.engagement).resolve()), **out,
+              "needs_follow_up": bool(out["regressions"] or out["gone_unverified"]),
+              "note": "gone_unverified means not reproducible today, NOT fixed. Replay the proof "
+                      "and use `scripts/watch verify`."}
+    return result
+
+
+def cmd_verify(a):
+    st, sdir = load_state(a)
+    hits = [fp for fp in st["findings"] if fp.startswith(a.fingerprint)]
+    if len(hits) != 1:
+        die(f"{a.fingerprint!r} matches {len(hits)} finding(s) in the registry")
+    ev = Path(a.evidence)
+    if not ev.is_file() or ev.stat().st_size == 0:
+        die(f"--evidence {ev} is not a non-empty file. A fix is verified by a saved replay of the "
+            "proof of concept, not by a statement.")
+    f = st["findings"][hits[0]]
+    ts = now_iso()
+    f.update(last_replayed=ts, evidence=str(ev.resolve()))
+    if a.fixed:
+        f.update(status="fixed", verified_fixed_at=ts)
+    else:
+        f.update(status="open" if f["status"] in ("unverified_gone", "regressed") else f["status"],
+                 gone_since=None)
+    jsave(sdir / "state.json", st)
+    return {"fingerprint": hits[0], "title": f["title"], "status": f["status"], "at": ts}
+
+
+def cmd_ack(a):
+    st, sdir = load_state(a)
+    adopt_last_surface(st, sdir)
+    pend = st.get("pending") or {}
+    st["cve_known"] = sorted(set(st.get("cve_known") or []) | set(pend.get("cve_ids") or []))
+    st["fingerprint"] = pend.get("wants") or st["fingerprint"]
+    st["pending"] = {}
+    st["acks"].append({"at": now_iso(), "note": a.note})
+    jsave(sdir / "state.json", st)
+    return {"acknowledged": a.note, "at": st["acks"][-1]["at"]}
+
+
+# -------------------------------------------------------------------- presentation
+
+def render(r):
+    lines = []
+    if "checked_at" in r and "signals" in r:
+        lines.append(f"watch {r['target']}  {r['checked_at']}  exit {r['exit']['code']} "
+                     f"({r['exit']['meaning']})")
+        for name, s in r["signals"].items():
+            lines.append(f"  signal {name:<8} {s['status']}"
+                         + (f"  {s['reason']}" if s.get("reason") else ""))
+        lines.append(f"  cost: {r['cost']['requests_to_target']} request(s) to the target, "
+                     f"{r['cost']['model_calls']} model calls")
+    elif "work" in r:
+        lines.append(f"watch retest {r['target']}: {len(r['work'])} proof(s) to replay")
+    for i in r.get("work", []):
+        flag = " HELD" if i.get("held") else ""
+        lines.append(f"P{i['priority']} {i['kind']:<14} {i['summary']}{flag}")
+        lines.append(f"     why: {i['why']}")
+        hb = i["handled_by"]
+        if hb.get("skill"):
+            lines.append(f"     skill: {hb['skill']}" + (f" (+ {', '.join(hb['also'])})"
+                                                          if hb["also"] else ""))
+        if hb.get("run"):
+            lines.append(f"     run: {hb['run']}")
+        if i["kind"] == "retest":
+            lines.append(f"     proof: {i['replay']['proof']} (exists: {i['replay']['proof_exists']})")
+    for n in r.get("not_queued", []):
+        lines.append(f"NOT QUEUED {n['host']}: {n['reason']}")
+    for n in r.get("notes", []):
+        lines.append(f"note: {n}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------- selftest
+
+def _selftest():
+    import http.server
+    import threading
+    fails = []
+
+    def want(got, expect, label):
+        if got != expect:
+            fails.append(f"{label}: got {got!r}, want {expect!r}")
+
+    def run(argv):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            try:
+                code = main(argv + ["--json"] if argv[0] not in ("init", "ack") else argv)
+            except SystemExit as e:
+                code = e.code
+        try:
+            return code, json.loads(buf.getvalue())
+        except ValueError:
+            return code, buf.getvalue() + err.getvalue()
+
+    saved = {k: os.environ.get(k) for k in ("MYTHOS_SCOPE", "MYTHOS_CVE_CACHE")}
+    tmp = Path(tempfile.mkdtemp(prefix="watch-selftest-"))
+    srv = None
+    try:
+        os.environ["MYTHOS_CVE_CACHE"] = str(tmp / "cvecache")
+        fixture = ROOT / "knowledge" / "cve" / "selftest-fixture.json"
+
+        # --- surface drift, both directions, on probe-shaped maps -------------------
+        def pm(routes, params=(), tech=(), cookie="", scripts=(), forms=(), redirect=None):
+            pages = [{"url": "http://app.test/" + r, "status": 200, "forms": [], "headers": {}}
+                     for r in routes]
+            pages[0].update(scripts=list(scripts), forms=list(forms), cookie_names=[cookie] if cookie
+                            else [], **({"redirected_to": redirect} if redirect else {}))
+            return {"pages": pages, "reachable_paths": [], "api_endpoints": [], "technology": list(tech),
+                    "parameters": [{"name": n, "seen_at": ["http://app.test/" + r], "hypotheses":
+                                    "idor/bola, sqli"} for n, r in params]}
+        o = "http://app.test"
+        before = signature(pm(["", "search", "old"], [("q", "search")], ["nginx/1.18.0"], "sid"), o)
+        after = signature(pm(["", "search", "export"], [("q", "search"), ("page", "search"),
+                                                         ("file", "export")],
+                             ["nginx/1.25.0", "express/4.18.0"], "jwt",
+                             ["http://cdn.evil.test/x.js", "http://api.app.test/y.js"]), o)
+        d = diff_signature(before, after)
+        want(d["new_routes"], ["GET /export"], "new endpoint detected")
+        want(d["removed_routes"], ["GET /old"], "removed route detected")
+        want(d["new_params"], ["page @ /search"], "new param on a known route only; `file` is "
+             "covered by the new endpoint")
+        want((d["auth_added"], d["auth_removed"]), (["cookie:jwt"], ["cookie:sid"]), "auth changed")
+        want(d["tech_changed"], {"nginx": ["1.18.0", "1.25.0"]}, "version change")
+        want(d["tech_added"], {"express": "4.18.0"}, "new framework")
+        want(d["new_hosts"], ["api.app.test", "cdn.evil.test"], "new hosts found")
+        want(any(diff_signature(after, after).values()), False, "no drift on identical maps")
+        want(diff_signature(after, before)["new_routes"], ["GET /old"], "reverse direction")
+        gate = diff_signature({**before, "routes": {"GET /admin": 403}},
+                              {**before, "routes": {"GET /admin": 200}})
+        want(gate["status_changes"], [{"route": "GET /admin", "was": 403, "now": 200}], "gate opened")
+
+        # --- a new out-of-scope host is reported and not queued ---------------------
+        scope = tmp / "scope.yaml"
+        scope.write_text("target: https://app.test\nin_scope:\n  - app.test\n  - '*.app.test'\n"
+                         "out_of_scope: []\nrules:\n  rate_limit_rps: 100\n  allow_active: true\n")
+        os.environ["MYTHOS_SCOPE"] = str(scope)
+        work, nq = surface_items(d, pm(["", "export"]), host_in_scope)
+        want([n["host"] for n in nq], ["cdn.evil.test"], "out-of-scope host listed in not_queued")
+        want([i["id"] for i in work if i["kind"] == "new-host"], ["new-host:api.app.test"],
+             "in-scope host queued for recon only")
+        want("cdn.evil.test" in json.dumps(work), False, "out-of-scope host is not in the work list")
+        stats = {"requests": 0, "blocked": []}
+        with guarded({"rate_limit_rps": 100.0}, stats):
+            try:
+                urllib.request.urlopen("http://cdn.evil.test/", timeout=1)
+                fails.append("guard let an out-of-scope request through")
+            except OutOfScope:
+                pass
+        want((stats["requests"], len(stats["blocked"])), (0, 1), "refused before anything was sent")
+
+        # --- new CVE for a known fingerprint, then the 3am rule ---------------------
+        doc = json.loads(fixture.read_text())
+        old = dict(doc, records=[r for r in doc["records"] if r["id"] != "CVE-2026-5027"])
+        (tmp / "before.json").write_text(json.dumps(old))
+        wants = [{"name": "langflow", "version": "1.6.0", "source": "fingerprint"}]
+        ns = argparse.Namespace(offline=True, snapshot=str(tmp / "before.json"))
+        c0, err = run_cvefeed(wants, ns)
+        known = {c["id"] for c in c0["candidates"]}
+        want("CVE-2026-5027" in known, False, "fixture before the CVE appeared")
+        c1, err = run_cvefeed(wants, argparse.Namespace(offline=True, snapshot=str(fixture)))
+        new = cve_items(c1["candidates"], known, set(), o, 5)
+        want([(i["id"], i["priority"], i["page_human"]) for i in new],
+             [("new-cve:CVE-2026-5027", 1, True)], "KEV on an exact fingerprint is urgent")
+        want("-rate-limit 5" in (new[0]["handled_by"]["run"] or ""), True, "nuclei command is paced")
+        again = cve_items(c1["candidates"], known, {"CVE-2026-5027"}, o, 5)
+        want(again[0]["page_human"], False, "announced once, not every run")
+        want(cve_items(c1["candidates"], {c["id"] for c in c1["candidates"]}, set(), o, 5), [],
+             "known CVEs are not new")
+        banner = cve_items([{**c1["candidates"][0], "match_confidence": "product-only"}], set(),
+                           set(), o, 5)
+        want(banner[0]["priority"], 2, "KEV without a version match is high, not a 3am page")
+        unrelated = cve_items([{**c1["candidates"][0], "product": "python", "version": "3.14.4",
+                                "match_confidence": "banner",
+                                "matched_package": "nodejs:node.js:*"}], set(), set(), o, 5)
+        want((unrelated[0]["priority"], unrelated[0]["page_human"]), (2, False),
+             "a banner KEV match on an unrelated package does not page")
+
+        # --- exit-code convention, end to end against a real local server -----------
+        pages = {"/": '<a href="/search">s</a><a href="/old">o</a>',
+                 "/search": '<form action="/search"><input name="q"></form>', "/old": "old"}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = pages.get(self.path.split("?")[0])
+                if body is None:
+                    return self.send_error(404)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *_):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        url = f"http://127.0.0.1:{port}/"
+        scope.write_text(f"target: {url}\nin_scope:\n  - 127.0.0.1\nout_of_scope: []\nrules:\n"
+                         f"  rate_limit_rps: 500\n  ports: [{port}]\n  allow_active: true\n")
+        base = ["--state", str(tmp / "state"), "--scope", str(scope)]
+        snap = ["--offline", "--snapshot", str(fixture)]
+        want(run(["check", url] + base + snap)[0], 2, "no state yet is an error")
+        os.environ.pop("MYTHOS_SCOPE")
+        want(run(["init", url, "--state", str(tmp / "state"), "--confirm-authorization", "x"])[0],
+             2, "no pinned scope is a refusal, not a guess")
+        want(run(["init", url] + base + ["--confirm-authorization", "selftest"])[0], 0, "init")
+        code, r = run(["check", url] + base + snap)
+        want((code, r["signals"]["surface"]["status"]), (0, "baseline"), "first run baselines, exit 0")
+        want(r["cost"]["requests_to_target"] > 0 and r["cost"]["model_calls"] == 0, True, "cost counted")
+        code, r = run(["check", url] + base + snap)
+        want((code, r["work"]), (0, []), "unchanged target: exit 0, empty work list")
+        pages["/"] = '<a href="/search">s</a><a href="/export">e</a>'
+        pages["/export"] = '<form action="/export"><input name="file"></form>'
+        del pages["/old"]
+        code, r = run(["check", url] + base + snap)
+        kinds = {i["kind"] for i in r["work"]}
+        want((code, "new-endpoint" in kinds, "removed-routes" in kinds), (1, True, True),
+             "drift between two runs: exit 1")
+        want(run(["check", url] + base + snap)[0], 1, "exit 1 is idempotent until consumed")
+        want(run(["ack", url, "--state", str(tmp / "state"), "--note", "selftest: reviewed"])[0], 0,
+             "ack")
+        want(run(["check", url] + base + snap)[0], 0, "after ack the baseline moved: exit 0")
+        scope.write_text(scope.read_text() + "# edited\n")
+        code, r = run(["check", url] + base + snap)
+        want((code, r["cost"]["requests_to_target"], r["signals"]["surface"]["status"],
+              r["work"][0]["kind"]), (3, 0, "skipped", "blocked"),
+             "a changed scope file holds traffic and pages a human")
+        want(run(["init", url] + base + ["--confirm-authorization", "selftest again"])[0], 0, "re-init")
+        sp = tmp / "state" / [p.name for p in (tmp / "state").iterdir()][0] / "state.json"
+        s = json.loads(sp.read_text())
+        s["authorization"]["confirmed_at"] = "2020-01-01T00:00:00Z"
+        sp.write_text(json.dumps(s))
+        code, r = run(["check", url] + base + snap)
+        want((code, r["cost"]["requests_to_target"]), (3, 0), "stale authorization holds traffic")
+        run(["init", url] + base + ["--confirm-authorization", "selftest again"])
+        srv.shutdown()
+        srv.server_close()
+        srv = None
+        code, r = run(["check", url] + base + snap)
+        want(code, 2, "unreachable target is an error")
+
+        # --- finding drift: fixed, still present, new, and the two honest states -----
+        def eng(name, specs):
+            d = tmp / name / "findings"
+            d.mkdir(parents=True)
+            for fid, klass, asset, status in specs:
+                (d / f"{fid}.md").write_text(
+                    f"---\nid: {fid}\ntitle: {klass} {fid}\nclass: {klass}\nstatus: {status}\n"
+                    f"asset: https://t.test{asset}\nparam: p\nseverity: medium\n"
+                    "cvss: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N\nproof: poc.sh\n"
+                    f"negative_control: owner request\n---\nbody\n")
+            return str(tmp / name)
+        fs = ["--state", str(tmp / "fstate")]
+        os.environ["MYTHOS_SCOPE"] = str(scope)
+        run(["init", url] + fs + ["--scope", str(scope), "--confirm-authorization", "selftest"])
+        e1 = eng("e1", [("a", "idor", "/a/1", "validated"), ("b", "xss", "/b", "validated")])
+        code, r = run(["record", url, e1] + fs)
+        want((code, len(r["new"])), (0, 2), "first record: both new")
+        e2 = eng("e2", [("a", "idor", "/a/2", "validated"), ("c", "sqli", "/c", "validated"),
+                        ("b", "xss", "/b", "candidate")])
+        code, r = run(["record", url, e2] + fs)
+        want((code, len(r["new"]), len(r["still_present"]), len(r["gone_unverified"])),
+             (1, 1, 1, 1), "second record: new, still present, gone")
+        code, r = run(["retest", url] + fs)
+        gone = [i for i in r["work"] if i["finding"]["status"] == "unverified_gone"]
+        want((code, len(gone), gone[0]["priority"]), (1, 1, 2), "gone finding is queued for replay")
+        want("not the same as fixed" in gone[0]["why"], True, "gone is not called fixed")
+        fp = gone[0]["finding"]["fingerprint"]
+        want(run(["verify", url, fp, "--fixed", "--evidence", str(tmp / "nope")] + fs)[0], 2,
+             "fixed needs a saved replay")
+        ev = tmp / "replay.txt"
+        ev.write_text("HTTP/1.1 403 on the proof; control returned 200\n")
+        want(run(["verify", url, fp, "--fixed", "--evidence", str(ev)] + fs)[1]["status"], "fixed",
+             "verified fix")
+        e3 = eng("e3", [("a", "idor", "/a/3", "validated"), ("b", "xss", "/b", "validated"),
+                        ("c", "sqli", "/c", "validated")])
+        code, r = run(["record", url, e3] + fs)
+        want((code, len(r["regressions"])), (1, 1), "fixed then validated again is a regression")
+
+        # --- a KEV entry on the known stack pages once, then stays queued -----------
+        sp = tmp / "fstate" / [p.name for p in (tmp / "fstate").iterdir()][0] / "state.json"
+        s = json.loads(sp.read_text())
+        s.update(fingerprint=wants, cve_known=sorted(known), cve_notified=[])
+        sp.write_text(json.dumps(s))
+        cve_only = ["check", url, "--signals", "cve", "--offline", "--snapshot", str(fixture)] + fs \
+            + ["--scope", str(scope)]
+        code, r = run(cve_only)
+        want((code, [i["id"] for i in r["work"]]), (3, ["new-cve:CVE-2026-5027"]),
+             "new KEV on the known stack: exit 3")
+        code, r = run(cve_only)
+        want((code, r["work"][0]["announced"]), (1, True), "same KEV the next run: exit 1, not 3")
+    finally:
+        if srv:
+            srv.shutdown()
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(tmp, ignore_errors=True)
+    for f in fails:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"watch selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# --------------------------------------------------------------------------- CLI
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--selftest" in argv:
+        return _selftest()
+    ap = argparse.ArgumentParser(prog="scripts/watch", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def verb(name, help_, scope=False):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("target", help="the target URL; its origin keys the state")
+        if scope:
+            p.add_argument("--scope", help="scope.yaml to pin (default: $MYTHOS_SCOPE, never "
+                                           "guessed)")
+        p.add_argument("--state", help="state base directory (default $MYTHOS_WATCH_STATE, else "
+                                       "engagements/.watch)")
+        p.add_argument("--json", action="store_true", help="print the full JSON result")
+        return p
+
+    p = verb("init", "create the state and confirm authorization (run again to re-confirm)", True)
+    p.add_argument("--confirm-authorization", required=True, metavar="NOTE",
+                   help="where and when you checked that the program is live and the scope "
+                        "unchanged, e.g. 'hackerone.com/x, 2026-11-14'")
+    p.add_argument("--from", dest="from_engagement", metavar="ENGAGEMENT_DIR",
+                   help="seed from a finished engagement: findings, surface.json, "
+                        "cve-candidates.json")
+    p.add_argument("--reconfirm-days", type=int, default=30)
+    p = verb("check", "the cheap check: surface drift, new CVEs, findings to replay", True)
+    p.add_argument("--signals", default="surface,cve,findings",
+                   help="comma list. `cve,findings` sends nothing to the target")
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--max", type=int, default=40, dest="max_pages")
+    p.add_argument("--timeout", type=float, default=10)
+    p.add_argument("--header", action="append", default=[], help="'Name: value', repeatable")
+    p.add_argument("--insecure", action="store_true")
+    p.add_argument("--offline", action="store_true", help="cvefeed: never touch the network")
+    p.add_argument("--snapshot", help="cvefeed: snapshot file to fall back to")
+    p.add_argument("--retest-days", type=int, default=7,
+                   help="replay a stored proof if not replayed for this long (default 7)")
+    p.add_argument("--reconfirm-days", type=int, default=30,
+                   help="hold traffic if authorization is older than this (default 30)")
+    p = verb("retest", "list the stored proofs to replay, with the replay protocol")
+    p.add_argument("--all", action="store_true", help="every stored proof, not only the due ones")
+    p.add_argument("--retest-days", type=int, default=7)
+    p = verb("record", "fold a finished engagement in: scripts/findings --diff, registry, baseline")
+    p.add_argument("engagement", help="engagements/<dir>")
+    p = verb("verify", "record the outcome of a replayed proof of concept")
+    p.add_argument("fingerprint", help="finding fingerprint, or a unique prefix of it")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--fixed", action="store_true", help="the proof now fails and the control behaves")
+    g.add_argument("--present", action="store_true", help="the proof still works")
+    p.add_argument("--evidence", required=True, help="saved output of the replay (must exist)")
+    p = verb("ack", "accept what the last check saw as the new baseline")
+    p.add_argument("--note", required=True, help="why this drift is reviewed or dismissed")
+
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    try:
+        r = {"init": cmd_init, "check": cmd_check, "retest": cmd_retest, "record": cmd_record,
+             "verify": cmd_verify, "ack": cmd_ack}[a.cmd](a)
+    except OutOfScope as e:
+        die(str(e))
+    if isinstance(r, int):
+        return r
+    if a.json:
+        print(json.dumps(r, indent=2))
+    elif a.cmd in ("check", "retest"):
+        print(render(r))
+    else:
+        print(json.dumps(r, indent=2))
+    if a.cmd in ("check", "retest"):
+        return r["exit"]["code"]
+    return 1 if r.get("needs_follow_up") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

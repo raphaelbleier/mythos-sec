@@ -528,7 +528,9 @@ def main() -> int:
             print(f"  problem  {i}: {p}", file=sys.stderr)
         if args.diff:
             r = doc["retest"]
-            print(f"  retest: {len(r['fixed'])} fixed, "
+            # "fixed" is the JSON key scripts/watch reads; the printed label
+            # must not claim more than a non-reproduction shows.
+            print(f"  retest: {len(r['fixed'])} not reproduced (unverified), "
                   f"{len(r['still_present'])} still present, {len(r['new'])} new")
 
     if args.fail_on:

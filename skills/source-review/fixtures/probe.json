@@ -1,0 +1,17 @@
+{
+ "target": "http://127.0.0.1:5000/",
+ "origin": "http://127.0.0.1:5000",
+ "pages": [
+  {"url": "http://127.0.0.1:5000/", "status": 200, "bytes": 2, "type": "text/html"},
+  {"url": "http://127.0.0.1:5000/notes?q=a", "status": 200, "bytes": 11, "type": "application/json"},
+  {"url": "http://127.0.0.1:5000/legacy/export", "status": 200, "bytes": 40, "type": "text/csv"}
+ ],
+ "parameters": [
+  {"name": "q", "seen_at": ["http://127.0.0.1:5000/notes"], "method": "GET",
+   "hypotheses": "reflected-xss, sqli", "why": "reflected into the page or into a query"}
+ ],
+ "reachable_paths": [{"path": "/robots.txt", "status": 200, "bytes": 24}],
+ "api_endpoints": ["GET /profile"],
+ "technology": [],
+ "notes": []
+}

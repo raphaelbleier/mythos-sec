@@ -1,0 +1,1670 @@
+#!/usr/bin/env python3
+"""Record the HTTP an engagement actually sent, and replay it.
+
+`engagements/audit.jsonl` holds the argv of every toolbox exec and its exit
+code. It does not hold a single request: host curl, `scripts/probe`,
+`scripts/verify` and everything a tool sends on the wire never appear in it, so
+nothing could answer "what did the agent send just before the target broke" or
+check a stored proof of concept. This does.
+
+  scripts/traffic start              start a recording proxy for this engagement
+  scripts/traffic exec -- curl ...   run any host command through it
+  scripts/traffic env [--container]  proxy and CA variables (sh, or --json)
+  scripts/traffic summary            requests, hosts, rate, out of scope, 5xx, what came before
+  scripts/traffic list               one line per request, with the id the other commands take
+  scripts/traffic show ID            one recorded request and response
+  scripts/traffic replay ID          send the recorded request again, byte for byte, diff the response
+  scripts/traffic export             HAR 1.2 for Burp, Caido or a browser's devtools
+  scripts/traffic phase NAME         mark a phase boundary (recon, scan, exploit, report)
+  scripts/traffic run                write run.json
+  scripts/traffic stop               stop the proxy and write run.json
+
+The engagement is `--dir engagements/<dir>`, else the directory of $MYTHOS_SCOPE.
+
+How it records. The proxy is a plain stdlib forward proxy that reads each
+request's framing and nothing else: the bytes it forwards are the bytes it
+stores. For https it answers CONNECT and terminates TLS with a per-run CA made
+by `openssl` (OpenSSL 3 or later); the CA key lives in a temp directory the
+toolbox cannot see and is deleted on stop, only `ca.crt` is published. It
+speaks HTTP/1.1 on both sides, so clients fall back from h2.
+
+What it cannot see is written down, not hidden. A request it could not record
+becomes a `gap` line (client refused the CA, upstream certificate did not
+verify, ambiguous framing, an internal error), a truncated body is flagged, and
+a CONNECT it could not intercept is an `opaque` tunnel with byte counts only.
+`summary` prints all of them. A path that never reaches the proxy leaves no
+line at all: raw sockets, nmap, smuggling tools, h2, and anything that ignores
+HTTP(S)_PROXY. `summary` flags a toolbox tool that ran with no recorded
+request, which is how a silent bypass shows.
+
+Layout under engagements/<dir>/traffic/:
+
+  log.jsonl     append-only, one JSON object per line, 0600. The id of a record is
+                its line number. Request and response are stored as the bytes that
+                crossed the wire (base64), plus method, host, path and status.
+  events.jsonl  proxy start and stop, phase markers
+  ca.crt        the per-run CA certificate (public)
+  proxy.json    where the proxy listens while it runs
+
+Credentials. log.jsonl is raw: it holds live cookies and tokens, because a
+replay that cannot send the real Cookie proves nothing. It stays in the
+git-ignored engagement directory, 0600. Everything the tool prints or exports
+is redacted with the patterns in scripts/findings (one copy), unless `--raw` is
+given. Do not paste `show --raw` or `export --raw` into a report.
+
+Stdlib only. `--selftest` needs no network (it uses the loopback interface).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import concurrent.futures
+import datetime as dt
+import difflib
+import hashlib
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import shlex
+import signal
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import zlib
+from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+sys.dont_write_bytecode = True  # importing the hooks must not litter hooks/__pycache__
+REPO = Path(__file__).resolve().parent.parent
+MAX_HEAD = 65536
+HARD_BODY = 64 << 20          # a request body the proxy will hold in memory to forward
+DEFAULT_CAP = 1 << 20          # bytes of each request and response kept in the record
+PLAIN_PORTS = {"http": 80, "https": 443}
+# Replay compares the response, and these change on every request.
+VOLATILE = "date,age,x-request-id,x-correlation-id,x-amzn-requestid,cf-ray"
+# Network tools that do not speak HTTP, so "ran and sent no request" is expected of them.
+NON_HTTP = {"nmap", "masscan", "amass", "subfinder", "smuggler", "h2spacex"}
+# A header the findings patterns miss: any authorization scheme but bearer, basic, token.
+EXTRA = [(re.compile(r"(?im)^((?:proxy-)?authorization\s*:\s*)(?!(?:bearer|basic|token)\s)(?!\[REDACTED)\S.*$"),
+          r"\1[REDACTED]")]
+
+
+def load_script(path: Path):
+    """Import an extensionless sibling script, so its tables stay the only copy."""
+    loader = importlib.machinery.SourceFileLoader(path.stem.replace("-", "_"), str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+_findings = None
+
+
+def redact(text: str) -> str:
+    """scripts/findings' redaction, plus EXTRA. If the patterns cannot be loaded the
+    caller must fail: an export that skips redaction is worse than no export."""
+    global _findings
+    if _findings is None:
+        _findings = load_script(REPO / "scripts" / "findings")
+    text = _findings.redact(text)
+    for pattern, repl in EXTRA:
+        text = pattern.sub(repl, text)
+    return text
+
+
+# --------------------------------------------------------------- HTTP framing
+
+class Bad(Exception):
+    """Something the proxy will not guess about: it stops interpreting and says so."""
+
+
+class Refused(OSError):
+    """The proxy declines to connect, so the toolbox gains no reach it did not have."""
+
+
+def read_head(rf):
+    """(raw head up to and including the blank line, whether the blank line arrived)."""
+    head = b""
+    while True:
+        line = rf.readline(MAX_HEAD + 1)
+        if not line:
+            return head, False
+        if not head and line in (b"\r\n", b"\n"):
+            continue  # a stray blank line before a request
+        head += line
+        if len(head) > MAX_HEAD:
+            raise Bad("message head over 64 KiB")
+        if line in (b"\r\n", b"\n"):
+            return head, True
+
+
+def parse_head(head: bytes):
+    """(start line, [(name, value)]) with names and values exactly as sent."""
+    lines = head.split(b"\n")
+    hdrs = []
+    for line in lines[1:]:
+        line = line.rstrip(b"\r").decode("latin-1")
+        if line:
+            name, _, value = line.partition(":")
+            hdrs.append((name, value.strip()))
+    return lines[0].rstrip(b"\r").decode("latin-1"), hdrs
+
+
+def header(hdrs, name):
+    return [v for n, v in hdrs if n.lower() == name]
+
+
+def status_of(head: bytes) -> int:
+    sl = head.split(b"\n", 1)[0].split()
+    return int(sl[1]) if len(sl) > 1 and sl[1].isdigit() else 0
+
+
+def framing(hdrs, response=False, method="", status=0):
+    """How the body ends: ("none"|"length"|"chunked"|"close", n).
+
+    Raises Bad when the headers disagree. A proxy that picked a winner would
+    change what the target sees, so the caller stops interpreting instead."""
+    if any(n != n.strip() and n.strip().lower() in ("content-length", "transfer-encoding")
+           for n, _ in hdrs):
+        raise Bad("whitespace in a framing header name")
+    if response and (method == "HEAD" or status in (204, 304) or 100 <= status < 200):
+        return "none", 0
+    cl, te = header(hdrs, "content-length"), header(hdrs, "transfer-encoding")
+    if te:
+        if cl or len(te) > 1 or te[0].lower().split(",")[-1].strip() != "chunked":
+            raise Bad("content-length and transfer-encoding, or an unusual transfer-encoding")
+        return "chunked", 0
+    if cl:
+        if len(set(cl)) > 1 or not cl[0].isdigit():
+            raise Bad("conflicting or invalid content-length")
+        return "length", int(cl[0])
+    return ("close", 0) if response else ("none", 0)
+
+
+def pump_body(rf, send, kind, n):
+    """Pass one message body from rf to send(), bytes unchanged."""
+    if kind == "length":
+        while n > 0:
+            data = rf.read(min(n, 65536))
+            if not data:
+                raise EOFError("body ended early")
+            send(data)
+            n -= len(data)
+    elif kind == "chunked":
+        while True:
+            line = rf.readline(4096)
+            if not line:
+                raise EOFError("body ended early")
+            send(line)
+            try:
+                size = int(line.split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                raise Bad("bad chunk size") from None
+            if size == 0:
+                while True:  # trailers, then the blank line
+                    t = rf.readline(MAX_HEAD)
+                    if not t:
+                        raise EOFError("body ended early")
+                    send(t)
+                    if t in (b"\r\n", b"\n"):
+                        return
+            left = size + 2
+            while left > 0:
+                data = rf.read(min(left, 65536))
+                if not data:
+                    raise EOFError("body ended early")
+                send(data)
+                left -= len(data)
+    elif kind == "close":
+        while True:
+            data = rf.read1(65536)
+            if not data:
+                return
+            send(data)
+
+
+class Cap:
+    """The first `limit` bytes of a stream, and whether anything was cut."""
+
+    def __init__(self, limit):
+        self.buf, self.limit, self.cut = bytearray(), limit, False
+
+    def add(self, data):
+        room = self.limit - len(self.buf)
+        if room > 0:
+            self.buf += data[:room]
+        if len(data) > max(room, 0):
+            self.cut = True
+
+
+def split_message(raw: bytes):
+    m = re.search(rb"\r?\n\r?\n", raw)
+    return (raw[:m.end()], raw[m.end():]) if m else (raw, b"")
+
+
+def dechunk(b: bytes):
+    """(body, complete). Tolerant: a truncated capture returns what it holds."""
+    out, i = bytearray(), 0
+    while True:
+        j = b.find(b"\n", i)
+        if j < 0:
+            return bytes(out), False
+        try:
+            size = int(b[i:j].split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            return bytes(out), False
+        i = j + 1
+        if size == 0:
+            return bytes(out), True
+        out += b[i:i + size]
+        i += size
+        i += 2 if b[i:i + 2] == b"\r\n" else 1 if b[i:i + 1] == b"\n" else 0
+
+
+def body_of(hdrs, body: bytes, decode=True):
+    """The message body as an application sees it: de-chunked and, if possible, decompressed.
+    Returns (bytes, note)."""
+    note = ""
+    if header(hdrs, "transfer-encoding") and header(hdrs, "transfer-encoding")[0].lower().endswith("chunked"):
+        body, whole = dechunk(body)
+        note = "" if whole else "chunked body incomplete"
+    enc = (header(hdrs, "content-encoding") or [""])[0].lower()
+    if decode and enc in ("gzip", "x-gzip", "deflate"):
+        try:
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS if "gzip" in enc else zlib.MAX_WBITS)
+            body = d.decompress(body, 32 << 20)
+        except zlib.error:
+            note = (note + " " + f"{enc} not decoded").strip()
+    elif decode and enc not in ("", "identity"):
+        note = (note + " " + f"{enc} not decoded").strip()
+    return body, note
+
+
+# ------------------------------------------------------------------- log files
+
+def tdir(d: Path) -> Path:
+    return d / "traffic"
+
+
+def append(path: Path, rec: dict):
+    """One write per line, O_APPEND: the proxy and a replay can both write."""
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    line = (json.dumps(rec, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        while line:
+            line = line[os.write(fd, line):]
+    finally:
+        os.close(fd)
+
+
+def read_log(d: Path):
+    """[(id, record)] in file order. An unreadable line becomes a gap, never a silent skip."""
+    out = []
+    try:
+        lines = (tdir(d) / "log.jsonl").read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        return out
+    for n, line in enumerate(lines, 1):
+        try:
+            out.append((n, json.loads(line)))
+        except ValueError:
+            out.append((n, {"kind": "gap", "t": 0, "reason": "unreadable_record", "detail": f"line {n}"}))
+    return out
+
+
+def read_events(d: Path):
+    try:
+        return [json.loads(x) for x in (tdir(d) / "events.jsonl").read_text().splitlines() if x.strip()]
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def raw_of(rec, key):
+    return base64.b64decode(rec[key]) if rec.get(key) else b""
+
+
+def url_of(rec):
+    port = "" if PLAIN_PORTS.get(rec.get("scheme")) == rec.get("port") else f":{rec.get('port')}"
+    host = f"[{rec['host']}]" if ":" in rec.get("host", "") else rec.get("host", "")
+    return f"{rec.get('scheme')}://{host}{port}{rec.get('p', '')}"
+
+
+def exchange_record(t, dur, ttfb, client, key, ip, req, res, extra=None):
+    scheme, host, port = key
+    first, hdrs = parse_head(split_message(req.buf if isinstance(req, Cap) else req)[0]) if req else ("", [])
+    bits = first.split(" ")
+    status = (status_of(bytes(res.buf if isinstance(res, Cap) else res)) or None) if res else None
+    rec = {"kind": "exchange", "t": round(t, 3), "dur": round(dur, 3), "ttfb": round(ttfb, 3) if ttfb else None,
+           "client": client, "scheme": scheme, "host": host, "port": port, "ip": ip,
+           "m": bits[0], "p": bits[1] if len(bits) > 1 else "", "s": status,
+           "ua": (header(hdrs, "user-agent") or [""])[0][:120],
+           "req": base64.b64encode(bytes(req.buf if isinstance(req, Cap) else req)).decode(),
+           "res": base64.b64encode(bytes(res.buf if isinstance(res, Cap) else res)).decode() if res else "",
+           "req_cut": bool(isinstance(req, Cap) and req.cut), "res_cut": bool(isinstance(res, Cap) and res.cut)}
+    rec.update(extra or {})
+    return rec
+
+
+# ------------------------------------------------------------------ the proxy
+
+class CA:
+    """A per-run CA and per-host leaf certificates, made with the openssl CLI."""
+
+    def __init__(self, workdir: Path):
+        self.dir, self.lock, self.ctxs = workdir, threading.Lock(), {}
+        self.crt, self.key, self.leaf_key = workdir / "ca.crt", workdir / "ca.key", workdir / "leaf.key"
+        self.openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                     "-keyout", self.key, "-out", self.crt, "-days", "30", "-subj", "/CN=Mythos capture CA",
+                     "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign")
+        self.openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-out", self.leaf_key)
+
+    @staticmethod
+    def openssl(*args):
+        r = subprocess.run(["openssl", *map(str, args)], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"openssl {args[0]} failed: {r.stderr.strip()[:200]}")
+
+    def context(self, host):
+        with self.lock:
+            if host not in self.ctxs:
+                try:
+                    ipaddress.ip_address(host)
+                    san = f"IP:{host}"
+                except ValueError:
+                    san = f"DNS:{host}"
+                name = hashlib.sha256(host.encode()).hexdigest()[:16]
+                crt = self.dir / f"{name}.crt"
+                self.openssl("req", "-new", "-x509", "-key", self.leaf_key, "-CA", self.crt, "-CAkey", self.key,
+                             "-subj", f"/CN={host[:60]}", "-addext", f"subjectAltName={san}", "-addext", "basicConstraints=critical,CA:FALSE",
+                             "-addext", "keyUsage=critical,digitalSignature", "-addext", "extendedKeyUsage=serverAuth", "-days", "30",
+                             "-set_serial", int.from_bytes(os.urandom(8), "big") >> 1, "-out", crt)
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(crt, self.leaf_key)
+                ctx.set_alpn_protocols(["http/1.1"])
+                self.ctxs[host] = ctx
+            return self.ctxs[host]
+
+
+class Config:
+    def __init__(self, log: Path, ca, insecure_upstream, cap, timeout, gateway=None):
+        self.log, self.ca, self.cap, self.timeout, self.gateway = log, ca, cap, timeout, gateway
+        self.lock = threading.Lock()
+        self.up_ctx = ssl.create_default_context()
+        self.up_ctx.set_alpn_protocols(["http/1.1"])
+        self.verify = not insecure_upstream
+        if insecure_upstream:
+            self.up_ctx.check_hostname, self.up_ctx.verify_mode = False, ssl.CERT_NONE
+
+    def write(self, rec):
+        with self.lock:
+            append(self.log, rec)
+
+    def gap(self, reason, host=None, port=None, detail=""):
+        self.write({"kind": "gap", "t": round(time.time(), 3), "reason": reason, "host": host, "port": port,
+                    "detail": detail})
+
+    def dial(self, host, port, client_ip):
+        """A TCP connection to the target. A client that is not on this machine's loopback
+        never gets the host's loopback services: inside the toolbox, 127.0.0.1 is the
+        toolbox, and a redirect to it must not become a request to the operator's machine."""
+        if host == "host.docker.internal" and self.gateway:  # the name the toolbox uses for this host
+            host = self.gateway
+        s = socket.create_connection((host, port), self.timeout)
+        if not ipaddress.ip_address(client_ip).is_loopback and ipaddress.ip_address(s.getpeername()[0]).is_loopback:
+            s.close()
+            raise Refused(f"{host}:{port} is this machine's loopback, and the client is not on it")
+        s.settimeout(self.timeout)
+        return s
+
+    def connect(self, key, client_ip):
+        scheme, host, port = key
+        s = self.dial(host, port, client_ip)
+        tls = None
+        if scheme == "https":
+            s = self.up_ctx.wrap_socket(s, server_hostname=host)
+            tls = {"verified": self.verify, "version": s.version()}
+        return s, s.makefile("rb", 65536), s.getpeername()[0], tls
+
+
+def wants_close(hdrs, version):
+    conn = {x.strip().lower() for v in header(hdrs, "connection") for x in v.split(",")}
+    return "close" in conn or (version == "HTTP/1.0" and "keep-alive" not in conn)
+
+
+def reply(sock, code, text):
+    body = f"mythos traffic: {text}\n".encode()
+    try:
+        sock.sendall(f"HTTP/1.1 {code} {'Bad Gateway' if code == 502 else 'Bad Request'}\r\n"
+                     f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+    except OSError:
+        pass
+
+
+def blind(csock, crf, usock, first=b"", on_close=None):
+    """Copy bytes both ways until either side closes. Returns (bytes up, bytes down)."""
+    count = [len(first), 0]
+    if first:
+        usock.sendall(first)
+
+    def one(read, write, i):
+        try:
+            while True:
+                data = read(65536)
+                if not data:
+                    break
+                write(data)
+                count[i] += len(data)
+        except OSError:
+            pass
+        for s in (csock, usock):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    th = threading.Thread(target=one, args=(crf.read1, usock.sendall, 0), daemon=True)
+    th.start()
+    one(usock.recv, csock.sendall, 1)
+    th.join(2)
+    return count
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        cfg = self.server.cfg
+        try:
+            self.serve(cfg)
+        except Exception as e:  # a bug here must show in the record, not as a request that is simply missing
+            cfg.gap("proxy_error", detail=f"{type(e).__name__}: {e}")
+            traceback.print_exc()
+
+    def serve(self, c):
+        cs = self.request
+        cs.settimeout(c.timeout)
+        rf = cs.makefile("rb", 65536)
+        client_ip = self.client_address[0]
+        client = "%s:%d" % self.client_address[:2]
+        tunnel, up = None, None  # tunnel: (scheme, host, port) once inside a CONNECT; up: the upstream connection
+        try:
+            while True:
+                try:
+                    head, whole = read_head(rf)
+                except Bad as e:
+                    c.gap("malformed_request", detail=str(e))
+                    return reply(cs, 400, str(e))
+                if not whole:
+                    return
+                first, hdrs = parse_head(head)
+                bits = first.split(" ")
+                if len(bits) != 3:
+                    c.gap("malformed_request", detail=first[:100])
+                    return reply(cs, 400, "not an HTTP request line")
+                method, target, version = bits
+
+                if method.upper() == "CONNECT":
+                    host, _, port = target.rpartition(":")
+                    host, port = host.strip("[]"), int(port) if port.isdigit() else 443
+                    if c.ca is None:
+                        return self.opaque(c, cs, rf, host, port, client, client_ip, "no CA: openssl 3 or later not found")
+                    cs.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    try:
+                        cs = c.ca.context(host).wrap_socket(cs, server_side=True)
+                    except (ssl.SSLError, OSError) as e:
+                        return c.gap("tls_client_rejected", host, port, str(e)[:160])
+                    cs.settimeout(c.timeout)
+                    rf = cs.makefile("rb", 65536)
+                    tunnel = ("https", host, port)
+                    continue
+
+                lines = head.split(b"\n")
+                if tunnel:
+                    key, via = tunnel, "connect"
+                else:
+                    if not target.lower().startswith("http://"):
+                        c.gap("malformed_request", detail=first[:100])
+                        return reply(cs, 400, "this is a forward proxy: send an absolute http:// URL or CONNECT")
+                    rest = target[7:]
+                    i = min([k for k in (rest.find("/"), rest.find("?")) if k >= 0] or [len(rest)])
+                    u = urlsplit(target)
+                    key, via = ("http", (u.hostname or "").lower(), u.port or 80), "proxy"
+                    path = rest[i:] if rest[i:i + 1] == "/" else "/" + rest[i:]
+                    lines[0] = f"{method} {path} {version}".encode("latin-1") + (b"\r" if lines[0].endswith(b"\r") else b"")
+                    # Proxy-* headers are for this hop only; everything else is forwarded as the client wrote it.
+                    lines = [lines[0]] + [x for x in lines[1:] if not x.lower().startswith((b"proxy-connection:", b"proxy-authorization:"))]
+                sent_head = b"\n".join(lines)
+                t0 = time.time()
+
+                try:
+                    kind, n = framing(hdrs)
+                except Bad as e:
+                    return self.unframed(c, cs, rf, key, sent_head, client, client_ip, str(e))
+                if kind != "none" and header(hdrs, "expect") and header(hdrs, "expect")[0].lower() == "100-continue":
+                    cs.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")  # else the client waits a second for it
+                body = bytearray()
+
+                def keep(b):
+                    body.extend(b)
+                    if len(body) > HARD_BODY:
+                        raise Bad("request body over 64 MiB")
+                try:
+                    pump_body(rf, keep, kind, n)
+                except (Bad, EOFError) as e:
+                    c.gap("malformed_request", key[1], key[2], str(e))
+                    return reply(cs, 400, str(e))
+                req = Cap(c.cap)
+                req.add(sent_head + bytes(body))
+
+                # one try on a fresh connection if a reused one had already been closed by the target
+                retried, err, res, status, ttfb, rhead = False, None, None, None, None, b""
+                for attempt in (0, 1):
+                    fresh = up is None or up[0] != key
+                    try:
+                        if fresh:
+                            if up:
+                                up[1].close()
+                            up = None
+                            up = (key, *c.connect(key, client_ip))
+                        up[1].sendall(sent_head + bytes(body))
+                        t1 = time.time()
+                        rhead, whole = read_head(up[2])
+                        if not whole:
+                            raise EOFError("upstream closed before a response")
+                        err = None
+                        break
+                    except (OSError, EOFError, Bad, ssl.SSLError) as e:
+                        if up:
+                            up[1].close()
+                        up = None
+                        err = f"{type(e).__name__}: {e}"
+                        if fresh or attempt:
+                            break
+                        retried = True
+                tls = up[4] if up else None
+                if err:
+                    reason = ("refused_loopback" if "Refused" in err else
+                              "upstream_tls_verify_failed" if "CERTIFICATE_VERIFY" in err or "hostname" in err else "upstream_error")
+                    if reason != "upstream_error":
+                        c.gap(reason, key[1], key[2], err[:160])
+                    c.write(exchange_record(t0, time.time() - t0, None, client, key, None, req, None,
+                                            {"via": via, "error": err[:200], "retried": retried}))
+                    return reply(cs, 502, f"upstream failed: {err[:160]}"
+                                 + ("  (restart the proxy with --insecure-upstream to accept this certificate)"
+                                    if reason == "upstream_tls_verify_failed" else ""))
+                ttfb = t1 and time.time() - t1
+
+                status = status_of(rhead)
+                while 100 <= status < 200 and status != 101:  # interim responses are the proxy's business, 101 is not
+                    rhead, whole = read_head(up[2])
+                    status = status_of(rhead)
+                first_r, rhdrs = parse_head(rhead)
+                res = Cap(c.cap)
+                res.add(rhead)
+                cs.sendall(rhead)
+                extra = {"via": via, "retried": retried, "tls": tls}
+                close = wants_close(hdrs, version) or wants_close(rhdrs, first_r.split(" ")[0])
+                try:
+                    if status == 101:
+                        extra["upgraded"] = True
+                        c.write(exchange_record(t0, time.time() - t0, ttfb, client, key, up[3], req, res, extra))
+                        n_up, n_down = blind(cs, rf, up[1])
+                        return c.gap("upgraded_stream", key[1], key[2], f"{n_up} bytes up, {n_down} down not parsed")
+                    rkind, rn = framing(rhdrs, True, method, status)
+                    close = close or rkind == "close"
+                    pump_body(up[2], lambda b: (res.add(b), cs.sendall(b)), rkind, rn)
+                except Bad as e:
+                    extra["error"], close = f"unframed response: {e}", True
+                except (OSError, EOFError) as e:
+                    extra["error"], close = f"{type(e).__name__}: {e}", True
+                c.write(exchange_record(t0, time.time() - t0, ttfb, client, key, up[3], req, res, extra))
+                if close:
+                    return
+        except (OSError, ssl.SSLError):
+            return  # the client went away; whatever it sent has been recorded
+        finally:
+            if up:
+                up[1].close()
+            cs.close()
+
+    def unframed(self, c, cs, rf, key, head, client, client_ip, why):
+        """Framing the proxy will not resolve: forward blindly, record what crossed, say so."""
+        c.gap("ambiguous_framing", key[1], key[2], why)
+        t0 = time.time()
+        try:
+            usock, urf, ip, _ = c.connect(key, client_ip)
+        except (OSError, ssl.SSLError) as e:
+            return reply(cs, 502, f"upstream failed: {e}")
+        n_up, n_down = blind(cs, rf, usock, head)
+        c.write({"kind": "tunnel", "t": round(t0, 3), "dur": round(time.time() - t0, 3), "client": client,
+                 "scheme": key[0], "host": key[1], "port": key[2], "bytes_up": n_up, "bytes_down": n_down,
+                 "opaque": True, "reason": f"unframed: {why}", "req": base64.b64encode(head[:c.cap]).decode()})
+
+    def opaque(self, c, cs, rf, host, port, client, client_ip, why):
+        t0 = time.time()
+        try:
+            usock = c.dial(host, port, client_ip)
+        except OSError as e:
+            return reply(cs, 502, f"upstream failed: {e}")
+        cs.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        n_up, n_down = blind(cs, rf, usock)
+        c.write({"kind": "tunnel", "t": round(t0, 3), "dur": round(time.time() - t0, 3), "client": client,
+                 "scheme": "https", "host": host, "port": port, "bytes_up": n_up, "bytes_down": n_down,
+                 "opaque": True, "reason": why})
+
+
+class Listener(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads, allow_reuse_address, request_queue_size = True, True, 128
+
+    def __init__(self, addr, cfg):
+        super().__init__(addr, Handler)
+        self.cfg = cfg
+
+
+def docker_gateway():
+    try:
+        r = subprocess.run(["docker", "network", "inspect", "bridge", "-f", "{{(index .IPAM.Config 0).Gateway}}"],
+                           capture_output=True, text=True, timeout=5)
+        return str(ipaddress.ip_address(r.stdout.strip()))
+    except Exception:
+        return None
+
+
+def have_openssl3():
+    try:
+        out = subprocess.run(["openssl", "version"], capture_output=True, text=True).stdout
+        m = re.match(r"OpenSSL (\d+)", out)
+        return bool(m and int(m.group(1)) >= 3)
+    except OSError:
+        return False
+
+
+def serve(d: Path, a):
+    """Foreground proxy. `start` runs this detached."""
+    t = tdir(d)
+    t.mkdir(mode=0o700, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="mythos-ca-"))
+    ca, ca_note = None, None
+    if have_openssl3():
+        ca = CA(work)
+        (t / "ca.crt").write_bytes(ca.crt.read_bytes())
+    else:
+        ca_note = "openssl 3 or later not found: https is tunnelled, not recorded"
+    gateway = docker_gateway()
+    cfg = Config(t / "log.jsonl", ca, a.insecure_upstream, a.max_body, a.timeout, gateway)
+    addrs = a.bind or ["127.0.0.1"] + ([gateway] if gateway else [])
+    servers, port = [], a.port
+    for addr in addrs:
+        try:
+            s = Listener((addr, port), cfg)
+        except OSError as e:
+            if a.bind or addr == "127.0.0.1":
+                raise SystemExit(f"traffic: cannot listen on {addr}:{port}: {e}")
+            continue  # the docker bridge address is optional (Docker Desktop has none)
+        port = s.server_address[1]
+        servers.append(s)
+        threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.3}, daemon=True).start()
+    info = {"pid": os.getpid(), "port": port, "bind": [s.server_address[0] for s in servers],
+            "tls_intercept": ca is not None, "insecure_upstream": a.insecure_upstream, "max_body": a.max_body,
+            "started": round(time.time(), 3), "note": ca_note}
+    append(t / "events.jsonl", {"t": info["started"], "event": "start", **info})
+    (t / "proxy.json.tmp").write_text(json.dumps(info))
+    (t / "proxy.json.tmp").replace(t / "proxy.json")
+    done = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: done.set())
+    done.wait()
+    for s in servers:
+        s.shutdown()
+    append(t / "events.jsonl", {"t": round(time.time(), 3), "event": "stop"})
+    (t / "proxy.json").unlink(missing_ok=True)
+    for f in work.iterdir():
+        f.unlink()
+    work.rmdir()
+    return 0
+
+
+# ----------------------------------------------------------------- engagement
+
+def engagement(a) -> Path:
+    path = a.dir or a.top_dir or (os.environ.get("MYTHOS_SCOPE") and str(Path(os.environ["MYTHOS_SCOPE"]).parent))
+    if not path:
+        sys.exit("traffic: no engagement. Pass --dir engagements/<dir> or pin MYTHOS_SCOPE (engagement-setup, step 4).")
+    d = Path(path)
+    if not d.is_dir():
+        sys.exit(f"traffic: not a directory: {d}")
+    os.environ["MYTHOS_SCOPE"] = str(d.resolve() / "scope.yaml")  # the guards read this, and it must be this engagement
+    return d.resolve()
+
+
+def proxy_state(d: Path):
+    """(proxy.json, alive). (None, False) when no proxy was ever started."""
+    try:
+        info = json.loads((tdir(d) / "proxy.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return None, False
+    try:
+        os.kill(info["pid"], 0)
+        return info, True
+    except (OSError, KeyError):
+        return info, False
+
+
+def proxy_env(d: Path, container=False):
+    """{} when this engagement records nothing; SystemExit when it should but the proxy is down."""
+    info, alive = proxy_state(d)
+    if info is None:
+        return {}
+    if not alive:
+        sys.exit(f"traffic: the capture proxy for {d.name} is not running, so a request now would go unrecorded.\n"
+                 f"  scripts/traffic --dir {d} start     (or `stop` to end recording for this engagement)")
+    if container:
+        try:
+            ca = "/repo/engagements/" + str(d.relative_to(REPO / "engagements")) + "/traffic/ca.crt"
+        except ValueError:
+            sys.exit("traffic: the toolbox only mounts engagements/, and this engagement is outside it")
+        url = f"http://host.docker.internal:{info['port']}"
+    else:
+        ca, url = str(tdir(d) / "ca.crt"), f"http://127.0.0.1:{info['port']}"
+    env = {"HTTP_PROXY": url, "HTTPS_PROXY": url, "http_proxy": url, "https_proxy": url}
+    if container:  # loopback inside the toolbox is the toolbox, never the host behind the proxy
+        env.update({"NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
+    if info["tls_intercept"]:
+        env.update({k: ca for k in ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")})
+    return env
+
+
+def cmd_start(d, a):
+    info, alive = proxy_state(d)
+    if alive:
+        print(f"traffic: already recording on port {info['port']}", file=sys.stderr)
+        return 0
+    t = tdir(d)
+    t.mkdir(mode=0o700, exist_ok=True)
+    (t / "proxy.json").unlink(missing_ok=True)
+    cmd = [sys.executable, __file__, "serve", "--dir", str(d), "--port", str(a.port), "--max-body", str(a.max_body),
+           "--timeout", str(a.timeout)] + (["--insecure-upstream"] if a.insecure_upstream else [])
+    for b in a.bind or []:
+        cmd += ["--bind", b]
+    with open(t / "proxy.err", "ab") as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=err, stderr=err, start_new_session=True)
+    for _ in range(100):
+        info, alive = proxy_state(d)
+        if alive:
+            break
+        if proc.poll() is not None:
+            sys.exit("traffic: the proxy exited at startup:\n" + (t / "proxy.err").read_text()[-600:])
+        time.sleep(0.1)
+    else:
+        sys.exit("traffic: the proxy did not come up in 10 seconds")
+    print(f"traffic: recording {d.name} on {', '.join(f'{b}:{info['port']}' for b in info['bind'])}"
+          f" (https {'intercepted' if info['tls_intercept'] else 'TUNNELLED, NOT RECORDED: ' + str(info['note'])})")
+    print(f"  host:      eval \"$(scripts/traffic --dir {d} env)\"   or   scripts/traffic exec -- curl ...")
+    print("  toolbox:   `scripts/traffic env --container --json` gives the variables scripts/mythos must pass to docker exec")
+    return 0
+
+
+def cmd_stop(d, a):
+    info, alive = proxy_state(d)
+    if alive:
+        os.kill(info["pid"], signal.SIGTERM)
+        for _ in range(100):
+            if not proxy_state(d)[1]:
+                break
+            time.sleep(0.1)
+        time.sleep(0.2)
+    elif info:
+        print("traffic: the proxy had already died without a stop event; records after its last request are unknown",
+              file=sys.stderr)
+        append(tdir(d) / "events.jsonl", {"t": round(time.time(), 3), "event": "stop", "crashed": True})
+        (tdir(d) / "proxy.json").unlink(missing_ok=True)
+    else:
+        print("traffic: no proxy was started for this engagement", file=sys.stderr)
+    return cmd_run(d, a)
+
+
+def cmd_env(d, a):
+    env = proxy_env(d, a.container)
+    if a.json:
+        print(json.dumps(env))
+    else:
+        for k, v in env.items():
+            print(f"export {k}={shlex.quote(v)}")
+    return 0
+
+
+def cmd_exec(d, a):
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        sys.exit("usage: scripts/traffic exec -- <command ...>")
+    env = proxy_env(d)
+    if not env:
+        print("traffic: no capture proxy for this engagement; this request will NOT be recorded", file=sys.stderr)
+    os.execvpe(cmd[0], cmd, {**os.environ, **env})
+
+
+def cmd_phase(d, a):
+    append(tdir(d) / "events.jsonl", {"t": round(time.time(), 3), "event": "phase", "name": a.name})
+    print(f"traffic: phase {a.name}")
+    return 0
+
+
+# ------------------------------------------------------------------- analysis
+
+def scope_offenders(d: Path, hostports):
+    """({(host, port) the scope guard flags}, scope file or None), through hooks/scope-guard.py --check."""
+    guard, off, scope = REPO / "hooks" / "scope-guard.py", set(), None
+    items = sorted(hostports)
+    for i in range(0, len(items), 100):
+        urls = [f"https://{h}:{p}/" for h, p in items[i:i + 100]]
+        out = json.loads(subprocess.run([sys.executable, str(guard), "--check", " ".join(urls)],
+                                        capture_output=True, text=True).stdout or "{}")
+        scope = out.get("scope")
+        flagged = set(out.get("offenders") or [])
+        off |= {(h, p) for h, p in items[i:i + 100] if h.lower() in flagged or f"{h.lower()}:{p}" in flagged}
+    return off, scope
+
+
+def command_offenders(cmd):
+    out = json.loads(subprocess.run([sys.executable, str(REPO / "hooks" / "scope-guard.py"), "--check", cmd],
+                                    capture_output=True, text=True).stdout or "{}")
+    return out.get("offenders") or []
+
+
+def iso(t):
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def audit_runs(d: Path, t0, t1):
+    """Toolbox invocations from audit.jsonl that ended inside [t0, t1]."""
+    runs = []
+    try:
+        lines = (d.parent / "audit.jsonl").read_text().splitlines()
+    except FileNotFoundError:
+        return runs
+    for line in lines:
+        try:
+            e = json.loads(line)
+            if e.get("phase") != "end":
+                continue
+            end = dt.datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        except (ValueError, KeyError):
+            continue
+        argv = e.get("argv") or []
+        cmd = argv[2] if argv[:2] in (["bash", "-lc"], ["sh", "-c"]) and len(argv) > 2 else shlex.join(argv)
+        try:
+            tool = Path(shlex.split(cmd)[0]).name
+        except (ValueError, IndexError):
+            tool = "?"
+        if t0 - 5 <= end <= t1 + 5:
+            runs.append({"tool": tool, "cmd": cmd, "exit": e.get("exit"), "seconds": e.get("seconds") or 0, "end": end})
+    return runs
+
+
+def phases_of(d: Path, events, exchanges, t_end):
+    """Phases from `traffic phase` markers; without markers, inferred from the engagement's files."""
+    marks = [(e["t"], e["name"]) for e in events if e.get("event") == "phase"]
+    out = []
+    if marks:
+        first = sum(1 for r in exchanges if r["t"] < marks[0][0])
+        if first:
+            out.append({"name": "(before the first marker)", "start": None, "end": iso(marks[0][0]), "source": "marker",
+                        "requests": first})
+        for i, (t, name) in enumerate(marks):
+            end = marks[i + 1][0] if i + 1 < len(marks) else float("inf")
+            out.append({"name": name, "start": iso(t), "end": iso(min(end, t_end)) if t_end else None, "source": "marker",
+                        "requests": sum(1 for r in exchanges if t <= r["t"] < end)})
+        return out
+    for name, path in (("recon", "recon"), ("scan", "scan"), ("findings", "findings"), ("report", "report.md")):
+        p = d / path
+        files = [f for f in ([p] if p.is_file() else p.rglob("*") if p.is_dir() else []) if f.is_file()]
+        if files:
+            times = [f.stat().st_mtime for f in files]
+            out.append({"name": name, "start": iso(min(times)), "end": iso(max(times)), "source": "files",
+                        "requests": sum(1 for r in exchanges if min(times) <= r["t"] <= max(times))})
+    return out
+
+
+def analyse(d: Path, before=5):
+    """Everything summary, run.json and the tests print, as one dict."""
+    entries = read_log(d)
+    events = read_events(d)
+    ex = [dict(r, id=i) for i, r in entries if r.get("kind") == "exchange"]
+    gaps = [dict(r, id=i) for i, r in entries if r.get("kind") == "gap"]
+    tunnels = [dict(r, id=i) for i, r in entries if r.get("kind") == "tunnel"]
+    ex.sort(key=lambda r: r["t"])
+    info, alive = proxy_state(d)
+    starts = [e for e in events if e.get("event") == "start"]
+    stops = [e for e in events if e.get("event") == "stop"]
+    stamps = [r["t"] for r in ex] + [r["t"] for r in tunnels] + [e["t"] for e in events if e.get("event") in ("start", "stop")]
+    t_start = starts[0]["t"] if starts else (min(stamps) if stamps else None)
+    t_end = time.time() if alive else (max(stamps + [r["t"] + r.get("dur", 0) for r in ex]) if stamps else None)
+
+    hosts = collections.OrderedDict()
+    for r in ex:
+        h = hosts.setdefault(f"{r['host']}:{r['port']}", collections.Counter())
+        h["requests"] += 1
+        h["error" if r.get("error") or r["s"] is None else f"{r['s'] // 100}xx"] += 1
+    hostports = {(r["host"], r["port"]) for r in ex} | {(r["host"], r["port"]) for r in tunnels}
+    off, scope_file = scope_offenders(d, hostports) if hostports else (set(), None)
+    in_scope = None if scope_file is None else lambda hp: hp not in off
+    for key, h in hosts.items():
+        host, _, port = key.rpartition(":")
+        h["in_scope"] = None if in_scope is None else in_scope((host, int(port)))
+
+    # rate: requests per wall-clock second
+    per_sec = collections.Counter(int(r["t"]) for r in ex)
+    limit = None
+    try:
+        rules = load_script(REPO / "hooks" / "budget-guard.py").load_rules()
+        limit = rules and rules[1].get("rate_limit_rps")
+        limit = float(limit) if limit is not None else None
+    except Exception:
+        limit = None
+    span = (max(r["t"] + r.get("dur", 0) for r in ex) - min(r["t"] for r in ex)) if ex else 0
+    rate = {"avg_rps": round(len(ex) / span, 2) if span >= 1 else float(len(ex)),
+            "peak_rps": max(per_sec.values(), default=0), "limit_rps": limit,
+            "seconds_over_limit": sum(1 for v in per_sec.values() if limit and v > limit) if limit else None}
+
+    def broke(r):
+        return bool(r.get("error")) or r["s"] is None or r["s"] >= 500
+
+    breaks, seen = [], set()
+    for i, r in enumerate(ex):
+        key = (r["host"], r["port"])
+        if broke(r) and key not in seen and not r.get("replay_of"):
+            seen.add(key)
+            prior = [p for p in ex[:i] if (p["host"], p["port"]) == key][-before:]
+            breaks.append({"host": f"{r['host']}:{r['port']}", "first_failure": brief(r, r["t"]),
+                           "before": [brief(p, r["t"]) for p in prior]})
+
+    clients = collections.Counter((r.get("ua") or "(none)") for r in ex)
+    cuts = {"request": sum(r.get("req_cut", False) for r in ex), "response": sum(r.get("res_cut", False) for r in ex)}
+    gap_counts = collections.Counter(g["reason"] for g in gaps)
+    runs = audit_runs(d, t_start, t_end) if t_start else []
+    tools = {}
+    for r in runs:
+        row = tools.setdefault(r["tool"], {"runs": 0, "seconds": 0.0, "failed": 0, "timed_out": 0})
+        row["runs"] += 1
+        row["seconds"] = round(row["seconds"] + r["seconds"], 1)
+        row["failed"] += r["exit"] not in (0, None)
+        row["timed_out"] += r["exit"] in (124, 137)
+    budget = load_script(REPO / "hooks" / "budget-guard.py")
+    http_tools = (set(budget.BATCH_TOOLS) | set(budget.SINGLE_SHOT)) - NON_HTTP
+    unseen = sorted({r["tool"] for r in runs if r["tool"] in http_tools and r["seconds"] >= 1
+                     and not any(r["end"] - r["seconds"] - 2 <= x["t"] <= r["end"] + 2 for x in ex)})
+    distinct = sorted({r["cmd"] for r in runs})[:200]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        flagged = [{"cmd": c[:300], "offenders": o} for c, o in zip(distinct, pool.map(command_offenders, distinct)) if o]
+
+    return {
+        "engagement": d.name,
+        "window": {"start": t_start and iso(t_start), "end": t_end and iso(t_end), "running": alive,
+                   "duration_s": round(t_end - t_start, 1) if t_start and t_end else None},
+        "capture": {"proxy_starts": len(starts), "proxy_stops": len(stops), "clean": len(starts) == len(stops) + (1 if alive else 0),
+                    "tls_intercept": (starts[-1].get("tls_intercept") if starts else None),
+                    "insecure_upstream": (starts[-1].get("insecure_upstream") if starts else None),
+                    "complete": not (gaps or tunnels or cuts["request"] or cuts["response"] or unseen),
+                    "gaps": dict(gap_counts), "gap_hosts": sorted({f"{g['host']}:{g['port']}" for g in gaps if g.get("host")}),
+                    "opaque_tunnels": len(tunnels), "truncated": cuts, "tools_with_no_recorded_request": unseen},
+        "requests": {"total": len(ex), "replays": sum(1 for r in ex if r.get("replay_of")),
+                     "server_errors": sum(1 for r in ex if r["s"] and r["s"] >= 500),
+                     "failed": sum(1 for r in ex if r.get("error") or r["s"] is None)},
+        "hosts": {k: dict(v) for k, v in hosts.items()},
+        "rate": rate,
+        "scope": {"file": scope_file, "out_of_scope_hosts": sorted(f"{h}:{p}" for h, p in off),
+                  "out_of_scope_requests": sum(1 for r in ex if (r["host"], r["port"]) in off),
+                  "tool_invocations_flagged": flagged},
+        "breaks": breaks,
+        "clients": dict(clients.most_common(10)),
+        "tools": tools,
+        "phases": phases_of(d, events, ex, t_end or 0),
+    }
+
+
+def brief(r, ref):
+    return {"id": r["id"], "t": iso(r["t"]), "before_s": f"{ref - r['t']:.2f}", "method": r["m"],
+            "url": redact(r["p"]), "status": r["s"], "error": r.get("error")}
+
+
+def cmd_run(d, a):
+    run = analyse(d)
+    (d / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+    print(f"traffic: wrote {d / 'run.json'}: {run['requests']['total']} request(s), "
+          f"{len(run['hosts'])} host(s), capture {'complete' if run['capture']['complete'] else 'INCOMPLETE'}")
+    return 0
+
+
+def cmd_summary(d, a):
+    run = analyse(d, a.before)
+    if a.json:
+        print(json.dumps(run, indent=2))
+        return 0
+    w, c, rq, rt, sc = run["window"], run["capture"], run["requests"], run["rate"], run["scope"]
+    if not (rq["total"] or c["gaps"] or c["opaque_tunnels"]):
+        print(f"{d.name}: nothing recorded. Either no proxy ran, or nothing reached it.")
+        return 0
+    print(f"engagement   {d.name}   {w['start']} .. {w['end']}{' (proxy running)' if w['running'] else ''}"
+          f"   {w['duration_s']}s")
+    print(f"requests     {rq['total']} recorded ({rq['replays']} replays), {rq['server_errors']} 5xx, "
+          f"{rq['failed']} failed before a response")
+    lim = f", limit {rt['limit_rps']:g}, over it in {rt['seconds_over_limit']} s" if rt["limit_rps"] else ""
+    print(f"rate         avg {rt['avg_rps']} rps, peak {rt['peak_rps']} rps{lim}")
+    print(f"hosts        {len(run['hosts'])}")
+    for key, h in run["hosts"].items():
+        mark = "" if h["in_scope"] else ("   OUT OF SCOPE" if h["in_scope"] is False else "   scope unknown")
+        codes = "  ".join(f"{k} {v}" for k, v in sorted(h.items()) if k not in ("requests", "in_scope"))
+        print(f"  {key:<32}{h['requests']:>6}   {codes}{mark}")
+    print(f"out of scope {sc['out_of_scope_requests']} request(s) to {len(sc['out_of_scope_hosts'])} host(s)"
+          + (f": {', '.join(sc['out_of_scope_hosts'])}" if sc["out_of_scope_hosts"] else "")
+          + ("" if sc["file"] else "   (no scope file found: not checked)"))
+    for f in sc["tool_invocations_flagged"]:
+        print(f"  toolbox command the scope guard flags: {f['cmd'][:100]} -> {', '.join(f['offenders'])}")
+    for b in run["breaks"]:
+        f = b["first_failure"]
+        print(f"first failure on {b['host']}: #{f['id']} {f['method']} {f['url']} -> {f['status'] or f['error']}")
+        for p in b["before"]:
+            print(f"    #{p['id']:<5} -{p['before_s']}s  {p['method']} {p['url']}  -> {p['status'] or p['error']}")
+    print("clients      " + ", ".join(f"{k} x{v}" for k, v in run["clients"].items()))
+    if run["tools"]:
+        print("tools        " + ", ".join(f"{k} x{v['runs']} ({v['seconds']}s)" for k, v in run["tools"].items()))
+    for p in run["phases"]:
+        print(f"phase        {p['name']:<9} {p['requests']} request(s)   [{p['source']}]")
+    if c["complete"]:
+        print("capture      complete for every request that reached the proxy")
+    else:
+        print("capture      INCOMPLETE:")
+        for k, v in c["gaps"].items():
+            print(f"  gap        {k} x{v}" + (f"  ({', '.join(c['gap_hosts'])})" if c["gap_hosts"] else ""))
+        if c["opaque_tunnels"]:
+            print(f"  tunnels    {c['opaque_tunnels']} CONNECT(s) passed through with byte counts only")
+        if c["truncated"]["request"] or c["truncated"]["response"]:
+            print(f"  truncated  {c['truncated']['request']} request(s), {c['truncated']['response']} response(s) over --max-body")
+        if c["tools_with_no_recorded_request"]:
+            print(f"  no request recorded while these toolbox tools ran: {', '.join(c['tools_with_no_recorded_request'])}"
+                  " (they probably ignore HTTP_PROXY)")
+    return 0
+
+
+def cmd_list(d, a):
+    rows = [(i, r) for i, r in read_log(d) if r.get("kind") == "exchange"]
+    if not rows:
+        print("traffic: nothing recorded")
+        return 0
+    t0 = min(r["t"] for _, r in rows)
+    pat = re.compile(a.grep) if a.grep else None
+    shown = 0
+    for i, r in rows:
+        status = r["s"] if r["s"] is not None else "ERR"
+        line = f"{i:>6}  +{r['t'] - t0:8.2f}s  {r['m']:<6} {status:<4} {r['host']}:{r['port']}{redact(r['p'])[:90]}"
+        if a.host and a.host not in f"{r['host']}:{r['port']}" or a.status and not str(status).startswith(a.status) \
+                or pat and not pat.search(line):
+            continue
+        print(line + ("  (replay of %d)" % r["replay_of"] if r.get("replay_of") else ""))
+        shown += 1
+        if shown >= a.limit:
+            print(f"... --limit {a.limit} reached")
+            break
+    return 0
+
+
+def record(d, rid):
+    for i, r in read_log(d):
+        if i == rid:
+            return r
+    sys.exit(f"traffic: no record {rid}")
+
+
+def cmd_show(d, a):
+    r = record(d, a.id)
+    if r.get("kind") != "exchange":
+        print(json.dumps({k: v for k, v in r.items() if k != "req"}, indent=2))
+        return 0
+    out = [f"# {a.id}  {iso(r['t'])}  {r['dur']}s  client {r['client']}  via {r.get('via')}  -> {r.get('ip')}",
+           *(["# error: " + r["error"]] if r.get("error") else []),
+           *(["# REQUEST TRUNCATED in the record"] if r.get("req_cut") else [])]
+    for key in ("req", "res"):
+        raw = raw_of(r, key)
+        head, body = split_message(raw)
+        _, hdrs = parse_head(head)
+        text, note = body_of(hdrs, body)
+        shown = text.decode("utf-8", "replace") if len(text) < 200000 and b"\0" not in text[:512] else f"<{len(text)} binary bytes>"
+        if not a.full and len(shown) > 4000:
+            shown = shown[:4000] + f"\n... {len(shown) - 4000} more characters (--full)"
+        out += ["", head.decode("latin-1").rstrip("\r\n"), "", shown + (f"\n# {note}" if note else "")] if raw else ["", "# (none)"]
+        if key == "res" and r.get("res_cut"):
+            out.append("# RESPONSE TRUNCATED in the record")
+    text = "\n".join(out)
+    print(text if a.raw else redact(text))
+    return 0
+
+
+# --------------------------------------------------------------------- export
+
+def har_entry(i, r, red):
+    f = redact if red else (lambda s: s)
+    req, res = raw_of(r, "req"), raw_of(r, "res")
+    rhead, rbody = split_message(req)
+    first, rh = parse_head(rhead)
+    url = f(url_of(r))
+    resp_head, resp_body = split_message(res)
+    sfirst, sh = parse_head(resp_head)
+
+    def hlist(hdrs):
+        out = []
+        for n, v in hdrs:
+            name, _, value = f(f"{n}: {v}").partition(":")
+            out.append({"name": name, "value": value.strip()})
+        return out
+
+    def content(hdrs, body):
+        data, note = body_of(hdrs, body)
+        try:
+            text, enc = data.decode("utf-8"), None
+        except UnicodeDecodeError:
+            text, enc = (None, None) if red else (base64.b64encode(data).decode(), "base64")
+        c = {"size": len(data), "mimeType": (header(hdrs, "content-type") or [""])[0]}
+        if text is not None:
+            c["text"] = f(text)
+        if enc:
+            c["encoding"] = enc
+        if note or (text is None and red):
+            c["comment"] = note or "binary body omitted by redaction"
+        return c
+
+    pc = content(rh, rbody)
+    entry = {
+        "startedDateTime": dt.datetime.fromtimestamp(r["t"], dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "time": round(r["dur"] * 1000, 1),
+        "request": {"method": r["m"], "url": url, "httpVersion": (first.split(" ") + ["", "", ""])[2],
+                    "cookies": [], "headers": hlist(rh),
+                    "queryString": [{"name": k, "value": v} for k, v in parse_qsl(urlsplit(url).query, keep_blank_values=True)],
+                    "headersSize": len(rhead), "bodySize": len(rbody)},
+        "response": {"status": r["s"] or 0, "statusText": " ".join(sfirst.split(" ")[2:]),
+                     "httpVersion": sfirst.split(" ")[0], "cookies": [], "headers": hlist(sh),
+                     "content": content(sh, resp_body) if res else {"size": 0, "mimeType": ""},
+                     "redirectURL": f((header(sh, "location") or [""])[0]), "headersSize": len(resp_head),
+                     "bodySize": len(resp_body)},
+        "cache": {},
+        "timings": {"send": 0, "wait": round((r.get("ttfb") or 0) * 1000, 1),
+                    "receive": round(max(r["dur"] - (r.get("ttfb") or 0), 0) * 1000, 1)},
+        "_mythos": {"id": i, "client": r["client"], "via": r.get("via"), "replay_of": r.get("replay_of"),
+                    "error": r.get("error"), "request_truncated": r.get("req_cut"),
+                    "response_truncated": r.get("res_cut")},
+    }
+    if rbody:
+        entry["request"]["postData"] = {"mimeType": pc["mimeType"], "text": pc.get("text", "")}
+        if "encoding" in pc:
+            entry["request"]["postData"]["comment"] = "base64"
+    if r.get("ip"):
+        entry["serverIPAddress"] = r["ip"]
+    return entry
+
+
+def build_har(d, red=True):
+    rows = read_log(d)
+    ex = sorted(((i, r) for i, r in rows if r.get("kind") == "exchange"), key=lambda x: x[1]["t"])
+    other = [dict(r, id=i) for i, r in rows if r.get("kind") in ("gap", "tunnel")]
+    for g in other:
+        g.pop("req", None)
+    return {"log": {
+        "version": "1.2", "creator": {"name": "mythos-traffic", "version": "1"},
+        "entries": [har_entry(i, r, red) for i, r in ex],
+        "comment": ("INCOMPLETE: %d gap or tunnel record(s) in _mythos.not_captured" % len(other)) if other
+                   else "every request that reached the proxy is an entry",
+        "_mythos": {"engagement": d.name, "redacted": red, "not_captured": other}}}
+
+
+def cmd_export(d, a):
+    out = Path(a.out) if a.out else tdir(d) / ("traffic.raw.har" if a.raw else "traffic.har")
+    out.parent.mkdir(exist_ok=True)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(build_har(d, not a.raw), f, indent=1)
+        f.write("\n")
+    print(f"traffic: wrote {out}" + ("  (NOT redacted: live credentials, keep it in the engagement)" if a.raw else "  (redacted)"))
+    return 0
+
+
+# --------------------------------------------------------------------- replay
+
+def compare(old_raw, new_raw, ignore, ignore_body, method, cut):
+    """How two raw responses differ. `same` is the verdict."""
+    oh, ob = split_message(old_raw)
+    nh, nb = split_message(new_raw)
+    of, ohd = parse_head(oh)
+    nf, nhd = parse_head(nh)
+    skip = {x.strip().lower() for x in ignore.split(",") if x.strip()}
+    pairs = lambda hd: collections.Counter((n.lower(), v) for n, v in hd if n.lower() not in skip)
+    oc, nc = pairs(ohd), pairs(nhd)
+    ostat, nstat = (of.split(" ", 2) + ["", ""])[1], (nf.split(" ", 2) + ["", ""])[1]
+    obody, onote = body_of(ohd, ob, decode=not cut)
+    nbody, nnote = body_of(nhd, nb, decode=not cut)
+    if cut:  # a truncated record can only be compared as far as it goes
+        nbody = nbody[:len(obody)]
+    otext, ntext = obody.decode("latin-1"), nbody.decode("latin-1")
+    for pat in ignore_body:
+        otext, ntext = re.sub(pat, "<ignored>", otext), re.sub(pat, "<ignored>", ntext)
+    body_same = otext == ntext
+    diff = []
+    if not body_same:
+        try:
+            ot, nt = obody.decode("utf-8"), nbody.decode("utf-8")
+            for pat in ignore_body:
+                ot, nt = re.sub(pat, "<ignored>", ot), re.sub(pat, "<ignored>", nt)
+            diff = list(difflib.unified_diff(ot.splitlines(), nt.splitlines(), "recorded", "replayed", lineterm="", n=1))[:40]
+        except UnicodeDecodeError:
+            diff = [f"binary bodies differ: {len(obody)} bytes recorded, {len(nbody)} replayed"]
+    res = {"status": {"recorded": ostat, "replayed": nstat, "same": ostat == nstat},
+           "headers": {"removed": sorted("%s: %s" % k for k in (oc - nc)), "added": sorted("%s: %s" % k for k in (nc - oc)),
+                       "same": oc == nc, "ignored": sorted(skip)},
+           "body": {"same": body_same, "recorded_bytes": len(obody), "replayed_bytes": len(nbody),
+                    "recorded_sha256": hashlib.sha256(obody).hexdigest()[:16], "replayed_sha256": hashlib.sha256(nbody).hexdigest()[:16],
+                    "ignored_patterns": list(ignore_body), "diff": diff},
+           "recorded_truncated": bool(cut), "notes": [n for n in (onote, nnote) if n]}
+    res["same"] = res["status"]["same"] and res["headers"]["same"] and body_same
+    return res
+
+
+def cmd_replay(d, a):
+    r = record(d, a.id)
+    if r.get("kind") != "exchange" or not r.get("req"):
+        sys.exit(f"traffic: record {a.id} is not a request that can be replayed")
+    if r.get("req_cut"):
+        sys.exit(f"traffic: the request in record {a.id} was truncated at --max-body; replaying it would send something else")
+    off, scope = scope_offenders(d, {(r["host"], r["port"])})
+    if scope is None or off:
+        sys.exit(f"traffic: refusing to send to {r['host']}:{r['port']}: "
+                 + ("no scope file to check against" if scope is None else "the scope guard says it is out of scope"))
+    raw = raw_of(r, "req")
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(["http/1.1"])
+    if a.insecure:
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    t0, err, res = time.time(), None, bytearray()
+    try:
+        s = socket.create_connection((r["host"], r["port"]), a.timeout)
+        s.settimeout(a.timeout)
+        if r["scheme"] == "https":
+            s = ctx.wrap_socket(s, server_hostname=r["host"])
+        rf = s.makefile("rb")
+        s.sendall(raw)
+        head, whole = read_head(rf)
+        while whole and 100 <= status_of(head) < 200 and status_of(head) != 101:
+            head, whole = read_head(rf)
+        if not whole:
+            raise EOFError("connection closed before a response")
+        res += head
+        _, hd = parse_head(head)
+        kind, n = framing(hd, True, r["m"], status_of(head))
+        pump_body(rf, res.extend, kind, n)
+        ip = s.getpeername()[0]
+    except (OSError, EOFError, Bad, ssl.SSLError) as e:
+        err, ip = f"{type(e).__name__}: {e}", None
+    extra = {"via": "replay", "replay_of": a.id, **({"error": err} if err else {})}
+    rec = exchange_record(t0, time.time() - t0, None, "replay", (r["scheme"], r["host"], r["port"]), ip, raw, bytes(res) or None, extra)
+    append(tdir(d) / "log.jsonl", rec)
+    if err:
+        print(f"traffic: replay of {a.id} failed: {err}", file=sys.stderr)
+        return 2
+    old = raw_of(r, "res")
+    if not old:
+        print(f"traffic: record {a.id} has no response to compare with ({r.get('error')}); the replay got {rec['s']}")
+        return 2
+    out = compare(old, bytes(res), a.ignore_headers, a.ignore_body or [], r["m"], r.get("res_cut"))
+    out.update(id=a.id, request=f"{r['m']} {url_of(r)}")
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"replay of {a.id}: {r['m']} {redact(url_of(r))}   {'IDENTICAL' if out['same'] else 'DIFFERS'}")
+        s, h, b = out["status"], out["headers"], out["body"]
+        print(f"  status   {s['recorded']} -> {s['replayed']}   {'same' if s['same'] else 'CHANGED'}")
+        print(f"  headers  {'same' if h['same'] else 'differ'}   (ignored: {', '.join(h['ignored']) or 'none'})")
+        for x in h["removed"]:
+            print("    - " + redact(x))
+        for x in h["added"]:
+            print("    + " + redact(x))
+        print(f"  body     {'same' if b['same'] else 'DIFFERS'}   {b['recorded_bytes']} -> {b['replayed_bytes']} bytes"
+              + (f"   (recorded response was truncated, compared as far as it goes)" if out["recorded_truncated"] else ""))
+        for line in b["diff"]:
+            print("    " + redact(line))
+        for n in out["notes"]:
+            print("  note     " + n)
+    return 0 if out["same"] else 1
+
+
+# -------------------------------------------------------------------- selftest
+
+def _selftest() -> int:
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # framing: the cases a proxy must refuse to guess about
+    want(framing([("Content-Length", "5")]), ("length", 5), "content-length")
+    want(framing([("Transfer-Encoding", "chunked")]), ("chunked", 0), "chunked")
+    want(framing([], True), ("close", 0), "response without framing reads to close")
+    want(framing([], True, "HEAD"), ("none", 0), "HEAD has no body")
+    for label, hd in {"CL and TE": [("Content-Length", "4"), ("Transfer-Encoding", "chunked")],
+                      "two different CL": [("Content-Length", "4"), ("Content-Length", "5")],
+                      "padded name": [("Transfer-Encoding ", "chunked")],
+                      "TE not chunked": [("Transfer-Encoding", "gzip")]}.items():
+        try:
+            framing(hd)
+            failures.append(f"framing accepted {label}")
+        except Bad:
+            pass
+    want(dechunk(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"), (b"abcde", True), "dechunk")
+    want(dechunk(b"3\r\nab"), (b"ab", False), "dechunk truncated")
+
+    # redaction, with the patterns of scripts/findings
+    secret = ("Cookie: session=SECRETCOOKIE\nAuthorization: Bearer SECRETBEARER\nAuthorization: Digest username=SECRETDIGEST\n"
+              'x=1&token=SECRETQUERY\n{"password": "SECRETPASS"}\n'
+              "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SECRETSIG\n")
+    out = redact(secret)
+    for leak in ("SECRETCOOKIE", "SECRETBEARER", "SECRETDIGEST", "SECRETQUERY", "SECRETPASS", "SECRETSIG"):
+        if leak in out:
+            failures.append(f"redaction left {leak}")
+    want("Bearer" in out, True, "redaction keeps the scheme")
+
+    fx = REPO / "toolbox" / "proxy" / "fixtures" / "fixture"
+    with tempfile.TemporaryDirectory() as td:
+        env_keep = os.environ.get("MYTHOS_SCOPE")
+        # work on a copy: analyse() and export write nothing into the committed fixture
+        import shutil
+        work = Path(td) / "fixture"
+        shutil.copytree(fx, work)
+        shutil.copy(fx.parent / "audit.jsonl", Path(td) / "audit.jsonl")
+        os.environ["MYTHOS_SCOPE"] = str(work / "scope.yaml")
+        run = analyse(work, 3)
+
+        # summary counting, against a fixture whose numbers are known
+        want(run["requests"]["total"], 21, "fixture request count")
+        want(run["requests"]["replays"], 1, "fixture replay count")
+        want(run["requests"]["server_errors"], 2, "5xx count")
+        want(run["requests"]["failed"], 1, "failed before a response")
+        want(sorted(run["hosts"]), ["admin.app.test:443", "app.test:443", "app.test:8443", "evil.test:80"], "hosts")
+        want(run["hosts"]["app.test:443"]["requests"], 18, "per-host count")
+        want(sorted(run["scope"]["out_of_scope_hosts"]),
+             ["admin.app.test:443", "app.test:8443", "evil.test:80", "x.app.test:8443"],
+             "out of scope comes from the scope guard (an excluded host, a host outside the list, a port not listed, a tunnel)")
+        want(run["scope"]["out_of_scope_requests"], 3, "out of scope request count")
+        want(run["rate"]["peak_rps"], 7, "peak rps")
+        want(run["rate"]["limit_rps"], 5.0, "limit read through budget-guard")
+        want(run["rate"]["seconds_over_limit"], 1, "seconds over the limit")
+        want([b["host"] for b in run["breaks"]], ["app.test:443"], "one break")
+        want([p["id"] for p in run["breaks"][0]["before"]], [11, 12, 13], "the three requests before the break")
+        want(run["breaks"][0]["first_failure"]["id"], 14, "first failure")
+        want(run["capture"]["gaps"], {"tls_client_rejected": 1}, "gap counted")
+        want(run["capture"]["opaque_tunnels"], 1, "tunnel counted")
+        want(run["capture"]["truncated"], {"request": 0, "response": 1}, "truncation counted")
+        want(run["capture"]["complete"], False, "an incomplete record says so")
+        want(run["capture"]["tools_with_no_recorded_request"], ["ffuf"], "a tool that ran and sent nothing is flagged")
+        want(sorted(run["tools"]), ["curl", "ffuf", "nmap", "nuclei"], "tools from audit.jsonl")
+        want([f["offenders"] for f in run["scope"]["tool_invocations_flagged"]], [["evil.test"]], "toolbox command flagged by the guard")
+        want([(p["name"], p["source"]) for p in run["phases"]], [("recon", "marker"), ("scan", "marker")], "phases from markers")
+        want([p["requests"] for p in run["phases"]], [15, 6], "requests per phase")
+
+        # HAR: structure, order, redaction, and that the request survives the round trip
+        har = build_har(work, True)
+        text = json.dumps(har)
+        for leak in ("SECRETCOOKIE", "SECRETBEARER", "SECRETQUERY", "SECRETPASS", "SECRETJWT", "hunter2"):
+            if leak in text:
+                failures.append(f"redacted HAR leaks {leak}")
+        want(har["log"]["version"], "1.2", "HAR version")
+        want(len(har["log"]["entries"]), 21, "HAR entries")
+        times = [e["startedDateTime"] for e in har["log"]["entries"]]
+        want(times, sorted(times), "HAR entries in time order")
+        want(len(har["log"]["_mythos"]["not_captured"]), 2, "HAR carries the gaps")
+        want(har["log"]["comment"].startswith("INCOMPLETE"), True, "HAR says it is incomplete")
+        raw_har = build_har(work, False)
+        e3 = next(e for e in raw_har["log"]["entries"] if e["_mythos"]["id"] == 3)
+        rec3 = dict(read_log(work))[3]
+        rebuilt = (f"{e3['request']['method']} {rec3['p']} {e3['request']['httpVersion']}\r\n"
+                   + "".join(f"{h['name']}: {h['value']}\r\n" for h in e3["request"]["headers"]) + "\r\n"
+                   + e3["request"].get("postData", {}).get("text", "")).encode()
+        want(rebuilt, raw_of(rec3, "req"), "raw HAR rebuilds the recorded request exactly")
+        want(e3["request"]["headers"][-2]["value"].startswith("Bearer SECRETBEARER"), True, "raw HAR keeps the credential")
+        os.environ["MYTHOS_SCOPE"] = env_keep or ""
+        if not env_keep:
+            os.environ.pop("MYTHOS_SCOPE")
+
+    # replay diff: the same request against a changed target
+    old = b"HTTP/1.1 200 OK\r\nDate: a\r\nContent-Length: 12\r\nSet-Cookie: s=1\r\n\r\nhello nonce1"
+    want(compare(old, old.replace(b"Date: a", b"Date: b"), VOLATILE, [], "GET", False)["same"], True, "volatile header ignored")
+    changed = compare(old, old.replace(b"hello", b"world"), VOLATILE, [], "GET", False)
+    want((changed["same"], changed["body"]["same"], changed["status"]["same"]), (False, False, True), "body diff found")
+    want(any(l.startswith("+world") for l in changed["body"]["diff"]), True, "diff names the change")
+    want(compare(old, old.replace(b"200 OK", b"500 Err"), VOLATILE, [], "GET", False)["status"]["same"], False, "status change")
+    want(compare(old, old.replace(b"set-cookie", b"x"), VOLATILE, [], "GET", False)["headers"]["same"], True, "header names compare case-insensitively")
+    want(compare(old, old.replace(b"s=1", b"s=2"), VOLATILE, [], "GET", False)["headers"]["added"], ["set-cookie: s=2"], "header change named")
+    want(compare(old, old.replace(b"nonce1", b"nonce2"), VOLATILE, [r"nonce\d"], "GET", False)["same"], True, "ignore-body pattern")
+    want(compare(old, old + b" and more", VOLATILE, [], "GET", True)["body"]["same"], True, "truncated record compared as a prefix")
+
+    failures += _live_selftest()
+    for f in failures:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"traffic selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def _live_selftest():
+    """The core claim, tested: the bytes in the record are the bytes the target received.
+    Loopback only. https is exercised when openssl 3 is present."""
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"live {label}: got {got!r}, want {expect!r}")
+
+    seen, answers = [], {"body": b"hello"}
+
+    class Target(socketserver.BaseRequestHandler):
+        def handle(self):
+            rf = self.request.makefile("rb")
+            while True:
+                head, whole = read_head(rf)
+                if not whole:
+                    return
+                _, hd = parse_head(head)
+                kind, n = framing(hd)
+                body = bytearray()
+                pump_body(rf, body.extend, kind, n)
+                seen.append(head + bytes(body))
+                if head.startswith(b"GET /boom"):
+                    self.request.sendall(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    continue
+                payload = answers["body"]
+                self.request.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nSet-Cookie: id=SECRETSET\r\n\r\n"
+                                     + b"%x\r\n" % len(payload) + payload + b"\r\n0\r\n\r\n")
+
+    class TLSTarget(Target):
+        pass
+
+    import urllib.request
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "eng"
+        d.mkdir()
+        (d / "scope.yaml").write_text("target: 127.0.0.1\nin_scope:\n  - 127.0.0.1\nrules:\n  rate_limit_rps: 50\n")
+        os.environ["MYTHOS_SCOPE"] = str(d / "scope.yaml")
+        t = tdir(d)
+        t.mkdir()
+        tls_ok = have_openssl3()
+        ca = CA(Path(td)) if tls_ok else None
+        cfg = Config(t / "log.jsonl", ca, True, DEFAULT_CAP, 5)
+        target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Target)
+        target.daemon_threads = True
+        proxy = Listener(("127.0.0.1", 0), cfg)
+        servers = [target, proxy]
+        tls_target = None
+        if tls_ok:
+            tls_target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TLSTarget)
+            tls_target.daemon_threads = True
+            ctx = ca.context("127.0.0.1")
+            tls_target.socket = ctx.wrap_socket(tls_target.socket, server_side=True)
+            servers.append(tls_target)
+        for s in servers:
+            threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+        try:
+            pport, tport = proxy.server_address[1], target.server_address[1]
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{pport}"}))
+            req = urllib.request.Request(f"http://127.0.0.1:{tport}/a?x=1&token=SECRETQ", data=b"k=v",
+                                         headers={"X-Odd-Header": "Value  With  Spaces", "Cookie": "s=SECRETC"})
+            with opener.open(req) as r:
+                want(r.read(), b"hello", "response reaches the client unchanged")
+            time.sleep(0.2)
+            rows = [r for _, r in read_log(d) if r.get("kind") == "exchange"]
+            want(len(rows), 1, "one exchange recorded")
+            want(raw_of(rows[0], "req"), seen[0], "recorded request is byte-identical to what the target received")
+            want(raw_of(rows[0], "req").startswith(b"POST /a?x=1&token=SECRETQ HTTP/1.1\r\n"), True,
+                 "absolute-form request line became origin-form")
+            want(b"Proxy-Connection" in raw_of(rows[0], "req"), False, "hop-by-hop proxy header not forwarded")
+            want((rows[0]["s"], rows[0]["via"]), (200, "proxy"), "status and path recorded")
+
+            # replay: same answer, then a changed answer
+            args = argparse.Namespace(id=1, insecure=True, timeout=5, ignore_headers=VOLATILE, ignore_body=[], json=True)
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_replay(d, args)
+            want(rc, 0, "replay of an unchanged target is identical")
+            want(seen[-1], seen[0], "replay sends the same bytes")
+            answers["body"] = b"changed"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_replay(d, args)
+            want(rc, 1, "replay of a changed target differs")
+            want(json.loads(buf.getvalue())["body"]["same"], False, "the diff says where")
+            want(sum(1 for _, r in read_log(d) if r.get("replay_of") == 1), 2, "replays are themselves recorded")
+
+            # the toolbox must not gain the host's loopback through the proxy
+            for client_ip, expect in (("172.17.0.2", Refused), ("127.0.0.1", None)):
+                try:
+                    cfg.dial("127.0.0.1", tport, client_ip).close()
+                    got = None
+                except Refused as e:
+                    got = Refused
+                want(got, expect, f"loopback dial from {client_ip}")
+
+            # a 5xx and an upstream that is gone
+            with contextlib.suppress(Exception):
+                opener.open(f"http://127.0.0.1:{tport}/boom")
+            with contextlib.suppress(Exception):
+                opener.open("http://127.0.0.1:1/")
+            time.sleep(0.2)
+            run = analyse(d)
+            want(run["requests"]["server_errors"], 1, "5xx seen live")
+            want(run["requests"]["failed"], 1, "refused connection recorded, not dropped")
+
+            if tls_ok:
+                cafile = str(ca.crt)
+                sctx = ssl.create_default_context(cafile=cafile)
+                tp = tls_target.server_address[1]
+                # the proxy needs its own CA to terminate the client's TLS: the tests share one
+                sopener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{pport}"}),
+                    urllib.request.HTTPSHandler(context=sctx))
+                answers["body"] = b"secure"
+                with sopener.open(f"https://127.0.0.1:{tp}/s") as r:
+                    want(r.read(), b"secure", "https response through the intercepting proxy")
+                time.sleep(0.2)
+                srows = [r for _, r in read_log(d) if r.get("kind") == "exchange" and r["scheme"] == "https"]
+                want(len(srows), 1, "https exchange recorded")
+                want(raw_of(srows[0], "req"), seen[-1], "https request is byte-identical to what the target received")
+                want(bool(srows[0]["tls"] and srows[0]["tls"]["version"]), True, "upstream tls noted")
+                # a client that does not trust the CA is a gap, not a missing line
+                bad = urllib.request.build_opener(urllib.request.ProxyHandler({"https": f"http://127.0.0.1:{pport}"}))
+                with contextlib.suppress(Exception):
+                    bad.open(f"https://127.0.0.1:{tp}/s")
+                time.sleep(0.3)
+                want(analyse(d)["capture"]["gaps"].get("tls_client_rejected"), 1, "client rejecting the CA is recorded as a gap")
+        except Exception as e:  # noqa
+            failures.append(f"live: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        finally:
+            for s in servers:
+                s.shutdown()
+                s.server_close()
+            os.environ.pop("MYTHOS_SCOPE", None)
+    return failures
+
+
+# ------------------------------------------------------------------------ cli
+
+def main() -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", help="engagements/<dir> (default: the directory of $MYTHOS_SCOPE)")
+    ap = argparse.ArgumentParser(
+        description="Record the HTTP an engagement sent, summarize it, replay it, export it as HAR.",
+        epilog="Start with `scripts/traffic start`, run tools, then `scripts/traffic summary`. "
+               "See the docstring at the top of this file for what is and is not captured.")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--dir", dest="top_dir", help="engagements/<dir>, before or after the command")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def add(name, help_, fn):
+        p = sub.add_parser(name, parents=[common], help=help_, description=help_)
+        p.set_defaults(fn=fn)
+        return p
+
+    proxy_args = argparse.ArgumentParser(add_help=False)
+    proxy_args.add_argument("--port", type=int, default=0, help="listen port (default: any free one)")
+    proxy_args.add_argument("--bind", action="append", help="address to listen on, repeatable "
+                            "(default: 127.0.0.1 and the docker bridge gateway, so the toolbox can reach it)")
+    proxy_args.add_argument("--insecure-upstream", action="store_true",
+                            help="accept any certificate from the target (default: verify, and record a gap on failure)")
+    proxy_args.add_argument("--max-body", type=int, default=DEFAULT_CAP, help="bytes of each request and response to keep")
+    proxy_args.add_argument("--timeout", type=int, default=60, help="seconds a connection may sit idle")
+    p = sub.add_parser("start", parents=[common, proxy_args], help="start the recording proxy"); p.set_defaults(fn=cmd_start)
+    p = sub.add_parser("serve", parents=[common, proxy_args], help=argparse.SUPPRESS)
+    p.set_defaults(fn=lambda d, a: serve(d, a))
+    add("stop", "stop the proxy and write run.json", cmd_stop)
+    p = add("env", "proxy and CA variables for this engagement (nothing if it records nothing)", cmd_env)
+    p.add_argument("--container", action="store_true", help="the values as the toolbox sees them")
+    p.add_argument("--json", action="store_true")
+    p = add("exec", "run a command with the proxy and CA variables set", cmd_exec)
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p = add("summary", "what was sent: counts, hosts, rate, out of scope, 5xx, what came before", cmd_summary)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--before", type=int, default=5, help="requests to show before the first failure of a host")
+    add("run", "write run.json", cmd_run)
+    p = add("list", "one line per request", cmd_list)
+    p.add_argument("--host"); p.add_argument("--status", help="status prefix, e.g. 5 or 40"); p.add_argument("--grep")
+    p.add_argument("--limit", type=int, default=50)
+    p = add("show", "one request and its response, redacted", cmd_show)
+    p.add_argument("id", type=int)
+    p.add_argument("--raw", action="store_true", help="do not redact")
+    p.add_argument("--full", action="store_true", help="do not cut long bodies")
+    p = add("replay", "send a recorded request again, byte for byte, and diff the response", cmd_replay)
+    p.add_argument("id", type=int)
+    p.add_argument("--ignore-headers", default=VOLATILE, help="comma list of response headers that may differ (default: %(default)s)")
+    p.add_argument("--ignore-body", action="append", metavar="REGEX", help="a pattern to blank on both sides before comparing, repeatable")
+    p.add_argument("--insecure", action="store_true", help="do not verify the target's certificate")
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+    p = add("export", "write HAR 1.2", cmd_export)
+    p.add_argument("--out"); p.add_argument("--raw", action="store_true", help="do not redact")
+    p = add("phase", "mark the start of a phase", cmd_phase)
+    p.add_argument("name")
+    a = ap.parse_args()
+    if a.selftest:
+        return _selftest()
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    return a.fn(engagement(a), a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

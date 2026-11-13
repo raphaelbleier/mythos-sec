@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+"""Mythos source map — read a source tree into aim points, in one tool call.
+
+Grey-box work starts with three questions the live surface cannot answer: which
+routes exist, which of them have no authorization guard, and which request
+values reach a dangerous call. Answering those by reading files through an agent
+is many model round trips over a whole repository. This does the mechanical part
+deterministically and prints a map the agent can act on.
+
+  scripts/sourcemap <path> [--probe surface.json|-] [--json]
+                           [--max-files 4000] [--max-bytes 524288]
+                           [--max-seconds 30]
+
+What it emits: the route inventory (method, path template, file and line), the
+authorization inventory (which routes carry a guard and which do not, with the
+unguarded state-changing routes called out first), the sink inventory, shallow
+source-to-sink candidates, and the hardcoded credentials, debug flags and
+permissive CORS/CSRF/cookie settings it could see. With `--probe` it correlates
+the routes against `scripts/probe --json`: which source routes the crawl
+reached, which it never touched (the valuable set), and which probed paths have
+no source match.
+
+Honest about its method. Python is parsed with `ast`. Every other language is
+matched with targeted regular expressions, which is **not a parser**: a route
+registered in a loop, a path assembled from variables, a guard applied by a
+framework convention or a value that reaches a sink through another function is
+invisible to it. The reachability pass is intra-block and never interprocedural,
+so its confidence is capped at `medium` and a candidate is a hypothesis, never
+a finding. The `cannot_see` section of the output repeats this per run.
+
+Source findings do not widen scope: see the `source-review` skill. Reading a
+repository the tester was not given is out of scope, and a line of code becomes
+a finding only through a live request under the proof standard in the `exploit`
+skill.
+
+Stdlib only, no network, no writes outside stdout. `--selftest` runs the asserts
+over the fixtures in `skills/source-review/fixtures/`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import sys
+import time
+from pathlib import Path
+
+LANG = {".py": "python", ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+        ".ts": "js", ".tsx": "js", ".rb": "ruby", ".php": "php", ".java": "java",
+        ".kt": "java", ".go": "go"}
+
+# Directories that hold dependencies, build output or tests. Pruning them keeps
+# a monorepo bounded and keeps a fixture route out of the authorization table.
+PRUNE = {"node_modules", ".git", ".hg", ".svn", "vendor", "dist", "build", "out",
+         ".next", ".nuxt", ".venv", "venv", "env", "__pycache__", "site-packages",
+         "target", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+         "bower_components", "third_party", "coverage", "htmlcov", ".gradle",
+         ".idea", ".terraform", "test", "tests", "spec", "__tests__", "testdata",
+         "e2e", "fixtures", "migrations"}
+SKIP_FILE = re.compile(r"\.(?:min|bundle|lock|test|spec)\.|\.min\.(?:js|css)$|-lock\.json$")
+
+# A guard name. Deliberately prefix-anchored: `loginHandler` and `handleOauth`
+# are not guards, and a false guard hides exactly the finding this tool is for.
+AUTH_RE = re.compile(
+    r"(?i)\b(?:"
+    r"auth\w*"
+    r"|(?:is|ensure|check|verify|require[sd]?|with|must_?be|only)[_-]?"
+    r"(?:auth\w*|users?|login|logged[_-]?in|admin|roles?\w*|scopes?\w*|permissions?\w*|token|jwt)"
+    r"|login_?required|logged[_-]?in|permission\w*|jwt\w*"
+    r"|protect(?:ed)?|guard\w*|secured?|roles?[_-]?allowed|preauthorize"
+    r"|admin[_-]?required|staff[_-]?member[_-]?required|user_passes_test"
+    r"|session[_-]?required|identity[_-]?required|tenant[_-]?required"
+    r")\b")
+
+# A call that looks like a guard but whose name no keyword list catches
+# (`requireMcp`, `ensureOwner`). Enough to annotate a route, never to clear it.
+WEAK_GUARD = re.compile(r"\b(?:require[A-Z_]\w*|ensure\w*|verify\w*|authorize\w*|"
+                        r"protect\w*|guard\w*)\s*\(")
+
+# Names that mean a route changes state even when its method is unknown.
+WRITE_VERB = re.compile(
+    r"(?i)\b(?:delete|remove|destroy|update|edit|create|add|new|save|store|upload|"
+    r"import|export|transfer|pay|charge|refund|approve|reject|redeem|invite|reset|"
+    r"revoke|grant|promote|demote|disable|enable|publish|merge|rotate|impersonate)\b")
+
+REQ_MARKER = {
+    "python": re.compile(
+        r"\brequest\.(?:args|form|values|json|data|files|cookies|headers|GET|POST|body|"
+        r"query_params|path_params|stream|get_json)|\bget_json\s*\(|\bFile\s*\(|\bForm\s*\("),
+    "js": re.compile(
+        r"\breq(?:uest)?\.(?:query|body|params|headers|cookies|url)\b|\bsearchParams\b|"
+        r"\bformData\s*\(|\bparams\s*\.\s*\w+|\breq\.json\s*\("),
+    "php": re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|FILES)\b|\$request->(?:input|get|query|all|post|json)"),
+    "java": re.compile(r"@(?:RequestParam|PathVariable|RequestBody|RequestHeader|CookieValue)\b|getParameter\s*\("),
+    "go": re.compile(r"\w+\.URL\.Query\(\)|\w+\.(?:FormValue|PostFormValue|ParseForm)\s*\(|"
+                     r"\b(?:r|req|request)\.(?:Body|Header)\b|"
+                     r"\bc\.(?:Query|Param|PostForm|BindJSON|ShouldBind\w*)\s*\(|"
+                     r"chi\.URLParam|mux\.Vars"),
+    "ruby": re.compile(r"\bparams\s*\[|\brequest\.(?:body|headers|query_parameters)"),
+}
+
+ESCAPER = re.compile(r"(?:html\.escape|markupsafe\.escape|\bescape\s*\(|bleach\.clean|"
+                     r"\bquote(?:_plus)?\s*\(|json\.dumps|escapeHtml)")
+
+KIND_NOTE = {
+    "sql": "query text built from a value instead of bound as a parameter",
+    "exec": "reaches a shell, an interpreter or eval",
+    "deserialize": "deserializes a blob the caller may control",
+    "template": "renders a template built from a string",
+    "xss-sink": "writes into a page or response without escaping",
+    "path": "builds a filesystem path or opens a file",
+    "redirect": "sends a Location the caller may control",
+    "http-client": "makes an outbound request to a URL the caller may supply",
+}
+
+# Python sinks are matched on the call's dotted name; `sql` additionally
+# requires the first argument to be interpolated (an f-string, a `+`/`%`, or
+# `.format`), so a parameterized query is not reported.
+PY_SINK = {
+    "os.system": "exec", "os.popen": "exec", "os.execv": "exec", "os.spawnl": "exec",
+    "subprocess.run": "exec", "subprocess.call": "exec", "subprocess.Popen": "exec",
+    "subprocess.check_output": "exec", "subprocess.check_call": "exec",
+    "subprocess.getoutput": "exec", "eval": "exec", "exec": "exec",
+    "pickle.loads": "deserialize", "pickle.load": "deserialize",
+    "cPickle.loads": "deserialize", "yaml.load": "deserialize",
+    "marshal.loads": "deserialize", "dill.loads": "deserialize",
+    "jsonpickle.decode": "deserialize",
+    "render_template_string": "template", "Template": "template",
+    "from_string": "template", "Environment.from_string": "template",
+    "Markup": "xss-sink", "mark_safe": "xss-sink", "format_html": "xss-sink",
+    "open": "path", "os.path.join": "path", "send_file": "path",
+    "send_from_directory": "path", "FileResponse": "path",
+    "redirect": "redirect", "HttpResponseRedirect": "redirect",
+    "RedirectResponse": "redirect",
+    "requests.get": "http-client", "requests.post": "http-client",
+    "requests.put": "http-client", "requests.delete": "http-client",
+    "requests.request": "http-client", "urlopen": "http-client",
+    "httpx.get": "http-client", "httpx.post": "http-client",
+    "ClientSession.get": "http-client", "urllib3.request": "http-client",
+}
+PY_SQL_CALL = {"execute", "executemany", "executescript", "raw", "text", "execute_sql"}
+
+# Everything that is not Python: regular expressions, one per (kind, language).
+TEXT_SINK = [
+    ("sql", "js", r"\.(?:query|execute|raw|unsafe)\s*\(\s*(?:`[^`]*\$\{|['\"][^'\"]*['\"]\s*\+|\w+\s*\+)"),
+    ("sql", "php", r"(?:mysqli_query|pg_query|->query|->prepare|DB::(?:select|statement|raw|unprepared))\s*\([^)]*\$"),
+    ("sql", "java", r"(?:createQuery|createNativeQuery|executeQuery|executeUpdate|prepareStatement)\s*\([^)]*(?:\+|String\.format)"),
+    ("sql", "go", r"\.(?:Query|QueryRow|QueryContext|Exec|ExecContext)\s*\([^)]*(?:fmt\.Sprintf|\+\s*\w)"),
+    ("sql", "ruby", r"(?:find_by_sql|execute|where)\s*\(?\s*[\"'][^\"']*#\{"),
+    ("exec", "js", r"\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync)\s*\(|"
+                   r"\beval\s*\(|new Function\s*\("),
+    ("exec", "php", r"\b(?:system|exec|shell_exec|passthru|popen|proc_open|eval|assert)\s*\("),
+    ("exec", "java", r"Runtime\.getRuntime\(\)\.exec|new ProcessBuilder|ScriptEngineManager"),
+    ("exec", "go", r"exec\.Command(?:Context)?\s*\("),
+    ("exec", "ruby", r"%x\{|Kernel\.system|\bsystem\s*\(|Open3\.|\beval\s*\("),
+    ("deserialize", "js", r"serialize\.unserialize\s*\(|vm\.runIn\w+\s*\(|\bdeserialize\s*\("),
+    ("deserialize", "php", r"\bunserialize\s*\("),
+    ("deserialize", "java", r"\bObjectInputStream\b|\breadObject\s*\(|XMLDecoder|new Yaml\s*\("),
+    ("deserialize", "ruby", r"Marshal\.load|YAML\.(?:load|unsafe_load)|Oj\.load"),
+    ("deserialize", "go", r"gob\.NewDecoder\s*\("),
+    ("template", "js", r"(?:ejs|pug|handlebars|hbs|nunjucks|mustache)\.(?:render|compile)\s*\(|\.render\s*\(\s*`"),
+    ("template", "java", r"(?:SpelExpressionParser|parseExpression|TemplateEngine)\s*[(.]"),
+    ("template", "ruby", r"ERB\.new\s*\(|render\s+inline:"),
+    ("template", "php", r"Blade::render\s*\(|->createTemplate\s*\("),
+    ("xss-sink", "js", r"\.innerHTML\s*=|dangerouslySetInnerHTML|document\.write\s*\(|insertAdjacentHTML\s*\("),
+    ("xss-sink", "go", r"\btext/template\b"),
+    ("xss-sink", "php", r"\becho\s+\$_(?:GET|POST|REQUEST)|\bprint\s+\$_(?:GET|POST)"),
+    ("path", "js", r"path\.join\s*\(|fs\.(?:readFile|readFileSync|createReadStream)\s*\(|res\.sendFile\s*\("),
+    ("path", "php", r"\b(?:file_get_contents|fopen|readfile|include|include_once|require_once)\s*[\s(]"),
+    ("path", "java", r"new File\s*\(|Paths\.get\s*\(|new FileInputStream\s*\("),
+    ("path", "go", r"filepath\.Join\s*\(|os\.(?:Open|ReadFile)\s*\(|http\.ServeFile\s*\("),
+    ("path", "ruby", r"File\.(?:read|open|join)\s*\(|\bsend_file\s+"),
+    ("redirect", "js", r"res\.redirect\s*\(|NextResponse\.redirect\s*\("),
+    ("redirect", "php", r"header\s*\(\s*['\"]Location|\bredirect\s*\("),
+    ("redirect", "java", r"sendRedirect\s*\(|\"redirect:"),
+    ("redirect", "go", r"http\.Redirect\s*\("),
+    ("redirect", "ruby", r"\bredirect_to\s"),
+    ("http-client", "js", r"\b(?:axios|got|superagent)\s*(?:\.\w+)?\s*\(|\bfetch\s*\(|http\.(?:get|request)\s*\("),
+    ("http-client", "php", r"\bcurl_init\s*\(|\bfile_get_contents\s*\(\s*\$"),
+    ("http-client", "java", r"\b(?:HttpClient|RestTemplate|WebClient)\b|new URL\s*\("),
+    ("http-client", "go", r"http\.(?:Get|Post|Head|NewRequest)\s*\("),
+    ("http-client", "ruby", r"Net::HTTP|HTTParty|URI\.open|open-uri"),
+]
+TEXT_SINK = [(kind, lang, re.compile(rx)) for kind, lang, rx in TEXT_SINK]
+
+# (kind, present, absent): a line matching `present` and not `absent` is a hit.
+CONFIG = [
+    ("hardcoded-credential",
+     r"(?i)['\"]?\b(?:password|passwd|pwd|secret|secret_key|api_?key|access_?key|"
+     r"private_?key|client_?secret|auth_?token|db_pass\w*)\b['\"]?\s*(?:=>|[:=])\s*"
+     r"['\"]([^'\"\n]{6,})['\"]", None),
+    ("debug-enabled",
+     r"(?i)\b(?:debug|app_debug|flask_debug|django_debug)\b['\"]?\s*\]?\s*(?:=>|[:=])\s*"
+     r"(?:true|1|['\"]1['\"])\b|app\.run\([^)]*debug\s*=\s*True", None),
+    ("cors-permissive",
+     r"(?i)access-control-allow-origin['\"]?\s*[:=,]\s*['\"]\*|allow_origins\s*=\s*\[\s*['\"]\*|"
+     r"\borigin\s*:\s*['\"]\*|AllowAllOrigins\s*:\s*true|\bcors\s*\(\s*\)|\bCORS\s*\(\s*\w+\s*\)", None),
+    ("cors-reflected-origin",
+     r"(?i)access-control-allow-origin['\"]?\s*\]?\s*(?:=>|=|:)\s*[^'\"\s*]", None),
+    ("csrf-disabled",
+     r"(?i)csrf_exempt|csrf\.exempt|WTF_CSRF_ENABLED\s*[:=]\s*False|\bcsrf\s*:\s*false|"
+     r"\.csrf\(\)\s*\.disable\(\)|protect_from_forgery\s+except|csrfProtection\s*:\s*false", None),
+    ("insecure-cookie",
+     r"(?i)(?:httponly|http_only|secure)\s*(?:=>|[:=])\s*(?:false|0)\b|"
+     r"same_?site\s*(?:=>|[:=])\s*['\"]?none['\"]?|SESSION_COOKIE_SECURE\s*[:=]\s*False", None),
+    ("insecure-cookie",
+     r"(?i)(?:set_cookie|res\.cookie|addCookie|SetCookie)\s*\(", r"(?i)httponly|http_only"),
+    ("tls-verify-disabled",
+     r"(?i)\bverify\s*=\s*False|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|"
+     r"CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)", None),
+]
+CONFIG = [(kind, re.compile(a), re.compile(b) if b else None) for kind, a, b in CONFIG]
+# A value that is plainly not a credential.
+PLACEHOLDER = re.compile(r"(?i)^(?:\$|\{|<|%|\(|your|example|changeme$|placeholder|xxx|\.\.\.|"
+                         r"null|none|undefined|true|false|\*|/|-+$)|\$\{|process\.env|os\.environ|getenv")
+ENV_LINE = re.compile(r"(?i)os\.environ|process\.env|getenv|System\.getenv|ENV\[|config\(|dotenv")
+
+CANNOT_SEE = [
+    "routes registered dynamically (a loop over a table, a plugin, a decorator factory)",
+    "paths assembled from variables, and blueprint/router mount prefixes: a path may be missing its prefix",
+    "guards applied by framework convention (DRF default permission classes, a parent controller's "
+    "before_action, a global middleware stack): check `global_guards` before calling a route unguarded",
+    "values that reach a sink through another function, an ORM, or a queue: the reachability pass is "
+    "intra-block only and never interprocedural",
+    "a reflection where only some interpolated values are escaped: a visible escaper call on the "
+    "line suppresses the row, so check the whole expression by hand",
+    "anything in a pruned directory (dependencies, build output, tests) or in a language without an "
+    "extractor here",
+    "whether the code on disk is the code the live target runs",
+]
+
+
+# ------------------------------------------------------------------ helpers
+def templ(path: str) -> str:
+    """One path-template spelling for every framework's parameter syntax."""
+    p = path.strip()
+    p = re.sub(r"<(?:[a-zA-Z_][\w]*:)?([\w]+)>", r"{\1}", p)          # flask/django <int:id>
+    p = re.sub(r"\[\.\.\.([\w]+)\]", r"{\1}", p)                       # next [...slug]
+    p = re.sub(r"\[([\w]+)\]", r"{\1}", p)                             # next [id]
+    p = re.sub(r"(?<![\w}])[:*]([\w]+)", r"{\1}", p)                   # express/gin :id, *path
+    p = re.sub(r"\{([\w]+)\?\}", r"{\1}", p)                           # laravel {id?}
+    p = re.sub(r"\(\s*\?P?<([\w]+)>[^)]*\)", r"{\1}", p)               # django re_path
+    p = re.sub(r"/{2,}", "/", p)
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/") or "/"
+
+
+def shape(path: str) -> str:
+    """The path with every variable segment blanked, for matching source against live."""
+    out = []
+    for seg in templ(path.split("?")[0]).split("/"):
+        if seg.startswith("{") or re.fullmatch(r"\d+", seg) or \
+                re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", seg) or \
+                re.fullmatch(r"[0-9a-fA-F]{16,}", seg):
+            out.append("{}")
+        else:
+            out.append(seg)
+    return "/".join(out) or "/"
+
+
+def dotted(node) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    elif isinstance(node, ast.Call):
+        # `open(p).read()` is `open.read`, not a second `open`
+        inner = dotted(node.func)
+        return ".".join([inner] + list(reversed(parts))) if parts else inner
+    return ".".join(reversed(parts))
+
+
+def literal(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def has_auth(body: str) -> bool:
+    """An authorization check written inside the handler instead of as a guard:
+    an auth-shaped name next to a 401 or 403. Not a guard, but enough that the
+    route must not be reported as flatly unauthorized without a live check."""
+    if WEAK_GUARD.search(body):
+        return True
+    credential = re.compile(r"(?i)\btokens?\w*|\bsessions?\b|\bapi[_-]?key\b|\bcredential|\bsignature\b")
+    return bool(AUTH_RE.search(body) or credential.search(body)) and \
+        bool(re.search(r"(?i)\b(?:401|403|unauthorized|forbidden)\b", body))
+
+
+def guard_tokens(text: str) -> set[str]:
+    """Identifiers in a middleware position that name a guard. A name ending in
+    `guard` counts too: `writeGuard` is the usual spelling and no keyword list
+    catches it."""
+    return {g for g in re.findall(r"\b[A-Za-z_$][\w$]*\b", text)
+            if AUTH_RE.fullmatch(g) or g.lower().endswith("guard")}
+
+
+def state_changing(method: str, path: str, handler: str) -> bool:
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return True
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return False
+    return bool(WRITE_VERB.search(f"{path} {handler}"))
+
+
+def route(framework, method, path, rel, line, handler, guards):
+    m = method.upper()
+    p = templ(path)
+    return {"framework": framework, "method": m, "path": p, "file": rel, "line": line,
+            "handler": handler or "", "guards": sorted(set(guards)),
+            "state_changing": state_changing(m, p, handler or "")}
+
+
+# ------------------------------------------------------------------ python
+def scan_python(rel, text, out):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        out["notes"].append(f"{rel}: python parse failed at line {e.lineno}, skipped")
+        return
+    handlers = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        guards, routes = [], []
+        for dec in node.decorator_list:
+            call = dec if isinstance(dec, ast.Call) else None
+            name = dotted(dec.func) if call else dotted(dec)
+            last = name.rsplit(".", 1)[-1]
+            if last == "route" and call and call.args and literal(call.args[0]) is not None:
+                methods = ["GET"]
+                for kw in call.keywords:
+                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                        got = [literal(e) for e in kw.value.elts]
+                        methods = [m for m in got if m] or methods
+                fw = "fastapi" if "fastapi" in text.lower() and "flask" not in text.lower() else "flask"
+                routes += [(fw, m, literal(call.args[0])) for m in methods]
+            elif (last in ("get", "post", "put", "patch", "delete", "head", "options")
+                  and call and call.args and literal(call.args[0]) is not None
+                  and re.search(r"(?i)\b(app|router|api|bp|blueprint|srv|server)$",
+                                name.rsplit(".", 1)[0] or "")):
+                fw = "flask" if "flask" in text.lower() else "fastapi"
+                routes.append((fw, last, literal(call.args[0])))
+            elif AUTH_RE.search(name):
+                guards.append(last)
+        # FastAPI dependency guards: `user = Depends(require_user)` in the signature.
+        for default in list(node.args.defaults) + [d for d in node.args.kw_defaults if d]:
+            seg = ast.get_source_segment(text, default) or ""
+            if "Depends" in seg and AUTH_RE.search(seg):
+                guards.append(re.sub(r"\s+", "", seg)[:60])
+        out["guards_by_handler"].setdefault(node.name, [])
+        out["guards_by_handler"][node.name] += guards
+        for fw, method, path in routes:
+            handlers.add(node.name)
+            out["routes"].append(route(fw, method, path, rel, node.lineno, node.name, guards))
+
+    # django URLconf entries; the view's own decorators are resolved afterwards
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and dotted(node.func).rsplit(".", 1)[-1]
+                in ("path", "re_path", "url") and node.args and literal(node.args[0]) is not None
+                and len(node.args) > 1):
+            view = dotted(node.args[1]) or ""
+            if not view or view.endswith("include"):
+                continue
+            out["routes"].append(route("django", "*", literal(node.args[0]), rel,
+                                       node.lineno, view.rsplit(".", 1)[-1], []))
+
+    # sinks
+    for node in ast.walk(tree):
+        # a handler that returns an interpolated HTML string is a reflection sink;
+        # there is no call to match, so the Return node is the site
+        if isinstance(node, ast.Return) and isinstance(node.value, (ast.JoinedStr, ast.BinOp)):
+            seg = (ast.get_source_segment(text, node) or "").split("\n")[0]
+            if "<" in seg and ">" in seg and not ESCAPER.search(seg):
+                out["sinks"].append({"kind": "xss-sink", "lang": "python", "file": rel,
+                                     "line": node.lineno, "call": "return",
+                                     "snippet": seg[:160], "note": KIND_NOTE["xss-sink"]})
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        name = dotted(node.func)
+        last = name.rsplit(".", 1)[-1]
+        kind = None
+        if last in PY_SQL_CALL and node.args:
+            arg = node.args[0]
+            interpolated = (isinstance(arg, ast.JoinedStr)
+                            or (isinstance(arg, ast.BinOp)
+                                and isinstance(arg.op, (ast.Add, ast.Mod)))
+                            or (isinstance(arg, ast.Call)
+                                and dotted(arg.func).endswith(".format")))
+            if interpolated or last == "raw":
+                kind = "sql"
+        if kind is None:
+            for key, k in PY_SINK.items():
+                if name == key or name.endswith("." + key):
+                    kind = k
+                    break
+        if kind:
+            seg = (ast.get_source_segment(text, node) or name).split("\n")[0]
+            out["sinks"].append({"kind": kind, "lang": "python", "file": rel,
+                                 "line": node.lineno, "call": name,
+                                 "snippet": seg[:160], "note": KIND_NOTE[kind]})
+
+    # blocks: one per function, with the names that hold a request value
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        tainted = set()
+        if node.name in handlers:
+            tainted |= {a.arg for a in node.args.args + node.args.kwonlyargs
+                        if a.arg not in ("self", "cls", "request", "req")}
+        # two passes, so one hop of indirection is seen:
+        # `data = request.get_json()` then `u = data["username"]`
+        for _ in range(2):
+            for child in ast.walk(node):
+                if not isinstance(child, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = child.value if isinstance(child, ast.Assign) else child.value
+                seg = ast.get_source_segment(text, value) if value else ""
+                seg = seg or ""
+                if REQ_MARKER["python"].search(seg) or any(
+                        re.search(rf"\b{re.escape(n)}\b", seg) for n in tainted):
+                    targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                    for t in targets:
+                        tainted |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        body = ast.get_source_segment(text, node) or ""
+        out["blocks"].append({"file": rel, "start": node.lineno, "end": node.end_lineno or node.lineno,
+                              "handler": node.name, "lang": "python", "tainted": tainted,
+                              "has_request": bool(REQ_MARKER["python"].search(body)) or bool(tainted),
+                              "has_auth": has_auth(body)})
+
+
+# ------------------------------------------------------------------ others
+JS_ROUTE = re.compile(r"\b(?:app|router|server|fastify|api|r|srv)\s*\.\s*"
+                      r"(get|post|put|patch|delete|head|options|all)\s*\(\s*(['\"`])([^'\"`]+)\2(.*)$")
+JS_USE = re.compile(r"\b(?:app|router|server|fastify)\s*\.\s*(?:use|addHook)\s*\((.*)$")
+# fastify and koa attach the guard as a route option, not as a positional argument
+JS_HOOK = re.compile(r"(?:preHandler|preValidation|onRequest|beforeHandler)\s*:\s*([^,}\n]+)")
+FASTIFY_METHOD = re.compile(r"method\s*:\s*['\"](\w+)['\"]")
+FASTIFY_URL = re.compile(r"url\s*:\s*['\"]([^'\"]+)['\"]")
+NEXT_EXPORT = re.compile(r"export\s+(?:async\s+)?(?:function|const)\s+"
+                         r"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b")
+NEXT_ACTION = re.compile(r"export\s+async\s+function\s+(\w+)\s*\(")
+LARAVEL = re.compile(r"Route::\s*(get|post|put|patch|delete|any|match)\s*\(\s*['\"]([^'\"]+)['\"](.*)$")
+SPRING_MAP = re.compile(r"@(Get|Post|Put|Patch|Delete|Request)Mapping\s*\(([^)]*)\)")
+SPRING_PATH = re.compile(r"['\"]([^'\"]+)['\"]")
+SPRING_METHOD = re.compile(r"RequestMethod\.(\w+)")
+# the receiver must be a plain identifier: `r.Get("/x", h)` is a route,
+# `req.URL.Query().Get("host")` is not
+GO_ROUTE = re.compile(r"\b\w+\s*\.\s*(Get|Post|Put|Patch|Delete|Head|Options|GET|POST|PUT|PATCH|"
+                      r"DELETE|Any|HandleFunc|Handle)\s*\(\s*[\"`]([^\"`]+)[\"`](.*)$")
+RAILS_VERB = re.compile(r"^\s*(get|post|put|patch|delete)\s+['\"]([^'\"]+)['\"](.*)$")
+RAILS_RES = re.compile(r"^\s*resources?\s+:(\w+)")
+RAILS_CTRL = re.compile(r"(?:=>|to:)\s*['\"](\w+)#")
+
+
+def js_routes(rel, text, lines, out):
+    fw = "fastify" if "fastify" in text else "express"
+    for i, line in enumerate(lines, 1):
+        m = JS_ROUTE.search(line)
+        if m:
+            verb, _, path, rest = m.groups()
+            guards = sorted(guard_tokens(rest))
+            hook = JS_HOOK.search(rest)
+            if hook:
+                guards.append(hook.group(1).strip()[:60])
+            method = "*" if verb == "all" else verb
+            out["routes"].append(route(fw, method, path, rel, i, "", guards))
+        u = JS_USE.search(line)
+        if u and AUTH_RE.search(u.group(1)):
+            out["global_guards"].append({"file": rel, "line": i, "text": line.strip()[:140]})
+    # fastify route objects: method and url within a few lines of each other
+    for i, line in enumerate(lines, 1):
+        mm = FASTIFY_METHOD.search(line)
+        if not mm:
+            continue
+        window = "\n".join(lines[max(0, i - 6):i + 6])
+        mu = FASTIFY_URL.search(window)
+        if mu:
+            guards = sorted(guard_tokens(window))
+            hook = JS_HOOK.search(window)
+            if hook:
+                guards.append(hook.group(1).strip()[:60])
+            out["routes"].append(route("fastify", mm.group(1), mu.group(1), rel, i, "", guards))
+
+
+def next_routes(rel, text, lines, out):
+    """App-router handlers, pages/api files and server actions, from the path."""
+    parts = Path(rel).parts
+    if "app" in parts:
+        after = parts[parts.index("app") + 1:-1]
+        path = "/" + "/".join(p for p in after if not (p.startswith("(") and p.endswith(")")))
+    elif "pages" in parts:
+        after = parts[parts.index("pages") + 1:]
+        stem = Path(after[-1]).stem
+        path = "/" + "/".join(list(after[:-1]) + ([] if stem == "index" else [stem]))
+    else:
+        return
+    name = Path(rel).name
+    if name.startswith("route."):
+        methods = sorted(set(NEXT_EXPORT.findall(text))) or ["*"]
+        for m in methods:
+            line = next((i for i, l in enumerate(lines, 1) if f" {m}" in l and "export" in l), 1)
+            out["routes"].append(route("next-app-router", m, path, rel, line, name, []))
+    elif "pages" in parts and "api" in parts:
+        out["routes"].append(route("next-pages-api", "*", path, rel, 1, name, []))
+    if re.match(r"^\s*['\"]use server['\"]", text):
+        for m in NEXT_ACTION.finditer(text):
+            line = text[:m.start()].count("\n") + 1
+            out["routes"].append(route("next-server-action", "POST", path, rel, line,
+                                       m.group(1), []))
+
+
+def laravel_routes(rel, text, lines, out):
+    for i, line in enumerate(lines, 1):
+        m = LARAVEL.search(line)
+        if m:
+            verb, path, rest = m.groups()
+            guards = sorted({g for g in re.findall(r"['\"]([\w.:-]+)['\"]", rest)
+                             if AUTH_RE.match(g)})
+            out["routes"].append(route("laravel", "*" if verb in ("any", "match") else verb,
+                                       path, rel, i, "", guards))
+        if re.search(r"(?i)middleware\s*\(", line) and AUTH_RE.search(line) and "Route::" in line \
+                and not LARAVEL.search(line):
+            out["global_guards"].append({"file": rel, "line": i, "text": line.strip()[:140]})
+
+
+def spring_routes(rel, text, lines, out):
+    prefix = ""
+    cls = re.search(r"@RequestMapping\s*\(([^)]*)\)\s*(?:\n|\r\n)?\s*(?:public\s+)?class", text)
+    if cls:
+        p = SPRING_PATH.search(cls.group(1))
+        prefix = p.group(1) if p else ""
+    for m in SPRING_MAP.finditer(text):
+        verb, body = m.groups()
+        line = text[:m.start()].count("\n") + 1
+        if verb == "Request":
+            mm = SPRING_METHOD.search(body)
+            method = mm.group(1) if mm else "*"
+            if re.search(r"\n\s*(?:public\s+)?class", text[m.end():m.end() + 80]):
+                continue  # the class-level mapping is the prefix, not a route
+        else:
+            method = verb.upper()
+        p = SPRING_PATH.search(body)
+        path = (prefix.rstrip("/") + "/" + (p.group(1) if p else "").lstrip("/")) if prefix else \
+            (p.group(1) if p else "/")
+        window = text[max(0, m.start() - 300):m.end() + 200]
+        guards = sorted({g for g in re.findall(r"@(\w+)", window) if AUTH_RE.fullmatch(g)})
+        handler = re.search(r"\b(\w+)\s*\(", text[m.end():m.end() + 200])
+        out["routes"].append(route("spring", method, path, rel, line,
+                                   handler.group(1) if handler else "", guards))
+    for i, line in enumerate(lines, 1):
+        if re.search(r"authorizeHttpRequests|antMatchers|requestMatchers|addFilterBefore", line):
+            out["global_guards"].append({"file": rel, "line": i, "text": line.strip()[:140]})
+
+
+def go_routes(rel, text, lines, out):
+    fw = "gin" if "gin.Default" in text or "gin.New" in text else \
+        "chi" if "chi.NewRouter" in text else "net/http"
+    for i, line in enumerate(lines, 1):
+        m = GO_ROUTE.search(line)
+        if m:
+            verb, path, rest = m.groups()
+            method = "*" if verb in ("HandleFunc", "Handle", "Any") else verb.upper()
+            guards = sorted(guard_tokens(rest))
+            handler = re.search(r",\s*([\w.]+)\s*\)", rest)
+            out["routes"].append(route(fw, method, path, rel, i,
+                                       handler.group(1) if handler else "", guards))
+        if re.search(r"\.Use\s*\(", line) and AUTH_RE.search(line):
+            out["global_guards"].append({"file": rel, "line": i, "text": line.strip()[:140]})
+
+
+RAILS_ACTIONS = [("GET", ""), ("POST", ""), ("GET", "new"), ("GET", "{id}/edit"),
+                 ("GET", "{id}"), ("PATCH", "{id}"), ("DELETE", "{id}")]
+
+
+def rails_routes(rel, text, lines, out):
+    if rel.endswith("routes.rb"):
+        for i, line in enumerate(lines, 1):
+            m = RAILS_VERB.match(line)
+            if m:
+                verb, path, rest = m.groups()
+                c = RAILS_CTRL.search(rest)
+                out["routes"].append(route("rails", verb, path, rel, i,
+                                           c.group(1) if c else "", []))
+            r = RAILS_RES.match(line)
+            if r:
+                for method, suffix in RAILS_ACTIONS:
+                    out["routes"].append(route("rails", method,
+                                               f"/{r.group(1)}/{suffix}".rstrip("/"),
+                                               rel, i, r.group(1), []))
+    m = re.search(r"app/controllers/(?:.*/)?(\w+)_controller\.rb$", rel)
+    if m:
+        for i, line in enumerate(lines, 1):
+            if "before_action" in line and AUTH_RE.search(line):
+                out["guards_by_controller"].setdefault(m.group(1), []).append(line.strip()[:80])
+
+
+def text_blocks(rel, lang, lines, out, start_lines):
+    """One block per route in this file, spanning to the next route's line."""
+    marker = REQ_MARKER.get(lang)
+    bounds = sorted(set(start_lines)) + [len(lines) + 1]
+    for i, start in enumerate(bounds[:-1]):
+        body = "\n".join(lines[start - 1:bounds[i + 1] - 1])
+        out["blocks"].append({"file": rel, "start": start, "end": bounds[i + 1] - 1,
+                              "handler": "", "lang": lang, "tainted": set(),
+                              "has_request": bool(marker and marker.search(body)),
+                              "has_auth": has_auth(body)})
+
+
+def scan_text(rel, text, lines, lang, out):
+    before = len(out["routes"])
+    if lang == "js":
+        if re.search(r"\b(?:express|fastify)\b", text):
+            js_routes(rel, text, lines, out)
+        if re.search(r"(?:^|/)(?:app|pages)/", rel.replace("\\", "/") + "/"):
+            next_routes(rel, text, lines, out)
+    elif lang == "php" and "Route::" in text:
+        laravel_routes(rel, text, lines, out)
+    elif lang == "java" and "Mapping" in text:
+        spring_routes(rel, text, lines, out)
+    elif lang == "go" and re.search(r"net/http|chi|gin-gonic|HandleFunc", text):
+        go_routes(rel, text, lines, out)
+    elif lang == "ruby":
+        rails_routes(rel, text, lines, out)
+    for kind, slang, rx in TEXT_SINK:
+        if slang != lang:
+            continue
+        for i, line in enumerate(lines, 1):
+            if rx.search(line):
+                out["sinks"].append({"kind": kind, "lang": lang, "file": rel, "line": i,
+                                     "call": "", "snippet": line.strip()[:160],
+                                     "note": KIND_NOTE[kind]})
+    text_blocks(rel, lang, lines, out, [r["line"] for r in out["routes"][before:]])
+
+
+# ------------------------------------------------------------------ walk
+def repo_frameworks(root: Path) -> list[str]:
+    """Declared dependencies and layout markers, read from a handful of files."""
+    found = set()
+    markers = [("package.json", {"express": "express", "fastify": "fastify", "next": "next"}),
+               ("composer.json", {"laravel/framework": "laravel", "symfony/": "symfony"}),
+               ("go.mod", {"gin-gonic": "gin", "go-chi": "chi", "gorilla/mux": "net/http"}),
+               ("Gemfile", {"rails": "rails", "sinatra": "sinatra"}),
+               ("pom.xml", {"spring-boot": "spring", "springframework": "spring"}),
+               ("build.gradle", {"spring-boot": "spring"}),
+               ("requirements.txt", {"flask": "flask", "fastapi": "fastapi", "django": "django"}),
+               ("pyproject.toml", {"flask": "flask", "fastapi": "fastapi", "django": "django"})]
+    for name, table in markers:
+        f = root / name
+        if f.is_file():
+            try:
+                body = f.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            for needle, fw in table.items():
+                if needle in body:
+                    found.add(fw)
+    if (root / "config" / "routes.rb").is_file():
+        found.add("rails")
+    if (root / "manage.py").is_file():
+        found.add("django")
+    for p in ("routes/web.php", "routes/api.php", "artisan"):
+        if (root / p).exists():
+            found.add("laravel")
+    return sorted(found)
+
+
+def files_of(root: Path, max_files: int, max_bytes: int, deadline: float, skipped: dict):
+    out = []
+    for path in sorted(root.rglob("*") if root.is_dir() else [root]):
+        if time.monotonic() > deadline:
+            skipped["deadline_hit"] = True
+            break
+        if path.is_dir():
+            continue
+        # only below the root: a tree that itself sits in a pruned-looking
+        # directory is still the tree the caller asked for
+        pruned = set(path.relative_to(root).parts[:-1]) & PRUNE if root.is_dir() else set()
+        if pruned:
+            skipped["dirs_pruned"] = sorted(set(skipped["dirs_pruned"]) | pruned)
+            continue
+        if path.suffix not in LANG or SKIP_FILE.search(path.name):
+            continue
+        if len(out) >= max_files:
+            skipped["files_over_cap"] += 1
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > max_bytes:
+            skipped["files_too_big"].append(f"{path} ({size}B)")
+            continue
+        out.append(path)
+    return out
+
+
+# ------------------------------------------------------- correlation + pairing
+def probed_shapes(doc: dict) -> set[str]:
+    paths = set()
+    for page in doc.get("pages", []):
+        url = page.get("url", "")
+        paths.add(re.sub(r"^[a-z][\w+.-]*://[^/]+", "", url, flags=re.I) or "/")
+    for row in doc.get("reachable_paths", []):
+        paths.add(row.get("path", ""))
+    for row in doc.get("parameters", []):
+        for seen in row.get("seen_at", []):
+            if seen.startswith(("GET ", "POST ", "PUT ", "PATCH ", "DELETE ")):
+                paths.add(seen.split(" ", 1)[1])
+            else:
+                paths.add(re.sub(r"^[a-z][\w+.-]*://[^/]+", "", seen, flags=re.I))
+    for entry in doc.get("api_endpoints", []):
+        if isinstance(entry, str) and entry.split(" ", 1)[0].isupper() and " " in entry:
+            paths.add(entry.split(" ", 1)[1])
+    # probe annotates a spec-derived parameter location: `/orders/{id} (path)`
+    return {shape(re.sub(r"\s*\((?:query|body|path|header|cookie)\)\s*$", "", p))
+            for p in paths if p}
+
+
+def seg_match(probed: str, source: str) -> bool:
+    """A probed path and a source template agree when every segment lines up and
+    a source parameter segment accepts whatever the probe found there."""
+    a, b = probed.split("/"), source.split("/")
+    return len(a) == len(b) and all(x == y or y == "{}" for x, y in zip(a, b))
+
+
+def correlate(routes, doc):
+    live = probed_shapes(doc)
+    src = {}
+    for r in routes:
+        src.setdefault(shape(r["path"]), []).append(f"{r['method']} {r['path']}")
+    reached = {k for k in src if any(seg_match(p, k) for p in live)}
+    return {
+        "probed_shapes": len(live),
+        "reachable": [{"shape": k, "routes": sorted(set(src[k]))} for k in sorted(reached)],
+        "source_only": [{"shape": k, "routes": sorted(set(src[k]))}
+                        for k in sorted(src) if k not in reached],
+        "probed_only": sorted(p for p in live if not any(seg_match(p, k) for k in src)),
+    }
+
+
+def candidates(routes, sinks, blocks):
+    by_file = {}
+    for b in blocks:
+        by_file.setdefault(b["file"], []).append(b)
+    routes_by_handler = {}
+    for r in routes:
+        routes_by_handler.setdefault(r["handler"], []).append(r)
+    out = []
+    for sink in sinks:
+        here = [b for b in by_file.get(sink["file"], [])
+                if b["start"] <= sink["line"] <= b["end"]]
+        if not here:
+            continue
+        block = min(here, key=lambda b: b["end"] - b["start"])
+        hit = [r for r in routes
+               if r["file"] == block["file"] and block["start"] <= r["line"] <= block["end"]]
+        if not hit and block["handler"]:
+            hit = routes_by_handler.get(block["handler"], [])
+        if not hit:
+            continue
+        marker = REQ_MARKER.get(block["lang"])
+        direct = bool(marker and marker.search(sink["snippet"]))
+        named = any(re.search(rf"\b{re.escape(n)}\b", sink["snippet"]) for n in block["tainted"])
+        if direct:
+            conf, why = "medium", "a request value appears in the sink call itself"
+        elif named:
+            conf, why = "medium", "the sink call names a variable assigned from the request"
+        elif block["has_request"]:
+            conf, why = "low", "the block reads the request and reaches the sink, path not traced"
+        else:
+            continue
+        for r in hit:
+            out.append({"route": f"{r['method']} {r['path']}", "route_file": r["file"],
+                        "route_line": r["line"], "guards": r["guards"],
+                        "sink_kind": sink["kind"], "sink_file": sink["file"],
+                        "sink_line": sink["line"], "sink_snippet": sink["snippet"],
+                        "confidence": conf, "why": why})
+    out.sort(key=lambda c: (c["confidence"] != "medium", c["sink_kind"], c["route"]))
+    return out
+
+
+def config_findings(rel, lines):
+    out = []
+    for i, line in enumerate(lines, 1):
+        for kind, present, absent in CONFIG:
+            m = present.search(line)
+            if not m or (absent and absent.search(line)):
+                continue
+            if kind == "hardcoded-credential":
+                value = m.group(1) if m.lastindex else ""
+                if PLACEHOLDER.search(value) or ENV_LINE.search(line):
+                    continue
+            out.append({"kind": kind, "file": rel, "line": i, "snippet": line.strip()[:160]})
+    return out
+
+
+# ------------------------------------------------------------------ scan
+def scan(root: Path, probe: dict | None = None, max_files: int = 4000,
+         max_bytes: int = 512 * 1024, max_seconds: float = 30.0) -> dict:
+    started = time.monotonic()
+    deadline = started + max_seconds
+    skipped = {"files_too_big": [], "files_over_cap": 0, "dirs_pruned": [],
+               "deadline_hit": False}
+    out = {"routes": [], "sinks": [], "blocks": [], "config": [], "global_guards": [],
+           "guards_by_handler": {}, "guards_by_controller": {}, "notes": []}
+
+    paths = files_of(root, max_files, max_bytes, deadline, skipped)
+    base = root if root.is_dir() else root.parent
+    scanned = 0
+    for path in paths:
+        if time.monotonic() > deadline:
+            skipped["deadline_hit"] = True
+            skipped["files_over_cap"] += len(paths) - scanned
+            break
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            out["notes"].append(f"{path}: unreadable ({e})")
+            continue
+        rel = str(path.relative_to(base))
+        lines = text.splitlines()
+        lang = LANG[path.suffix]
+        scanned += 1
+        if lang == "python":
+            scan_python(rel, text, out)
+            for kind, slang, rx in TEXT_SINK:  # none registered for python
+                if slang == "python":
+                    for i, line in enumerate(lines, 1):
+                        if rx.search(line):
+                            out["sinks"].append({"kind": kind, "lang": lang, "file": rel,
+                                                 "line": i, "call": "",
+                                                 "snippet": line.strip()[:160],
+                                                 "note": KIND_NOTE[kind]})
+        else:
+            scan_text(rel, text, lines, lang, out)
+        out["config"] += config_findings(rel, lines)
+
+    # resolve guards a framework attaches away from the route declaration
+    for r in out["routes"]:
+        block = [b for b in out["blocks"]
+                 if b["file"] == r["file"] and b["start"] <= r["line"] <= b["end"]]
+        if block and min(block, key=lambda b: b["end"] - b["start"])["has_auth"]:
+            r["inline_auth"] = True
+        if r["guards"]:
+            continue
+        if r["framework"] == "django":
+            r["guards"] = sorted(set(out["guards_by_handler"].get(r["handler"], [])))
+        elif r["framework"] == "rails":
+            r["guards"] = sorted(set(out["guards_by_controller"].get(r["handler"], [])))
+
+    seen, sinks = set(), []
+    for x in out["sinks"]:
+        key = (x["kind"], x["file"], x["line"])
+        if key not in seen:
+            seen.add(key)
+            sinks.append(x)
+    out["sinks"] = sinks
+
+    seen, routes = set(), []
+    for r in sorted(out["routes"], key=lambda r: (r["path"], r["method"], r["file"], r["line"])):
+        key = (r["method"], r["path"], r["file"], r["line"])
+        if key not in seen:
+            seen.add(key)
+            routes.append(r)
+
+    result = {
+        "root": str(root),
+        "frameworks": sorted(set(repo_frameworks(root)) | {r["framework"] for r in routes}),
+        "limits": {"max_files": max_files, "max_bytes": max_bytes, "max_seconds": max_seconds},
+        "scanned": {"files": scanned, "routes": len(routes), "sinks": len(out["sinks"]),
+                    "seconds": round(time.monotonic() - started, 2)},
+        "skipped": skipped,
+        "routes": routes,
+        "unguarded_state_changing": [r for r in routes if r["state_changing"] and not r["guards"]],
+        "guarded": [f"{r['method']} {r['path']}" for r in routes if r["guards"]],
+        "global_guards": out["global_guards"],
+        "sinks": sinks,
+        "candidates": candidates(routes, out["sinks"], out["blocks"]),
+        "config": out["config"],
+        "notes": out["notes"],
+        "cannot_see": CANNOT_SEE,
+    }
+    if probe is not None:
+        result["correlation"] = correlate(routes, probe)
+    return result
+
+
+# ------------------------------------------------------------------ render
+def render(r: dict) -> str:
+    s = r["scanned"]
+    out = [f"# source map of {r['root']}", "",
+           f"{s['files']} files, {s['routes']} routes, {s['sinks']} sinks, "
+           f"{len(r['candidates'])} source-to-sink candidates, {s['seconds']}s",
+           f"frameworks: {', '.join(r['frameworks']) or 'none detected'}", ""]
+
+    if r["unguarded_state_changing"]:
+        out += ["## state-changing routes with no guard in the source", ""]
+        for x in r["unguarded_state_changing"]:
+            out.append(f"{x['method']:<7} {x['path']}  {x['file']}:{x['line']}"
+                       + (f"  ({x['handler']})" if x["handler"] else "")
+                       + ("  [auth-shaped check inside the handler, read it]"
+                          if x.get("inline_auth") else ""))
+        out.append("")
+    if r["global_guards"]:
+        out += ["## global guards (may cover the routes above; check the mount)", ""]
+        out += [f"{g['file']}:{g['line']}  {g['text']}" for g in r["global_guards"][:15]]
+        out.append("")
+
+    out += ["## routes", ""]
+    for x in r["routes"][:200]:
+        guards = ", ".join(x["guards"]) if x["guards"] else "-"
+        out.append(f"{x['method']:<7} {x['path']:<42} guard={guards:<24} "
+                   f"{x['file']}:{x['line']}")
+    if len(r["routes"]) > 200:
+        out.append(f"... and {len(r['routes']) - 200} more")
+    out.append("")
+
+    if r["candidates"]:
+        out += ["## source-to-sink candidates (hypotheses, confidence capped at medium)", ""]
+        for c in r["candidates"][:60]:
+            out += [f"[{c['confidence']}] {c['sink_kind']}  {c['route']}  "
+                    f"(guard={', '.join(c['guards']) or '-'})",
+                    f"    sink  {c['sink_file']}:{c['sink_line']}  {c['sink_snippet']}",
+                    f"    why   {c['why']}"]
+        if len(r["candidates"]) > 60:
+            out.append(f"... and {len(r['candidates']) - 60} more")
+        out.append("")
+
+    if r["sinks"]:
+        counts = {}
+        for x in r["sinks"]:
+            counts[x["kind"]] = counts.get(x["kind"], 0) + 1
+        out += ["## sinks by kind", ""]
+        out += [f"{k:<13} {n:>4}  {KIND_NOTE[k]}" for k, n in sorted(counts.items())]
+        out.append("")
+
+    if r["config"]:
+        out += ["## secrets and configuration", ""]
+        for x in r["config"][:40]:
+            out.append(f"{x['kind']:<22} {x['file']}:{x['line']}  {x['snippet']}")
+        if len(r["config"]) > 40:
+            out.append(f"... and {len(r['config']) - 40} more")
+        out.append("")
+
+    c = r.get("correlation")
+    if c:
+        out += ["## correlation with the live surface", "",
+                f"probed path shapes: {c['probed_shapes']}", ""]
+        if c["source_only"]:
+            out += ["routes in the source the probe never reached "
+                    "(the valuable set: nobody found these by crawling):", ""]
+            for x in c["source_only"][:60]:
+                out.append(f"  {', '.join(x['routes'])}")
+            out.append("")
+        if c["reachable"]:
+            out += [f"route shapes the probe reached: {len(c['reachable'])}", ""]
+        if c["probed_only"]:
+            out += ["probed paths with no source match (another service, a rewrite, "
+                    "or an extractor miss):", ""]
+            out += [f"  {p}" for p in c["probed_only"][:40]]
+            out.append("")
+
+    sk = r["skipped"]
+    out += ["## what was skipped", "",
+            f"files over the cap: {sk['files_over_cap']}; too big: {len(sk['files_too_big'])}; "
+            f"deadline hit: {sk['deadline_hit']}",
+            f"pruned directories present in the tree: {', '.join(sk['dirs_pruned']) or 'none'}", ""]
+    if r["notes"]:
+        out += ["## notes"] + r["notes"] + [""]
+    out += ["## what this cannot see", ""]
+    out += [f"- {x}" for x in r["cannot_see"]]
+    out += ["", "Every row is an aim point, not a finding. A source candidate enters the "
+            "engagement at `candidate` and reaches `validated` only through a live request "
+            "with its oracle and negative control (see the `source-review` and `exploit` skills)."]
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------ selftest
+def _selftest() -> int:
+    fx = Path(__file__).resolve().parent.parent / "skills" / "source-review" / "fixtures"
+    assert fx.is_dir(), f"fixtures missing at {fx}"
+    r = scan(fx)
+    paths = {f"{x['method']} {x['path']}" for x in r["routes"]}
+
+    # two frameworks, from two extractors
+    assert "flask" in r["frameworks"] and "express" in r["frameworks"], r["frameworks"]
+    assert "GET /notes" in paths and "POST /admin/delete/{note_id}" in paths, sorted(paths)
+    assert "POST /run" in paths and "GET /profile" in paths, sorted(paths)
+
+    # authorization inventory: the guard is found, and the missing one is called out
+    guards = {f"{x['method']} {x['path']}": x["guards"] for x in r["routes"]}
+    assert guards["GET /me"] == ["login_required"], guards["GET /me"]
+    assert guards["GET /profile"] == ["requireAuth"], guards["GET /profile"]
+    unguarded = {f"{x['method']} {x['path']}" for x in r["unguarded_state_changing"]}
+    assert unguarded == {"POST /admin/delete/{note_id}", "POST /run"}, unguarded
+
+    # sinks: the interpolated query is one, the parameterized one is not
+    sql = [x for x in r["sinks"] if x["kind"] == "sql"]
+    assert [x["line"] for x in sql] == [35], sql
+    assert any(x["kind"] == "exec" and x["file"].endswith("server.js") for x in r["sinks"])
+    assert any(x["kind"] == "redirect" for x in r["sinks"])
+
+    # candidates: request value into the sink, medium at best
+    cands = {(c["route"], c["sink_kind"]): c for c in r["candidates"]}
+    assert ("GET /notes", "sql") in cands, sorted(cands)
+    assert cands[("GET /notes", "sql")]["confidence"] == "medium"
+    assert cands[("POST /run", "exec")]["confidence"] == "medium"
+    assert all(c["confidence"] in ("low", "medium") for c in r["candidates"])
+
+    # config
+    kinds = {x["kind"] for x in r["config"]}
+    assert {"hardcoded-credential", "debug-enabled", "cors-permissive"} <= kinds, kinds
+
+    # probe correlation
+    doc = json.loads((fx / "probe.json").read_text())
+    c = scan(fx, probe=doc)["correlation"]
+    reached = {x["shape"] for x in c["reachable"]}
+    only = {rt for x in c["source_only"] for rt in x["routes"]}
+    assert "/notes" in reached, c["reachable"]
+    assert "POST /admin/delete/{note_id}" in only, sorted(only)
+    assert "/legacy/export" in c["probed_only"], c["probed_only"]
+
+    # path templates and shapes agree across frameworks
+    assert templ("/orders/<int:oid>") == templ("/orders/:oid") == templ("/orders/[oid]") == "/orders/{oid}"
+    assert shape("/api/order/7") == shape("/api/order/{oid}") == "/api/order/{}"
+
+    # caps are reported, not silently applied
+    assert scan(fx, max_files=1)["skipped"]["files_over_cap"] >= 1
+    assert scan(fx, max_bytes=10)["skipped"]["files_too_big"]
+    print("selftest ok")
+    return 0
+
+
+def main() -> int:
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", help="source tree to map (a directory, or one file)")
+    ap.add_argument("--probe", metavar="FILE",
+                    help="`scripts/probe --json` output, or - for stdin, to correlate "
+                         "the source routes against the live surface")
+    ap.add_argument("--max-files", type=int, default=4000)
+    ap.add_argument("--max-bytes", type=int, default=512 * 1024,
+                    help="per-file size cap; a bigger file is skipped and reported")
+    ap.add_argument("--max-seconds", type=float, default=30.0,
+                    help="walltime cap; what is left unscanned is reported")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+
+    root = Path(a.path).expanduser()
+    if not root.exists():
+        raise SystemExit(f"sourcemap: {a.path}: no such path")
+    doc = None
+    if a.probe:
+        raw = sys.stdin.read() if a.probe == "-" else Path(a.probe).read_text(encoding="utf-8")
+        try:
+            doc = json.loads(raw)
+        except ValueError as e:
+            raise SystemExit(f"sourcemap: --probe is not JSON: {e}")
+        if not isinstance(doc, dict):
+            raise SystemExit("sourcemap: --probe expects `scripts/probe --json` output")
+
+    result = scan(root, doc, a.max_files, a.max_bytes, a.max_seconds)
+    print(json.dumps(result, indent=1) if a.json else render(result))
+    return 0 if result["routes"] or result["sinks"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+{"ts": "2025-11-14T08:46:42+0000", "phase": "start", "argv": ["nuclei", "-u", "https://app.test", "-rl", "4"], "timeout": 900}
+{"ts": "2025-11-14T08:46:48+0000", "phase": "end", "argv": ["nuclei", "-u", "https://app.test", "-rl", "4"], "exit": 0, "seconds": 6.0}
+{"ts": "2025-11-14T08:46:55+0000", "phase": "start", "argv": ["bash", "-lc", "curl -s https://evil.test/"], "timeout": 900}
+{"ts": "2025-11-14T08:46:56+0000", "phase": "end", "argv": ["bash", "-lc", "curl -s https://evil.test/"], "exit": 0, "seconds": 0.1}
+{"ts": "2025-11-14T08:46:55+0000", "phase": "start", "argv": ["nmap", "-sV", "app.test"], "timeout": 900}
+{"ts": "2025-11-14T08:47:00+0000", "phase": "end", "argv": ["nmap", "-sV", "app.test"], "exit": 0, "seconds": 5.0}
+{"ts": "2025-11-14T08:47:06+0000", "phase": "start", "argv": ["ffuf", "-u", "https://app.test/FUZZ", "-w", "words.txt", "-rate", "4"], "timeout": 900}
+{"ts": "2025-11-14T08:47:10+0000", "phase": "end", "argv": ["ffuf", "-u", "https://app.test/FUZZ", "-w", "words.txt", "-rate", "4"], "exit": 124, "seconds": 4.0}

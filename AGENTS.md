@@ -26,6 +26,14 @@ work from it. This matters more than it looks: an agent given the CVE
 description reached 87% on a one-day benchmark against 7% without it, so
 knowing what to look for is most of the result.
 
+Between engagements, `scripts/watch` keeps a tested target under observation
+(`docs/continuous.md`): it diffs the surface, matches new CVEs against the known
+stack and lists stored proofs to replay, and the `continuous` skill acts on its
+work list. It is pinned to the engagement's scope file and holds all traffic
+when that file changes or the authorization confirmation is older than 30 days,
+because a scheduled job testing a program whose scope moved is how a tester ends
+up unauthorized.
+
 Load a phase skill when you reach that phase; do not preload them all.
 `knowledge/` holds per-class confirmation playbooks: read the relevant file
 when a skill points to it.
