@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Mythos">
+  <title>Mythos</title>
+  <!-- mark: the labyrinth, entered from the bottom -->
+  <g transform="translate(12,12)" fill="none" stroke="#f0a52a" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 48 96 H 11 V 22 H 85 V 88 H 25 V 36 H 71 V 74 H 39 V 50 H 57"/>
+  </g>
+</svg>
