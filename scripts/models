@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Per-agent model assignment for OpenCode, read from models.json.
+
+  scripts/models                          # JSON for the default profile
+  scripts/models anthropic                # JSON for another profile
+  scripts/models zai-coding-plan/glm-5.3  # every agent on one model
+  scripts/models --write                  # copy the default profile into opencode.json
+  scripts/models --check                  # exit 1 if opencode.json drifted from models.json
+
+The output is a config fragment. OPENCODE_CONFIG_CONTENT beats opencode.json and
+the agent frontmatter, so this runs the whole suite on another provider:
+
+  OPENCODE_CONFIG_CONTENT="$(scripts/models anthropic)" opencode
+"""
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+M = json.loads((ROOT / "models.json").read_text())
+
+
+def render(arg=None):
+    if arg and "/" in arg:
+        def pick(tier):
+            return arg
+    else:
+        name = arg or M["default_profile"]
+        if name not in M["profiles"]:
+            sys.exit(f"models: unknown profile '{name}' (have: {', '.join(M['profiles'])})")
+        pick = M["profiles"][name]["models"].__getitem__
+    # The primary agent follows the top-level model, so `--model` still moves it.
+    primary = next(n for n, a in M["agents"].items() if a.get("primary"))
+    return {"model": pick(M["agents"][primary]["tier"]),
+            "agent": {n: {"model": pick(a["tier"])}
+                      for n, a in M["agents"].items() if n != primary}}
+
+
+def main(argv):
+    arg = argv[0] if argv else None
+    if arg in ("--check", "--write"):
+        path = ROOT / "opencode.json"
+        cfg, want = json.loads(path.read_text()), render()
+        if arg == "--write":
+            cfg.update(want)
+            path.write_text(json.dumps(cfg, indent=2) + "\n")
+        elif {k: cfg.get(k) for k in want} != want:
+            print("opencode.json differs from models.json (run scripts/models --write)")
+            return 1
+        return 0
+    print(json.dumps(render(arg), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

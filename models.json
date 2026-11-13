@@ -1,0 +1,109 @@
+{
+  "$comment": "Per-agent model assignment. Read by scripts/models; semantics in docs/models.md. A consumer reads agents.<id>.tier, then profiles.<profile>.models.<tier>. The validator tier must differ from strong: a model approves its own errors 11.9 points more often when it wrote them, and that bias follows authorship, not the context window, so a fresh context on the same model is not an independent check. Where a profile cannot provide a second model it sets single_model_validation true, and the finding must say the validator pass was not independent.",
+  "default_profile": "zai",
+  "tiers": [
+    "fast",
+    "mid",
+    "strong",
+    "validator"
+  ],
+  "agents": {
+    "mythos": {
+      "primary": true,
+      "tier": "strong",
+      "reason": "longest prompt, runs the whole engagement unattended and owns scope and closure decisions, so an error here costs the run"
+    },
+    "mythos-planner": {
+      "tier": "mid",
+      "reason": "one structured plan from scope and surface, no long tool loop"
+    },
+    "mythos-recon": {
+      "tier": "fast",
+      "reason": "drives httpx, katana and ffuf and summarises the surface; later phases check what it finds"
+    },
+    "mythos-scanner": {
+      "tier": "fast",
+      "reason": "runs nuclei, dalfox and sqlmap and records candidates, which are unproven by definition"
+    },
+    "mythos-browser": {
+      "tier": "mid",
+      "reason": "long Playwright tool loops, and its verdict on a client-rendered finding is evidence"
+    },
+    "mythos-exploiter": {
+      "tier": "strong",
+      "reason": "decides validated versus unconfirmed under the exploit skill: exact request, negative control, validator pass"
+    },
+    "mythos-reporter": {
+      "tier": "mid",
+      "reason": "turns validated findings into severity and CVSS and must not claim past the evidence"
+    }
+  },
+  "profiles": {
+    "zai": {
+      "needs": "ZHIPU_API_KEY or `opencode auth login` (Z.AI Coding Plan)",
+      "models": {
+        "fast": "zai-coding-plan/glm-5.3-flash",
+        "mid": "zai-coding-plan/glm-5.3",
+        "strong": "zai-coding-plan/glm-5.3",
+        "validator": "zai-coding-plan/glm-5.3"
+      },
+      "single_model_validation": true,
+      "validator_note": "This profile has no second model fit to re-check a proof, so the validator pass runs on the hunting model and is not independent. Set a cross-provider validator, or record the limitation in the finding."
+    },
+    "zai-api": {
+      "needs": "ZHIPU_API_KEY or `opencode auth login` (Z.AI), pay per token",
+      "models": {
+        "fast": "zai/glm-5.3-flash",
+        "mid": "zai/glm-5.3",
+        "strong": "zai/glm-5.3",
+        "validator": "zai/glm-5.3"
+      },
+      "single_model_validation": true,
+      "validator_note": "This profile has no second model fit to re-check a proof, so the validator pass runs on the hunting model and is not independent. Set a cross-provider validator, or record the limitation in the finding."
+    },
+    "zen": {
+      "needs": "OPENCODE_API_KEY or `opencode auth login` (OpenCode Zen), pay per token, same GLM models hosted in the US and EU",
+      "models": {
+        "fast": "opencode/glm-5.3-flash",
+        "mid": "opencode/glm-5.3",
+        "strong": "opencode/glm-5.3",
+        "validator": "opencode/glm-5.3"
+      },
+      "single_model_validation": true,
+      "validator_note": "The only second model here is Flash, which models.json already keeps out of the exploit phase, so it cannot be trusted to re-check a proof either. Validation is not independent on this profile."
+    },
+    "anthropic": {
+      "needs": "ANTHROPIC_API_KEY",
+      "models": {
+        "fast": "anthropic/claude-haiku-5-5",
+        "mid": "anthropic/claude-sonnet-5-5",
+        "strong": "anthropic/claude-opus-5-5",
+        "validator": "anthropic/claude-sonnet-5-5"
+      },
+      "single_model_validation": false
+    },
+    "openai": {
+      "needs": "OPENAI_API_KEY",
+      "models": {
+        "fast": "openai/gpt-6-luna",
+        "mid": "openai/gpt-6.1-terra",
+        "strong": "openai/gpt-6.1-sol",
+        "validator": "openai/gpt-6.1-terra"
+      },
+      "single_model_validation": false
+    }
+  },
+  "claude_code": {
+    "$comment": "Aliases for the Claude Code `model:` frontmatter field. Not consumed yet: scripts/build-hosts.py still writes `model: inherit`.",
+    "fast": "haiku",
+    "mid": "sonnet",
+    "strong": "opus"
+  },
+  "validation": {
+    "$comment": "Which model re-checks a stored proof of concept.",
+    "agent": "mythos-exploiter",
+    "tier": "validator",
+    "why": "A fresh context does not remove self-preference: it is tied to authorship. Measured at 11.9 percentage points over 64,800 calls. Where validator equals strong, the pass is a re-run, not an independent check, and skills/exploit requires the finding to say so.",
+    "cross_provider_example": "OPENCODE_CONFIG_CONTENT=\"$(scripts/models anthropic)\" for the validator pass while the hunt runs on the default profile"
+  }
+}
