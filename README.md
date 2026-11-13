@@ -44,6 +44,23 @@ is fixed; the affected claims are withdrawn until the sweep has been run again.
 What each fault was and how it is now prevented:
 [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
 
+**The one measurement made since the fix points the other way.** On 14 November
+2026 the coverage gate was re-measured on DVGA with the repaired harness: four
+cells, paired on each of the 21 documented vulnerabilities rather than on the
+target, rated blind by two independent raters on different models. Both put the
+gate-off arm ahead. Rater A saw recall 0.48 against 0.19 with six discordant
+pairs all one way (McNemar exact p = 0.0312); rater B saw 0.57 against 0.29
+(p = 0.0703). It is one target, 21 entries, one cluster, a minimum detectable
+difference of 0.30, and two raters who disagree across the 0.05 line, so it does
+not establish that the gate hurts either. The run, both ratings and the honest
+limits are in
+[`bench/data/runs/gate-dvga-20261114/`](bench/data/runs/gate-dvga-20261114/).
+
+That run also produced the project's first precision figures, 0.80 to 1.00
+depending on the rater, with six false positives found between them. Every
+earlier precision of 1.00 came from a triage schema in which no row could be a
+false positive.
+
 Withdrawn:
 
 - **The Vuln Bank coverage-gate separation** (Mythos with the gate 34 and 33
