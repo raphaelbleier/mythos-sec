@@ -1,0 +1,28 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generated host files are in sync
+        run: python3 scripts/build-hosts.py --check
+
+      - name: Python files compile
+        run: |
+          git ls-files '*.py' | xargs -r python3 -m py_compile
+
+      - name: Shell scripts parse
+        run: |
+          git ls-files '*.sh' | xargs -r -n1 bash -n
