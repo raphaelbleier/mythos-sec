@@ -4,24 +4,34 @@
 Mythos is skill-driven: Claude Code is the agent and runs REAL security tools
 inside the container via the subcommands below. No engine, no second LLM.
 
-  scripts/mythos up                  pull (or build) the image + start the toolbox
+  scripts/mythos up                  pull (or build) the image, verify its cosign signature, start the toolbox
   scripts/mythos tools               show key tools and versions
   scripts/mythos run nuclei -u URL   run one tool (argv passed as a list, no shell)
-  scripts/mythos sh 'ffuf ... | jq'  run a shell pipeline in the toolbox
+  scripts/mythos sh 'ffuf ... | jq'  run a shell pipeline in the toolbox (several args = one quoted command)
   scripts/mythos <tool> [args...]    shorthand for `run <tool> ...`
   scripts/mythos net <network>       connect the toolbox to a lab docker network
   scripts/mythos down                stop + remove the toolbox
+  scripts/mythos --timeout N <cmd>   kill this one exec after N seconds (0 = no limit)
 
-Env: MYTHOS_IMAGE (default ghcr.io/raphaelbleier/mythos-toolbox:latest),
-     MYTHOS_BUILD=1 (force local build), MYTHOS_CONTAINER (default mythos-toolbox).
+Env: MYTHOS_IMAGE (default: the digest in toolbox/IMAGE_DIGEST, updated per release),
+     MYTHOS_BUILD=1 (force local build), MYTHOS_CONTAINER (default mythos-toolbox),
+     MYTHOS_TIMEOUT (default 900 s per exec; a hung sqlmap or ffuf must not eat an
+     unattended engagement's budget. Exit 124/137 = hit the limit).
 Every exec is logged (before and after) to engagements/audit.jsonl.
-The repo is mounted at /repo; host.docker.internal reaches the host.
+The repo is mounted read-only at /repo, only engagements/ is writable (and audit.jsonl in
+it is read-only): the host executes hooks/, scripts/ and skills/, so the container must not
+be able to rewrite them. host.docker.internal reaches the host.
 """
-import json, os, subprocess, sys, time
+import json, os, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-IMG = os.environ.get("MYTHOS_IMAGE", "ghcr.io/raphaelbleier/mythos-toolbox:latest")
+OFFICIAL = "ghcr.io/raphaelbleier/mythos-toolbox"
+# Digest of the signed release image; a release updates this file, never a mutable tag.
+IMG = os.environ.get("MYTHOS_IMAGE") or f"{OFFICIAL}@{(REPO / 'toolbox' / 'IMAGE_DIGEST').read_text().strip()}"
+SIGNER = r"^https://github\.com/raphaelbleier/mythos-sec/\.github/workflows/toolbox\.yml@refs/(tags/v[^/]+|heads/main)$"
+ISSUER = "https://token.actions.githubusercontent.com"
+TIMEOUT = int(os.environ.get("MYTHOS_TIMEOUT", "900"))
 LOCAL = "mythos-toolbox"
 NAME = os.environ.get("MYTHOS_CONTAINER", "mythos-toolbox")
 AUDIT = REPO / "engagements" / "audit.jsonl"
@@ -59,7 +69,8 @@ def image():
     """Pick the image to run: pulled GHCR image, else local build."""
     global IMG
     if os.environ.get("MYTHOS_BUILD") != "1":
-        if have(IMG) or docker("pull", IMG, quiet=False).returncode == 0:
+        # A digest is content-addressed, so a local copy needs no refresh; a tag does.
+        if ("@sha256:" in IMG and have(IMG)) or docker("pull", IMG, quiet=False).returncode == 0 or have(IMG):
             return IMG
         print(f"mythos: pull of {IMG} failed, building locally.", file=sys.stderr)
     if os.environ.get("MYTHOS_BUILD") == "1" or not have(LOCAL):
@@ -69,16 +80,38 @@ def image():
     return LOCAL
 
 
+def verify(img):
+    """Check the cosign signature of the official image; a bad or missing one is fatal."""
+    if img == LOCAL:
+        return
+    cmd = ["cosign", "verify", "--certificate-identity-regexp", SIGNER,
+           "--certificate-oidc-issuer", ISSUER, img]
+    if not img.startswith(OFFICIAL):
+        print(f"mythos: {img} is not the official image, signature not checked.", file=sys.stderr)
+    elif not shutil.which("cosign"):
+        print(f"mythos: cosign not found, image signature NOT verified. Run: {shlex.join(cmd)}", file=sys.stderr)
+    else:
+        r = subprocess.run(cmd, env=ENV, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f"mythos: cosign verification of {img} FAILED, refusing to start it.\n{r.stderr}")
+
+
 def up():
     if running():
         return
+    if docker("info").returncode:
+        sys.exit("mythos: cannot reach the Docker daemon (is it running, and is your user in the docker group?)")
     img = image()
+    verify(img)
     docker("rm", "-f", NAME)
+    AUDIT.parent.mkdir(exist_ok=True)
+    AUDIT.touch()
     args = ["run", "-d", "--rm", "--init", "--name", NAME,
             "--cap-drop", "ALL", "--cap-add", "NET_RAW",
             "--security-opt", "no-new-privileges",
             "--add-host=host.docker.internal:host-gateway",
-            "-v", f"{REPO}:/repo", "-w", "/repo"]
+            "-v", f"{REPO}:/repo:ro", "-v", f"{AUDIT.parent}:/repo/engagements",
+            "-v", f"{AUDIT}:/repo/engagements/audit.jsonl:ro", "-w", "/repo"]
     if sys.platform.startswith("linux"):  # keep bind-mount files owned by the host user
         args += ["--user", f"{os.getuid()}:{os.getgid()}"]
     docker(*args, img, check=True)
@@ -89,18 +122,24 @@ def exec_(argv):
     if not running():
         up()
     t = time.time()
-    audit(phase="start", argv=argv)
+    audit(phase="start", argv=argv, timeout=TIMEOUT)
     tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
-    rc = subprocess.run(["docker", "exec", "-i", *tty, "-w", "/repo", NAME, *argv], env=ENV).returncode
+    limit = ["timeout", "--signal=TERM", "--kill-after=5", str(TIMEOUT)] if TIMEOUT > 0 else []
+    rc = subprocess.run(["docker", "exec", "-i", *tty, "-w", "/repo", NAME, *limit, *argv], env=ENV).returncode
     audit(phase="end", argv=argv, exit=rc, seconds=round(time.time() - t, 2))
+    if limit and rc in (124, 137):
+        print(f"mythos: exit {rc}, probably the {TIMEOUT}s limit; rerun with --timeout N (0 = none).", file=sys.stderr)
     return rc
 
 
 def main(a):
+    global TIMEOUT
+    if a[:1] == ["--timeout"]:
+        if len(a) < 2 or not a[1].isdigit():
+            sys.exit("usage: scripts/mythos --timeout SECONDS <command ...>")
+        TIMEOUT, a = int(a[1]), a[2:]
     if not a:
-        sys.exit("usage: scripts/mythos {up|down|tools|net <network>|sh <cmd>|run <tool ...>|<tool ...>}")
-    if docker("info").returncode:
-        sys.exit("mythos: cannot reach the Docker daemon (is it running, and is your user in the docker group?)")
+        sys.exit("usage: scripts/mythos [--timeout N] {up|down|tools|net <network>|sh <cmd>|run <tool ...>|<tool ...>}")
     c, rest = a[0], a[1:]
     if c == "up": up()
     elif c == "down":
@@ -114,7 +153,7 @@ def main(a):
         r = docker("network", "connect", rest[0], NAME)
         if r.returncode and "already exists" not in r.stderr: sys.exit(r.stderr)
         print(f"mythos: toolbox connected to {rest[0]}.", file=sys.stderr)
-    elif c == "sh": return exec_(["bash", "-lc", " ".join(rest)])
+    elif c == "sh": return exec_(["bash", "-lc", rest[0] if len(rest) == 1 else shlex.join(rest)])
     elif c == "run": return exec_(rest)
     else: return exec_(a)  # shorthand: scripts/mythos nuclei -u ...
     return 0

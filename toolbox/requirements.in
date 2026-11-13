@@ -1,0 +1,14 @@
+# Direct dependencies of the toolbox Python belt. Compile with:
+#   uv pip compile --generate-hashes --python-version 3.14 --python-platform linux \
+#     toolbox/requirements.in -o toolbox/requirements.txt
+# graphw00f is not listed: the PyPI name is an inert placeholder, the real tool is
+# cloned from a pinned commit in the Dockerfile.
+arjun
+wafw00f
+h2spacex==1.2.2
+playwright
+# jwt_tool dependencies
+termcolor
+cryptography
+pycryptodomex
+requests

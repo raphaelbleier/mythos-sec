@@ -15,7 +15,7 @@ wcvs            75159ea557772447a7760184e1f08e3cc3395090
 # apt (Kali rolling, version = snapshot at build): nmap sqlmap nikto commix whatweb
 #   sslscan wafw00f hydra chromium python3 curl jq openssl ... (see Dockerfile)
 #   plus (non-fatal, per package): default-jre-headless php-cli (for ysoserial / phpggc)
-# pip (best-effort): arjun wafw00f graphw00f h2spacex==1.2.2 playwright
+# pip: hash-pinned in requirements.txt (compiled from requirements.in), installed with --require-hashes
 #   dropped: paramspider (no distribution on PyPI, "from versions: none"; --break-system-packages does not help).
 #   semgrep: dropped. SAST, not used by any skill (Mythos tests black-box), and it dominated
 #     the image size. h2spacex ships no CLI; race.py imports it as a module.
@@ -23,5 +23,7 @@ wcvs            75159ea557772447a7760184e1f08e3cc3395090
 jwt_tool        3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b   (ticarpi/jwt_tool, /opt/jwt_tool)
 smuggler.py     2be871e6151ce85167a277fab21c74c851d8b20b   (defparam/smuggler, /opt/smuggler, no release tags)
 phpggc          f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c   (ambionics/phpggc, /opt/phpggc, no release tags)
+graphw00f       1fc956a956eeaeea74fd8038780fd118f4876ae9   (dolevf/graphw00f 1.2.1, /opt/graphw00f; NOT pip: the PyPI name is an inert placeholder)
 # jar:
-ysoserial       v0.0.6   (frohoff/ysoserial ysoserial-all.jar, /opt/ysoserial; run via `ysoserial` wrapper)
+ysoserial       v0.0.6   (frohoff/ysoserial ysoserial-all.jar, /opt/ysoserial; run via `ysoserial` wrapper), sha256 checked at build
+# nuclei-templates  v10.5.2   (git clone at the tag into ~/nuclei-templates)

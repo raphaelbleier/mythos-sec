@@ -10,7 +10,7 @@
 #   dvwa       http://localhost:4280   Damn Vulnerable Web App (classic)
 #   vampi      http://localhost:5002   VAmPI (vulnerable REST API)
 #   dvga       http://localhost:5013   Damn Vulnerable GraphQL App (hard: GraphQL RCE)
-#   vuln-bank-web http://localhost:5003  Vuln Bank (needs VULNBANK_DIR checkout)
+#   vuln-bank-web http://localhost:5003  Vuln Bank (needs VULNBANK_DIR=<checkout>, no default)
 #   oast       http://localhost:8081   HTTP+DNS catcher (OAST), log at /__log
 #   admin-bot  http://localhost:8000   POST /visit {url} with admin cookie
 # Network `mythos-lab` has a fixed name: scripts/mythos net mythos-lab
@@ -30,14 +30,14 @@ services:
     networks: [mythos-lab]
 
   juiceshop:
-    image: bkimminich/juice-shop:v17.1.1
+    image: bkimminich/juice-shop:v17.1.1@sha256:9e437b456e444ff001d1663e4f6f05c796fe02f1058dd2651d6791a15b43dfeb
     container_name: mythos-juiceshop
     ports:
       - "127.0.0.1:3000:3000"
     networks: [mythos-lab]
 
   dvwa:
-    image: vulnerables/web-dvwa:latest
+    image: vulnerables/web-dvwa:latest@sha256:dae203fe11646a86937bf04db0079adef295f426da68a92b40e3b181f337daa7
     container_name: mythos-dvwa
     ports:
       - "127.0.0.1:4280:80"
@@ -46,7 +46,7 @@ services:
   # Lightweight vulnerable REST API (IDOR/BOLA, SQLi, JWT, mass assignment).
   # Stands in for crAPI on memory-constrained hosts (single small container).
   vampi:
-    image: erev0s/vampi:latest
+    image: erev0s/vampi:latest@sha256:0a5a224b6e14ae7da6a6ea265178ff71286ff903aec74adee98f660bb0e4ca12
     container_name: mythos-vampi
     environment:
       - vulnerable=1
@@ -57,7 +57,7 @@ services:
   # Damn Vulnerable GraphQL Application — hard class: GraphQL code execution,
   # SSRF->RCE via importPaste, introspection, broken access control.
   dvga:
-    image: dolevf/dvga:latest
+    image: dolevf/dvga:latest@sha256:040aa33c199d99f3380c9ff9a1ee5d725e9abca7b189c63a35a2a73bda79c957
     container_name: mythos-dvga
     environment:
       - WEB_HOST=0.0.0.0
@@ -67,8 +67,10 @@ services:
 
   # Vuln Bank (Commando-X/vuln-bank): race conditions, GraphQL, BOPLA, stored XSS.
   # Clone it first: git clone https://github.com/Commando-X/vuln-bank "$VULNBANK_DIR"
+  # postgres 13 went end-of-life on 2025-11-13; kept because vuln-bank targets it.
+  # Loopback-only lab network, no published port.
   vuln-bank-db:
-    image: postgres:13
+    image: postgres:13@sha256:4689940c683801b4ab839ab3b0a0a3555a5fe425371422310944e89eca7d8068
     container_name: mythos-vuln-bank-db
     environment:
       - POSTGRES_DB=vulnerable_bank
@@ -81,7 +83,10 @@ services:
       retries: 10
 
   vuln-bank-web:
-    build: ${VULNBANK_DIR:-/mnt/linux-data/mythos-bench/vuln-bank}
+    # A required-variable form (${VULNBANK_DIR:?...}) would make every compose command
+    # fail, including `up vulnapp`, so an unset variable points at a path whose name
+    # is the error message.
+    build: ${VULNBANK_DIR:-./VULNBANK_DIR-not-set_clone-Commando-X-vuln-bank-and-export-VULNBANK_DIR}
     container_name: mythos-vuln-bank
     environment:
       - DB_NAME=vulnerable_bank
