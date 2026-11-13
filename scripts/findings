@@ -266,11 +266,19 @@ def parse(path: Path) -> dict:
     }
 
 
+# A deliverable, not a finding. A real run wrote its whole report into
+# findings/report.md, which this parsed into one finding with no class and no
+# status. Inventing a finding out of the report is worse than reporting none.
+NOT_A_FINDING = {"report.md", "readme.md", "notes.md", "summary.md", "coverage.md"}
+
+
 def collect(engagement: Path) -> list[dict]:
     d = engagement / "findings"
     if not d.is_dir():
         return []
-    return [parse(f) for f in sorted(d.glob("*.md"))]
+    files = [f for f in sorted(d.glob("*.md"))
+             if f.name.lower() not in NOT_A_FINDING]
+    return [parse(f) for f in files]
 
 
 def dedupe(findings: list[dict]) -> list[dict]:
@@ -456,6 +464,8 @@ def main() -> int:
                     help="exit 1 if a validated finding is at or above this "
                          "severity (for a CI gate)")
     ap.add_argument("--json", action="store_true", help="print the JSON to stdout")
+    # exit codes: 0 parsed, 1 --fail-on tripped, 2 bad arguments or unreadable
+    # input, 3 no per-finding files to parse.
     ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.selftest:
@@ -470,6 +480,26 @@ def main() -> int:
     rows = dedupe(collect(d))
     reported = rows if args.all else [r for r in rows if r["state"] in REPORTED_STATES]
     problems = [(r["id"], p) for r in rows for p in r["problems"]]
+
+    if not rows:
+        # Silence here would read as "a clean engagement". It is far more often
+        # the agent having written prose instead of the per-finding files the
+        # exploit skill prescribes, which is what a live run on DVGA did.
+        hint = ("no per-finding files under findings/. This is not the same as "
+                "finding nothing: skills/exploit requires one findings/<id>.md "
+                "per finding, with front matter carrying id, title, class, "
+                "status, asset, param, severity, cvss, proof and "
+                "negative_control. report.md is the deliverable and is not "
+                "parsed. Write the per-finding files, then run this again.")
+        if (d / "findings" / "report.md").exists():
+            hint += (" A report.md exists under findings/, so the prose was "
+                     "written and the structured records were not.")
+        print(f"findings: {hint}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"engagement": d.name, "findings": [],
+                              "counts": {}, "problems": [{"id": "-",
+                                                          "problem": hint}]}, indent=2))
+        return 3
 
     doc = {"engagement": d.name, "findings": reported,
            "counts": {s: sum(1 for r in rows if r["state"] == s)

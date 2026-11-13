@@ -51,6 +51,26 @@ missing`. `reproduced` items say what the validator pass did not confirm,
 reason (false positive, by design, out of scope, not reproducible). Severity is
 not assigned to appendix items.
 
+## The engagement layout, exactly
+
+A live run wrote its whole report into `findings/report.md`, which left nothing
+machine-readable and produced one bogus finding with no class. The layout is
+not a suggestion:
+
+```
+engagements/<dir>/
+  report.md            the deliverable, at the ROOT, never inside findings/
+  findings/<id>.md     one file per finding, front matter + evidence
+  findings.json        written by scripts/findings, do not hand-write it
+  scope.yaml           the authorization boundary
+```
+
+Each `findings/<id>.md` carries `id`, `title`, `class` (a knowledge-base class
+name, so the CWE maps), `status`, `asset`, `param`, `severity`, `cvss`, `proof`,
+`negative_control`, and `reason` for a rejected one. Write these before the
+prose, not after: the prose is assembled from them, and `scripts/findings`
+refuses to run without them with exit code 3.
+
 ## Machine-readable output
 
 Run `scripts/findings engagements/<dir>` before you write the prose. It reads
