@@ -116,6 +116,23 @@ def coverage_gate_wired(root):
     return bool(f.exists() and "coverage-gate.py" in f.read_text())
 
 
+def coverage_gate_effective(root, host):
+    """Whether the gate can actually fire on this host, not merely be wired.
+
+    `hooks/hooks.json` is a Claude Code file. OpenCode loads the plugin under
+    `.opencode/plugin/`, which carries the two PreToolUse guards and has no Stop
+    hook, so the coverage gate never runs there however the file is staged.
+    Recording only `coverage_gate_wired` would therefore log the intended
+    condition rather than the one that happened, which is the same class of
+    mistake as naming the condition after the output directory. A gate
+    comparison is only meaningful on the Claude Code host until an OpenCode
+    equivalent exists.
+    """
+    if host != "claude":
+        return False
+    return coverage_gate_wired(root)
+
+
 def repo_commit(repo=None):
     repo = Path(repo or Path(__file__).resolve().parent.parent.parent)
     try:

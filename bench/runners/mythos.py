@@ -46,6 +46,7 @@ def grants(workdir, model=None):
          "treatment": {"scaffolding": True, "plugin": True, "skills": True,
                        "subagents": True, "toolbox": True, "scope_guard": True,
                        "coverage_gate": base.coverage_gate_wired(stage),
+                       "coverage_gate_effective": base.coverage_gate_effective(stage, "opencode"),
                        "pure": False, "tools": "agent default",
                        "assets": sorted(ASSETS)}}
     if model:

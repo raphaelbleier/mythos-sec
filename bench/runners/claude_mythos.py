@@ -36,6 +36,7 @@ def grants(workdir, model=None):
             "treatment": {"scaffolding": True, "plugin": True, "skills": True,
                           "subagents": True, "toolbox": True, "scope_guard": True,
                           "coverage_gate": base.coverage_gate_wired(stage),
+                          "coverage_gate_effective": base.coverage_gate_effective(stage, "claude"),
                           "skip_permissions": True, "tools": "host default",
                           "assets": sorted(ASSETS)}}
 
