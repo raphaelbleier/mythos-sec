@@ -61,6 +61,85 @@ Record: server, framework, language, CMS, WAF, notable headers. The stack drives
 which bug classes matter (e.g. Flask/Jinja → SSTI; PHP → LFI/SQLi; Node → proto
 pollution; Spring → actuator/SpEL).
 
+### 1a. The AI / automation stack
+
+Self-hosted LLM and workflow tooling is where unauthenticated RCE keeps landing,
+and it gets exploited within hours of disclosure (Langflow alone has collected a
+handful of CISA KEV entries; see `knowledge/techniques/cve-triage-2026.md`).
+`whatweb` does not know
+any of it, so ask directly. **Get the exact version** — it is the difference
+between a candidate you can rank and a guess:
+
+```
+scripts/cvefeed products          # the full list, with the version endpoint for each
+```
+
+| Product | Default port | Where the version is |
+|---|---|---|
+| Langflow | 7860 | `GET /api/v1/version` → `{"version": ...}`; `/api/v1/auto_login` |
+| Flowise | 3000 | `GET /api/v1/version`; `GET /api/v1/ping` |
+| Dify | 5001 | `GET /console/api/version?current_version=0.0.0` |
+| Open WebUI | 8080 | `GET /api/config` → `{"name": "Open WebUI", "version": ...}` |
+| Ollama | 11434 | `GET /api/version`; `/` → `Ollama is running`; `/api/tags` |
+| vLLM | 8000 | `GET /version`; `/v1/models`; `/openapi.json` → `info.version` |
+| LiteLLM | 4000 | `GET /health/readiness` → `litellm_version` |
+| n8n | 5678 | `GET /rest/settings` → `data.versionCli` |
+| ComfyUI | 8188 | `GET /system_stats` → `system.comfyui_version`; `/object_info` |
+| Gradio | 7860 | `GET /config` → `{"version": ...}`; `/info`; `/file=` paths |
+| MCP gateway | — | `GET /sse` or `/mcp` (`text/event-stream`); POST JSON-RPC `initialize` → `result.serverInfo` |
+
+No container needed for this — it is one GET per path:
+
+```
+for p in api/v1/version api/config api/version version config system_stats \
+         rest/settings health/readiness console/api/version info object_info; do
+  printf '%-26s ' "/$p"
+  curl -sS -m 5 -o /tmp/v -w '%{http_code} %{size_download} ' <URL>/$p; head -c 120 /tmp/v; echo
+done
+```
+
+An exposed MCP endpoint is its own class of surface: enumerate the tools it
+offers (`tools/list`) and treat every one that touches a shell, a file or an
+HTTP client as an injection sink. Record the server name and version from
+`initialize`.
+
+Note the version **and how you got it**: read off a `/version` endpoint is
+`--fingerprint`, scraped from a banner or a bundle is `--banner`. Step 1b needs
+that distinction.
+
+## 1b. CVE candidates for what you just fingerprinted
+
+Fresh CVEs are the cheapest high-severity finding on modern self-hosted
+software, and the ids rot too fast to keep in a skill. `scripts/cvefeed` holds
+the live data (CISA KEV, EPSS, NVD, nuclei templates, GHSA, OSV) and ranks it
+by the pipeline in `knowledge/techniques/cve-triage-2026.md`.
+
+```
+scripts/cvefeed match --fingerprint langflow@1.6.0 --banner 'nginx@1.18.0' \
+    --product mcp --json > engagements/<dir>/cve-candidates.json
+scripts/cvefeed match --fingerprint langflow@1.6.0            # the readable version
+```
+
+`--fingerprint NAME@VERSION` for a version you read off the product,
+`--banner NAME@VERSION` for one you guessed from a header, `--product NAME`
+when you have no version at all. The confidence it prints depends on which you
+used, so do not promote a guess. You can also pipe the surface map straight in:
+`scripts/probe <target> --depth 2 --json | scripts/cvefeed match --from-probe
+--json` (everything probe reads off a header counts as a banner).
+
+It refreshes from the feeds at the start of the engagement and falls back to the
+committed snapshot in `knowledge/cve/` with its age printed. Read that header:
+if it says `** STALE **`, say so in the report. It contacts third-party CVE
+APIs, never the target — a scope-guard warning naming `services.nvd.nist.gov`
+or `api.first.org` is this step, not a scope slip.
+
+Hand `cve-candidates.json` to the orchestrator. It is a ranked list of **what
+is worth testing**, never a verdict: a KEV entry means exploited in the wild
+somewhere, EPSS is a prediction, and a version match is worth what your
+fingerprint is worth. A row with `nuclei_template` has a non-destructive check
+ready (`scripts/mythos nuclei -id <cve> -u <URL>`); a KEV row without one goes
+to the `cve-deep-dive` skill.
+
 ## 2. Subdomains + liveness (domain targets only; skip for a single host/IP)
 
 ```
@@ -125,7 +204,10 @@ scripts/mythos sh "curl -s <URL>/graphql -H 'Content-Type: application/json' \
 
 Write `engagements/<dir>/recon/surface.md` summarizing:
 
-- technologies / server / WAF;
+- technologies / server / WAF, each with its version and how the version was
+  obtained;
+- the top CVE candidates from `cve-candidates.json` with their KEV/EPSS flags
+  and match confidence, plus the age and source of the CVE data;
 - live in-scope hosts;
 - endpoints grouped by interest: auth, admin, API, upload, redirect-like, file-like, numeric-id (IDOR), reflected;
 - forms and their parameters;

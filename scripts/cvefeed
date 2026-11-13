@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+"""Mythos CVE feed — fresh CVE intelligence for the fingerprinted stack, in one call.
+
+The triage pipeline is in `knowledge/techniques/cve-triage-2026.md`: KEV first,
+then EPSS, then whether the version on the target is actually in the affected
+range, then whether a proof of concept or a nuclei template exists. This
+implements that pipeline over live data, so the engagement is never reasoning
+from CVE ids someone hard-coded months ago.
+
+  scripts/cvefeed status                       # how old is the data, and where from
+  scripts/cvefeed refresh                      # refresh the local cache from the feeds
+  scripts/cvefeed refresh --out knowledge/cve  # write the committed snapshot (CI)
+  scripts/cvefeed products                     # what it fingerprints, and where the version leaks
+  scripts/cvefeed match --fingerprint langflow@1.6.0 --product nginx
+  scripts/probe <url> --depth 2 --json | scripts/cvefeed match --from-probe --json
+
+`match` prints a **ranked list of what is worth testing**, never a verdict: a
+KEV entry means exploited in the wild somewhere, not that this target is
+vulnerable. Every row carries the feed it came from, when that feed was
+fetched, and how confident the version match is.
+
+Data path: the local cache (TTL `--ttl-hours`, default 6) → a live refresh →
+the committed snapshot `knowledge/cve/snapshot.json`, whose age is always
+printed. A failed fetch, a rate limit or a malformed answer degrades to the
+snapshot; it never raises.
+
+Hosts it contacts (third-party APIs, *not* the target — the engagement's scope
+covers the target, these are out of it by definition, so a scope-guard warning
+naming one of them is this tool doing its job):
+
+  www.cisa.gov            CISA KEV catalog (JSON feed)
+  api.first.org           EPSS scores (batched, 100 CVEs per request)
+  services.nvd.nist.gov   NVD 2.0 recent-window query (NVD_API_KEY honored)
+  raw.githubusercontent.com   nuclei-templates cves.json (CVE -> template path)
+  api.github.com          GHSA advisories (needs a token: CI only, see below)
+  api.osv.dev             OSV package queries, incl. MAL-* malicious packages
+
+GHSA needs a token, and an engagement must not require a new secret, so GHSA is
+fetched only where `GITHUB_TOKEN`/`GH_TOKEN` exists (the scheduled workflow
+`.github/workflows/cve-snapshot.yml`) and baked into the snapshot. Without a
+token `match` says "ghsa: skipped (no token)" instead of failing.
+
+Pruning policy (keeps the committed snapshot small enough for git; also in
+`knowledge/cve/README.md`): NVD/GHSA/OSV records only inside `--window-days`
+(default 30), KEV additions inside `--kev-window-days` (default 365), and a
+record is kept only if it is on KEV, is a MAL-* malicious-package advisory, has
+a nuclei template, or scores at least `--min-cvss` (7.0) or `--min-epss`
+(0.05). Descriptions are dropped, titles and reference lists are capped, and
+OSV/GHSA version lists are reduced to ranges.
+"""
+import argparse, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SNAPSHOT = ROOT / "knowledge" / "cve" / "snapshot.json"
+SCHEMA = 1
+UA = "mythos-cvefeed/1.0 (authorized security testing)"
+
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_URL = "https://api.first.org/data/v1/epss"
+NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NUCLEI_URL = ("https://raw.githubusercontent.com/projectdiscovery/"
+              "nuclei-templates/main/cves.json")
+GHSA_URL = "https://api.github.com/advisories"
+OSV_URL = "https://api.osv.dev/v1/query"
+
+# Software that keeps producing unauthenticated RCE and gets exploited within
+# hours of disclosure. `fingerprint` is where the version usually leaks — a
+# hint for recon, not a promise: confirm it against the response you get.
+PRODUCTS = [
+    {"name": "langflow", "keywords": ["langflow"], "packages": [("PyPI", "langflow")],
+     "port": 7860, "fingerprint": "GET /api/v1/version -> {\"version\": ...}; "
+     "/api/v1/auto_login; login page title 'Langflow'"},
+    {"name": "flowise", "keywords": ["flowise"], "packages": [("npm", "flowise")],
+     "port": 3000, "fingerprint": "GET /api/v1/version -> {\"version\": ...}; "
+     "GET /api/v1/ping; asset paths under /assets/index-*.js"},
+    {"name": "dify", "keywords": ["dify", "langgenius"], "packages": [("PyPI", "dify")],
+     "port": 5001, "fingerprint": "GET /console/api/version?current_version=0.0.0 -> "
+     "{\"version\": ...}; GET /api/health"},
+    {"name": "open-webui", "keywords": ["open-webui", "open webui", "openwebui"],
+     "packages": [("PyPI", "open-webui")], "port": 8080,
+     "fingerprint": "GET /api/config -> {\"name\": \"Open WebUI\", \"version\": ...}"},
+    {"name": "ollama", "keywords": ["ollama"],
+     "packages": [("Go", "github.com/ollama/ollama")], "port": 11434,
+     "fingerprint": "GET /api/version -> {\"version\": ...}; GET / -> "
+     "'Ollama is running'; GET /api/tags lists the models"},
+    {"name": "vllm", "keywords": ["vllm", "vllm-project"], "packages": [("PyPI", "vllm")],
+     "port": 8000, "fingerprint": "GET /version -> {\"version\": ...}; GET /v1/models; "
+     "GET /openapi.json -> info.version"},
+    {"name": "litellm", "keywords": ["litellm", "berriai"], "packages": [("PyPI", "litellm")],
+     "port": 4000, "fingerprint": "GET /health/readiness -> {\"litellm_version\": ...}; "
+     "GET /openapi.json -> info.version"},
+    {"name": "n8n", "keywords": ["n8n"], "packages": [("npm", "n8n")], "port": 5678,
+     "fingerprint": "GET /rest/settings -> data.versionCli; GET /healthz (liveness only)"},
+    {"name": "comfyui", "keywords": ["comfyui", "comfy-org", "comfyanonymous"],
+     "packages": [("PyPI", "comfyui-frontend-package")], "port": 8188,
+     "fingerprint": "GET /system_stats -> system.comfyui_version; GET /object_info "
+     "(custom nodes, each its own CVE surface)"},
+    {"name": "gradio", "keywords": ["gradio"], "packages": [("PyPI", "gradio")], "port": 7860,
+     "fingerprint": "GET /config -> {\"version\": ...}; GET /info; "
+     "/gradio_api/* or /file= paths in the HTML"},
+    {"name": "mcp", "keywords": ["model context protocol", "modelcontextprotocol",
+                                 "mcp server", "mcp gateway", "mcp-remote"],
+     "packages": [("PyPI", "mcp"), ("npm", "@modelcontextprotocol/sdk"),
+                  ("npm", "mcp-remote")], "port": None,
+     "fingerprint": "GET /sse or /mcp (text/event-stream); POST /mcp or /messages with "
+     "JSON-RPC 'initialize' -> result.serverInfo.{name,version}"},
+]
+
+POC_RE = re.compile(r"(?i)(exploit-db\.com|packetstorm|0day\.today|github\.com/[^/]+/[^/]*"
+                    r"(poc|exploit|cve-)|/poc\b|nuclei-templates)")
+PRE_RE = re.compile(r"(?i)[-_.]?(a|b|c|rc|alpha|beta|dev|pre|post)[-_.]?(\d*)$")
+CONSTRAINT_RE = re.compile(r"(>=|<=|==|>|<|=)\s*([0-9][^\s,|]*)")
+
+
+# ---------------------------------------------------------------- small helpers
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_date(value):
+    """Tolerant date parse over every shape these feeds use. None, never a raise."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    for cut in (None, 19, 10):
+        try:
+            dt = datetime.fromisoformat(text if cut is None else text[:cut])
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def age_of(stamp):
+    """(seconds, human) age of an ISO stamp; (None, 'unknown') if unparsable."""
+    dt = parse_date(stamp)
+    if not dt:
+        return None, "unknown age"
+    seconds = max(0.0, (now() - dt).total_seconds())
+    if seconds < 3600:
+        return seconds, f"{seconds / 60:.0f}m old"
+    if seconds < 86400:
+        return seconds, f"{seconds / 3600:.1f}h old"
+    return seconds, f"{seconds / 86400:.1f}d old"
+
+
+def http(url, timeout=25, headers=None, data=None, retries=3, pause=0.0):
+    """One request with backoff. Returns (status, body_bytes, error_or_None).
+
+    NVD throttles hard without an API key and answers 403/429 when it does, so a
+    retryable status sleeps instead of failing the whole refresh.
+    """
+    hdrs = {"User-Agent": UA, "Accept": "application/json"}
+    hdrs.update(headers or {})
+    for attempt in range(retries):
+        if pause:
+            time.sleep(pause)
+        req = urllib.request.Request(url, data=data, headers=hdrs,
+                                     method="POST" if data else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read(), None
+        except urllib.error.HTTPError as e:
+            body = e.read(4000) if e.fp else b""
+            if e.code in (403, 429, 500, 502, 503, 504) and attempt + 1 < retries:
+                time.sleep(min(30.0, 3.0 * 2 ** attempt))
+                continue
+            return e.code, body, f"HTTP {e.code} {e.reason}"
+        except Exception as e:                       # DNS, TLS, timeout, refused
+            if attempt + 1 < retries:
+                time.sleep(min(10.0, 2.0 * 2 ** attempt))
+                continue
+            return None, b"", f"{type(e).__name__}: {e}"
+    return None, b"", "retries exhausted"
+
+
+def get_json(url, **kw):
+    """(doc, error). A malformed body is an error, not an exception."""
+    status, body, err = http(url, **kw)
+    if err:
+        return None, err
+    try:
+        return json.loads(body.decode("utf-8", "replace")), None
+    except ValueError as e:
+        return None, f"malformed JSON from {urllib.parse.urlsplit(url).netloc}: {e}"
+
+
+# ------------------------------------------------------------ version handling
+
+def vkey(version):
+    """Comparable key for a version string, or None if it is not a version.
+
+    Numeric groups in order, with a pre-release marker sorting below the release
+    ('1.6.2rc1' < '1.6.2'). Zero-padded strings ('9.4.0.030') compare as ints.
+    """
+    if not version or not isinstance(version, str):
+        return None
+    text = version.strip().lstrip("vV")
+    if not text or text in ("*", "-", "0"):
+        return ((0,), 0) if text == "0" else None
+    pre = 0
+    m = PRE_RE.search(text)
+    if m:
+        text, pre = text[:m.start()], (1 if m.group(1).lower() == "post" else -1)
+    nums = re.findall(r"\d+", text)
+    if not nums:
+        return None
+    return (tuple(int(n) for n in nums), pre)
+
+
+def vcmp(a, b):
+    """-1/0/1 over two vkey()s, padding the shorter number tuple with zeros."""
+    (na, pa), (nb, pb) = a, b
+    width = max(len(na), len(nb))
+    na = na + (0,) * (width - len(na))
+    nb = nb + (0,) * (width - len(nb))
+    for x, y in zip(na, nb):
+        if x != y:
+            return -1 if x < y else 1
+    return 0 if pa == pb else (-1 if pa < pb else 1)
+
+
+def constraints_of(entry):
+    """[(op, vkey, text)] for one affected entry. Empty list = range unknown."""
+    out = []
+    for op, field in (("<", "fixed"), ("<=", "last_affected"), (">=", "introduced")):
+        key = vkey(entry.get(field) or "")
+        if key and not (field == "introduced" and (entry.get(field) or "").strip() == "0"):
+            out.append((op, key, f"{op} {entry[field]}"))
+    for op, raw in CONSTRAINT_RE.findall(entry.get("raw") or ""):
+        key = vkey(raw)
+        if key:
+            out.append(("==" if op in ("=", "==") else op, key, f"{op} {raw}"))
+    return out
+
+
+def in_range(version, entry):
+    """True / False / None(unknown) for a version against one affected entry."""
+    have = vkey(version)
+    cons = constraints_of(entry)
+    if not have or not cons:
+        return None
+    for op, want, _ in cons:
+        c = vcmp(have, want)
+        ok = {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0, "==": c == 0}[op]
+        if not ok:
+            return False
+    return True
+
+
+# --------------------------------------------------------------- feed ingestion
+
+def blank(rec_id):
+    return {"id": rec_id, "title": "", "published": None, "severity": None, "cvss": None,
+            "cwes": [], "kev": False, "kev_date_added": None, "ransomware": False,
+            "epss": None, "epss_date": None, "nuclei_template": None, "affected": [],
+            "product_hints": [], "references": [], "poc_refs": [], "provenance": []}
+
+
+def merge(index, rec_id, feed, upstream_id, stamp, **fields):
+    """Fold one feed's view of a CVE into the index, keeping provenance per feed."""
+    rec = index.setdefault(rec_id, blank(rec_id))
+    for key, value in fields.items():
+        if value in (None, "", [], False):
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if item not in rec[key]:
+                    rec[key].append(item)
+        elif key in ("cvss", "epss") and rec[key] is not None:
+            rec[key] = max(rec[key], value)
+        elif not rec.get(key):
+            rec[key] = value
+    rec["provenance"].append({"feed": feed, "upstream_id": upstream_id, "fetched_at": stamp})
+    return rec
+
+
+def poc_refs(urls, tagged=()):
+    out = [u for u in tagged if u]
+    out += [u for u in urls if POC_RE.search(u or "") and u not in out]
+    return out[:4]
+
+
+def fetch_kev(index, policy):
+    stamp = iso(now())
+    doc, err = get_json(KEV_URL, timeout=40)
+    if err:
+        return {"status": f"failed: {err}", "records": 0, "url": KEV_URL}
+    cutoff = now() - timedelta(days=policy["kev_window_days"])
+    kept = 0
+    for v in doc.get("vulnerabilities") or []:
+        cve = (v.get("cveID") or "").strip().upper()
+        added = parse_date(v.get("dateAdded"))
+        if not cve.startswith("CVE-") or (added and added < cutoff):
+            continue
+        merge(index, cve, "kev", cve, stamp,
+              title=(v.get("vulnerabilityName") or "")[:160],
+              published=v.get("dateAdded"), kev=True, kev_date_added=v.get("dateAdded"),
+              ransomware=(v.get("knownRansomwareCampaignUse") or "").lower() == "known",
+              cwes=list(v.get("cwes") or [])[:3],
+              product_hints=[(v.get("vendorProject") or "").lower(),
+                             (v.get("product") or "").lower()],
+              affected=[{"package": f"{v.get('vendorProject')}/{v.get('product')}".lower(),
+                         "raw": "", "source": "kev"}])
+        kept += 1
+    return {"status": "ok", "records": kept, "url": KEV_URL, "fetched_at": stamp,
+            "catalog_version": doc.get("catalogVersion"),
+            "note": f"KEV additions newer than {policy['kev_window_days']}d "
+                    f"of {doc.get('count')} total"}
+
+
+def nvd_score(cve):
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        for m in (cve.get("metrics") or {}).get(key) or []:
+            data = m.get("cvssData") or {}
+            if data.get("baseScore") is not None:
+                return float(data["baseScore"]), (data.get("baseSeverity")
+                                                  or m.get("baseSeverity") or "").upper()
+    return None, None
+
+
+def nvd_affected(cve):
+    out = []
+    for config in cve.get("configurations") or []:
+        for node in config.get("nodes") or []:
+            for cpe in node.get("cpeMatch") or []:
+                if not cpe.get("vulnerable"):
+                    continue
+                parts = (cpe.get("criteria") or "").split(":")
+                entry = {"package": ":".join(parts[3:6]) if len(parts) > 5 else
+                         cpe.get("criteria", ""), "source": "nvd", "raw": ""}
+                for field, op in (("versionStartIncluding", ">="),
+                                  ("versionStartExcluding", ">"),
+                                  ("versionEndIncluding", "<="),
+                                  ("versionEndExcluding", "<")):
+                    if cpe.get(field):
+                        entry["raw"] = (entry["raw"] + f" {op} {cpe[field]}").strip()
+                if len(parts) > 5 and parts[5] not in ("*", "-"):
+                    entry["raw"] = (entry["raw"] + f" == {parts[5]}").strip()
+                if entry not in out:
+                    out.append(entry)
+    return out[:12]
+
+
+def fetch_nvd(index, policy):
+    """Recent window, HIGH+CRITICAL only. The window is chunked to NVD's 120-day max."""
+    stamp = iso(now())
+    key = os.environ.get("NVD_API_KEY", "").strip()
+    headers = {"apiKey": key} if key else {}
+    pause = 0.8 if key else 6.5          # 50 req/30s with a key, 5 without
+    end, kept, errors, calls = now(), 0, [], 0
+    start = end - timedelta(days=policy["window_days"])
+    slices, cursor = [], start
+    while cursor < end:
+        nxt = min(end, cursor + timedelta(days=110))
+        slices.append((cursor, nxt))
+        cursor = nxt
+    for lo, hi in slices:
+        for severity in ("CRITICAL", "HIGH"):
+            index_at = 0
+            while True:
+                query = urllib.parse.urlencode({
+                    "pubStartDate": lo.strftime("%Y-%m-%dT%H:%M:%S.000"),
+                    "pubEndDate": hi.strftime("%Y-%m-%dT%H:%M:%S.000"),
+                    "cvssV3Severity": severity, "noRejected": "",
+                    "resultsPerPage": 2000, "startIndex": index_at})
+                doc, err = get_json(f"{NVD_URL}?{query}", headers=headers, timeout=60,
+                                    pause=pause if calls else 0.0)
+                calls += 1
+                if err:
+                    errors.append(f"{severity}: {err}")
+                    break
+                for row in doc.get("vulnerabilities") or []:
+                    cve = row.get("cve") or {}
+                    cve_id = (cve.get("id") or "").upper()
+                    if not cve_id.startswith("CVE-"):
+                        continue
+                    score, sev = nvd_score(cve)
+                    desc = next((d.get("value") for d in cve.get("descriptions") or []
+                                 if d.get("lang") == "en"), "")
+                    refs = [r.get("url") for r in cve.get("references") or []][:6]
+                    tagged = [r.get("url") for r in cve.get("references") or []
+                              if "Exploit" in (r.get("tags") or [])]
+                    affected = nvd_affected(cve)
+                    merge(index, cve_id, "nvd", cve_id, stamp,
+                          title=desc[:200], published=cve.get("published"),
+                          cvss=score, severity=sev,
+                          cwes=[d.get("value") for w in cve.get("weaknesses") or []
+                                for d in w.get("description") or []
+                                if (d.get("value") or "").startswith("CWE")][:3],
+                          kev=bool(cve.get("cisaExploitAdd")),
+                          kev_date_added=cve.get("cisaExploitAdd"),
+                          affected=affected, references=refs,
+                          poc_refs=poc_refs(refs, tagged),
+                          product_hints=sorted({a["package"] for a in affected}))
+                    kept += 1
+                total = doc.get("totalResults") or 0
+                index_at += doc.get("resultsPerPage") or 0
+                if index_at >= total or not doc.get("vulnerabilities"):
+                    break
+    return {"status": "ok" if not errors else f"partial: {'; '.join(errors[:3])}",
+            "records": kept, "url": NVD_URL, "fetched_at": stamp, "requests": calls,
+            "api_key": bool(key),
+            "note": f"published in the last {policy['window_days']}d, HIGH+CRITICAL only"}
+
+
+def fetch_ghsa(index, policy):
+    """Reviewed GitHub advisories. Token-only, so this is the CI path."""
+    stamp = iso(now())
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if not token:
+        return {"status": "skipped: no GITHUB_TOKEN (CI bakes GHSA into the snapshot)",
+                "records": 0, "url": GHSA_URL,
+                "note": "GHSA is fetched only where a token exists, so an engagement "
+                        "needs no new secret; the snapshot carries it instead"}
+    headers = {"Authorization": f"Bearer {token}",
+               "X-GitHub-Api-Version": "2022-11-28",
+               "Accept": "application/vnd.github+json"}
+    window = (f"{(now() - timedelta(days=policy['window_days'])).date()}.."
+              f"{now().date()}")
+    kept, errors = 0, []
+    for severity in ("critical", "high"):
+        for page in range(1, 6):
+            query = urllib.parse.urlencode({"per_page": 100, "page": page,
+                                            "severity": severity, "type": "reviewed",
+                                            "published": window})
+            doc, err = get_json(f"{GHSA_URL}?{query}", headers=headers, timeout=40,
+                                pause=0.3)
+            if err:
+                errors.append(f"{severity} p{page}: {err}")
+                break
+            if not isinstance(doc, list) or not doc:
+                break
+            for adv in doc:
+                if adv.get("withdrawn_at"):
+                    continue
+                ghsa = adv.get("ghsa_id") or ""
+                cve = (adv.get("cve_id") or "").upper()
+                refs = [r for r in adv.get("references") or []][:6]
+                affected = [{"package": f"{(v.get('package') or {}).get('ecosystem')}/"
+                                        f"{(v.get('package') or {}).get('name')}".lower(),
+                             "raw": v.get("vulnerable_version_range") or "",
+                             "fixed": v.get("first_patched_version") or "",
+                             "source": "ghsa"}
+                            for v in adv.get("vulnerabilities") or []][:12]
+                merge(index, cve or ghsa, "ghsa", ghsa, stamp,
+                      title=(adv.get("summary") or "")[:200],
+                      published=adv.get("published_at"),
+                      cvss=(adv.get("cvss") or {}).get("score"),
+                      severity=(adv.get("severity") or "").upper(),
+                      cwes=[c.get("cwe_id") for c in adv.get("cwes") or []][:3],
+                      affected=affected, references=refs + [adv.get("html_url")],
+                      poc_refs=poc_refs(refs),
+                      product_hints=sorted({a["package"] for a in affected}))
+                kept += 1
+            if len(doc) < 100:
+                break
+    return {"status": "ok" if not errors else f"partial: {'; '.join(errors[:3])}",
+            "records": kept, "url": GHSA_URL, "fetched_at": stamp,
+            "note": f"reviewed advisories published {window}, high+critical"}
+
+
+def osv_affected(vuln):
+    out = []
+    for aff in vuln.get("affected") or []:
+        pkg = aff.get("package") or {}
+        base = f"{pkg.get('ecosystem', '')}/{pkg.get('name', '')}".lower()
+        for rng in aff.get("ranges") or []:
+            entry = {"package": base, "raw": "", "source": "osv"}
+            for event in rng.get("events") or []:
+                for field in ("introduced", "fixed", "last_affected"):
+                    if event.get(field):
+                        entry[field] = event[field]
+            if entry not in out:
+                out.append(entry)
+        if not (aff.get("ranges") or []):
+            out.append({"package": base, "raw": "", "source": "osv"})
+    return out[:12]                                  # `versions` lists are dropped: too big
+
+
+def fetch_osv(index, policy):
+    """One query per catalogued package. MAL-* advisories are the supply-chain half."""
+    stamp = iso(now())
+    kept, errors, mal, asked = 0, [], 0, 0
+    for product in PRODUCTS:
+        for ecosystem, name in product["packages"]:
+            payload = json.dumps({"package": {"name": name, "ecosystem": ecosystem}}).encode()
+            doc, err = get_json(OSV_URL, data=payload, timeout=30, pause=0.2,
+                                headers={"Content-Type": "application/json"})
+            asked += 1
+            if err:
+                errors.append(f"{ecosystem}/{name}: {err}")
+                continue
+            for vuln in doc.get("vulns") or []:
+                vid = vuln.get("id") or ""
+                aliases = [a.upper() for a in vuln.get("aliases") or []]
+                cve = next((a for a in aliases if a.startswith("CVE-")), "")
+                specific = vuln.get("database_specific") or {}
+                is_mal = vid.upper().startswith("MAL-")
+                affected = osv_affected(vuln)
+                merge(index, cve or vid, "osv", vid, stamp,
+                      title=(vuln.get("summary") or vuln.get("details") or "")[:200],
+                      published=vuln.get("published"),
+                      severity="CRITICAL" if is_mal else (specific.get("severity") or "").upper(),
+                      cwes=list(specific.get("cwe_ids") or [])[:3],
+                      affected=affected,
+                      references=[r.get("url") for r in vuln.get("references") or []][:6],
+                      poc_refs=poc_refs([r.get("url") for r in vuln.get("references") or []]),
+                      product_hints=sorted({a["package"] for a in affected}
+                                           | {product["name"]}))
+                index[cve or vid]["malicious_package"] = is_mal or index[cve or vid].get(
+                    "malicious_package", False)
+                kept += 1
+                mal += bool(is_mal)
+    return {"status": "ok" if not errors else f"partial: {'; '.join(errors[:3])}",
+            "records": kept, "url": OSV_URL, "fetched_at": stamp,
+            "note": f"{asked} catalogued packages queried, {mal} MAL-* malicious-package "
+                    f"advisories (a MAL hit on a shipped version is the strongest "
+                    f"supply-chain signal there is)"}
+
+
+def fetch_nuclei():
+    """CVE -> template path. The one field that says 'a safe check exists right now'."""
+    stamp = iso(now())
+    status, body, err = http(NUCLEI_URL, timeout=60)
+    if err:
+        return {}, {"status": f"failed: {err}", "records": 0, "url": NUCLEI_URL}
+    mapping = {}
+    for line in body.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue                                 # a malformed line is skipped, not fatal
+        cve = (row.get("ID") or "").strip().upper()
+        if cve.startswith("CVE-") and row.get("file_path"):
+            mapping[cve] = row["file_path"]
+    return mapping, {"status": "ok" if mapping else "failed: no rows parsed",
+                     "records": len(mapping), "url": NUCLEI_URL, "fetched_at": stamp,
+                     "note": "pruned to the CVEs kept in this data set; `nuclei -tl` in "
+                             "the toolbox lists the full template set"}
+
+
+def fetch_epss(index):
+    """Batched by 100. Only for ids already in the set — the full EPSS file is 20MB+."""
+    stamp = iso(now())
+    ids = [i for i in index if i.startswith("CVE-")]
+    done, errors = 0, []
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
+        doc, err = get_json(f"{EPSS_URL}?cve={','.join(batch)}&limit=100", timeout=30,
+                            pause=0.3 if start else 0.0)
+        if err:
+            errors.append(err)
+            continue
+        for row in (doc or {}).get("data") or []:
+            rec = index.get((row.get("cve") or "").upper())
+            if not rec:
+                continue
+            try:
+                rec["epss"] = round(float(row.get("epss")), 5)
+            except (TypeError, ValueError):
+                continue
+            rec["epss_date"] = row.get("date")
+            rec["provenance"].append({"feed": "epss", "upstream_id": rec["id"],
+                                      "fetched_at": stamp})
+            done += 1
+    return {"status": "ok" if not errors else f"partial: {'; '.join(errors[:2])}",
+            "records": done, "url": EPSS_URL, "fetched_at": stamp,
+            "note": "probability of exploitation in the next 30 days; a prediction, "
+                    "not evidence of exploitation"}
+
+
+# -------------------------------------------------------------- prune and build
+
+def prune(records, policy):
+    """The committed-snapshot policy, as one testable function.
+
+    Kept: on KEV, or a MAL-* malicious package, or a nuclei template exists, or
+    inside the window and scoring at least min_cvss / min_epss. Everything else
+    goes, because a snapshot that holds every CVE is a snapshot nobody commits.
+    """
+    cutoff = now() - timedelta(days=policy["window_days"])
+    kev_cutoff = now() - timedelta(days=policy["kev_window_days"])
+    out = []
+    for rec in records:
+        published = parse_date(rec.get("published"))
+        if rec.get("kev"):
+            added = parse_date(rec.get("kev_date_added")) or published
+            if added is None or added >= kev_cutoff:
+                out.append(rec)
+            continue
+        if rec.get("malicious_package"):
+            out.append(rec)
+            continue
+        if published is not None and published < cutoff:
+            continue
+        scored = ((rec.get("cvss") or 0) >= policy["min_cvss"]
+                  or (rec.get("epss") or 0) >= policy["min_epss"])
+        if scored or rec.get("nuclei_template"):
+            out.append(rec)
+    return out
+
+
+def build(policy, feeds=("kev", "nvd", "ghsa", "osv")):
+    """Fetch everything, prune, score. Returns the data document (never raises)."""
+    index, sources = {}, {}
+    templates, sources["nuclei"] = fetch_nuclei()
+    if "kev" in feeds:
+        sources["kev"] = fetch_kev(index, policy)
+    if all(sources[n]["status"].startswith("failed") for n in sources):
+        # Two independent hosts unreachable means there is no network, and walking the
+        # rest costs an unattended engagement minutes of retries for nothing.
+        for name in ("nvd", "ghsa", "osv", "epss"):
+            sources[name] = {"status": "skipped: the first two feeds failed, network "
+                                       "looks unavailable", "records": 0, "url": ""}
+        return {"schema": SCHEMA, "generated_at": iso(now()), "policy": policy,
+                "sources": sources, "records": [], "nuclei": {}}
+    if "nvd" in feeds:
+        sources["nvd"] = fetch_nvd(index, policy)
+    if "ghsa" in feeds:
+        sources["ghsa"] = fetch_ghsa(index, policy)
+    if "osv" in feeds:
+        sources["osv"] = fetch_osv(index, policy)
+    for cve, rec in index.items():
+        rec["nuclei_template"] = templates.get(cve)
+    sources["epss"] = fetch_epss(index)
+    records = prune(list(index.values()), policy)
+    for rec in records:
+        rec["product_hints"] = sorted({h for h in rec["product_hints"] if h})[:12]
+        rec["references"] = [r for r in rec["references"] if r][:6]
+    kept = {r["id"] for r in records}
+    sources["nuclei"]["records"] = len([c for c in templates if c in kept])
+    return {"schema": SCHEMA, "generated_at": iso(now()), "policy": policy,
+            "sources": sources,
+            "records": sorted(records, key=lambda r: r["id"]),
+            "nuclei": {c: p for c, p in sorted(templates.items()) if c in kept}}
+
+
+# ------------------------------------------------------------------ data access
+
+def cache_file(args):
+    if args.cache:
+        return Path(args.cache).expanduser() / "snapshot.json"
+    env = os.environ.get("MYTHOS_CVE_CACHE")
+    if env:
+        return Path(env).expanduser() / "snapshot.json"
+    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(base).expanduser() / "mythos" / "cve" / "snapshot.json"
+
+
+def read_doc(path):
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        return (doc, None) if isinstance(doc, dict) and doc.get("records") is not None \
+            else (None, f"{path}: not a cvefeed snapshot")
+    except Exception as e:
+        return None, f"{path}: {type(e).__name__}: {e}"
+
+
+def load(args, policy):
+    """(doc, provenance). Cache -> live refresh -> committed snapshot, in that order."""
+    cache = cache_file(args)
+    snapshot = Path(args.snapshot) if args.snapshot else SNAPSHOT
+    if not args.refresh:
+        doc, err = read_doc(cache)
+        if doc:
+            seconds, human = age_of(doc.get("generated_at"))
+            if seconds is not None and seconds <= args.ttl_hours * 3600:
+                return doc, {"origin": f"cache {cache}", "age": human, "stale": False,
+                             "generated_at": doc.get("generated_at")}
+    if not args.offline:
+        doc = build(policy)
+        ok = [n for n, s in doc["sources"].items() if s["status"] == "ok"]
+        if doc["records"] or len(ok) >= 2:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(doc), encoding="utf-8")
+            except OSError as e:
+                doc["cache_error"] = str(e)          # read-only FS: use it, don't store it
+            return doc, {"origin": "live refresh", "age": "0m old", "stale": False,
+                         "generated_at": doc["generated_at"]}
+    doc, err = read_doc(snapshot)
+    if not doc:
+        return None, {"origin": "none", "age": "n/a", "stale": True, "error": err,
+                      "generated_at": None}
+    seconds, human = age_of(doc.get("generated_at"))
+    stale = seconds is None or seconds > args.max_age_days * 86400
+    return doc, {"origin": f"committed snapshot {snapshot.relative_to(ROOT)}"
+                 if snapshot.is_relative_to(ROOT) else f"committed snapshot {snapshot}",
+                 "age": human, "stale": stale, "generated_at": doc.get("generated_at"),
+                 "why": "offline" if args.offline else "live refresh unusable"}
+
+
+# ---------------------------------------------------------------------- matching
+
+def catalogued(name):
+    low = (name or "").lower()
+    for product in PRODUCTS:
+        if low == product["name"] or low in product["keywords"]:
+            return product
+    return None
+
+
+def hints_for(name):
+    product = catalogued(name)
+    if product:
+        return [product["name"]] + product["keywords"] + \
+               [f"{e}/{n}".lower() for e, n in product["packages"]]
+    return [(name or "").lower()]
+
+
+def mentions(rec, hints):
+    haystack = " ".join(rec.get("product_hints") or []) + " " + (rec.get("title") or "") + \
+        " " + " ".join(a.get("package", "") for a in rec.get("affected") or [])
+    haystack = haystack.lower()
+    return any(h and h in haystack for h in hints)
+
+
+# Confidence is about the *version*, never about the target being vulnerable.
+CONFIDENCE = {
+    "exact": (3, "the fingerprinted version falls inside the affected range"),
+    "banner": (2, "a version guessed from a banner falls inside the affected range"),
+    "range-unknown": (1, "the product matches but this record has no parsable "
+                         "affected range, so the version was not checked"),
+    "product-only": (0, "the product matches and no version was supplied"),
+}
+
+
+def match_one(rec, want):
+    """(confidence, reason, package) or (None, reason, None) when ruled out."""
+    version, source = want.get("version"), want.get("source") or "banner"
+    if not version:
+        return "product-only", "no version supplied", None
+    checked = []
+    for entry in rec.get("affected") or []:
+        verdict = in_range(version, entry)
+        if verdict is None:
+            continue
+        shown = entry.get("raw") or " ".join(
+            f"{op} {entry[f]}" for op, f in ((">=", "introduced"), ("<", "fixed"),
+                                             ("<=", "last_affected")) if entry.get(f))
+        checked.append((verdict, entry.get("package"), shown))
+        if verdict:
+            conf = "exact" if source == "fingerprint" else "banner"
+            return conf, f"{version} satisfies {shown or 'the affected range'}", \
+                entry.get("package")
+    if checked:
+        return None, (f"{version} is outside every affected range checked "
+                      f"({'; '.join(s for _, _, s in checked[:3])})"), None
+    return "range-unknown", f"no parsable affected range to check {version} against", None
+
+
+def rank_key(cand):
+    """The order `knowledge/techniques/cve-triage-2026.md` prescribes, made precise.
+
+    Five keys, descending, each only breaking ties in the one before it:
+      1 exploitation: 3 KEV+ransomware, 2 KEV, 1 MAL-* malicious package, 0 no
+      2 EPSS band:    3 >= 0.5, 2 >= 0.1, 1 >= 0.01, 0 below or unknown
+      3 version match confidence: exact 3, banner 2, range-unknown 1, product-only 0
+      4 a check exists: 2 nuclei template, 1 other public PoC reference, 0 none
+      5 the raw EPSS, then CVSS, then the id, so the order is stable
+    """
+    rec = cand["record"]
+    exploited = 3 if (rec.get("kev") and rec.get("ransomware")) else \
+        2 if rec.get("kev") else 1 if rec.get("malicious_package") else 0
+    epss = rec.get("epss") or 0.0
+    band = 3 if epss >= 0.5 else 2 if epss >= 0.1 else 1 if epss >= 0.01 else 0
+    check = 2 if rec.get("nuclei_template") else 1 if rec.get("poc_refs") else 0
+    return (-exploited, -band, -CONFIDENCE[cand["confidence"]][0], -check,
+            -epss, -(rec.get("cvss") or 0.0), rec["id"])
+
+
+def why(cand):
+    rec = cand["record"]
+    bits = []
+    if rec.get("kev"):
+        bits.append("CISA KEV: exploited in the wild somewhere" +
+                    (", ransomware campaigns" if rec.get("ransomware") else ""))
+    if rec.get("malicious_package"):
+        bits.append("MAL-*: the package version itself is compromised")
+    if rec.get("epss") is not None:
+        bits.append(f"EPSS {rec['epss']:.3f} (prediction, not evidence)")
+    bits.append(f"version match: {cand['confidence']} — {cand['reason']}")
+    if rec.get("nuclei_template"):
+        bits.append(f"nuclei template exists: {rec['nuclei_template']}")
+    elif rec.get("poc_refs"):
+        bits.append("public PoC reference (unverified)")
+    return "; ".join(bits)
+
+
+def wants_from(args):
+    out = []
+    for raw, source in [(x, "fingerprint") for x in args.fingerprint] + \
+                       [(x, "banner") for x in args.banner] + \
+                       [(x, None) for x in args.product]:
+        name, _, version = raw.partition("@")
+        if not version:
+            name, _, version = raw.partition("/")   # 'nginx/1.18.0' banner shape
+        if not name.strip():
+            raise SystemExit(f"cvefeed: bad product {raw!r}: expected NAME[@VERSION]")
+        out.append({"name": name.strip().lower(), "version": version.strip() or None,
+                    "source": source or ("banner" if version else None)})
+    if args.from_probe:
+        doc = json.load(sys.stdin)
+        for tech in doc.get("technology") or []:
+            name, _, version = tech.partition("/")
+            out.append({"name": name.strip().lower(), "version": version.strip() or None,
+                        "source": "banner"})        # probe reads it off a header
+    return out
+
+
+def match(doc, wants, limit):
+    cands, excluded = [], []
+    for want in wants:
+        hints = hints_for(want["name"])
+        for rec in doc.get("records") or []:
+            if not mentions(rec, hints):
+                continue
+            confidence, reason, package = match_one(rec, want)
+            if confidence is None:
+                excluded.append({"id": rec["id"], "product": want["name"], "reason": reason})
+                continue
+            cands.append({"record": rec, "product": want["name"],
+                          "version": want.get("version"),
+                          "version_source": want.get("source") or "none",
+                          "confidence": confidence, "reason": reason, "package": package})
+    cands.sort(key=rank_key)
+    seen, unique = set(), []
+    for cand in cands:
+        token = (cand["record"]["id"], cand["product"])
+        if token not in seen:
+            seen.add(token)
+            unique.append(cand)
+    return unique[:limit], excluded
+
+
+# --------------------------------------------------------------------- rendering
+
+DISCLAIMER = ("Candidates are aim points, not findings. Nothing here says the target is "
+              "vulnerable: a KEV entry means exploited in the wild somewhere, EPSS is a "
+              "prediction, and a version match is only as good as the fingerprint it came "
+              "from. Confirm each one with the non-destructive oracle from the "
+              "cve-deep-dive skill before it goes in a report.")
+
+
+def source_line(doc):
+    return ", ".join(f"{name} {info.get('records', 0)}({info['status'].split(':')[0]})"
+                     for name, info in (doc.get("sources") or {}).items())
+
+
+def provenance_block(doc, prov):
+    lines = [f"data: {prov['origin']}, generated {prov.get('generated_at') or '?'} "
+             f"({prov['age']})" + ("  ** STALE **" if prov.get("stale") else "")]
+    if prov.get("why"):
+        lines.append(f"why this source: {prov['why']}")
+    if prov.get("stale"):
+        lines.append("STALE: this data is older than the freshness window. Treat every row "
+                     "as possibly out of date and refresh before you rely on it.")
+    for name, info in (doc.get("sources") or {}).items():
+        age = age_of(info.get("fetched_at"))[1] if info.get("fetched_at") else "not fetched"
+        lines.append(f"  {name:<7} {info['status']:<58.58} {info.get('records', 0):>5} rec  "
+                     f"{age}")
+        if info.get("note"):
+            lines.append(f"          {info['note']}")
+    return lines
+
+
+def render_match(doc, prov, wants, cands, excluded):
+    asked = ", ".join(f"{w['name']}{'@' + w['version'] if w.get('version') else ''}"
+                      f" ({w.get('source') or 'no version'})" for w in wants)
+    out = [f"# CVE candidates for {asked or '(nothing asked)'}", ""]
+    out += provenance_block(doc, prov) + [""]
+    out.append(f"{len(cands)} candidate(s) worth testing, {len(excluded)} ruled out by "
+               f"version, from {len(doc.get('records') or [])} records in the set")
+    out.append("")
+    for n, cand in enumerate(cands, 1):
+        rec = cand["record"]
+        flags = " ".join(filter(None, [
+            "KEV" + ("+RANSOMWARE" if rec.get("ransomware") else "") if rec.get("kev") else "",
+            "MAL" if rec.get("malicious_package") else "",
+            f"epss={rec['epss']:.3f}" if rec.get("epss") is not None else "epss=?",
+            f"cvss={rec['cvss']}" if rec.get("cvss") else "",
+            f"match={cand['confidence']}"]))
+        out.append(f"{n}. {rec['id']}  [{cand['product']}]  {flags}")
+        if rec.get("title"):
+            out.append(f"   {rec['title'][:140]}")
+        out.append(f"   why here: {why(cand)}")
+        if rec.get("nuclei_template"):
+            out.append(f"   confirm:  scripts/mythos nuclei -id {rec['id'].lower()} "
+                       f"-u <target>   ({rec['nuclei_template']})")
+        feeds = ", ".join(sorted({f"{p['feed']}:{p['upstream_id']}"
+                                  for p in rec.get("provenance") or []}))
+        out.append(f"   from:     {feeds}")
+        if rec.get("references"):
+            out.append(f"   refs:     {' '.join(rec['references'][:2])}")
+        out.append("")
+    if excluded:
+        out += ["## ruled out by version (kept for the report's honesty)", ""]
+        out += [f"- {e['id']} [{e['product']}]: {e['reason']}" for e in excluded[:20]]
+        out.append("")
+    out += [DISCLAIMER]
+    return "\n".join(out)
+
+
+def match_json(doc, prov, wants, cands, excluded):
+    return {"generated_at": iso(now()), "data": {**prov, "sources": doc.get("sources", {}),
+                                                 "records_in_set": len(doc.get("records") or []),
+                                                 "policy": doc.get("policy")},
+            "requested": wants,
+            "ranking": "kev > epss band > version-match confidence > nuclei/PoC; see "
+                       "knowledge/techniques/cve-triage-2026.md",
+            "candidates": [{
+                "id": c["record"]["id"], "product": c["product"], "version": c["version"],
+                "version_source": c["version_source"], "match_confidence": c["confidence"],
+                "match_reason": c["reason"], "matched_package": c["package"],
+                "kev": bool(c["record"].get("kev")),
+                "kev_date_added": c["record"].get("kev_date_added"),
+                "ransomware": bool(c["record"].get("ransomware")),
+                "malicious_package": bool(c["record"].get("malicious_package")),
+                "epss": c["record"].get("epss"), "epss_date": c["record"].get("epss_date"),
+                "cvss": c["record"].get("cvss"), "severity": c["record"].get("severity"),
+                "cwes": c["record"].get("cwes"), "title": c["record"].get("title"),
+                "nuclei_template": c["record"].get("nuclei_template"),
+                "poc_refs": c["record"].get("poc_refs"),
+                "affected": c["record"].get("affected"),
+                "references": c["record"].get("references"),
+                "provenance": c["record"].get("provenance"),
+                "why": why(c)} for c in cands],
+            "excluded_by_version": excluded,
+            "disclaimer": DISCLAIMER}
+
+
+def render_status(doc, prov):
+    out = ["# cvefeed data status", ""] + provenance_block(doc, prov)
+    policy = doc.get("policy") or {}
+    out += ["", f"policy: {json.dumps(policy)}",
+            f"records: {len(doc.get('records') or [])}, "
+            f"on KEV: {sum(1 for r in doc['records'] if r.get('kev'))}, "
+            f"with a nuclei template: "
+            f"{sum(1 for r in doc['records'] if r.get('nuclei_template'))}, "
+            f"MAL-*: {sum(1 for r in doc['records'] if r.get('malicious_package'))}",
+            f"cache: {cache_file_display(doc)}"]
+    return "\n".join(out)
+
+
+def cache_file_display(doc):
+    return doc.get("_cache_display", "(see --cache / MYTHOS_CVE_CACHE)")
+
+
+def render_products():
+    out = ["# fingerprints cvefeed knows", "",
+           "Unauthenticated RCE keeps landing in this software and gets exploited within",
+           "hours. Fingerprint it in recon, then pass the version here. The paths are",
+           "hints: confirm against the response you actually get.", ""]
+    for p in PRODUCTS:
+        out.append(f"## {p['name']}" + (f"  (default port {p['port']})" if p["port"] else ""))
+        out.append(f"version: {p['fingerprint']}")
+        if p["packages"]:
+            out.append("packages: " + ", ".join(f"{e}/{n}" for e, n in p["packages"]))
+        out.append("aliases: " + ", ".join(p["keywords"]))
+        out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------- selftest
+
+def _selftest():
+    fixture = ROOT / "knowledge" / "cve" / "selftest-fixture.json"
+    doc, err = read_doc(fixture)
+    assert doc and not err, err
+
+    # version keys and comparison, including zero-padded and pre-release forms
+    assert vcmp(vkey("1.6.0"), vkey("1.6.2")) < 0 and vcmp(vkey("9.4.0.030"),
+                                                           vkey("9.4.0.29")) > 0
+    assert vcmp(vkey("1.6.2rc1"), vkey("1.6.2")) < 0 and vcmp(vkey("1.2"), vkey("1.2.0")) == 0
+    assert vkey("") is None and vkey("unknown") is None
+
+    # ranges: fixed / last_affected / GHSA raw strings / unparsable
+    assert in_range("1.6.0", {"fixed": "1.6.2"}) is True
+    assert in_range("1.7.0", {"fixed": "1.6.2"}) is False
+    assert in_range("1.0.18", {"last_affected": "1.0.18"}) is True
+    assert in_range("2.0.0", {"raw": ">= 1.14.0, < 35.9.1"}) is True
+    assert in_range("36.0.0", {"raw": ">= 1.14.0, < 35.9.1"}) is False
+    assert in_range("1.0.0", {"package": "x/y"}) is None
+
+    # confidence levels: fingerprint vs banner vs no range vs no version
+    def conf(**want):
+        cands, excl = match(doc, [want], 20)
+        return {c["record"]["id"]: c["confidence"] for c in cands}, excl
+    got, _ = conf(name="langflow", version="1.6.0", source="fingerprint")
+    assert got["CVE-2026-5027"] == "exact", got
+    assert got["CVE-2026-33017"] == "range-unknown", got
+    got, _ = conf(name="langflow", version="1.6.0", source="banner")
+    assert got["CVE-2026-5027"] == "banner", got
+    got, _ = conf(name="langflow", version=None, source=None)
+    assert set(got.values()) == {"product-only"}, got
+    got, excl = conf(name="langflow", version="9.9.9", source="fingerprint")
+    assert "CVE-2026-5027" not in got and any(e["id"] == "CVE-2026-5027" for e in excl)
+    assert "9.9.9 is outside" in excl[0]["reason"]
+
+    # ranking: KEV+ransomware, then KEV, then EPSS band, then confidence, then a template
+    cands, _ = match(doc, [{"name": "langflow", "version": "1.6.0",
+                            "source": "fingerprint"},
+                           {"name": "flowise", "version": "3.0.0", "source": "banner"},
+                           {"name": "n8n", "version": None, "source": None}], 20)
+    order = [c["record"]["id"] for c in cands]
+    assert order == ["CVE-2026-5027", "MAL-2026-0001", "CVE-2025-59528",
+                     "CVE-2026-33017", "CVE-2026-00000"], order
+    assert "CISA KEV" in why(cands[0]) and "nuclei template exists" in why(cands[0])
+
+    # pruning: window, severity/EPSS floor, and the keep-anyway cases
+    policy = {"window_days": 30, "kev_window_days": 365, "min_cvss": 7.0, "min_epss": 0.05}
+    recent, old = iso(now() - timedelta(days=2)), iso(now() - timedelta(days=400))
+    rows = [{"id": "keep-kev", "kev": True, "kev_date_added": iso(now() - timedelta(days=3))},
+            {"id": "drop-old-kev", "kev": True, "kev_date_added": old},
+            {"id": "keep-mal", "malicious_package": True, "published": old},
+            {"id": "drop-old", "published": old, "cvss": 9.9},
+            {"id": "drop-low", "published": recent, "cvss": 4.0, "epss": 0.001},
+            {"id": "keep-cvss", "published": recent, "cvss": 8.1},
+            {"id": "keep-epss", "published": recent, "cvss": 5.0, "epss": 0.2},
+            {"id": "keep-template", "published": recent, "cvss": 3.0,
+             "nuclei_template": "http/cves/x.yaml"}]
+    kept = {r["id"] for r in prune(rows, policy)}
+    assert kept == {"keep-kev", "keep-mal", "keep-cvss", "keep-epss", "keep-template"}, kept
+
+    # stale-snapshot fallback: offline, no cache, and the age is spelled out
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        args = Args(snapshot=str(fixture), offline=True, cache=d, max_age_days=7)
+        got, prov = load(args, policy)
+        assert got and prov["origin"].startswith("committed snapshot")
+        assert prov["stale"] and prov["why"] == "offline"
+        text = render_match(got, prov, [{"name": "langflow", "version": "1.6.0",
+                                         "source": "fingerprint"}], *match(
+            got, [{"name": "langflow", "version": "1.6.0", "source": "fingerprint"}], 10))
+        assert "** STALE **" in text and "d old" in text and DISCLAIMER[:40] in text
+        # a fresh cache wins over everything and is never reported as stale
+        fresh = dict(got, generated_at=iso(now()))
+        Path(d, "snapshot.json").write_text(json.dumps(fresh))
+        got2, prov2 = load(args, policy)
+        assert prov2["origin"].startswith("cache") and not prov2["stale"]
+        # no snapshot at all degrades to None, not a traceback
+        none, prov3 = load(Args(snapshot=str(Path(d) / "nope.json"), offline=True,
+                                cache=str(Path(d) / "empty")), policy)
+        assert none is None and prov3["origin"] == "none" and prov3["error"]
+
+    # the JSON shape recon writes and the planner reads
+    blob = match_json(doc, {"origin": "test", "age": "0m old", "stale": False,
+                            "generated_at": iso(now())},
+                      [{"name": "langflow", "version": "1.6.0", "source": "fingerprint"}],
+                      *match(doc, [{"name": "langflow", "version": "1.6.0",
+                                    "source": "fingerprint"}], 10))
+    assert json.loads(json.dumps(blob))["candidates"][0]["match_confidence"] == "exact"
+    assert blob["candidates"][0]["provenance"][0]["feed"] == "kev"
+    print("cvefeed selftest ok")
+
+
+class Args:
+    """The handful of fields load() reads, for the selftest."""
+
+    def __init__(self, **kw):
+        self.refresh = kw.get("refresh", False)
+        self.offline = kw.get("offline", False)
+        self.cache = kw.get("cache")
+        self.snapshot = kw.get("snapshot")
+        self.ttl_hours = kw.get("ttl_hours", 6)
+        self.max_age_days = kw.get("max_age_days", 7)
+
+
+# -------------------------------------------------------------------------- CLI
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
+    ap = argparse.ArgumentParser(prog="scripts/cvefeed", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the offline asserts against the committed fixture and exit")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def shared(parser, with_policy=True):
+        parser.add_argument("--cache", help="cache directory (default "
+                            "$MYTHOS_CVE_CACHE, else $XDG_CACHE_HOME/mythos/cve; "
+                            "point it at engagements/<dir>/.cve-cache to keep it with "
+                            "the engagement). Never written inside the repo.")
+        parser.add_argument("--ttl-hours", type=float, default=6,
+                            help="reuse the cache if it is younger than this (default 6)")
+        parser.add_argument("--snapshot", help=f"committed snapshot to fall back to "
+                            f"(default {SNAPSHOT.relative_to(ROOT)})")
+        parser.add_argument("--max-age-days", type=float, default=7,
+                            help="older than this and the data is reported STALE (default 7)")
+        parser.add_argument("--offline", action="store_true",
+                            help="never touch the network: cache, else snapshot")
+        parser.add_argument("--refresh", action="store_true",
+                            help="ignore a fresh cache and fetch the feeds first")
+        parser.add_argument("--json", action="store_true")
+        if with_policy:
+            parser.add_argument("--window-days", type=int, default=30,
+                                help="NVD/GHSA/OSV publication window (default 30)")
+            parser.add_argument("--kev-window-days", type=int, default=365,
+                                help="how far back KEV additions are kept (default 365)")
+            parser.add_argument("--min-cvss", type=float, default=7.0)
+            parser.add_argument("--min-epss", type=float, default=0.05)
+
+    p_status = sub.add_parser("status", help="age and provenance of every record set")
+    shared(p_status)
+
+    p_refresh = sub.add_parser("refresh", help="fetch the feeds into the cache, or write "
+                                               "the committed snapshot with --out")
+    shared(p_refresh)
+    p_refresh.add_argument("--out", help="directory to write snapshot.json into "
+                                         "(the scheduled workflow uses knowledge/cve)")
+
+    p_match = sub.add_parser("match", help="rank the CVEs worth testing for a fingerprint")
+    shared(p_match)
+    p_match.add_argument("--fingerprint", action="append", default=[], metavar="NAME@VERSION",
+                         help="exact version read off the product itself, repeatable")
+    p_match.add_argument("--banner", action="append", default=[], metavar="NAME@VERSION",
+                         help="version guessed from a banner or header, repeatable")
+    p_match.add_argument("--product", action="append", default=[], metavar="NAME",
+                         help="product with no version at all, repeatable")
+    p_match.add_argument("--from-probe", action="store_true",
+                         help="read `scripts/probe --json` on stdin and take its "
+                              "technology list as banner-confidence versions")
+    p_match.add_argument("--limit", type=int, default=25)
+
+    sub.add_parser("products", help="the fingerprints it knows and where the version leaks")
+
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return 2
+    if args.cmd == "products":
+        print(render_products())
+        return 0
+
+    policy = {"window_days": args.window_days, "kev_window_days": args.kev_window_days,
+              "min_cvss": args.min_cvss, "min_epss": args.min_epss}
+
+    if args.cmd == "refresh" and args.out:
+        doc = build(policy)
+        failed = [n for n, s in doc["sources"].items() if s["status"].startswith("failed")]
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "snapshot.json").write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n",
+                                           encoding="utf-8")
+        size = (out / "snapshot.json").stat().st_size
+        if args.json:
+            print(json.dumps({"snapshot": str(out / "snapshot.json"), "bytes": size,
+                              "records": len(doc["records"]), "sources": doc["sources"]},
+                             indent=1))
+        else:
+            print(f"wrote {out / 'snapshot.json'}  {size / 1024:.0f} KiB, "
+                  f"{len(doc['records'])} records")
+            print(source_line(doc))
+        return 1 if len(failed) >= 3 else 0          # a snapshot missing most feeds is a CI fail
+
+    doc, prov = load(args, policy)
+    if doc is None:
+        print(f"cvefeed: no data at all ({prov.get('error')}). Run `scripts/cvefeed refresh` "
+              f"with network, or commit a snapshot.", file=sys.stderr)
+        return 1
+    doc["_cache_display"] = str(cache_file(args))
+
+    if args.cmd in ("status", "refresh"):
+        print(json.dumps({"data": prov, "sources": doc.get("sources"),
+                          "policy": doc.get("policy"),
+                          "records": len(doc.get("records") or []),
+                          "cache": doc["_cache_display"]}, indent=1)
+              if args.json else render_status(doc, prov))
+        return 0
+
+    wants = wants_from(args)
+    if not wants:
+        print("cvefeed match: give --fingerprint/--banner/--product, or --from-probe",
+              file=sys.stderr)
+        return 2
+    cands, excluded = match(doc, wants, args.limit)
+    print(json.dumps(match_json(doc, prov, wants, cands, excluded), indent=1)
+          if args.json else render_match(doc, prov, wants, cands, excluded))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

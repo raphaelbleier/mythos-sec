@@ -1,0 +1,80 @@
+{
+ "schema": 1,
+ "generated_at": "2026-09-01T00:00:00Z",
+ "_comment": "Fixture for `scripts/cvefeed --selftest`. Hand-written, deliberately stale, NOT live data: the ids and scores are shaped to exercise the ranking, the four version-match confidence levels, the stale-snapshot fallback and the pruning policy. Never read it for real triage.",
+ "policy": {"window_days": 30, "kev_window_days": 365, "min_cvss": 7.0, "min_epss": 0.05},
+ "sources": {
+  "kev": {"status": "ok", "records": 2, "url": "fixture", "fetched_at": "2026-09-01T00:00:00Z"},
+  "nuclei": {"status": "ok", "records": 1, "url": "fixture", "fetched_at": "2026-09-01T00:00:00Z"},
+  "epss": {"status": "ok", "records": 4, "url": "fixture", "fetched_at": "2026-09-01T00:00:00Z"}
+ },
+ "nuclei": {"CVE-2026-5027": "http/cves/2026/CVE-2026-5027.yaml"},
+ "records": [
+  {
+   "id": "CVE-2026-5027",
+   "title": "Langflow unauthenticated code execution (fixture)",
+   "published": "2026-08-20T00:00:00Z",
+   "severity": "CRITICAL", "cvss": 9.8, "cwes": ["CWE-94"],
+   "kev": true, "kev_date_added": "2026-08-25", "ransomware": false,
+   "epss": 0.912, "epss_date": "2026-08-31",
+   "nuclei_template": "http/cves/2026/CVE-2026-5027.yaml",
+   "affected": [{"package": "pypi/langflow", "raw": "", "fixed": "1.6.2", "source": "osv"}],
+   "product_hints": ["langflow", "pypi/langflow"],
+   "references": ["https://nvd.nist.gov/vuln/detail/CVE-2026-5027"],
+   "poc_refs": [],
+   "provenance": [
+    {"feed": "kev", "upstream_id": "CVE-2026-5027", "fetched_at": "2026-09-01T00:00:00Z"},
+    {"feed": "osv", "upstream_id": "GHSA-fixt-ure0-0001", "fetched_at": "2026-09-01T00:00:00Z"}
+   ]
+  },
+  {
+   "id": "CVE-2026-33017",
+   "title": "Langflow advisory without a parsable affected range (fixture)",
+   "published": "2026-08-22T00:00:00Z",
+   "severity": "CRITICAL", "cvss": 9.8, "cwes": ["CWE-94"],
+   "kev": false, "ransomware": false,
+   "epss": 0.4, "epss_date": "2026-08-31",
+   "nuclei_template": null,
+   "affected": [{"package": "pypi/langflow", "raw": "", "source": "nvd"}],
+   "product_hints": ["langflow", "pypi/langflow"],
+   "references": [], "poc_refs": [],
+   "provenance": [{"feed": "nvd", "upstream_id": "CVE-2026-33017", "fetched_at": "2026-09-01T00:00:00Z"}]
+  },
+  {
+   "id": "MAL-2026-0001",
+   "title": "Malicious version of the flowise package (fixture)",
+   "published": "2026-08-28T00:00:00Z",
+   "severity": "CRITICAL", "cvss": null, "cwes": [],
+   "kev": false, "ransomware": false, "malicious_package": true,
+   "epss": null, "epss_date": null, "nuclei_template": null,
+   "affected": [{"package": "npm/flowise", "raw": "", "introduced": "3.0.0", "last_affected": "3.0.0", "source": "osv"}],
+   "product_hints": ["flowise", "npm/flowise"],
+   "references": [], "poc_refs": [],
+   "provenance": [{"feed": "osv", "upstream_id": "MAL-2026-0001", "fetched_at": "2026-09-01T00:00:00Z"}]
+  },
+  {
+   "id": "CVE-2025-59528",
+   "title": "Flowise remote code execution (fixture)",
+   "published": "2026-08-15T00:00:00Z",
+   "severity": "CRITICAL", "cvss": 10.0, "cwes": ["CWE-94"],
+   "kev": false, "ransomware": false,
+   "epss": 0.917, "epss_date": "2026-08-31", "nuclei_template": null,
+   "affected": [{"package": "npm/flowise", "raw": "", "fixed": "3.0.2", "source": "ghsa"}],
+   "product_hints": ["flowise", "npm/flowise"],
+   "references": [], "poc_refs": ["https://github.com/example/CVE-2025-59528-poc"],
+   "provenance": [{"feed": "ghsa", "upstream_id": "GHSA-fixt-ure0-0002", "fetched_at": "2026-09-01T00:00:00Z"}]
+  },
+  {
+   "id": "CVE-2026-00000",
+   "title": "n8n low-interest advisory (fixture)",
+   "published": "2026-08-10T00:00:00Z",
+   "severity": "HIGH", "cvss": 7.5, "cwes": [],
+   "kev": false, "ransomware": false,
+   "epss": 0.005, "epss_date": "2026-08-31", "nuclei_template": null,
+   "affected": [{"package": "npm/n8n", "raw": "< 1.60.0", "source": "ghsa"}],
+   "product_hints": ["n8n", "npm/n8n"],
+   "references": [], "poc_refs": [],
+   "provenance": [{"feed": "ghsa", "upstream_id": "GHSA-fixt-ure0-0003", "fetched_at": "2026-09-01T00:00:00Z"}]
+  }
+ ]
+}
