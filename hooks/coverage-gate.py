@@ -24,17 +24,18 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def engagement():
-    """The newest engagement directory, preferring one that already has a surface map.
+    """The newest engagement directory.
 
     The agent may write under the working directory or under the repo, so check both.
+    Newest wins even when it carries no surface map: an older engagement that does carry
+    one would otherwise hijack the gate, which then checks the wrong report. `ensure_map`
+    maps the current engagement when the agent skipped recon.
     """
     roots = ([Path(os.environ["MYTHOS_ENGAGEMENTS"])] if os.environ.get("MYTHOS_ENGAGEMENTS")
              else [Path.cwd() / "engagements", REPO / "engagements"])
     dirs = [d for r in roots for d in r.glob("*") if d.is_dir()]
-    mapped = [d for d in dirs if (d / "surface.json").exists()]
-    pool = mapped or dirs
-    if pool:
-        return max(pool, key=lambda d: d.stat().st_mtime)
+    if dirs:
+        return max(dirs, key=lambda d: d.stat().st_mtime)
     f = os.environ.get("MYTHOS_SCOPE")      # no engagement dir: the run's own workspace
     return Path(f).parent if f and Path(f).exists() else None
 
