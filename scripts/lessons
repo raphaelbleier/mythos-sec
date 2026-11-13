@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Read back what past engagements learned, and say what to try first.
+
+`hooks/lessons-record.py` appends one record per finding to a ledger at the end
+of every engagement. This reads that ledger.
+
+Two questions it answers:
+
+  prior    Of the findings this framework has WRITTEN DOWN for a class, how
+           many survived validation? Recon calls this after fingerprinting and
+           the planner uses it to order work inside a phase.
+
+           Read the denominator carefully. It is findings reported, not classes
+           attempted, because nothing in the engagement records "I tested this
+           class and found nothing". So `prior` measures precision among
+           reported findings, not yield: a class with 4/5 is one the framework
+           is rarely wrong about when it speaks up, which is not the same as
+           one that pays off often. Treat it as a tie-breaker, not a plan.
+
+  suspect  Which playbooks have never confirmed anything? A knowledge note
+           whose oracle never fires across many attempts is either wrong, or
+           describes something this toolbox cannot actually prove. Either way
+           a human should look at it. This is the one output aimed at the
+           maintainer rather than at a run.
+
+Ranking uses the lower bound of a Wilson 95% interval, not the raw rate, so one
+lucky confirmation out of one attempt does not outrank four out of five. With
+no history, every class ties and the caller keeps its own default order: an
+empty ledger must not silently reorder an engagement.
+
+## This is an untested hypothesis, not a measured improvement
+
+No published result supports the specific thing this does. A literature review
+in November 2026 found that none of Reflexion, Voyager, ExpeL, Agent Workflow
+Memory or Generative Agents records outcomes per task class and re-ranks later
+work by them; they store text lessons, workflows or code and retrieve by
+similarity. Nothing tests cross-engagement memory for security work at all.
+
+What the closest evidence says is worse than nothing:
+
+  In an independent replication (Ye et al., August 2026, GPT-5-mini, 3 runs),
+  Agent Workflow Memory scored 54.1% against a 54.8% no-memory baseline on
+  WebArena, and ReasoningBank gained 1.5 points at p = 0.23. Under shuffled
+  task order both fell 4 to 5 points BELOW the baseline.
+
+  In SkillsBench (84 tasks, 7 configurations, 5 trials per task), curated
+  skills written by hand gained 16.2 points on average while skills the agent
+  wrote for itself lost 1.3 points.
+
+Task-order overfitting, negative transfer and memory poisoning all have
+published support as failure modes. So three limits are built in deliberately:
+the ledger never reorders the phases, only the priority inside a phase; a stack
+with fewer than MIN_STACK_RECORDS records falls back to the global history
+rather than ranking from noise; and the Wilson lower bound keeps a single lucky
+confirmation from winning. None of that makes it work. It makes it cheap to be
+wrong about, and auditable, which is the most that can be claimed until someone
+measures it on this framework with repeats and a shuffled-order control.
+
+The `suspect` output is on firmer ground, because it is a maintainer's
+diagnostic rather than a claim about agent performance: a playbook with no
+confirmations across many attempts is a fact about the playbook.
+
+Records carry a salted hash of the target, never the hostname, so `seen` needs
+the same machine's salt to recognise a target it has tested before.
+
+Stdlib only, no network. `--selftest` runs the asserts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+# Only `validated` counts. `reproduced` means the request was re-sent by hand;
+# it does not require the validator pass, so counting it would let the agent
+# raise its own score by relabelling.
+CONFIRMED = {"validated"}
+# Below this many records for a stack, fall back to the global history: a
+# ranking from two observations is noise dressed as evidence.
+MIN_STACK_RECORDS = 8
+# A playbook needs this many attempts before "never confirmed" means anything.
+SUSPECT_MIN_ATTEMPTS = 6
+
+
+def ledger_path(explicit: str | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    env = os.environ.get("MYTHOS_LESSONS")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".mythos" / "lessons.jsonl"
+
+
+def load(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # a torn append costs one line, not the file
+        if isinstance(row, dict) and row.get("class"):
+            rows.append(row)
+    return rows
+
+
+def wilson_lower(hits: int, n: int, z: float = 1.96) -> float:
+    """Lower bound of the Wilson score interval. 0.0 for no observations."""
+    if n == 0:
+        return 0.0
+    p = hits / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, (centre - margin) / denom)
+
+
+def _tokens(value) -> set[str]:
+    if not value:
+        return set()
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    return {str(v).strip().lower() for v in value if str(v).strip()}
+
+
+def tally(rows: list[dict], stack: set[str]) -> tuple[dict, bool]:
+    """(class -> {hits, attempts}, whether the stack filter was applied)."""
+    scoped = rows
+    used_stack = False
+    if stack:
+        matching = [r for r in rows if _tokens(r.get("stack")) & stack]
+        if len(matching) >= MIN_STACK_RECORDS:
+            scoped, used_stack = matching, True
+    out: dict[str, dict] = defaultdict(lambda: {"hits": 0, "attempts": 0})
+    for r in scoped:
+        entry = out[str(r["class"]).lower()]
+        entry["attempts"] += 1
+        if str(r.get("state", "")).lower() in CONFIRMED:
+            entry["hits"] += 1
+    return dict(out), used_stack
+
+
+def prior(rows: list[dict], stack: set[str]) -> dict:
+    counts, used_stack = tally(rows, stack)
+    ranked = sorted(
+        ({"class": k,
+          "hits": v["hits"],
+          "attempts": v["attempts"],
+          "rate": round(v["hits"] / v["attempts"], 3) if v["attempts"] else 0.0,
+          "score": round(wilson_lower(v["hits"], v["attempts"]), 3)}
+         for k, v in counts.items()),
+        key=lambda e: (-e["score"], -e["attempts"], e["class"]))
+    return {"records": len(rows), "stack_filtered": used_stack,
+            "stack": sorted(stack), "classes": ranked}
+
+
+def suspect(rows: list[dict]) -> dict:
+    by_playbook: dict[str, dict] = defaultdict(lambda: {"hits": 0, "attempts": 0})
+    for r in rows:
+        key = str(r.get("playbook") or r.get("class") or "").lower()
+        if not key:
+            continue
+        by_playbook[key]["attempts"] += 1
+        if str(r.get("state", "")).lower() in CONFIRMED:
+            by_playbook[key]["hits"] += 1
+    out = [{"playbook": k, "attempts": v["attempts"], "hits": v["hits"]}
+           for k, v in by_playbook.items()
+           if v["hits"] == 0 and v["attempts"] >= SUSPECT_MIN_ATTEMPTS]
+    return {"threshold": SUSPECT_MIN_ATTEMPTS,
+            "suspect": sorted(out, key=lambda e: -e["attempts"])}
+
+
+def seen(rows: list[dict], host: str, ledger: Path) -> dict:
+    salt_file = ledger.parent / ".salt"
+    salt = salt_file.read_text().strip() if salt_file.exists() else ""
+    thash = hashlib.sha256((salt + host).encode()).hexdigest()[:16]
+    hits = [r for r in rows if r.get("target") == thash]
+    return {"target_hash": thash, "records": len(hits),
+            "classes": sorted({str(r["class"]) for r in hits}),
+            "rejected": sorted({str(r["class"]) for r in hits
+                                if str(r.get("state", "")).lower() == "rejected"})}
+
+
+def _text(result: dict, mode: str) -> str:
+    if mode == "prior":
+        if not result["classes"]:
+            return ("No history yet. Keep the default phase order; this ledger "
+                    "starts paying off after a few engagements.")
+        scope = ("this stack" if result["stack_filtered"]
+                 else f"all targets ({result['records']} records)")
+        lines = [f"Classes by validation rate among reported findings on {scope}:",
+                 "  (denominator is findings written, not classes attempted:",
+                 "   this is precision when the framework speaks up, not yield)"]
+        for e in result["classes"]:
+            lines.append(f"  {e['score']:.2f}  {e['class']:<28} "
+                         f"{e['hits']}/{e['attempts']} validated")
+        if not result["stack_filtered"] and result["stack"]:
+            lines.append(f"  (fewer than {MIN_STACK_RECORDS} records for "
+                         f"{', '.join(result['stack'])}, so this is the global "
+                         f"history)")
+        return "\n".join(lines)
+    if mode == "suspect":
+        if not result["suspect"]:
+            return (f"No playbook has {result['threshold']}+ attempts without a "
+                    f"confirmation.")
+        lines = ["Playbooks whose reported findings never survived validation:"]
+        for e in result["suspect"]:
+            lines.append(f"  {e['playbook']:<32} 0/{e['attempts']}")
+        lines.append("Either the oracle is wrong, the toolbox cannot prove it, or "
+                     "the playbook encourages reporting what it cannot confirm. "
+                     "Read the note before trusting it again; the three causes "
+                     "look identical from here.")
+        return "\n".join(lines)
+    if not result["records"]:
+        return "This target has no history in the ledger."
+    lines = [f"Tested before: {result['records']} recorded finding(s).",
+             f"  classes: {', '.join(result['classes'])}"]
+    if result["rejected"]:
+        lines.append(f"  previously rejected (do not re-report without new "
+                     f"evidence): {', '.join(result['rejected'])}")
+    return "\n".join(lines)
+
+
+def _selftest() -> int:
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    want(round(wilson_lower(0, 0), 3), 0.0, "no observations")
+    # 4/5 must outrank 1/1: that is the whole point of the lower bound
+    if not wilson_lower(4, 5) > wilson_lower(1, 1):
+        failures.append("4/5 should outrank 1/1")
+    if not wilson_lower(1, 1) > wilson_lower(0, 12):
+        failures.append("1/1 should outrank 0/12")
+
+    rows = []
+    for _ in range(4):
+        rows.append({"class": "mass-assignment", "state": "validated",
+                     "stack": ["flask", "postgres"], "target": "a"})
+    rows.append({"class": "mass-assignment", "state": "rejected",
+                 "stack": ["flask"], "target": "a"})
+    for _ in range(12):
+        rows.append({"class": "ssti", "state": "unconfirmed",
+                     "stack": ["flask"], "target": "a",
+                     "playbook": "knowledge/web/ssti.md"})
+
+    ranked = prior(rows, {"flask"})
+    want(ranked["classes"][0]["class"], "mass-assignment", "best class first")
+    want(ranked["stack_filtered"], True, "stack filter applied")
+    want(ranked["classes"][0]["hits"], 4, "hits counted")
+
+    # too few stack records falls back to the global history rather than
+    # ranking from noise
+    want(prior(rows, {"django"})["stack_filtered"], False, "stack fallback")
+
+    want(prior([], {"flask"})["classes"], [], "empty ledger ranks nothing")
+
+    s = suspect(rows)["suspect"]
+    want([e["playbook"] for e in s], ["knowledge/web/ssti.md"], "suspect playbook")
+    want(suspect(rows[:5])["suspect"], [], "below threshold is not suspect")
+
+    for f in failures:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"lessons selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="What past engagements learned: class priors and suspect playbooks.")
+    ap.add_argument("mode", nargs="?", default="prior",
+                    choices=["prior", "suspect", "seen", "stats"],
+                    help="prior: classes worth trying first. suspect: playbooks "
+                         "that never confirm. seen: history for one target. "
+                         "stats: ledger size.")
+    ap.add_argument("--stack", default="",
+                    help="fingerprint tokens from recon, comma or space separated")
+    ap.add_argument("--target", default="", help="host, for `seen`")
+    ap.add_argument("--ledger", default=None, help="ledger path (default ~/.mythos/lessons.jsonl)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    if args.selftest:
+        return _selftest()
+
+    path = ledger_path(args.ledger)
+    rows = load(path)
+    if args.mode == "stats":
+        result = {"ledger": str(path), "records": len(rows),
+                  "targets": len({r.get("target") for r in rows}),
+                  "classes": len({r.get("class") for r in rows})}
+        print(json.dumps(result, indent=2) if args.json
+              else f"{len(rows)} record(s), {result['targets']} target(s), "
+                   f"{result['classes']} class(es) in {path}")
+        return 0
+    if args.mode == "suspect":
+        result = suspect(rows)
+    elif args.mode == "seen":
+        if not args.target:
+            ap.error("seen needs --target")
+        result = seen(rows, args.target, path)
+    else:
+        result = prior(rows, _tokens(args.stack))
+    print(json.dumps(result, indent=2) if args.json else _text(result, args.mode))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
