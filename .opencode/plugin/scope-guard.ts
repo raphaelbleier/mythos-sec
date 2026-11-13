@@ -1,9 +1,16 @@
-// Mythos scope guard for OpenCode: a thin adapter over hooks/scope-guard.py.
+// Mythos enforcement adapter for OpenCode: a thin shim over the two hooks in
+// hooks/, so OpenCode and Claude Code enforce exactly the same rules.
 //
-// The scope logic lives once, in hooks/scope-guard.py (also the Claude Code
-// PreToolUse hook). This plugin shells out to `scope-guard.py --check` for
-// every bash / webfetch call, finding the active engagement scope.yaml the
-// same way ($MYTHOS_SCOPE, else the newest engagements/*/scope.yaml).
+// The logic lives once, in hooks/scope-guard.py and hooks/budget-guard.py (both
+// also Claude Code PreToolUse hooks). This plugin shells out to each one's
+// `--check` for every bash / webfetch call, finding the active engagement
+// scope.yaml the same way ($MYTHOS_SCOPE, else the newest
+// engagements/*/scope.yaml).
+//
+// The budget guard carries the rules the scope file prints and nothing used to
+// enforce: rate_limit_rps, max_requests, allow_exploit, and the
+// non-destructive rule. It defaults to blocking, because a rate limit you
+// learn about afterwards has already been exceeded.
 //
 // Warn-only by default: the warning is printed to the bash tool's stderr so
 // the model sees it, and to the OpenCode log. MYTHOS_SCOPE_ENFORCE picks the
@@ -16,18 +23,35 @@
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
-const SCRIPT = fileURLToPath(new URL("../../hooks/scope-guard.py", import.meta.url))
+const SCOPE = fileURLToPath(new URL("../../hooks/scope-guard.py", import.meta.url))
+const BUDGET = fileURLToPath(new URL("../../hooks/budget-guard.py", import.meta.url))
+
+function py(script: string, args: string[], cwd: string): any | null {
+  const run = spawnSync("python3", [script, ...args], { cwd, encoding: "utf8" })
+  try {
+    return JSON.parse(run.stdout)
+  } catch {
+    return null // guard unavailable (no python3?): stay out of the way
+  }
+}
+
+function warn(tool: string, args: any, msg: string): void {
+  warn(tool, args, msg)
+}
 
 function check(tool: string, args: any, cwd: string): void {
   const target = tool === "bash" ? args?.command : tool === "webfetch" ? args?.url : undefined
   if (!target) return
-  const run = spawnSync("python3", [SCRIPT, "--check", String(target)], { cwd, encoding: "utf8" })
-  let msg: string | null = null
-  try {
-    msg = JSON.parse(run.stdout).message
-  } catch {
-    return // guard unavailable (no python3?): stay out of the way, like the Claude hook
+  // The budget guard runs first: it refuses outright, so there is no point
+  // pacing or warning about a call that is about to be rejected.
+  const budget = py(BUDGET, ["--check", "--charge", String(target)], cwd)
+  if (budget?.message) {
+    if (budget.action === "block") throw new Error(budget.message)
+    warn(tool, args, budget.message)
   }
+  if (budget?.sleep > 0) spawnSync("sleep", [String(budget.sleep)])
+
+  const msg: string | null = py(SCOPE, ["--check", String(target)], cwd)?.message ?? null
   if (!msg) return
   const mode = process.env.MYTHOS_SCOPE_ENFORCE ?? "warn"
   if (mode === "block") throw new Error(msg)
@@ -37,15 +61,11 @@ function check(tool: string, args: any, cwd: string): void {
     // widening scope.yaml, or set MYTHOS_SCOPE_ENFORCE=warn.
     throw new Error(msg + "\n(MYTHOS_SCOPE_ENFORCE=ask: refused pending your decision)")
   }
-  console.error(msg)
-  if (tool === "bash") {
-    const quoted = "'" + msg.replace(/'/g, `'\\''`) + "'"
-    args.command = `printf '%s\\n' ${quoted} >&2; ${args.command}`
-  }
+  warn(tool, args, msg)
 }
 
 export default {
-  id: "mythos.scope-guard",
+  id: "mythos.guards",
   // OpenCode 2.x
   async setup(ctx: any) {
     await ctx.tool.hook("execute.before", async (ev: any) => check(ev.tool, ev.input, process.cwd()))
