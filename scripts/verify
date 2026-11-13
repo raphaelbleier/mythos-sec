@@ -18,6 +18,8 @@ is evidence to keep, not a finished finding: the closure rules in the `exploit`
 skill still apply, and a canary that merely appears in the response is a
 reflection, not yet an exploit.
 """
+import os
+import pathlib
 import argparse, json, re, ssl, sys, time, urllib.error, urllib.parse, urllib.request
 
 UA = "mythos-verify/1.0 (authorized security testing)"

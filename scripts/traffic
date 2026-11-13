@@ -71,6 +71,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import socketserver
@@ -346,7 +347,7 @@ def exchange_record(t, dur, ttfb, client, key, ip, req, res, extra=None):
     first, hdrs = parse_head(split_message(req.buf if isinstance(req, Cap) else req)[0]) if req else ("", [])
     bits = first.split(" ")
     status = (status_of(bytes(res.buf if isinstance(res, Cap) else res)) or None) if res else None
-    rec = {"kind": "exchange", "t": round(t, 3), "dur": round(dur, 3), "ttfb": round(ttfb, 3) if ttfb else None,
+    rec = {"kind": "exchange", "t": round(t, 3), "dur": round(dur, 3), "ttfb": round(ttfb, 3) if ttfb is not None else None,
            "client": client, "scheme": scheme, "host": host, "port": port, "ip": ip,
            "m": bits[0], "p": bits[1] if len(bits) > 1 else "", "s": status,
            "ua": (header(hdrs, "user-agent") or [""])[0][:120],
@@ -716,7 +717,7 @@ def serve(d: Path, a):
         threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.3}, daemon=True).start()
     info = {"pid": os.getpid(), "port": port, "bind": [s.server_address[0] for s in servers],
             "tls_intercept": ca is not None, "insecure_upstream": a.insecure_upstream, "max_body": a.max_body,
-            "started": round(time.time(), 3), "note": ca_note}
+            "started": round(time.time(), 3), "note": ca_note, "ca_dir": str(work)}
     append(t / "events.jsonl", {"t": info["started"], "event": "start", **info})
     (t / "proxy.json.tmp").write_text(json.dumps(info))
     (t / "proxy.json.tmp").replace(t / "proxy.json")
@@ -792,7 +793,7 @@ def cmd_start(d, a):
     t = tdir(d)
     t.mkdir(mode=0o700, exist_ok=True)
     (t / "proxy.json").unlink(missing_ok=True)
-    cmd = [sys.executable, __file__, "serve", "--dir", str(d), "--port", str(a.port), "--max-body", str(a.max_body),
+    cmd = [sys.executable, os.path.abspath(__file__), "serve", "--dir", str(d), "--port", str(a.port), "--max-body", str(a.max_body),
            "--timeout", str(a.timeout)] + (["--insecure-upstream"] if a.insecure_upstream else [])
     for b in a.bind or []:
         cmd += ["--bind", b]
@@ -824,9 +825,10 @@ def cmd_stop(d, a):
             time.sleep(0.1)
         time.sleep(0.2)
     elif info:
-        print("traffic: the proxy had already died without a stop event; records after its last request are unknown",
+        print("traffic: the proxy died without a stop event; requests after its last record are unknown, and run.json says so",
               file=sys.stderr)
         append(tdir(d) / "events.jsonl", {"t": round(time.time(), 3), "event": "stop", "crashed": True})
+        shutil.rmtree(info.get("ca_dir", ""), ignore_errors=True)  # the CA key a killed proxy could not delete
         (tdir(d) / "proxy.json").unlink(missing_ok=True)
     else:
         print("traffic: no proxy was started for this engagement", file=sys.stderr)
@@ -886,7 +888,10 @@ def iso(t):
 
 
 def audit_runs(d: Path, t0, t1):
-    """Toolbox invocations from audit.jsonl that ended inside [t0, t1]."""
+    """Toolbox invocations from audit.jsonl that ended inside [t0, t1].
+
+    `end` is the epoch of the end record when scripts/mythos writes `t`, else its
+    one-second `ts`, and `fuzz` is the matching tolerance."""
     runs = []
     try:
         lines = (d.parent / "audit.jsonl").read_text().splitlines()
@@ -897,7 +902,7 @@ def audit_runs(d: Path, t0, t1):
             e = json.loads(line)
             if e.get("phase") != "end":
                 continue
-            end = dt.datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
+            end = float(e["t"]) if "t" in e else dt.datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
         except (ValueError, KeyError):
             continue
         argv = e.get("argv") or []
@@ -907,7 +912,8 @@ def audit_runs(d: Path, t0, t1):
         except (ValueError, IndexError):
             tool = "?"
         if t0 - 5 <= end <= t1 + 5:
-            runs.append({"tool": tool, "cmd": cmd, "exit": e.get("exit"), "seconds": e.get("seconds") or 0, "end": end})
+            runs.append({"tool": tool, "cmd": cmd, "exit": e.get("exit"), "seconds": e.get("seconds") or 0, "end": end,
+                         "fuzz": 0.05 if "t" in e else 1.5})
     return runs
 
 
@@ -1002,7 +1008,7 @@ def analyse(d: Path, before=5):
     budget = load_script(REPO / "hooks" / "budget-guard.py")
     http_tools = (set(budget.BATCH_TOOLS) | set(budget.SINGLE_SHOT)) - NON_HTTP
     unseen = sorted({r["tool"] for r in runs if r["tool"] in http_tools and r["seconds"] >= 1
-                     and not any(r["end"] - r["seconds"] - 2 <= x["t"] <= r["end"] + 2 for x in ex)})
+                     and not any(r["end"] - r["seconds"] - r["fuzz"] <= x["t"] <= r["end"] + r["fuzz"] for x in ex)})
     distinct = sorted({r["cmd"] for r in runs})[:200]
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
         flagged = [{"cmd": c[:300], "offenders": o} for c, o in zip(distinct, pool.map(command_offenders, distinct)) if o]
@@ -1011,7 +1017,7 @@ def analyse(d: Path, before=5):
         "engagement": d.name,
         "window": {"start": t_start and iso(t_start), "end": t_end and iso(t_end), "running": alive,
                    "duration_s": round(t_end - t_start, 1) if t_start and t_end else None},
-        "capture": {"proxy_starts": len(starts), "proxy_stops": len(stops), "clean": len(starts) == len(stops) + (1 if alive else 0),
+        "capture": {"proxy_starts": len(starts), "proxy_stops": len(stops), "clean": len(starts) == len(stops) + (1 if alive else 0) and not any(e.get("crashed") for e in stops),
                     "tls_intercept": (starts[-1].get("tls_intercept") if starts else None),
                     "insecure_upstream": (starts[-1].get("insecure_upstream") if starts else None),
                     "complete": not (gaps or tunnels or cuts["request"] or cuts["response"] or unseen),
@@ -1278,14 +1284,14 @@ def compare(old_raw, new_raw, ignore, ignore_body, method, cut):
 
 def cmd_replay(d, a):
     r = record(d, a.id)
-    if r.get("kind") != "exchange" or not r.get("req"):
-        sys.exit(f"traffic: record {a.id} is not a request that can be replayed")
-    if r.get("req_cut"):
-        sys.exit(f"traffic: the request in record {a.id} was truncated at --max-body; replaying it would send something else")
-    off, scope = scope_offenders(d, {(r["host"], r["port"])})
-    if scope is None or off:
-        sys.exit(f"traffic: refusing to send to {r['host']}:{r['port']}: "
-                 + ("no scope file to check against" if scope is None else "the scope guard says it is out of scope"))
+    off, scope = scope_offenders(d, {(r["host"], r["port"])}) if r.get("host") else (set(), "")
+    problem = ("is not a request that can be replayed" if r.get("kind") != "exchange" or not r.get("req") else
+               "was truncated at --max-body, so replaying it would send something else" if r.get("req_cut") else
+               f"is for {r['host']}:{r['port']}, which has no scope file to check against" if scope is None else
+               f"is for {r['host']}:{r['port']}, which the scope guard says is out of scope" if off else None)
+    if problem:
+        print(f"traffic: not replaying: record {a.id} {problem}", file=sys.stderr)
+        return 2
     raw = raw_of(r, "req")
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["http/1.1"])
@@ -1383,7 +1389,6 @@ def _selftest() -> int:
     with tempfile.TemporaryDirectory() as td:
         env_keep = os.environ.get("MYTHOS_SCOPE")
         # work on a copy: analyse() and export write nothing into the committed fixture
-        import shutil
         work = Path(td) / "fixture"
         shutil.copytree(fx, work)
         shutil.copy(fx.parent / "audit.jsonl", Path(td) / "audit.jsonl")
@@ -1437,6 +1442,12 @@ def _selftest() -> int:
                    + e3["request"].get("postData", {}).get("text", "")).encode()
         want(rebuilt, raw_of(rec3, "req"), "raw HAR rebuilds the recorded request exactly")
         want(e3["request"]["headers"][-2]["value"].startswith("Bearer SECRETBEARER"), True, "raw HAR keeps the credential")
+        # replay sends nothing to a host the scope guard flags, and nothing for a record that is not a request
+        import contextlib, io
+        for rid, label in ((18, "out-of-scope host"), (22, "gap record")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                want(cmd_replay(work, argparse.Namespace(id=rid, insecure=False, timeout=1, ignore_headers="",
+                                                         ignore_body=[], json=False)), 2, f"replay refuses a {label}")
         os.environ["MYTHOS_SCOPE"] = env_keep or ""
         if not env_keep:
             os.environ.pop("MYTHOS_SCOPE")
@@ -1627,8 +1638,6 @@ def main() -> int:
     proxy_args.add_argument("--max-body", type=int, default=DEFAULT_CAP, help="bytes of each request and response to keep")
     proxy_args.add_argument("--timeout", type=int, default=60, help="seconds a connection may sit idle")
     p = sub.add_parser("start", parents=[common, proxy_args], help="start the recording proxy"); p.set_defaults(fn=cmd_start)
-    p = sub.add_parser("serve", parents=[common, proxy_args], help=argparse.SUPPRESS)
-    p.set_defaults(fn=lambda d, a: serve(d, a))
     add("stop", "stop the proxy and write run.json", cmd_stop)
     p = add("env", "proxy and CA variables for this engagement (nothing if it records nothing)", cmd_env)
     p.add_argument("--container", action="store_true", help="the values as the toolbox sees them")
@@ -1657,6 +1666,10 @@ def main() -> int:
     p.add_argument("--out"); p.add_argument("--raw", action="store_true", help="do not redact")
     p = add("phase", "mark the start of a phase", cmd_phase)
     p.add_argument("name")
+    if sys.argv[1:2] == ["serve"]:  # what `start` runs detached; not a command for people
+        a = argparse.ArgumentParser(parents=[common, proxy_args]).parse_args(sys.argv[2:])
+        a.top_dir = None
+        return serve(engagement(a), a)
     a = ap.parse_args()
     if a.selftest:
         return _selftest()
