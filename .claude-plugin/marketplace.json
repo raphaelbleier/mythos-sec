@@ -10,7 +10,12 @@
   "plugins": [
     {
       "name": "mythos-sec",
-      "source": "./",
+      "source": {
+        "source": "github",
+        "repo": "raphaelbleier/mythos-sec",
+        "ref": "v0.2.1",
+        "sha": "0d3f480338e328b2f4f822214b4a070663174efc"
+      },
       "description": "Autonomous web red-team and bug-bounty framework (/cybersecurity)."
     }
   ]
