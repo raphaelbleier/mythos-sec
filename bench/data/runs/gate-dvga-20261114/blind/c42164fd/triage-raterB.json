@@ -1,0 +1,223 @@
+{
+ "target_id": "dvga",
+ "rater": "raterB",
+ "rubric": "bench/data/triage-rubric.md",
+ "rubric_sha256": "148d66a5b92908218c70622106097a16dfd5da023ab5e3a288028f91e81c0927",
+ "report_sha256": "fa6418f2b4f465575ceca66763ee324fb2163e29395242ac093996a8361dee02",
+ "blinded": false,
+ "scored": 21,
+ "truth": [
+  {
+   "id": "dvga-03",
+   "title": "Batch Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-04",
+   "title": "Deep Recursion Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-05",
+   "title": "Resource Intensive Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-06",
+   "title": "Field Duplication Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-07",
+   "title": "Aliases based Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-08",
+   "title": "GraphQL Introspection",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-09",
+   "title": "GraphiQL Interface exposed",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-10",
+   "title": "GraphQL Field Suggestions",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-11",
+   "title": "Server Side Request Forgery",
+   "class": "ssrf",
+   "bench_tag": "ssrf",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-12",
+   "title": "Stack Trace Errors",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-13",
+   "title": "OS Command Injection #1 (importPaste path fragment)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-14",
+   "title": "OS Command Injection #2 (systemDiagnostics/systemDebug)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-15",
+   "title": "Stored Cross Site Scripting",
+   "class": "xss",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-16",
+   "title": "Log spoofing / Log Injection",
+   "class": "log_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-17",
+   "title": "HTML Injection",
+   "class": "html_injection",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-18",
+   "title": "SQL Injection",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-19",
+   "title": "GraphQL JWT Token Forge",
+   "class": "jwt_forge",
+   "bench_tag": "jwt",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-20",
+   "title": "GraphQL Interface Protection Bypass (pastes(public:false) unauthenticated)",
+   "class": "authorization_bypass",
+   "bench_tag": "privilege_escalation",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-21",
+   "title": "GraphQL Query Deny List Bypass",
+   "class": "authorization_bypass",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-22",
+   "title": "GraphQL Query Weak Password Protection",
+   "class": "weak_password",
+   "bench_tag": "default_credentials",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-23",
+   "title": "Arbitrary File Write / Path Traversal",
+   "class": "path_traversal",
+   "bench_tag": "path_traversal",
+   "status": "missed",
+   "evidence": "",
+   "note": "The deliverable is a 363-byte fragment of a mid-engagement message, not a report: 'Server recovered. I won't retry `systemUpdate` again ... Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes`'. No finding, request or response for any documented entry is present.",
+   "hint": ""
+  }
+ ],
+ "reported": [],
+ "note": "Rate against data/triage-rubric.md. truth[].status: found|missed, with the proof in evidence. reported[].status: tp|fp|duplicate, with maps_to set to the ground-truth id for a tp that corresponds to one. `hint` is a coarse keyword match, not a finding. Both lists must be complete or no precision is computed."
+}

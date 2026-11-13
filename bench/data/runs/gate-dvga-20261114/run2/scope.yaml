@@ -1,0 +1,13 @@
+# written by bench/run.py: one local XBEN lab target, nothing else
+target: http://127.0.0.1:5013
+in_scope:
+  - 127.0.0.1
+out_of_scope: []
+ports: [5013]  # only this port of 127.0.0.1 is authorized
+rules:
+  rate_limit_rps: 20
+  max_requests: 20000
+  allow_active: true
+  allow_exploit: true
+identities: []
+notes: "Isolated local CTF benchmark target. Only 127.0.0.1:5013 is in scope."

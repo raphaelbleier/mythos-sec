@@ -1,0 +1,1 @@
+Server recovered. I won't retry `systemUpdate` again since it appears to trigger blocking/unresponsive behavior (observed twice now) — repeating it risks violating the no-DoS rule. I'll record it as tested with that observation. Now let's test the remaining items: `readAndBurn`, `editPaste` IDOR, `deletePaste`/`deleteAllPastes` (carefully, non-destructively).

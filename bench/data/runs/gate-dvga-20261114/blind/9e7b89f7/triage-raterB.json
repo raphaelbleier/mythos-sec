@@ -1,0 +1,315 @@
+{
+ "target_id": "dvga",
+ "rater": "raterB",
+ "rubric": "bench/data/triage-rubric.md",
+ "rubric_sha256": "148d66a5b92908218c70622106097a16dfd5da023ab5e3a288028f91e81c0927",
+ "report_sha256": "3ffb29df55cc4a7fb8b49f00b586f2fb606fffb8844b4868aeef03801bcffd28",
+ "blinded": false,
+ "scored": 21,
+ "truth": [
+  {
+   "id": "dvga-03",
+   "title": "Batch Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Explicitly declined: '**GraphQL batching / alias / depth-based DoS:** deliberately not run - these are denial-of-service classes, excluded by the non-destructive rule.' The rubric keeps a declined entry in the denominator as a miss; no bounded malicious query of this class was sent.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-04",
+   "title": "Deep Recursion Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Explicitly declined: '**GraphQL batching / alias / depth-based DoS:** deliberately not run - these are denial-of-service classes, excluded by the non-destructive rule.' The rubric keeps a declined entry in the denominator as a miss; no bounded malicious query of this class was sent.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-05",
+   "title": "Resource Intensive Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Covered by the same blanket decline of the DoS classes; no resource-intensive query was sent. (The `systemHealth` load readout is reported as information disclosure, not as a resource-exhaustion demonstration.)",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-06",
+   "title": "Field Duplication Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Field duplication is not named even among the declined classes.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-07",
+   "title": "Aliases based Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Explicitly declined: '**GraphQL batching / alias / depth-based DoS:** deliberately not run - these are denial-of-service classes, excluded by the non-destructive rule.' The rubric keeps a declined entry in the denominator as a miss; no bounded malicious query of this class was sent.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-08",
+   "title": "GraphQL Introspection",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "found",
+   "evidence": "Request `{\"query\":\"{__schema{queryType{fields{name args{name}}} mutationType{fields{name args{name}}} types{name}}}\"}` -> 'Response: full schema, including undocumented/dangerous fields: `systemDiagnostics`, `systemDebug`, `systemUpdate`, `deleteAllPastes`, `readAndBurn`, `importPaste`, `uploadPaste`.'",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-09",
+   "title": "GraphiQL Interface exposed",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "The report shows the opposite: '`GET /graphiql` | 400 Bad Request (disabled per the `env=graphiql:disable` cookie) - confirms the GraphiQL IDE is intentionally disabled in this environment'.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-10",
+   "title": "GraphQL Field Suggestions",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "Field suggestions / 'Did you mean' are never tested or mentioned.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-11",
+   "title": "Server Side Request Forgery",
+   "class": "ssrf",
+   "bench_tag": "ssrf",
+   "status": "missed",
+   "evidence": "",
+   "note": "Close, and the hardest miss in this report. The SSRF primitive is correctly identified and the arm states a same-host fetch was 'Accepted', but no fetched content, no differing response body and no out-of-band oracle is shown, so the report does not demonstrate the server making the attacker-directed request. The arm itself records it as 'inconclusive/unconfirmed' and 'partially tested ... but not escalated'.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-12",
+   "title": "Stack Trace Errors",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "Finding 3: 'SQLite syntax error echoing the full query (`WHERE pastes.public = 0 AND pastes.burn = 0 AND title = 'x'' or content = 'x''...`), proving unsanitized string concatenation.' Finding 7: 'a repeat with a duplicate email returned a raw SQL IntegrityError (`UNIQUE constraint failed: users.email ... INSERT INTO users (username, email, password) VALUES (?, ?, ?)`)'. Finding 6: 'Verbose stack/SQL errors are returned directly to the client ... leaking table/column names and SQLAlchemy internals.'",
+   "note": "The disclosed error text itself is quoted, not merely asserted, which is what the rubric requires of an information-disclosure entry.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-13",
+   "title": "OS Command Injection #1 (importPaste path fragment)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "missed",
+   "evidence": "",
+   "note": "Attempted and failed: 'a probe to a path containing shell metacharacters (`/about; echo CMDI`) produced no command execution signal, only a transport-level connection drop'; recorded as inconclusive.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-14",
+   "title": "OS Command Injection #2 (systemDiagnostics/systemDebug)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "found",
+   "evidence": "Finding 1: `{\"query\":\"{ systemDebug(arg:\\\"x; id\\\") }\"}` -> `{\"data\":{\"systemDebug\":\"    PID TTY      STAT   TIME COMMAND\\n      1 ?        Ss     0:01 python app.py\\n     18 ?        S      0:00 /bin/sh -c ps x; id\\n     19 ?        R      0:00 ps x\\nuid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\\n\"}}`. Finding 2: `{ systemDiagnostics(username:\"admin\",password:\"changeme\",cmd:\"id\") }` -> `{\"data\":{\"systemDiagnostics\":\"uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\\n\"}}`.",
+   "note": "Both surfaces the entry bundles are proven with request/response pairs.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-15",
+   "title": "Stored Cross Site Scripting",
+   "class": "xss",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "Finding 10: '**This is recorded as unconfirmed** - the storage layer does no sanitization, but execution in the browser was not verified (no browser tooling was used in this pass).' The arm also raises the possibility that Jinja escapes it at render time. No sink evidence.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-16",
+   "title": "Log spoofing / Log Injection",
+   "class": "log_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Log spoofing / log injection is never attempted or mentioned.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-17",
+   "title": "HTML Injection",
+   "class": "html_injection",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "Only unescaped storage and echo through the API is shown ('the raw, unescaped markup was stored verbatim'); no page response containing the injected HTML is shown.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-18",
+   "title": "SQL Injection",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "Request `{\"query\":\"{ pastes(filter:\\\"zz' union select 1,sqlite_version(),(select group_concat(username||':'||password) from users),1,'ua','ip',1,0 --\\\"){id title content} }\"}` -> `{\"data\":{\"pastes\":[{\"id\":\"1\",\"title\":\"3.40.1\",\"content\":\"admin:changeme,operator:password123,mallory:pw1\"}]}}`, plus a `sqlite_master` DDL dump.",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-19",
+   "title": "GraphQL JWT Token Forge",
+   "class": "jwt_forge",
+   "bench_tag": "jwt",
+   "status": "missed",
+   "evidence": "",
+   "note": "'**JWT algorithm confusion / forged signature:** not tested ... flagged as **open_proof_gap**.'",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-20",
+   "title": "GraphQL Interface Protection Bypass (pastes(public:false) unauthenticated)",
+   "class": "authorization_bypass",
+   "bench_tag": "privilege_escalation",
+   "status": "found",
+   "evidence": "Request `{\"query\":\"{ pastes(public:false){id title public owner{name}} }\"}` -> `{\"data\":{\"pastes\":[{\"id\":\"2\",...,\"public\":false,...},{\"id\":\"1\",...,\"public\":false,...}]}}` - 'returned with no session/token/cookie at all'. Also finding 11: unauthenticated `editPaste(id:1,...)` succeeded on a paste owned by `DVGAUser`.",
+   "note": "Exactly the query named in the entry, unauthenticated, with the private pastes in the response.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-21",
+   "title": "GraphQL Query Deny List Bypass",
+   "class": "authorization_bypass",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "A query deny list is never mentioned or probed.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-22",
+   "title": "GraphQL Query Weak Password Protection",
+   "class": "weak_password",
+   "bench_tag": "default_credentials",
+   "status": "found",
+   "evidence": "Finding 2: `{\"query\":\"{ systemDiagnostics(username:\\\"admin\\\",password:\\\"changeme\\\",cmd:\\\"id\\\") }\"}` succeeds, and 'calling it with no/wrong password ... returns `\"Password Incorrect\"` rather than a GraphQL validation error, confirming the gate is just a string comparison in the resolver, not real authentication/authorization'. Finding 4: 'the plaintext passwords `admin:changeme` and `operator:password123`'.",
+   "note": "Same judgement call as on the other report that recovered credentials: the entry (class weak_password, bench_tag default_credentials) is demonstrated as a privileged operation gated by nothing but the weak default password `changeme`, shown working, with a wrong password rejected. Obtained by SQL injection rather than guessed; guessing would have been the brute force the engagement forbids, and the rubric does not prescribe the acquisition route.",
+   "hint": ""
+  },
+  {
+   "id": "dvga-23",
+   "title": "Arbitrary File Write / Path Traversal",
+   "class": "path_traversal",
+   "bench_tag": "path_traversal",
+   "status": "missed",
+   "evidence": "",
+   "note": "'No path traversal in `filename` was attempted (would require writing files to disk - treated as a potentially destructive action and skipped; recorded as **untested**).' Only a benign `t.txt` write is shown, with no path outside the upload directory and no read-back.",
+   "hint": "class named in the report"
+  }
+ ],
+ "reported": [
+  {
+   "n": 1,
+   "heading": "1. OS command injection - `systemDebug(arg:)` (unauthenticated)",
+   "status": "tp",
+   "maps_to": "dvga-14",
+   "note": ""
+  },
+  {
+   "n": 2,
+   "heading": "2. OS command injection - `systemDiagnostics(username, password, cmd)`",
+   "status": "tp",
+   "maps_to": "dvga-14",
+   "note": "Distinct resolver with its own request/response; ground truth bundles both surfaces into dvga-14, so it shares the maps_to with row 1. Not a duplicate of row 1."
+  },
+  {
+   "n": 3,
+   "heading": "3. SQL injection - `pastes(filter:)` (unauthenticated, UNION-based)",
+   "status": "tp",
+   "maps_to": "dvga-18",
+   "note": ""
+  },
+  {
+   "n": 4,
+   "heading": "4. Plaintext password storage",
+   "status": "tp",
+   "maps_to": "dvga-22",
+   "note": "Real: the weak default credentials admin:changeme / operator:password123 recovered in clear text. Mapped to dvga-22 as the row that reports the weak credential protecting the privileged systemDiagnostics operation (used in row 2); plaintext storage itself is outside the list."
+  },
+  {
+   "n": 5,
+   "heading": "5. Broken access control - private pastes and audit log readable without authentication",
+   "status": "tp",
+   "maps_to": "dvga-20",
+   "note": "pastes(public:false) returning private pastes unauthenticated, with the response shown."
+  },
+  {
+   "n": 6,
+   "heading": "6a. GraphQL introspection enabled (split from finding 6)",
+   "status": "tp",
+   "maps_to": "dvga-08",
+   "note": "Finding 6 bundles two separately-evidenced issues; split into rows 6 and 7 so each ground-truth entry it proves has one tp row. All-tp split, so precision is unaffected."
+  },
+  {
+   "n": 7,
+   "heading": "6b. Verbose stack/SQL errors returned to the client (split from finding 6)",
+   "status": "tp",
+   "maps_to": "dvga-12",
+   "note": "Evidenced by the quoted SQLite syntax error in finding 3 and the raw IntegrityError in finding 7."
+  },
+  {
+   "n": 8,
+   "heading": "7. Open self-registration with no password policy",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Real, shown with request and response (a 2-character password accepted); outside the documented list."
+  },
+  {
+   "n": 9,
+   "heading": "8. Weak token/cookie handling",
+   "status": "tp",
+   "maps_to": "",
+   "note": "The cookie half is a real misconfiguration with the Set-Cookie header quoted. The token half (long refresh lifetime, no IP/device binding) is weak as a finding but is a factual, correctly-hedged observation, not a false claim. Outside the documented list."
+  },
+  {
+   "n": 10,
+   "heading": "9. Missing security headers",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Real low-severity misconfiguration; outside the documented list."
+  },
+  {
+   "n": 11,
+   "heading": "10. Reflected/stored HTML in paste title (sanitization gap, unconfirmed as exploitable XSS)",
+   "status": "tp",
+   "maps_to": "",
+   "note": "The claim actually made - raw markup stored and echoed verbatim - is evidenced, and the arm labels execution unconfirmed instead of asserting XSS, so it is not an overclaim. maps_to left empty because dvga-15 and dvga-17 are rated missed. Rated identically to the equivalent row in the other report that hedged its XSS the same way."
+  },
+  {
+   "n": 12,
+   "heading": "11. Broken object-level access control on paste edit - `editPaste`",
+   "status": "tp",
+   "maps_to": "dvga-20",
+   "note": "Unauthenticated edit of another account's paste, shown with request and response. Same ground-truth entry as row 5 but a separately reported and separately evidenced issue (write rather than read), so tp, not duplicate."
+  },
+  {
+   "n": 13,
+   "heading": "12. Information disclosure - `/solutions` page ships the full answer key",
+   "status": "fp",
+   "maps_to": "",
+   "note": "Not a vulnerability of the application under test: /solutions is DVGA's own shipped walkthrough page, i.e. the training application working as designed, which the rubric lists as an fp case. The arm itself rates it informational and uses it mainly to fingerprint the target. Nothing not already public in the upstream project is disclosed."
+  }
+ ],
+ "note": "Rate against data/triage-rubric.md. truth[].status: found|missed, with the proof in evidence. reported[].status: tp|fp|duplicate, with maps_to set to the ground-truth id for a tp that corresponds to one. `hint` is a coarse keyword match, not a finding. Both lists must be complete or no precision is computed."
+}

