@@ -719,11 +719,49 @@ def hints_for(name):
     return [(name or "").lower()]
 
 
+def _identity_names(rec):
+    """The product names this record is about, without the vendor or ecosystem.
+
+    An identity string is structured: a CPE is vendor:product:version and an
+    OSV or GHSA entry is ecosystem/package. Matching a hint against the whole
+    string as text confuses the two halves. The Pillow advisories carry
+    `python:pillow:*` because PyPI is the vendor, so a target merely running
+    python matched four heap overflows in an imaging library it may not even
+    have installed. The leading component is therefore dropped whenever there
+    is more than one, which still lets the interpreter's own `python:python:*`
+    match on its second component.
+    """
+    names = set()
+    raw = list(rec.get("product_hints") or []) + \
+        [a.get("package", "") for a in rec.get("affected") or []]
+    for item in raw:
+        item = (item or "").strip().lower()
+        if not item:
+            continue
+        names.add(item)
+        parts = [p for p in re.split(r"[:/]", item) if p and p != "*"]
+        # Drop the vendor or ecosystem, keep every component that could name
+        # the software itself.
+        names.update(parts[1:] if len(parts) > 1 else parts)
+    return names
+
+
 def mentions(rec, hints):
-    haystack = " ".join(rec.get("product_hints") or []) + " " + (rec.get("title") or "") + \
-        " " + " ".join(a.get("package", "") for a in rec.get("affected") or [])
-    haystack = haystack.lower()
-    return any(h and h in haystack for h in hints)
+    """Whether this record is about the product at all.
+
+    Returns False, "title" or "identity". The distinction matters: a title is
+    prose and names other software freely. "Pillow is a Python imaging library"
+    mentions python, and treating that as identity let the interpreter's version
+    be checked against Pillow's affected range, which produced four
+    high-severity candidates for a target that merely runs python. Identity
+    comes from the record's product hints or its affected package names; a
+    title-only match is reported, with no version claim attached.
+    """
+    if any(h and h in _identity_names(rec) for h in hints):
+        return "identity"
+    if any(h and h in (rec.get("title") or "").lower() for h in hints):
+        return "title"
+    return False
 
 
 # Confidence is about the *version*, never about the target being vulnerable.
@@ -736,13 +774,35 @@ CONFIDENCE = {
 }
 
 
-def match_one(rec, want):
+def _relevant(entry, hints):
+    """Does this affected entry describe the product that was asked about?
+
+    A record often lists ranges for several packages, and a version is only
+    evidence against a range for the same software. Checking python 3.14.4
+    against a node.js range matched a KEV row and would have paged someone for a
+    standard-library server. An entry with no package name is kept, because
+    dropping it would silently lose NVD records that carry only a CPE string.
+    """
+    package = (entry.get("package") or "").lower()
+    if not package:
+        return True
+    return any(h and (h in package or package in h) for h in hints)
+
+
+def match_one(rec, want, hints=()):
     """(confidence, reason, package) or (None, reason, None) when ruled out."""
     version, source = want.get("version"), want.get("source") or "banner"
     if not version:
         return "product-only", "no version supplied", None
+    hints = [h for h in (hints or []) if h]
+    entries = [e for e in (rec.get("affected") or []) if _relevant(e, hints)] \
+        if hints else list(rec.get("affected") or [])
+    if hints and (rec.get("affected") or []) and not entries:
+        return "range-unknown", (f"this record's affected ranges are for other "
+                                 f"packages, so {version} was not checked "
+                                 f"against them"), None
     checked = []
-    for entry in rec.get("affected") or []:
+    for entry in entries:
         verdict = in_range(version, entry)
         if verdict is None:
             continue
@@ -824,9 +884,17 @@ def match(doc, wants, limit):
     for want in wants:
         hints = hints_for(want["name"])
         for rec in doc.get("records") or []:
-            if not mentions(rec, hints):
+            how = mentions(rec, hints)
+            if not how:
                 continue
-            confidence, reason, package = match_one(rec, want)
+            if how == "title":
+                # The product's name appears only in the prose. That is worth
+                # surfacing, and it is not grounds for a version claim.
+                confidence, reason, package = "product-only", (
+                    f"{want['name']} appears only in this record's title, not in "
+                    f"its affected packages, so no version was checked"), None
+            else:
+                confidence, reason, package = match_one(rec, want, hints)
             if confidence is None:
                 excluded.append({"id": rec["id"], "product": want["name"], "reason": reason})
                 continue
@@ -1002,6 +1070,44 @@ def _selftest():
     assert got["CVE-2026-33017"] == "range-unknown", got
     got, _ = conf(name="langflow", version="1.6.0", source="banner")
     assert got["CVE-2026-5027"] == "banner", got
+
+    # A version is only evidence against a range for the same software. Checking
+    # python 3.14.4 against a node.js range matched a KEV row in a real run and
+    # would have paged someone for a standard-library server.
+    cross = {"id": "CVE-X", "affected": [{"package": "node.js", "introduced": "0",
+                                          "fixed": "99.0.0", "raw": ">= 0 < 99.0.0"}]}
+    c, reason_txt, _ = match_one(cross, {"version": "3.14.4", "source": "banner"},
+                                 ["python"])
+    assert c == "range-unknown" and "other packages" in reason_txt, (c, reason_txt)
+    c, _, _ = match_one(cross, {"version": "3.14.4", "source": "banner"},
+                        ["node.js"])
+    assert c == "banner", c
+    # an entry with no package name is still checked: NVD records may carry only a CPE
+    nameless = {"id": "CVE-Y", "affected": [{"introduced": "0", "fixed": "99.0.0"}]}
+    c, _, _ = match_one(nameless, {"version": "1.0", "source": "fingerprint"},
+                        ["anything"])
+    assert c == "exact", c
+    # Identity comes from packages and hints, never from the title's prose.
+    prose = {"id": "CVE-Z", "title": "Pillow is a Python imaging library",
+             "product_hints": ["pillow"],
+             "affected": [{"package": "pillow", "introduced": "2.0.0",
+                           "fixed": "13.0.0", "raw": ">= 2.0.0 < 13.0.0"}]}
+    assert mentions(prose, ["python"]) == "title", mentions(prose, ["python"])
+    assert mentions(prose, ["pillow"]) == "identity"
+    assert mentions(prose, ["nothing-here"]) is False
+    # A CPE's vendor field is not the product. These are the real hint strings
+    # from the Pillow advisories that matched a python banner.
+    cpe = {"id": "CVE-P", "title": "Pillow heap overflow",
+           "product_hints": ["pip/pillow", "python:pillow:*"],
+           "affected": [{"package": "pip/pillow", "introduced": "2.0.0",
+                         "fixed": "13.0.0", "raw": ">= 2.0.0 < 13.0.0"}]}
+    assert mentions(cpe, ["python"]) is False, _identity_names(cpe)
+    assert mentions(cpe, ["pillow"]) == "identity"
+    # the interpreter's own advisories still match on the product component
+    interp = {"id": "CVE-I", "title": "CPython", "product_hints": ["python:python:*"],
+              "affected": [{"package": "python:python:*", "introduced": "3.0",
+                            "fixed": "3.14.5", "raw": ">= 3.0 < 3.14.5"}]}
+    assert mentions(interp, ["python"]) == "identity", _identity_names(interp)
     got, _ = conf(name="langflow", version=None, source=None)
     assert set(got.values()) == {"product-only"}, got
     got, excl = conf(name="langflow", version="9.9.9", source="fingerprint")
