@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img src="docs/assets/logo.svg" alt="Mythos" width="420">
-  </picture>
+  <img src="docs/assets/logo.png" alt="Mythos" width="460">
 </p>
 
 <p align="center">
