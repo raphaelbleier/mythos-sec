@@ -75,6 +75,10 @@ CWE = {
     "cache-poisoning": 524, "cache-deception": 524,
     "request-smuggling": 444, "csrf": 352, "clickjacking": 1021,
     "open-redirect": 601, "cors": 942, "headers-cors": 942,
+    # CRLF in a response header is response splitting (113); in a log line it is
+    # the more general 93. A finding that reaches a header gets the specific one.
+    "crlf-injection": 113, "crlf": 113, "response-splitting": 113,
+    "log-injection": 117, "host-header-injection": 644,
     "jwt": 347, "oauth-oidc": 287, "saml": 347, "auth-flows-ato": 287,
     "session-fixation": 384, "2fa-bypass": 287,
     "graphql-api": 1176, "business-logic": 840,
@@ -433,6 +437,13 @@ def _selftest() -> int:
         f1 = next(r for r in rows if r["id"] == "f1")
         want(f1["cwe"], 639, "idor cwe")
         want(f1["severity"], "medium", "severity computed from the vector")
+        # Classes a real run produced. A missing entry is reported rather than
+        # guessed, which is right, but the report then carries a finding with no
+        # CWE, so the table has to keep up with what the skills name.
+        for klass in ("ssti", "bola", "dom-xss", "reflected-xss", "sql-injection",
+                      "path-traversal", "secrets-exposure", "information-disclosure",
+                      "open-redirect", "cors", "jwt", "auth-flows-ato", "crlf-injection"):
+            want(klass in CWE, True, f"CWE mapping for {klass}")
         want("session=secret" in (f1["evidence"] or ""), False, "evidence redacted")
         f3 = next(r for r in rows if r["id"] == "f3")
         want(any("severity says critical" in p for p in f3["problems"]), True,

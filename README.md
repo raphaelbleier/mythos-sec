@@ -277,6 +277,13 @@ this CLI, and the phase driver and verdict ledger are new. Treat the published
 figures as what motivated the rebuild, not as its result. They are in the git
 history.
 
+What the current code has been shown to do is narrower and unblinded: one run
+against the local lab target, 50 minutes on GLM 5.3, all four phases closing on
+their artifacts, 21 findings with evidence, a verdict for all 36 mapped
+endpoints (28 confirmed, 8 tested), and 534 recorded request and response pairs.
+That is a working pipeline, not a measurement: one target, one run, no control
+arm and no blinded rater.
+
 Other limits worth knowing before you trust it:
 
 - The coverage gate is a text check over the report. It cannot tell a real test
