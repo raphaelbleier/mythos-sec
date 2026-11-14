@@ -30,6 +30,15 @@ interface Args {
   flags: Record<string, string | boolean>;
 }
 
+const VERSION = (() => {
+  try {
+    const f = join(REPO, "cli", "package.json");
+    return "v" + (JSON.parse(readFileSync(f, "utf8")) as { version?: string }).version;
+  } catch {
+    return "";
+  }
+})();
+
 function parse(argv: string[]): Args {
   const out: Args = { _: [], flags: {} };
   const alias: Record<string, string> = {
@@ -376,6 +385,11 @@ async function cmdRun(args: Args): Promise<number> {
 
   const wantTui = args.flags["no-tui"] !== true && process.stdout.isTTY;
   let waitForTui: Promise<unknown> = Promise.resolve();
+
+  if (!wantTui) {
+    const { bannerLine } = await import("./tui/banner.js");
+    process.stdout.write(bannerLine(VERSION) + "\n");
+  }
 
   if (wantTui) {
     const { render } = await import("ink");

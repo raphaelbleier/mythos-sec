@@ -21,7 +21,7 @@ export interface Verdict {
 export type Event =
   | { t: "run:start"; target: string; dir: string; model: string; budget: number }
   | { t: "run:end"; ok: boolean; wall: number; summary: string }
-  | { t: "phase:start"; phase: string; attempt: number; of: number; model: string }
+  | { t: "phase:start"; phase: string; attempt: number; of: number; model: string; budget: number }
   | { t: "phase:end"; phase: string; state: PhaseState; wall: number; reason?: string }
   | { t: "agent:start"; id: string; phase: string; label: string; model: string }
   | { t: "agent:end"; id: string; steps: number; tokens: number; error?: string }

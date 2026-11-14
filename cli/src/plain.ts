@@ -26,7 +26,7 @@ function render(e: Event, verbose: boolean): string | null {
     case "run:end":
       return `done in ${e.wall}s — ${e.summary}`;
     case "phase:start":
-      return `phase ${e.phase} start${e.of > 1 ? ` (attempt ${e.attempt}/${e.of})` : ""} [${e.model}]`;
+      return `phase ${e.phase} start${e.of > 1 ? ` (attempt ${e.attempt}/${e.of})` : ""} [${e.model}, ${e.budget}s]`;
     case "phase:end":
       return `phase ${e.phase} ${e.state}${e.reason ? `: ${e.reason}` : ""} (${e.wall}s)`;
     case "agent:start":

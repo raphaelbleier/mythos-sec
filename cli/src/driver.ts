@@ -224,6 +224,7 @@ export class Driver {
         attempt,
         of: attempts,
         model: this.modelFor(`mythos-${name === "scan" ? "scanner" : name === "report" ? "reporter" : name}`),
+        budget: Math.round(this.phaseBudget(name) / 1000),
       });
       try {
         await this.runPhase(name, attempt);
