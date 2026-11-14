@@ -74,6 +74,15 @@ The result is not strong enough to claim the gate hurts.
 - **Two repeats per arm.** Run-to-run variance on agentic tasks is measured at
   2.2 to 6.0 points elsewhere, so two runs cannot separate the treatment from
   the noise.
+- **DVGA falls over under load, which bounds every number here.** The run
+  recorded three watchdog restarts, each after the target had been down for 90
+  seconds. A later head-to-head attempt on 14 November killed it outright: the
+  cell ended `target_failed` and the two arms queued behind it refused to run
+  rather than measure against a dead target. An arm that happens to be mid-probe
+  when the application dies loses that probe, and nothing in the record says
+  which probes those were. This is not a treatment effect and it is not
+  symmetric by construction, so it is a ceiling on how much any DVGA figure in
+  this project can carry, the gate numbers above included.
 - **DVGA is the target where the gate previously inverted**, because the
   surface map was eleven HTML pages while the application sits behind
   `/graphql`. The probe now enumerates the schema (19 operations), which is why
