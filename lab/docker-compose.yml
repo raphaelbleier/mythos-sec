@@ -13,6 +13,12 @@
 #   vuln-bank-web http://localhost:5003  Vuln Bank (needs VULNBANK_DIR=<checkout>, no default)
 #   oast       http://localhost:8081   HTTP+DNS catcher (OAST), log at /__log
 #   admin-bot  http://localhost:8000   POST /visit {url} with admin cookie
+#   cloud-metadata    (no host port) IMDSv1 + GCP + Azure emulator, in-lab only
+#   cloud-metadata-v2 (no host port) same, IMDSv2 token enforced
+#   cloud-app         http://localhost:5021  SSRF sinks in front of them
+#   apilab            http://localhost:5022  GraphQL + JSON-RPC
+#   authlab           http://localhost:5023  login, reset, 2FA, OAuth
+#   ailab             http://localhost:5024  chat, RAG, tools, MCP
 # Network `mythos-lab` has a fixed name: scripts/mythos net mythos-lab
 name: mythos-lab
 
@@ -20,6 +26,23 @@ networks:
   mythos-lab:
     name: mythos-lab
     driver: bridge
+  # The capability targets get their own network with IP masquerading off, so
+  # nothing on it has a route to the internet while published ports still
+  # reach it on loopback. Docker silently drops published ports for a
+  # container on an `internal: true` network, which is why this is a plain
+  # bridge without NAT rather than an internal one.
+  mythos-lab-targets:
+    name: mythos-lab-targets
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  # The metadata emulators sit here and nowhere else: internal, no published
+  # port, no route in or out. The only way to them is a server-side fetch from
+  # cloud-app, which is the only way to a real one too.
+  mythos-lab-metadata:
+    name: mythos-lab-metadata
+    driver: bridge
+    internal: true
 
 # MYTHOS_LAB_BIND is the address the targets publish on. It defaults to
 # 127.0.0.1, which is what keeps a deliberately vulnerable application off the
@@ -131,6 +154,65 @@ services:
     ports:
       - "${MYTHOS_LAB_BIND:-127.0.0.1}:8000:8000"
     networks: [mythos-lab]
+
+  # ---- cloud-metadata package: IMDS/GCP/Azure emulator + SSRF sinks ----
+  # IMDSv1 enabled: a plain GET returns the canary credentials.
+  cloud-metadata:
+    build: ./cloud
+    container_name: mythos-cloud-metadata
+    command: ["python", "-u", "metadata.py"]
+    environment:
+      - PORT=80
+    networks: [mythos-lab-metadata]
+
+  # IMDSv2 only: PUT /latest/api/token first, then GET with the token header.
+  cloud-metadata-v2:
+    build: ./cloud
+    container_name: mythos-cloud-metadata-v2
+    command: ["python", "-u", "metadata.py"]
+    environment:
+      - PORT=80
+      - IMDS_REQUIRE_TOKEN=1
+    networks: [mythos-lab-metadata]
+
+  cloud-app:
+    build: ./cloud
+    container_name: mythos-cloud-app
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5021:5000"
+    networks: [mythos-lab-targets, mythos-lab-metadata]
+
+  # ---- api-abuse package: GraphQL + JSON-RPC --------------------------
+  apilab:
+    build: ./apilab
+    container_name: mythos-apilab
+    environment:
+      # Set to 0 to test the field-suggestion path with introspection off.
+      - GRAPHQL_INTROSPECTION=${GRAPHQL_INTROSPECTION:-1}
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5022:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- account-takeover package: auth flows + OAuth ------------------
+  authlab:
+    build: ./authlab
+    container_name: mythos-authlab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5023:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- ai-attack package: chat, RAG, tools, MCP ----------------------
+  ailab:
+    build: ./ailab
+    container_name: mythos-ailab
+    environment:
+      # Exact fraction of trials that follow an injection, for checking the
+      # framework's k-trial statistics against a known ground truth.
+      - AI_COMPLIANCE=${AI_COMPLIANCE:-1.0}
+      - MCP_RUGPULL_AFTER=${MCP_RUGPULL_AFTER:-2}
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5024:5000"
+    networks: [mythos-lab-targets]
 
 volumes:
   oast-data:
