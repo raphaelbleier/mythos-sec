@@ -79,6 +79,20 @@ jobs:
             python3 "$s" --selftest
           done
 
+      # Again with PyYAML hidden. The scope guard parses a scope file with
+      # PyYAML when it is installed and with its own reader when it is not, and
+      # the two disagreed: the fallback read `ports: [80, 443]` as one opaque
+      # string and enforced no port restriction at all. That shipped for months
+      # because every machine that ran the tests had PyYAML.
+      - name: Guard selftests without PyYAML
+        run: |
+          mkdir -p /tmp/noyaml
+          printf 'raise ImportError("blocked for this check")\n' > /tmp/noyaml/yaml.py
+          for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch; do
+            echo "== $s (no PyYAML)"
+            PYTHONPATH=/tmp/noyaml python3 "$s" --selftest
+          done
+
       # The same selftests again, plus the guard behaviour end to end. Docker is
       # not available here, so the toolbox checks are skipped.
       - name: Repository selftest

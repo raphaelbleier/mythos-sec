@@ -182,10 +182,23 @@ def _newest_scope():
 
 
 def _crude_list(text: str, key: str):
+    """The values under `key`, for a machine with no PyYAML installed.
+
+    An inline list has to be split into its items. Appending `[80, 443]` whole
+    made `_ports` give up and return None, which is not a parse error anyone
+    sees: it is a scope file whose port restriction is silently not enforced,
+    so a request to port 8443 on an in-scope host passes without a warning.
+    Found by the traffic selftest on a runner without PyYAML, having passed for
+    months on machines that had it.
+    """
     out, grab = [], False
     for line in text.splitlines():
         if line.strip().startswith(key + ":"):
             inline = line.split(":", 1)[1].strip()
+            if inline.startswith("["):
+                inline = inline.split("]", 1)[0]
+                out += [v.strip().strip("'\"") for v in inline[1:].split(",") if v.strip()]
+                continue
             if inline and not inline.startswith("#"):
                 out.append(inline.strip("'\""))
                 continue
@@ -441,6 +454,23 @@ def _selftest() -> int:
     def eq(got, want, label):
         if got != want:
             failures.append(f"{label}: got {got!r}, want {want!r}")
+
+    # The no-PyYAML path. Every assertion below this one runs through whichever
+    # parser the machine happens to have, so the fallback needs its own, or a
+    # scope file parses differently on a runner than on a laptop and nobody
+    # notices until a port restriction quietly stops being enforced.
+    fixture = ("target: https://app.test\n"
+               "in_scope:\n  - app.test\n  - '*.app.test'\n"
+               "out_of_scope: []\n"
+               "rules:\n  rate_limit_rps: 5\n  ports: [80, 443]\n")
+    eq(_crude_list(fixture, "in_scope"), ["app.test", "*.app.test"], "fallback: block list")
+    eq(_crude_list(fixture, "out_of_scope"), [], "fallback: an empty inline list is empty")
+    eq(_crude_list(fixture, "ports"), ["80", "443"], "fallback: an inline list is split")
+    eq(_ports(_crude_list(fixture, "ports")), {80, 443}, "fallback: ports reach the check")
+    eq(_crude_list("ports: [8443]  # only this one\n", "ports"), ["8443"],
+       "fallback: a trailing comment is not a port")
+    eq(_ports(_crude_list("in_scope:\n  - a.test\n", "ports")), None,
+       "fallback: a scope with no ports restricts none")
 
     # normalization
     eq(norm_host("3232235777"), "192.168.1.1", "decimal IPv4")
