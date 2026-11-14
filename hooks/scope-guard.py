@@ -147,16 +147,31 @@ def _pinned_scope():
     `.mythos-scope` at the project root, every guard reads it, and the env var
     still wins when it is set by a harness or a wrapper that can set it.
     """
-    root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
-    f = root / PIN_FILE
-    try:
-        raw = f.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return None
-    if not raw:
-        return None
-    p = Path(raw if Path(raw).is_absolute() else root / raw)
-    return p if p.exists() else None
+    # Two roots, because they are not the same place in every host. Claude Code
+    # sets CLAUDE_PROJECT_DIR to the project; a benchmark cell stages the assets
+    # there and runs the agent in a separate working directory, so a pin written
+    # relative to the agent's cwd does not resolve against the project and the
+    # guard silently fell back to the newest scope by mtime. Found when the rule
+    # refusing an unrecorded request produced no refusals in a cell that had
+    # written the pin correctly.
+    roots = []
+    for candidate in (os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()):
+        if candidate:
+            p = Path(candidate)
+            if p not in roots:
+                roots.append(p)
+    for root in roots:
+        try:
+            raw = (root / PIN_FILE).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        for base in roots:
+            p = Path(raw) if Path(raw).is_absolute() else base / raw
+            if p.exists():
+                return p
+    return None
 
 def _newest_scope():
     root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
@@ -499,6 +514,19 @@ def _selftest() -> int:
         (Path(td) / PIN_FILE).write_text(str(pinned))
         eq(check("curl https://newest.test/")["offenders"], ["newest.test"],
            "the pin wins over the newest scope by mtime")
+        # The same pin, written relative to the agent's cwd while the project
+        # directory is somewhere else. This is the benchmark's shape.
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as other:
+            os.environ["CLAUDE_PROJECT_DIR"] = other
+            cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                (Path(td) / PIN_FILE).write_text("pinned.yaml")
+                eq(check("curl https://newest.test/")["offenders"], ["newest.test"],
+                   "a relative pin resolves against the agent's cwd")
+            finally:
+                os.chdir(cwd)
         (Path(td) / PIN_FILE).unlink()
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
 
