@@ -57,7 +57,7 @@ interface State {
   workers: Worker[];
   feed: Line[];
   findings: Array<{ title: string; severity: string }>;
-  verdicts: { confirmed: number; tested: number; skipped: number };
+  verdicts: { candidate: number; confirmed: number; rejected: number; tested: number; skipped: number };
   open: number;
   guards: { scope: number; budget: number; destructive: number };
   tokens: number;
@@ -76,7 +76,7 @@ const empty: State = {
   workers: [],
   feed: [],
   findings: [],
-  verdicts: { confirmed: 0, tested: 0, skipped: 0 },
+  verdicts: { candidate: 0, confirmed: 0, rejected: 0, tested: 0, skipped: 0 },
   open: 0,
   guards: { scope: 0, budget: 0, destructive: 0 },
   tokens: 0,
@@ -193,7 +193,14 @@ function reduce(s: State, e: Event): State {
       return push({ ...s, verdicts: { ...s.verdicts, [e.verdict.state]: s.verdicts[e.verdict.state] + 1 } }, {
         kind: "verdict",
         tag: e.verdict.state,
-        tone: e.verdict.state === "confirmed" ? "good" : "dim",
+        tone:
+          e.verdict.state === "confirmed"
+            ? "good"
+            : e.verdict.state === "candidate"
+              ? "warn"
+              : e.verdict.state === "rejected"
+                ? "bad"
+                : "dim",
         text: e.verdict.endpoint,
       });
     case "note": {
@@ -324,7 +331,10 @@ export function App({ bus }: { bus: Bus }) {
     {},
   );
   const sevText = Object.entries(sev).map(([k, n]) => `${n} ${k}`).join(", ") || "none yet";
-  const decided = state.verdicts.confirmed + state.verdicts.tested + state.verdicts.skipped;
+  const v = state.verdicts;
+  // A candidate is not decided: the validate phase still owes it an answer,
+  // and counting it as progress would show a run as further along than it is.
+  const decided = v.confirmed + v.rejected + v.tested + v.skipped;
   const total = decided + state.open;
   const barWidth = Math.max(10, Math.min(30, cols - 56));
 
@@ -402,11 +412,23 @@ export function App({ bus }: { bus: Bus }) {
           <Text color={c(t, t.muted)}>findings  </Text>
           <Text color={c(t, state.findings.length ? t.confirmed : t.idle)}>{sevText}</Text>
           <Text color={c(t, t.muted)}>{"    endpoints  "}</Text>
-          <Text color={c(t, t.confirmed)}>{state.verdicts.confirmed}{g.confirmed}</Text>
+          <Text color={c(t, t.confirmed)}>{v.confirmed}{g.confirmed}</Text>
           <Text color={c(t, t.muted)}>{" "}</Text>
-          <Text color={c(t, t.ink)}>{state.verdicts.tested}{g.tested}</Text>
+          <Text color={c(t, t.ink)}>{v.tested}{g.tested}</Text>
           <Text color={c(t, t.muted)}>{" "}</Text>
-          <Text color={c(t, t.idle)}>{state.verdicts.skipped}{g.skipped}</Text>
+          <Text color={c(t, t.idle)}>{v.skipped}{g.skipped}</Text>
+          {v.rejected ? (
+            <>
+              <Text color={c(t, t.muted)}>{" "}</Text>
+              <Text color={c(t, t.refused)}>{v.rejected}{g.refused}</Text>
+            </>
+          ) : null}
+          {v.candidate ? (
+            <>
+              <Text color={c(t, t.muted)}>{" "}</Text>
+              <Text color={c(t, t.warn)}>{v.candidate}{g.warn}</Text>
+            </>
+          ) : null}
           <Text color={c(t, t.muted)}>{total ? ` of ${total}` : ""}</Text>
         </Box>
         <Box>

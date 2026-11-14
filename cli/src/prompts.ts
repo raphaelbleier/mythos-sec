@@ -182,8 +182,14 @@ export function scanPrompt(scope: Scope): PhasePrompt {
     skill: "skills/web-scan/SKILL.md",
     prompt: `Phase: scan.
 
-Read \`skills/web-scan/SKILL.md\`, then \`recon.md\`, \`surface.json\` and
-\`cve-candidates.json\` from the engagement directory.
+Read \`skills/web-scan/SKILL.md\`, then \`plan.md\`, \`recon.md\`,
+\`surface.json\` and \`cve-candidates.json\` from the engagement directory.
+
+\`plan.md\` is not advice. The triage phase matched this target's surface
+against every skill's declared triggers and selected the ones that apply, so the
+skills it names for this phase are the ones to read, and the scripts it names
+are the ones to run. It also records what it did *not* select and why, which
+saves you looking for a surface that is not there.
 
 Produce \`candidates.md\`: one entry per thing worth an exploitation attempt,
 ordered by what you would try first, each with the endpoint, the parameter, the
@@ -217,7 +223,9 @@ export function exploitPrompt(scope: Scope, endpoints: string[], round: number):
     prompt: `Phase: exploit${round > 1 ? ` (round ${round})` : ""}.
 
 Read \`skills/exploit/SKILL.md\` first — it holds the closure rules — then
-\`candidates.md\` and \`recon.md\`. When a class has a playbook under
+\`plan.md\`, \`candidates.md\` and \`recon.md\`. \`plan.md\` names the
+skills this target's surface selected for this phase; read those rather than
+guessing which playbook applies. When a class has a playbook under
 \`knowledge/\`, read that file before you try the class.
 
 ## Your assignment
@@ -237,11 +245,18 @@ A verdict is one of three things, and you record it by writing
 non-alphanumeric characters replaced by dashes:
 
     endpoint: <the endpoint exactly as listed above>
-    state: confirmed | tested | skipped
+    state: candidate | tested | skipped
     note: <one or two sentences>
 
-  confirmed — you proved a flaw. Also write \`findings/<id>.md\`, one file per
-    finding, starting with the front matter \`scripts/findings\` parses:
+You cannot write \`confirmed\`. That word belongs to the validate phase, which
+reproduces your claim from the recorded traffic with a fresh context and no
+knowledge of how hopeful you were. This is not bureaucracy: when Berkeley's
+RECEIPT work put a naive "the JavaScript executed" check in front of an agent,
+the agent claimed 111 cross-site scripting findings and ten were real. An agent
+confirming its own work measures its own optimism.
+
+  candidate — you believe you proved a flaw. Write \`candidates/<id>.md\`, one
+    file per claim, starting with the front matter \`scripts/findings\` parses:
 
         ---
         id: vb-07
@@ -260,6 +275,12 @@ non-alphanumeric characters replaced by dashes:
     the application's own terms, and the remediation. The severity has to follow
     from the vector, because \`scripts/findings\` computes the score from the
     vector and reports a mismatch as a defect in the finding.
+
+    \`proof:\` is the part the validator actually needs. Give the traffic record
+    ID of the request that proves it and of the negative control, so the next
+    phase can replay your bytes instead of reconstructing your reasoning. A
+    claim with no record ID will be rejected, however well argued, because
+    nothing can reproduce it.
   tested — you sent real requests at it for the classes its shape suggests and
     none held. Say which classes, in the note.
   skipped — you deliberately did not test it. Say why: out of scope, needs an
@@ -292,7 +313,13 @@ export function reportPrompt(scope: Scope, singleModelValidation: boolean): Phas
     prompt: `Phase: report.
 
 Read \`skills/report/SKILL.md\`, then everything under \`findings/\` and
-\`verdicts/\`, plus \`recon.md\` and \`candidates.md\`.
+\`verdicts/\`, plus \`recon.md\`, \`plan.md\` and \`candidates.md\`.
+
+Everything under \`findings/\` has already been reproduced by a validator with
+its own context: that is what \`status: validated\` means. Candidates that did
+not survive that are in the ledger as \`rejected\`, and they belong in the
+report too — a claim that was tested and withdrawn is evidence of method, not an
+embarrassment to hide.
 
 Write \`report.md\`, for a human triager who has not seen any of this:
 
@@ -305,7 +332,10 @@ Write \`report.md\`, for a human triager who has not seen any of this:
    is what separates a report from a list of hits.
 4. What was not tested and why. Name it plainly. A gap you declare is a limit of
    the engagement; a gap you leave silent is a defect in the report.
-5. Unconfirmed suspicions, clearly marked as such, with what proving them would
+5. Candidates the validate phase rejected, with what failed when it tried to
+   reproduce them. Name them; a report that only lists what held tells a triager
+   nothing about how carefully it was written.
+6. Unconfirmed suspicions, clearly marked as such, with what proving them would
    have needed.
 
 Then build the machine-readable record:
@@ -314,7 +344,19 @@ Then build the machine-readable record:
             args ["engagements/${dir}", "--sarif", "engagements/${dir}/findings.sarif"]
 
 It computes CVSS from each vector and reports where a severity does not follow
-from its vector. Fix the finding, not the number.
+from its vector. Fix the finding, not the number. Where a finding carries a
+\`cvss4\` vector as well, both scores are emitted: HackerOne, Bugcrowd and
+Intigriti all accept 4.0 alongside 3.1, and some programs now prefer it.
+
+Then check that every finding can actually be reproduced by a human:
+
+    script: name "evidence", args ["check", "engagements/${dir}"]
+
+It exits non-zero when a finding cites a request that is not in the traffic
+store. That matters more than it sounds: no major platform now accepts an
+autonomously submitted report, so a person has to replay this proof and submit
+it under their own name. A finding they cannot replay is a finding they cannot
+submit.
 
 Finally, the coverage check. The \`script\` tool runs from the repository root,
 so both paths have to be spelled out:
@@ -328,11 +370,12 @@ check over the report, so it is a floor on coverage and never evidence of it.
 
 ${
   singleModelValidation
-    ? "This run had no second model available, so the validation pass was not " +
-      "independent. Say so in the report: a model approves its own errors 11.9 " +
-      "percentage points more often when it wrote them, and a reader has to know " +
-      "that check was missing."
-    : "A different model reviewed the findings. Where it disagreed, say so."
+    ? "This run had no second model available, so the validate phase ran on the " +
+      "same model that produced the candidates. Say so in the report: a model " +
+      "approves its own errors 11.9 percentage points more often when it wrote " +
+      "them, and a reader has to know the independence was partial."
+    : "A different model reproduced each candidate in the validate phase. Where " +
+      "it rejected one, the report says what failed."
 }
 
 Write for someone who will decide whether to pay out on this. No padding, no
@@ -340,25 +383,76 @@ severity inflation, nothing claimed that the evidence does not carry.`,
   };
 }
 
-export function validatorPrompt(findings: string): string {
-  return `You are the validator. You did not write these findings and you are not
-here to improve them: you are here to say which ones do not hold.
+/**
+ * The validate phase's worker prompt.
+ *
+ * The old version of this was a reviewer with no tools, reading the findings as
+ * prose and giving an opinion. An opinion about evidence is not the same thing
+ * as reproducing it, and the difference is measurable: a naive verifier in
+ * Berkeley's RECEIPT work waved through 111 claimed cross-site scripting
+ * findings of which ten were real. So the validator gets tools, a fresh
+ * context, and one job per candidate: send the recorded bytes again and see
+ * what comes back.
+ */
+export function validatePrompt(scope: Scope, candidates: string[], round: number): PhasePrompt {
+  const dir = scope.dir.split("/").pop();
+  return {
+    skill: "skills/exploit/SKILL.md",
+    prompt: `Phase: validate${round > 1 ? ` (round ${round})` : ""}.
 
-For each finding below, give a verdict:
+Another agent found these candidates. You did not write them, you are not here
+to improve them, and you have no stake in them holding. Your job is to decide
+which ones survive being reproduced.
 
-  holds      the evidence proves what the finding claims
-  overstated the flaw is real but the impact or severity does not follow
-  unproven   the evidence is consistent with the claim but does not establish it
-             (a reflection without execution, a 500 without a cause, a timing
-             difference without a baseline)
-  wrong      the evidence contradicts the claim
+## Your assignment
 
-Be specific about what is missing. "Needs more evidence" helps nobody; "the
-response proves the parameter is reflected, not that it executes — no finding
-without a payload that runs" does.
+${candidates.map((c) => `- ${c}`).join("\n")}
 
-About 44% of proofs of concept that pass exit-code and marker checks are invalid,
-so assume the error is there and look for it.
+For each one, in this order:
 
-${findings}`;
+1. Read \`candidates/<id>.md\`. Note its \`proof:\` and
+   \`negative_control:\` record IDs.
+2. Replay the proof byte for byte:
+
+       script: name "traffic", args ["replay", "<record id>", "--dir", "engagements/${dir}"]
+
+   Replay, not reconstruct. A request you retype from the finding's prose is a
+   different request, and the difference is where the false positive hides.
+3. Replay the negative control. A proof without a control that behaves
+   differently is not a proof: a 500 that happens on every input, a reflection
+   that happens with no payload, a timing difference with no baseline.
+4. Where the claim is client-side, re-run it in the \`browser\` tool with a
+   second \`context\` as the victim role, so the thing that fires is not the
+   same session that planted it.
+5. Where the claim is stochastic — anything involving a model, a race, or a
+   cache — repeat it. Report the number of successes out of the number of
+   attempts, and do not call a 3-of-10 result confirmed without saying so.
+
+Then write the outcome. Two files per candidate, with the \`files\` tool:
+
+    verdicts/<slug>.md       endpoint, state, note — state is \`confirmed\` or
+                             \`rejected\`, nothing else
+    findings/<id>.md         only when confirmed: the candidate's front matter,
+                             with \`status: validated\`, plus what you did to
+                             reproduce it and what came back
+
+A rejected candidate still gets its verdict file, and the note says what failed:
+the record did not replay, the control behaved the same way, the impact does not
+follow from the evidence, the endpoint no longer exists. A rejection is a result,
+not a gap, and the report will say so.
+
+When every candidate you were given has a verdict, build the evidence bundles:
+
+    script: name "evidence", args ["build", "engagements/${dir}"]
+
+## What not to do
+
+Do not look for new vulnerabilities. Not because you could not, but because a
+validator that goes hunting stops being independent of what it is judging, and
+this phase's whole worth is that independence.
+
+Do not fix a candidate's reasoning to make it hold. If the claim is real but the
+evidence does not carry it, that is \`rejected\` with a note naming what would
+prove it. Somebody can test that next time.`,
+  };
 }

@@ -10,8 +10,8 @@
  *   mythos doctor                               what is missing before a run
  *
  * There is one human gate in the whole tool and it is the scope file. After that
- * the engagement runs recon, scan, exploit and report unattended, and nothing
- * will ask the operator anything.
+ * the engagement runs recon, triage, scan, exploit, validate and report
+ * unattended, and nothing will ask the operator anything.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -107,7 +107,8 @@ OPTIONS
   -w, --workers <n>       parallel exploit workers. Default 3.
       --retries <n>       attempts per phase before it is recorded
                           incomplete. Default 2.
-      --skip <list>       phases to skip, comma separated
+      --skip <list>       phases to skip, comma separated: recon, triage,
+                          scan, exploit, validate, report
       --rps <n>           rate limit for a generated scope file. Default 5.
       --base-url <url>    OpenAI-compatible endpoint, for --model custom/<name>
       --headed            show the browser instead of running it headless
@@ -301,7 +302,13 @@ function cmdVerdicts(args: Args): number {
     state: string;
     note: string;
   }>;
-  const mark = { confirmed: "!", tested: "·", skipped: "-" } as Record<string, string>;
+  const mark = {
+    candidate: "?",
+    confirmed: "!",
+    rejected: "x",
+    tested: "·",
+    skipped: "-",
+  } as Record<string, string>;
   for (const r of rows) {
     process.stdout.write(`${mark[r.state] ?? "?"} ${r.state.padEnd(10)} ${r.endpoint}\n    ${r.note}\n`);
   }

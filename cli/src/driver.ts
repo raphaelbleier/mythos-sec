@@ -12,12 +12,24 @@
  * rather than on an opinion:
  *
  *   recon    surface.json and recon.md exist, and the map is not empty
+ *   triage   plan.json exists and selected at least one skill
  *   scan     candidates.md exists
  *   exploit  every endpoint in the surface has a verdict
+ *   validate no candidate is left unresolved
  *   report   report.md and findings.json exist (the coverage check is the report
  *            agent's own last step, not a gate: it is a text check over the
  *            prose and would fail a correct report that names a gap in words
  *            the check does not match)
+ *
+ * Two of those phases are newer than the rest and exist for reasons worth
+ * stating. `triage` is the only phase with no model in it at all: it matches the
+ * mapped surface against the triggers every skill declares in
+ * `skills/registry.yaml` and writes down which ones apply. Before it existed,
+ * fourteen of this repository's eighteen skills were named in no prompt
+ * anywhere, so no run ever opened them. `validate` exists because an agent that
+ * confirms its own finding is grading its own work: the exploit workers may now
+ * only write candidates, and a separate validator reproduces each one from the
+ * recorded bytes before it becomes a finding.
  *
  * A phase that does not produce its artifact runs again with what it left
  * behind, up to `retries` times. After that the run carries on and the phase is
@@ -41,10 +53,10 @@ import {
   reportPrompt,
   scanPrompt,
   systemPrompt,
-  validatorPrompt,
+  validatePrompt,
 } from "./prompts.js";
 import type { Scope } from "./scope.js";
-import { Ledger, surfaceFromMap } from "./verdicts.js";
+import { Ledger, surfaceFromMap, type VerdictState } from "./verdicts.js";
 
 const run = promisify(execFile);
 
@@ -71,7 +83,7 @@ export interface PhaseReport {
   reason?: string;
 }
 
-const PHASES = ["recon", "scan", "exploit", "report"] as const;
+const PHASES = ["recon", "triage", "scan", "exploit", "validate", "report"] as const;
 export type PhaseName = (typeof PHASES)[number];
 
 /**
@@ -84,7 +96,16 @@ export type PhaseName = (typeof PHASES)[number];
  * worth the most, and the floor keeps the last phase able to write a report at
  * all.
  */
-const SHARE: Record<PhaseName, number> = { recon: 0.3, scan: 0.35, exploit: 0.7, report: 1 };
+const SHARE: Record<PhaseName, number> = {
+  recon: 0.3,
+  // Triage runs a script, not a model. It gets a token share because the
+  // budget arithmetic wants a number, not because it needs the time.
+  triage: 0.02,
+  scan: 0.35,
+  exploit: 0.55,
+  validate: 0.5,
+  report: 1,
+};
 const FLOOR_MS = 300_000;
 
 export class Driver {
@@ -99,7 +120,7 @@ export class Driver {
   constructor(private opts: DriverOptions) {
     this.ledger = new Ledger(opts.scope.dir);
     this.guards = new Guards({ scopeFile: opts.scope.file, bus: opts.bus });
-    this.browser = new Browser({ headless: opts.headlessBrowser });
+    this.browser = new Browser({ headless: opts.headlessBrowser, dir: opts.scope.dir });
     this.plan = plan({ profile: opts.profile, model: opts.model });
     // Set before the toolbox starts, and inherited by every child process, so
     // the container and the prompts agree on how the target is addressed.
@@ -118,6 +139,8 @@ export class Driver {
     const { bus, scope } = this.opts;
     mkdirSync(join(scope.dir, "findings"), { recursive: true });
     mkdirSync(join(scope.dir, "verdicts"), { recursive: true });
+    mkdirSync(join(scope.dir, "candidates"), { recursive: true });
+    mkdirSync(join(scope.dir, "evidence"), { recursive: true });
 
     bus.emitEvent({
       t: "run:start",
@@ -223,7 +246,7 @@ export class Driver {
         phase: name,
         attempt,
         of: attempts,
-        model: this.modelFor(`mythos-${name === "scan" ? "scanner" : name === "report" ? "reporter" : name}`),
+        model: this.agentFor(name) === null ? "none (code)" : this.modelFor(this.agentFor(name)!),
         budget: Math.round(this.phaseBudget(name) / 1000),
       });
       try {
@@ -256,12 +279,24 @@ export class Driver {
     return Math.max(Math.min(left, FLOOR_MS), Math.floor(left * SHARE[name]));
   }
 
+  /** Which model profile agent drives a phase, or null where no model does. */
+  private agentFor(name: PhaseName): string | null {
+    if (name === "triage") return null;
+    if (name === "recon") return "mythos-recon";
+    if (name === "scan") return "mythos-scanner";
+    if (name === "exploit") return "mythos-exploiter";
+    if (name === "validate") return "mythos-validator";
+    return "mythos-reporter";
+  }
+
   private async runPhase(name: PhaseName, attempt: number) {
     const { scope, bus } = this.opts;
     const hints = bus.takeHints();
     const sys = systemPrompt(scope, attempt > 1 ? retryNote(attempt) : "");
 
+    if (name === "triage") return this.triagePhase();
     if (name === "exploit") return this.exploitPhase(sys, hints);
+    if (name === "validate") return this.validatePhase(sys, hints);
 
     const p =
       name === "recon"
@@ -270,17 +305,12 @@ export class Driver {
           ? scanPrompt(scope)
           : reportPrompt(scope, this.plan.singleModelValidation);
 
-    const agentName =
-      name === "recon" ? "mythos-recon" : name === "scan" ? "mythos-scanner" : "mythos-reporter";
-
-    if (name === "report") await this.validate();
-
     await runAgent(
       {
         id: `${name}-${attempt}`,
         label: name,
         phase: name,
-        model: this.modelFor(agentName),
+        model: this.modelFor(this.agentFor(name)!),
         system: sys,
         prompt: withHints(p.prompt, hints),
         budgetMs: this.phaseBudget(name),
@@ -288,6 +318,46 @@ export class Driver {
       },
       { scope, guards: this.guards, bus, browser: this.browser },
     );
+  }
+
+  /**
+   * Triage: no model, no tools, no prompt. `scripts/triage` reads the surface
+   * map and `skills/registry.yaml` and writes the plan.
+   *
+   * Keeping a model out of this is the whole point. The same surface must always
+   * select the same skills, and when the selection is wrong it has to be wrong
+   * in a file under version control rather than in one agent's judgement on one
+   * afternoon.
+   */
+  private async triagePhase() {
+    const { scope, bus } = this.opts;
+    const r = await run("python3", [script("triage"), scope.dir, "--write"], {
+      cwd: REPO,
+      maxBuffer: 16 << 20,
+    }).catch((e: { stdout?: string; stderr?: string; message?: string }) => ({
+      stdout: e.stdout ?? "",
+      stderr: e.stderr ?? e.message ?? "",
+    }));
+    const line = (r.stdout || r.stderr || "").trim().split("\n").at(-1);
+    if (line) bus.note("info", line);
+    const plan = this.readPlan();
+    for (const sel of plan) {
+      bus.note("info", `triage: ${sel.name} — ${sel.evidence[0] ?? sel.why}`);
+    }
+  }
+
+  /** The selected skills from plan.json, or an empty list when there is none. */
+  private readPlan(): Array<{ name: string; skill: string; phase: string; why: string; evidence: string[] }> {
+    const f = join(this.opts.scope.dir, "plan.json");
+    if (!existsSync(f)) return [];
+    try {
+      const data = JSON.parse(readFileSync(f, "utf8")) as {
+        selected?: Array<{ name: string; skill: string; phase: string; why: string; evidence?: string[] }>;
+      };
+      return (data.selected ?? []).map((s) => ({ ...s, evidence: s.evidence ?? [] }));
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -320,7 +390,9 @@ export class Driver {
       // Each worker drives its own Chromium: one page cannot serve three agents
       // navigating at once. They are closed on the way out, including when the
       // worker threw, or a run leaves a browser per worker per round behind.
-      const browsers = groups.map(() => new Browser({ headless: this.opts.headlessBrowser }));
+      const browsers = groups.map(
+        () => new Browser({ headless: this.opts.headlessBrowser, dir: scope.dir }),
+      );
       const results = await Promise.allSettled(
         groups.map((group, i) =>
           runAgent(
@@ -344,7 +416,7 @@ export class Driver {
       }
 
       const before = this.ledger.all.length;
-      this.collectVerdicts();
+      this.collectVerdicts("exploit");
       this.announceFindings();
       if (this.ledger.all.length === before) {
         // A round that recorded nothing will not record anything next time
@@ -353,7 +425,7 @@ export class Driver {
         break;
       }
     }
-    this.collectVerdicts();
+    this.collectVerdicts("exploit");
   }
 
   /**
@@ -383,8 +455,17 @@ export class Driver {
     }
   }
 
-  /** Read `verdicts/*.md` the workers wrote into the ledger. */
-  private collectVerdicts() {
+  /**
+   * Read `verdicts/*.md` into the ledger.
+   *
+   * A verdict is normally written once, but a candidate is written twice: the
+   * exploit worker records `candidate`, and the validator overwrites the same
+   * file with `confirmed` or `rejected`. So an existing row is replaced when the
+   * new state resolves an unresolved one, and left alone otherwise — a resolved
+   * verdict is never walked back by a later pass, because that would let a
+   * retry quietly unconfirm a reproduced finding.
+   */
+  private collectVerdicts(writtenBy: "exploit" | "validate" = "validate") {
     const dir = join(this.opts.scope.dir, "verdicts");
     if (!existsSync(dir)) return;
     for (const f of readdirSync(dir)) {
@@ -394,56 +475,129 @@ export class Driver {
       const stateRaw = /^state:\s*(\w+)/m.exec(text)?.[1]?.trim();
       const note = /^note:\s*([\s\S]*?)(?:\n[a-z_]+:|$)/m.exec(text)?.[1]?.trim() ?? "";
       if (!endpoint || !stateRaw) continue;
-      const state =
-        stateRaw === "confirmed" || stateRaw === "tested" || stateRaw === "skipped" ? stateRaw : "tested";
-      if (!this.ledger.has(endpoint)) {
-        this.ledger.record(endpoint, state, note, f);
-        this.opts.bus.emitEvent({ t: "verdict", verdict: { endpoint, state, note } });
-      }
+      const state = verdictState(stateRaw, writtenBy);
+      const existing = this.ledger.get(endpoint);
+      if (existing && (existing.state !== "candidate" || state === "candidate")) continue;
+      this.ledger.record(endpoint, state, note, f);
+      this.opts.bus.emitEvent({ t: "verdict", verdict: { endpoint, state, note } });
     }
   }
 
-  /** The independent check, on a different model where the profile has one. */
-  private async validate() {
+  /**
+   * Validate: reproduce every candidate, on a different model, in a fresh
+   * context, with tools.
+   *
+   * The version this replaces handed the findings to a model with no tools and
+   * asked for an opinion. An opinion about evidence is not a reproduction of it.
+   * This phase replays the recorded bytes instead, and it fans out the same way
+   * exploitation does, because the candidates are independent of each other and
+   * a validator that has to work through forty of them in series runs out of
+   * clock on the last thirty.
+   */
+  private async validatePhase(sys: string, hints: string[]) {
     const { scope, bus } = this.opts;
-    const dir = join(scope.dir, "findings");
-    if (!existsSync(dir)) return;
-    const files = readdirSync(dir).filter((f) => f.endsWith(".md"));
-    if (!files.length) return;
-
-    const body = files
-      .map((f) => `### ${f}\n\n${readFileSync(join(dir, f), "utf8").slice(0, 8000)}`)
-      .join("\n\n");
+    this.collectVerdicts();
+    const deadline = Date.now() + this.phaseBudget("validate");
+    let round = 0;
 
     if (this.plan.singleModelValidation) {
       bus.note(
         "warn",
-        "no second model in this profile: the validation pass is not independent and the report must say so",
+        "no second model in this profile: the validator runs on the hunting model and the report must say the check was not independent",
       );
     }
-    const r = await runAgent(
-      {
-        id: "validator",
-        label: "validator",
-        phase: "report",
-        model: this.plan.tiers.validator,
-        system:
-          "You review security findings written by another agent. You have no tools: judge only " +
-          "what the evidence in front of you establishes.",
-        prompt: validatorPrompt(body),
-        budgetMs: Math.min(240_000, Math.max(60_000, this.left() * 0.15)),
-        maxSteps: 2,
-      },
-      { scope, guards: this.guards, bus, browser: this.browser },
-    );
-    if (r.text.trim()) {
-      writeFileSync(
-        join(scope.dir, "validation.md"),
-        `# Validation pass\n\nModel: ${this.plan.tiers.validator}\n` +
-          `Independent: ${this.plan.singleModelValidation ? "no — same model as the author" : "yes"}\n\n${r.text}\n`,
+
+    while (Date.now() < deadline - 20_000) {
+      this.collectVerdicts();
+      const open = this.ledger.unresolved();
+      if (!open.length) break;
+      round += 1;
+      if (round > 3) {
+        bus.note("warn", `validate: ${open.length} candidates still unresolved after 3 rounds, moving on`);
+        break;
+      }
+
+      const groups = chunk(open.map((r) => r.endpoint), this.opts.workers);
+      const perWorker = Math.max(60_000, Math.floor((deadline - Date.now()) / 2));
+      bus.note("info", `validate round ${round}: ${open.length} candidates across ${groups.length} workers`);
+
+      const browsers = groups.map(
+        () => new Browser({ headless: this.opts.headlessBrowser, dir: scope.dir }),
       );
-      bus.note("info", "validation.md written");
+      const results = await Promise.allSettled(
+        groups.map((group, i) =>
+          runAgent(
+            {
+              id: `validate-r${round}-w${i + 1}`,
+              label: `validate ${i + 1}/${groups.length}`,
+              phase: "validate",
+              model: this.modelFor("mythos-validator"),
+              system: sys,
+              prompt: withHints(validatePrompt(scope, group, round).prompt, hints),
+              budgetMs: Math.min(perWorker, deadline - Date.now() - 10_000),
+              maxSteps: 90,
+            },
+            { scope, guards: this.guards, bus, browser: browsers[i]! },
+          ),
+        ),
+      );
+      await Promise.all(browsers.map((b) => b.close()));
+      for (const r of results) {
+        if (r.status === "rejected" && r.reason instanceof AbortedError) throw r.reason;
+      }
+
+      const before = this.ledger.unresolved().length;
+      this.collectVerdicts();
+      this.announceFindings();
+      if (this.ledger.unresolved().length === before) {
+        bus.note("warn", "validate: a full round resolved nothing, stopping the fan-out");
+        break;
+      }
     }
+
+    this.collectVerdicts();
+    await this.writeValidationNote();
+  }
+
+  /**
+   * One file the report phase can cite for how the check was run. Its value is
+   * not the numbers, it is the sentence about independence: a reader has to know
+   * whether the model that judged a finding is the one that wrote it.
+   */
+  private async writeValidationNote() {
+    const { scope, bus } = this.opts;
+    const v = this.ledger.summary();
+    const rejected = this.ledger.all.filter((r) => r.state === "rejected");
+    const lines = [
+      "# Validation pass",
+      "",
+      `Model: ${this.plan.tiers.validator}`,
+      `Independent: ${this.plan.singleModelValidation ? "no — the same model wrote the candidates" : "yes"}`,
+      "",
+      `${v.confirmed} confirmed, ${v.rejected} rejected, ${v.candidate} left unresolved.`,
+      "",
+    ];
+    if (rejected.length) {
+      lines.push("## Rejected candidates", "");
+      for (const r of rejected) lines.push(`- \`${r.endpoint}\` — ${r.note || "no reason recorded"}`);
+      lines.push("");
+    }
+    if (v.candidate) {
+      lines.push(
+        `${v.candidate} candidate${v.candidate === 1 ? "" : "s"} never got a verdict, so ` +
+          "they are neither findings nor dismissals and the report has to say so.",
+        "",
+      );
+    }
+    writeFileSync(join(scope.dir, "validation.md"), lines.join("\n"));
+    // Build the bundles here rather than trusting the report agent to do it:
+    // the evidence is what a human needs to replay and submit the finding, and
+    // it is the last thing anyone would notice was missing.
+    await run("python3", [script("evidence"), "build", scope.dir], {
+      cwd: REPO,
+      maxBuffer: 32 << 20,
+    }).catch(() => ({ stdout: "", stderr: "" }));
+    bus.note("info", "validation.md written");
   }
 
   /** The artifact gate for a phase. */
@@ -458,11 +612,20 @@ export class Driver {
       if (!has("recon.md")) return { ok: false, reason: "no recon.md" };
       return { ok: true };
     }
+    if (name === "triage") {
+      if (!has("plan.json")) return { ok: false, reason: "no plan.json" };
+      const selected = this.readPlan();
+      // A plan that selected nothing means the registry's triggers found no
+      // surface to match, which almost always means recon mapped very little.
+      // Saying so here is better than letting exploitation discover it.
+      if (!selected.length) return { ok: false, reason: "plan.json selected no skill" };
+      return { ok: true };
+    }
     if (name === "scan") {
       return has("candidates.md") ? { ok: true } : { ok: false, reason: "no candidates.md" };
     }
     if (name === "exploit") {
-      this.collectVerdicts();
+      this.collectVerdicts("exploit");
       this.announceFindings();
       // An empty surface satisfies "every endpoint has a verdict" without a
       // single request being sent, which would report the phase as done after
@@ -474,6 +637,29 @@ export class Driver {
       const open = await this.ledger.open();
       if (open.length) {
         return { ok: false, reason: `${open.length} endpoints without a verdict` };
+      }
+      return { ok: true };
+    }
+    if (name === "validate") {
+      this.collectVerdicts();
+      this.announceFindings();
+      const open = this.ledger.unresolved();
+      if (open.length) {
+        return { ok: false, reason: `${open.length} candidates without a verdict` };
+      }
+      // Every confirmed finding has to be replayable by a person, because no
+      // platform accepts an autonomously submitted report: a human replays the
+      // proof and submits it under their own name.
+      const check = await run("python3", [script("evidence"), "check", d], {
+        cwd: REPO,
+        maxBuffer: 16 << 20,
+      }).catch((e: { stdout?: string; stderr?: string }) => ({
+        stdout: e.stdout ?? "",
+        stderr: e.stderr ?? "failed",
+      }));
+      const bad = (check.stdout || check.stderr || "").trim().split("\n").filter(Boolean);
+      if (check.stderr?.trim()) {
+        return { ok: false, reason: `evidence check: ${bad.at(-1) ?? "a finding has no reproducible evidence"}` };
       }
       return { ok: true };
     }
@@ -499,7 +685,10 @@ export class Driver {
     const phases = this.reports.map((r) => `${r.phase}:${r.state}`).join(" ");
     return (
       `${findings} finding${findings === 1 ? "" : "s"}, ` +
-      `${v.confirmed} confirmed / ${v.tested} tested / ${v.skipped} skipped endpoints. ${phases}`
+      `${v.confirmed} confirmed / ${v.rejected} rejected / ${v.tested} tested / ` +
+      `${v.skipped} skipped endpoints` +
+      (v.candidate ? `, ${v.candidate} candidate${v.candidate === 1 ? "" : "s"} unresolved` : "") +
+      `. ${phases}`
     );
   }
 }
@@ -508,6 +697,23 @@ function retryNote(attempt: number): string {
   return `This is attempt ${attempt} at this phase. The previous attempt did not leave the file
 the phase owes. Read what is already in the engagement directory, keep it, and
 produce the missing artifact — do not start over.`;
+}
+
+/**
+ * Read the `state:` word a worker wrote.
+ *
+ * An unknown word becomes `tested` rather than an error: the endpoint was looked
+ * at, and recording that it was looked at is closer to the truth than dropping
+ * the verdict and reassigning the work. `confirmed` from an exploit worker is
+ * the one case worth noting — the prompt forbids it, but a worker that writes it
+ * anyway must not get a finding through the back door, so it is demoted to a
+ * candidate for the validator to reproduce.
+ */
+export function verdictState(raw: string, writtenBy: "exploit" | "validate" = "validate"): VerdictState {
+  const w = raw.trim().toLowerCase();
+  if (w === "confirmed") return writtenBy === "exploit" ? "candidate" : "confirmed";
+  if (w === "candidate" || w === "rejected" || w === "tested" || w === "skipped") return w;
+  return "tested";
 }
 
 /** Split a list into at most `n` groups, round-robin so each worker gets a mix. */

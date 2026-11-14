@@ -11,9 +11,19 @@
  * So "done" stops being the model's opinion. Every endpoint the surface map
  * found needs an explicit verdict:
  *
- *   confirmed  a finding exists, with the evidence pair
+ *   candidate  the exploit worker believes it found something
+ *   confirmed  a validator reproduced it independently, with the evidence pair
+ *   rejected   a validator could not reproduce it
  *   tested     tested against the classes the surface suggests, nothing proven
  *   skipped    deliberately not tested, with a reason a reader can check
+ *
+ * The split between `candidate` and `confirmed` is deliberate and it is the one
+ * thing here that is not about coverage. An agent that confirms its own finding
+ * is measuring its own hope: Berkeley's RECEIPT work put a naive "the JavaScript
+ * executed" verifier in front of an agent and got 111 claimed cross-site
+ * scripting findings, of which ten were real. So the worker that finds a flaw
+ * may only write a candidate, and a separate validator with a fresh context has
+ * to reproduce it from the recorded request before it becomes a finding.
  *
  * An endpoint with no verdict is not a decision, it is an omission, and the
  * driver keeps assigning work until none are left or the budget ends. The
@@ -28,7 +38,18 @@ import { REPO, script } from "./paths.js";
 
 const run = promisify(execFile);
 
-export type VerdictState = "confirmed" | "tested" | "skipped";
+export type VerdictState = "candidate" | "confirmed" | "rejected" | "tested" | "skipped";
+
+export const VERDICT_STATES: VerdictState[] = [
+  "candidate",
+  "confirmed",
+  "rejected",
+  "tested",
+  "skipped",
+];
+
+/** A candidate is an open question, not an outcome: validate still owes it one. */
+export const isResolved = (s: VerdictState) => s !== "candidate";
 
 export interface VerdictRow {
   endpoint: string;
@@ -95,6 +116,10 @@ export class Ledger {
     return this.rows.has(endpointKey(endpoint));
   }
 
+  get(endpoint: string): VerdictRow | undefined {
+    return this.rows.get(endpointKey(endpoint));
+  }
+
   /**
    * The mapped surface, from the probe's map via `scripts/coverage`. Reusing
    * that script keeps one definition of "the surface": a second parser here
@@ -126,8 +151,23 @@ export class Ledger {
     return (await this.surface()).filter((e) => !this.rows.has(endpointKey(e)));
   }
 
-  summary(): { confirmed: number; tested: number; skipped: number } {
-    const s = { confirmed: 0, tested: 0, skipped: 0 };
+  /**
+   * The candidates the validate phase still owes an answer. Keyed by the file
+   * the worker wrote, because that file holds the evidence the validator has to
+   * reproduce, and the endpoint alone does not say which claim is at stake.
+   */
+  unresolved(): VerdictRow[] {
+    return [...this.rows.values()].filter((r) => !isResolved(r.state));
+  }
+
+  summary(): Record<VerdictState, number> {
+    const s: Record<VerdictState, number> = {
+      candidate: 0,
+      confirmed: 0,
+      rejected: 0,
+      tested: 0,
+      skipped: 0,
+    };
     for (const r of this.rows.values()) s[r.state] += 1;
     return s;
   }

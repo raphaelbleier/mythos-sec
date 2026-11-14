@@ -14,7 +14,8 @@ export type PhaseState = "pending" | "running" | "done" | "incomplete" | "failed
 
 export interface Verdict {
   endpoint: string;
-  state: "confirmed" | "tested" | "skipped";
+  /** The same set as `VerdictState` in verdicts.ts, which owns its meaning. */
+  state: "candidate" | "confirmed" | "rejected" | "tested" | "skipped";
   note: string;
 }
 
