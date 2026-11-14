@@ -151,6 +151,18 @@ MAX_SLEEP = 30.0
 TRAFFIC_EXEC = re.compile(r"scripts/traffic\s+(?:--dir\s+\S+\s+)?exec\b")
 
 
+def _segments(command: str) -> list[str]:
+    """One shell command per entry, so a rule names the line it matched.
+
+    Splits on newlines and on the operators that separate commands, keeping it
+    deliberately crude: this is for attributing a match to a line, not for
+    parsing shell. A quoted semicolon inside a payload will split a segment,
+    which costs nothing because both halves are still checked.
+    """
+    parts = re.split(r"\n|;|&&|\|\||\|", command)
+    return [p for p in (x.strip() for x in parts) if p]
+
+
 def _scope_file() -> Path | None:
     path = os.environ.get("MYTHOS_SCOPE")
     if path:
@@ -285,17 +297,33 @@ def check(command: str, charge: bool = False) -> dict:
     command = str(command)
 
     # The destructive denylist does not need a scope file: it is absolute.
-    for pattern, why in DESTRUCTIVE:
-        if pattern.search(command):
-            mode = os.environ.get("MYTHOS_DESTRUCTIVE", "block")
-            out["message"] = (
-                "⛔ MYTHOS BUDGET GUARD: refused as destructive.\n"
-                f"    {why}.\n"
-                "    Mythos tests non-destructively: no data destruction, no "
-                "brute force, no denial of service. Find a read-only or "
-                "self-owned-object proof, or report the class as unconfirmed.")
-            out["action"] = "warn" if mode == "warn" else "block"
-            return out
+    #
+    # Matching is per segment, not over the whole string. An agent sends a
+    # multi-line script, and judging the blob meant one destructive line
+    # refused the whole thing while the message named a rule that had nothing
+    # to do with the line the agent was looking at. A live run hit exactly
+    # that: a POST to /register was refused with "HTTP DELETE destroys target
+    # data" because a later line in the same script held a DELETE. The call is
+    # still refused as a whole, since a hook cannot run half a script, but the
+    # message now quotes the segment responsible so the agent can resend
+    # without it instead of guessing.
+    for segment in _segments(command):
+        for pattern, why in DESTRUCTIVE:
+            if pattern.search(segment):
+                mode = os.environ.get("MYTHOS_DESTRUCTIVE", "block")
+                shown = segment.strip()
+                shown = shown if len(shown) <= 160 else shown[:157] + "..."
+                out["message"] = (
+                    "⛔ MYTHOS BUDGET GUARD: refused as destructive.\n"
+                    f"    {why}.\n"
+                    f"    The part that triggered this:\n      {shown}\n"
+                    "    The whole call is refused, because a hook cannot run "
+                    "half a script. Resend without that part.\n"
+                    "    Mythos tests non-destructively: no data destruction, no "
+                    "brute force, no denial of service. Find a read-only or "
+                    "self-owned-object proof, or report the class as unconfirmed.")
+                out["action"] = "warn" if mode == "warn" else "block"
+                return out
 
     loaded = load_rules()
     if not loaded:
@@ -402,6 +430,17 @@ def _selftest() -> int:
              "block", "brute force blocked")
         want(check("curl -X DELETE https://a.test/paste/7")["action"], "block",
              "DELETE blocked")
+        # A multi-line script is attributed to the line that matched, which a
+        # live run needed: a POST was refused under the DELETE rule because a
+        # later line in the same script held one.
+        multi = check("curl -sS -X POST https://a.test/register -d x\n"
+                      "curl -sS -X DELETE https://a.test/users/2\n"
+                      "echo done")
+        want(multi["action"], "block", "multi-line script with a DELETE blocked")
+        want("DELETE https://a.test/users/2" in multi["message"], True,
+             "the offending line is quoted")
+        want("register" in multi["message"], False,
+             "the innocent line is not blamed")
         # The hole a live run walked through: mass destruction as an operation
         # name in a request body, invisible to a shell-shaped denylist.
         want(check("""curl -X POST https://a.test/graphql -d '{"query":"{deleteAllPastes}"}'""")["action"],

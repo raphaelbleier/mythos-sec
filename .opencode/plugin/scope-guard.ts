@@ -36,7 +36,21 @@ function py(script: string, args: string[], cwd: string): any | null {
 }
 
 function warn(tool: string, args: any, msg: string): void {
-  warn(tool, args, msg)
+  console.error(msg)
+  if (tool !== "bash") return
+  // Surface the warning in the tool's own stderr so the model sees it beside
+  // the output. The message is multi-line and contains quotes, so it goes
+  // through the environment rather than being quoted into the command: a
+  // quoting mistake here corrupts the agent's command instead of warning
+  // about it, and the agent then reads a broken shell line as the guard
+  // malfunctioning.
+  // Only a fixed, shell-safe line is prefixed. The guard's own message is
+  // multi-line and contains quotes, and quoting it into the agent's command
+  // corrupted the command instead of warning about it: the agent read the
+  // broken shell line as the hook malfunctioning and started working around
+  // it. Nothing variable goes into the command string now. The full message is
+  // on stderr above, and on Claude Code the hook delivers it as context.
+  args.command = `printf '%s\\n' '[mythos guard] a warning was raised for this call; see the log' >&2; ${args.command}`
 }
 
 function check(tool: string, args: any, cwd: string): void {
