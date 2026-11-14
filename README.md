@@ -61,6 +61,27 @@ depending on the rater, with six false positives found between them. Every
 earlier precision of 1.00 came from a triage schema in which no row could be a
 false positive.
 
+**The scaffolding does not find more, it finds different.** A head-to-head on
+Vuln Bank the same day put Mythos, a bare control agent and Strix on the same
+model, key, budget and endpoint, scored against the same 76 documented
+vulnerabilities and rated blind by two raters (Cohen's kappa 0.80 to 1.00, the
+best agreement here so far). Recall was 0.34 and 0.39 for the scaffolding
+against 0.33 and 0.39 for the bare agent, McNemar p = 1.0000 both times. But
+each arm found six or seven entries the other missed, so their union is 31 and
+37 of 76 against 25 to 30 individually. The scaffolding uniquely reached the
+bill-payment, merchant and AI-configuration surfaces that this project's own
+limitations file had recorded as never reached. Details, and the five things
+this does not establish, in
+[`bench/data/runs/h2h-vulnbank-20261114/`](bench/data/runs/h2h-vulnbank-20261114/).
+
+Strix scored 0.00 recall, and that number should be read there rather than
+quoted: it was cut off before writing a report and labels its own findings
+"requires further review". Getting it to run took four attempts and all four
+failures were this project's own, one of which very likely accounts for the
+whole of the "Strix kept only 2 of 12 valid cells" recorded here previously.
+Every Strix comparison from this repository before 14 November 2026 is
+withdrawn.
+
 Withdrawn:
 
 - **The Vuln Bank coverage-gate separation** (Mythos with the gate 34 and 33
