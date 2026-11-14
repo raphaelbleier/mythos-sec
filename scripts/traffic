@@ -737,10 +737,50 @@ def serve(d: Path, a):
 
 # ----------------------------------------------------------------- engagement
 
+PIN_FILE = ".mythos-scope"
+
+
+def _pinned_scope():
+    """The engagement from the pin file `engagement-setup` writes.
+
+    Every Bash tool call is a fresh shell, so an `export MYTHOS_SCOPE` made when
+    the recorder was started is gone by the next call. A measured run hit this
+    exactly: `start` succeeded, then ten `exec` calls and nine `summary` calls in
+    later shells all failed to find an engagement, nothing was recorded, and the
+    coverage gate fell back to searching the report for path names. The agent had
+    used the tool correctly ten times.
+
+    The guards were given a pin file for the same reason. This reads the same
+    file, under both roots, because the project directory and the agent's working
+    directory are not the same place in a benchmark cell.
+    """
+    roots = []
+    for candidate in (os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()):
+        if candidate:
+            p = Path(candidate)
+            if p not in roots:
+                roots.append(p)
+    for root in roots:
+        try:
+            raw = (root / PIN_FILE).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        for base in roots:
+            scope = Path(raw) if Path(raw).is_absolute() else base / raw
+            if scope.exists():
+                return str(scope.parent)
+    return None
+
+
 def engagement(a) -> Path:
-    path = a.dir or a.top_dir or (os.environ.get("MYTHOS_SCOPE") and str(Path(os.environ["MYTHOS_SCOPE"]).parent))
+    path = (a.dir or a.top_dir
+            or (os.environ.get("MYTHOS_SCOPE") and str(Path(os.environ["MYTHOS_SCOPE"]).parent))
+            or _pinned_scope())
     if not path:
-        sys.exit("traffic: no engagement. Pass --dir engagements/<dir> or pin MYTHOS_SCOPE (engagement-setup, step 4).")
+        sys.exit("traffic: no engagement. Pass --dir engagements/<dir>, pin MYTHOS_SCOPE, or "
+                 "write the scope path into .mythos-scope (engagement-setup, step 4).")
     d = Path(path)
     if not d.is_dir():
         sys.exit(f"traffic: not a directory: {d}")

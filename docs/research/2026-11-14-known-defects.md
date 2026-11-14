@@ -6,8 +6,14 @@
 
 ## 1. `scripts/traffic exec` records nothing inside a benchmark cell
 
-**Status:** open. The evidence-based coverage gate depends on this and is
-therefore inert in a benchmark cell.
+**Status:** FIXED 14 November 2026. Cause confirmed, not guessed: every Bash
+tool call is a fresh shell, so the `export MYTHOS_SCOPE` made when the recorder
+was started is gone by the next call, and `engagement()` resolved only from
+`--dir` or that variable. The ten `exec` calls and nine `summary` calls were
+all exiting with "no engagement". `scripts/traffic` now reads the same
+`.mythos-scope` pin file the guards read, under both roots. Verified by
+reproducing the failure in a fresh shell with the variable unset: `start`,
+`exec` and `summary` now resolve the engagement and the request is recorded.
 
 **What happens.** In three measured cells the agent started the recorder
 correctly (`traffic/proxy.json`, `ca.crt` and `events.jsonl` are all written),
