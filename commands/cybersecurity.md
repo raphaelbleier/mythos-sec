@@ -67,7 +67,11 @@ Follow the **`engagement-setup` skill**:
    the stack, `scripts/lessons prior --stack <tokens>` ranks the classes by how
    often they have actually confirmed on a stack like this. With an empty
    ledger it says so and your default order stands.
-6. State the scope back to the user in one line (in-scope hosts, rate limit,
+6. **Start the recorder:** `scripts/traffic start`. Mark phases with
+   `scripts/traffic phase <name>` and send host requests through
+   `scripts/traffic exec -- curl ...`. Without it there is no record of what was
+   sent, and the coverage gate degrades to searching the report for path names.
+7. State the scope back to the user in one line (in-scope hosts, rate limit,
    whether exploitation is allowed). Do **not** start the toolbox yet: start it
    with `scripts/mythos up` the first time you actually need a container tool.
    Plain HTTP requests run faster with the host's own `curl`.
@@ -216,6 +220,10 @@ Write it yourself on a small target. On a large one delegate to
 `report.md` in bug-bounty format (title, severity + CVSS, asset, steps to
 reproduce, evidence, impact, remediation), ranked by severity. If the user asks
 for a German lab `.docx`, hand the findings to the `security-lab` skill.
+
+Run `scripts/traffic summary` and `scripts/traffic run` as well, and state the
+capture section in the report: if any request could not be recorded, the report
+says so rather than reading as complete.
 
 Run `scripts/findings engagements/<dir>` first, before the prose. It parses the
 front matter of every finding into `findings.json`, computes the CVSS score

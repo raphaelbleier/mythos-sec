@@ -88,6 +88,18 @@ is the authorization boundary; nothing runs until it is written down.
 
    The `scope` field in that output must be the file you just wrote.
 
+5. **Start the recorder.** `scripts/traffic start`, then mark each phase with
+   `scripts/traffic phase recon|scan|exploit|report`, and run host requests as
+   `scripts/traffic exec -- curl ...`.
+
+   This is not optional bookkeeping. `engagements/<dir>/audit.jsonl` logs a
+   command's argv and exit code, not its requests, so without the recorder
+   there is no record of what was actually sent. It is also what makes the
+   coverage gate mean something: with a traffic record, a mapped path counts as
+   covered only when a request went to it, and without one the gate falls back
+   to looking for the path's name in the report, which a run can satisfy by
+   listing the paths it did not test.
+
 5. **Read the history** for this target and stack, if there is any:
 
    ```bash

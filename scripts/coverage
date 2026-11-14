@@ -96,9 +96,79 @@ def is_covered(item, text):
     return re.search(pat, text) is not None
 
 
+def requested_paths(engagement):
+    """Paths a request actually went to, read from the recorded traffic.
+
+    A mention in a report is not a test. The gate could be satisfied by listing
+    the mapped paths under a heading, which is how a measured run accounted for
+    all 73 paths in a report that tested a fraction of them, and why the "all
+    mapped paths accounted for" claim was withdrawn. `scripts/traffic` records
+    what was actually sent, so the gate can ask the record instead of the prose.
+
+    Returns None when there is no traffic record, so the caller can fall back to
+    the text check and say which one it used. An engagement run without the
+    recorder is still gated, just more weakly.
+    """
+    log = Path(engagement) / "traffic" / "log.jsonl"
+    if not log.exists():
+        return None
+    paths = set()
+    try:
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            path = row.get("path") or ""
+            if not path:
+                continue
+            paths.add("/" + path.split("?")[0].lstrip("/"))
+    except OSError:
+        return None
+    return paths
+
+
+def is_requested(item, paths):
+    """Whether a request went to this path. Only paths can be checked this way.
+
+    A parameter or a GraphQL field is not a path, so the record cannot confirm
+    it on its own and those fall back to the text check.
+    """
+    key = match_key(item)
+    if not key or not key.startswith("/"):
+        return None
+    key = "/" + key.strip("/")
+    return any(p == key or p.startswith(key + "/") for p in paths)
+
+
 def open_items(d, extra=None):
+    """Mapped items the engagement has not accounted for.
+
+    Where a traffic record exists, a path is closed only if a request went to
+    it. The text check still closes a parameter or a field, and still closes a
+    path the record does not contain but the report discusses, because an
+    engagement may legitimately reach a path through a tool whose traffic the
+    recorder cannot see.
+    """
     text = covered(d, extra)
-    return [i for i in surface(d) if not is_covered(i, text)]
+    paths = requested_paths(d)
+    out = []
+    for item in surface(d):
+        if is_covered(item, text):
+            if paths is None:
+                continue
+            sent = is_requested(item, paths)
+            if sent is None or sent:
+                continue
+            # Named in the report, never requested. This is the case the gate
+            # existed for and used to pass.
+            out.append(item)
+        else:
+            out.append(item)
+    return out
 
 
 def _selftest():
@@ -116,6 +186,27 @@ def _selftest():
     assert not is_covered("/api", "the /v2/api route") and not is_covered("/api", "/apiary")
     assert is_covered("mutation importPaste(a, b)", "importPaste is injectable")
     assert not is_covered("mutation importPaste(a, b)", "reimportPasted")
+    # A path named in the report but never requested is the case the gate
+    # existed for and used to pass. With a traffic record it stays open.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "surface.json").write_text(json.dumps(
+            {"reachable_paths": ["/api/data", "/admin"],
+             "parameters": [{"name": "q", "url": "/api/data"}]}))
+        (d / "report.md").write_text(
+            "We reviewed /api/data and /admin and the q parameter thoroughly.")
+        named_only = {i for i in open_items(d)}
+        assert not named_only, f"text check alone closes everything: {named_only}"
+
+        (d / "traffic").mkdir()
+        (d / "traffic" / "log.jsonl").write_text(
+            json.dumps({"path": "/api/data", "method": "GET", "status": 200}) + "\n")
+        with_record = {match_key(i) for i in open_items(d)}
+        assert "/admin" in with_record, f"/admin was never requested: {with_record}"
+        assert "/api/data" not in with_record, f"/api/data was requested: {with_record}"
+        assert "param:q" not in with_record, "a parameter is not a path, text check stands"
+
     print("selftest ok")
 
 
