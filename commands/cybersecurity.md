@@ -54,11 +54,16 @@ Follow the **`engagement-setup` skill**:
    `engagements/<dir>/scope.yaml` from the template in the `engagement-setup`
    skill, and **fill `in_scope` with exactly what the program authorizes**.
    Default `in_scope` to the target host only. Never widen scope on your own.
-4. **Pin the scope file** before anything else runs:
-   `export MYTHOS_SCOPE="$PWD/engagements/<dir>/scope.yaml"`. Without this both
-   guards fall back to the newest `engagements/*/scope.yaml` by modification
-   time, so a leftover directory from an older engagement would authorize this
-   one. Verify with
+4. **Pin the scope file** before anything else runs, both lines:
+   `echo "engagements/<dir>/scope.yaml" > .mythos-scope` and
+   `export MYTHOS_SCOPE="$PWD/engagements/<dir>/scope.yaml"`. The file is what
+   the guards read: a hook runs as its own process in the host's environment,
+   so an export inside a tool call never reaches it, and a measured run pinned
+   the scope as instructed while the guards still used the newest
+   `engagements/*/scope.yaml` by modification time. The export is still needed
+   for `scripts/probe`, `scripts/verify` and `scripts/watch`, which are children
+   of your shell. Without the pin a leftover engagement directory would
+   authorize this one. Verify with
    `python3 hooks/scope-guard.py --check 'curl https://example.invalid/'` and
    check that the `scope` field names the file you just wrote.
 5. **Read the history**, if any: `scripts/lessons seen --target <host>` says

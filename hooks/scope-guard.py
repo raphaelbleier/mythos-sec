@@ -85,7 +85,7 @@ def load_scope():
     except Exception:
         yaml = None
     path = os.environ.get("MYTHOS_SCOPE")
-    scope_file = Path(path) if path else _newest_scope()
+    scope_file = Path(path) if path else (_pinned_scope() or _newest_scope())
     if not scope_file or not scope_file.exists():
         return None
     text = scope_file.read_text(encoding="utf-8", errors="replace")
@@ -127,6 +127,36 @@ def _ports(raw):
                 out.add(int(part))
     return out or None
 
+
+PIN_FILE = ".mythos-scope"
+
+
+def _pinned_scope():
+    """The scope the engagement pinned, from a file the agent can actually write.
+
+    `engagement-setup` and the orchestrator both say to `export MYTHOS_SCOPE`.
+    That reaches `scripts/probe` and `scripts/verify`, which are children of
+    that shell, and it never reaches these hooks: a PreToolUse hook runs as its
+    own process in the host's environment, not in the agent's shell, so an
+    export inside a Bash call is invisible here. A measured run pinned the scope
+    exactly as instructed and the guards still fell back to the newest
+    `engagements/*/scope.yaml` by modification time, which is the very fallback
+    the pin exists to avoid.
+
+    So the pin is a file. The agent writes the scope's path into
+    `.mythos-scope` at the project root, every guard reads it, and the env var
+    still wins when it is set by a harness or a wrapper that can set it.
+    """
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
+    f = root / PIN_FILE
+    try:
+        raw = f.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    p = Path(raw if Path(raw).is_absolute() else root / raw)
+    return p if p.exists() else None
 
 def _newest_scope():
     root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
@@ -456,6 +486,21 @@ def _selftest() -> int:
         eq(check("curl http://127.0.0.1:5001/")["offenders"], [], "lab loopback")
         eq(check("curl https://evil.test/")["offenders"], ["evil.test"],
            "lab still guards elsewhere")
+
+        # The pin file is what a hook can actually read: an export inside the
+        # agent's shell never reaches this process.
+        pinned = Path(td) / "pinned.yaml"
+        pinned.write_text("in_scope:\n  - pinned.test\n")
+        newest = Path(td) / "engagements" / "later"
+        newest.mkdir(parents=True, exist_ok=True)
+        (newest / "scope.yaml").write_text("in_scope:\n  - newest.test\n")
+        os.environ.pop("MYTHOS_SCOPE", None)
+        os.environ["CLAUDE_PROJECT_DIR"] = td
+        (Path(td) / PIN_FILE).write_text(str(pinned))
+        eq(check("curl https://newest.test/")["offenders"], ["newest.test"],
+           "the pin wins over the newest scope by mtime")
+        (Path(td) / PIN_FILE).unlink()
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
 
         # an empty in_scope authorizes nothing
         empty = Path(td) / "empty.yaml"

@@ -74,13 +74,21 @@ is the authorization boundary; nothing runs until it is written down.
    boundary:
 
    ```bash
+   echo "engagements/<dir>/scope.yaml" > .mythos-scope
    export MYTHOS_SCOPE="$PWD/engagements/<dir>/scope.yaml"
    ```
 
-   Do this before any other phase runs. Without it both guards fall back to
-   the newest `engagements/*/scope.yaml` by modification time, which means a
-   leftover directory from an older engagement can silently authorize this
-   one. Confirm the pin took effect:
+   Both lines, and the file matters more than the export. A PreToolUse hook
+   runs as its own process in the host's environment, not in your shell, so an
+   `export` inside a tool call never reaches the guards: a measured run pinned
+   the scope exactly as instructed and the guards still fell back to the newest
+   `engagements/*/scope.yaml` by modification time, which is the fallback the
+   pin exists to avoid. The file is read by both guards. The export is still
+   worth setting, because `scripts/probe`, `scripts/verify` and `scripts/watch`
+   are children of your shell and read it for the rate limit.
+
+   Without the pin, a leftover directory from an older engagement can silently
+   authorize this one. Confirm it took effect:
 
    ```bash
    python3 hooks/scope-guard.py --check 'curl https://example.invalid/'

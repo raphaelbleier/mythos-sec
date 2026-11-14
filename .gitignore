@@ -23,3 +23,6 @@ nuclei-output/
 
 # code-intelligence index (local only)
 .gitnexus/
+
+# the active engagement's scope pin, written by engagement-setup
+.mythos-scope

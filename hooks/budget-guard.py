@@ -163,11 +163,44 @@ def _segments(command: str) -> list[str]:
     return [p for p in (x.strip() for x in parts) if p]
 
 
+PIN_FILE = ".mythos-scope"
+
+
+def _pinned_scope():
+    """The scope the engagement pinned, from a file the agent can actually write.
+
+    `engagement-setup` and the orchestrator both say to `export MYTHOS_SCOPE`.
+    That reaches `scripts/probe` and `scripts/verify`, which are children of
+    that shell, and it never reaches these hooks: a PreToolUse hook runs as its
+    own process in the host's environment, not in the agent's shell, so an
+    export inside a Bash call is invisible here. A measured run pinned the scope
+    exactly as instructed and the guards still fell back to the newest
+    `engagements/*/scope.yaml` by modification time, which is the very fallback
+    the pin exists to avoid.
+
+    So the pin is a file. The agent writes the scope's path into
+    `.mythos-scope` at the project root, every guard reads it, and the env var
+    still wins when it is set by a harness or a wrapper that can set it.
+    """
+    root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
+    f = root / PIN_FILE
+    try:
+        raw = f.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    p = Path(raw if Path(raw).is_absolute() else root / raw)
+    return p if p.exists() else None
+
 def _scope_file() -> Path | None:
     path = os.environ.get("MYTHOS_SCOPE")
     if path:
         p = Path(path)
         return p if p.exists() else None
+    pinned = _pinned_scope()
+    if pinned:
+        return pinned
     root = Path(os.environ.get("CLAUDE_PROJECT_DIR", "."))
     candidates = list(root.glob("engagements/*/scope.yaml"))
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
