@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Mythos lessons recorder — Stop hook.
+"""Mythos lessons recorder, run by the CLI when an engagement finishes.
 
 An engagement throws away everything it learned. The next run against a
 similar stack starts from the same uniform prior: it will spend the same
 minutes on the class that never once confirmed, and reach the class that
 confirms four times in five just as late.
 
-This hook closes that loop with the smallest thing that works: at the end of
-an engagement it reads the findings the agent wrote and appends one record per
+This closes that loop with the smallest thing that works: at the end of an
+engagement it reads the findings the agent wrote and appends one record per
 finding to a ledger. `scripts/lessons` reads the ledger back and tells recon
 which classes to try first on this fingerprint, and which playbooks have never
 confirmed anything and are therefore suspect.
@@ -30,6 +30,11 @@ see. The salt lives beside the ledger and never leaves the operator's machine,
 so the hash cannot be reversed to a hostname by someone holding the file.
 
 Default location ~/.mythos/lessons.jsonl, overridable with $MYTHOS_LESSONS.
+
+  scripts/lessons-record          # record the engagement $MYTHOS_SCOPE points at
+  scripts/lessons-record --selftest
+
+The CLI runs it when a run finishes; `scripts/lessons` reads the ledger back.
 """
 
 from __future__ import annotations
@@ -183,7 +188,63 @@ def records(d: Path, salt: str) -> list[dict]:
     return out
 
 
+def _selftest() -> int:
+    """Asserts over the record shape, no network and no ledger of the operator's.
+
+    It exists because `--selftest` used to exit 0 without running anything, which
+    is worse than having none: a green line in CI that proves nothing.
+    """
+    import tempfile
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "engagement"
+        (d / "findings").mkdir(parents=True)
+        (d / "scope.yaml").write_text("target: http://h.test\nin_scope:\n  - h.test\n")
+        (d / "findings" / "f1.md").write_text(
+            "---\nid: f1\ntitle: Leaked key\nclass: sensitive-file-exposure\n"
+            "status: validated\nplaybook: knowledge/web/exposed-files.md\n---\nbody\n")
+        (d / "findings" / "f2.md").write_text(
+            "---\nid: f2\nclass: not-a-real-class\nstatus: candidate\n---\nbody\n")
+        (d / "findings" / "f3.md").write_text("---\nid: f3\nstatus: validated\n---\nno class\n")
+
+        rows = records(d, "testsalt")
+        want(len(rows), 2, "a finding with no class is skipped, the other two are kept")
+        by_state = {r["state"]: r for r in rows}
+        want(sorted(by_state), ["candidate", "validated"], "both states recorded")
+        want(by_state["validated"]["playbook"], "knowledge/web/exposed-files.md", "playbook kept")
+        want(by_state["candidate"]["class"], "other", "an unknown class is folded into 'other'")
+
+        # Nothing that identifies the target may reach a ledger that outlives the
+        # engagement directory.
+        blob = json.dumps(rows)
+        want("h.test" in blob, False, "the hostname never appears in a record")
+        want(len(rows[0]["target"]), 16, "the target is a short salted hash")
+        want(records(d, "othersalt")[0]["target"] != rows[0]["target"], True,
+             "a different salt gives a different hash")
+        want(set(rows[0]) == {"ts", "target", "stack", "class", "state", "playbook"}, True,
+             "no field beyond the documented six")
+
+        (d / "findings" / "f4.md").write_text("---\nid: f4\nclass: xss\nstatus: nonsense\n---\n")
+        states = {r["state"] for r in records(d, "testsalt")}
+        want("unknown" in states, True, "an unrecognised state is recorded as unknown")
+
+    for f in failures:
+        print(f"FAIL {f}")
+    print(f"lessons-record selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
 def main() -> int:
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
+    if sys.argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
     try:
         d = engagement()
         if d is None:
@@ -209,7 +270,7 @@ def main() -> int:
         marker.write_text(" ".join(sorted(
             already | {f"{r['class']}:{r['state']}" for r in new})))
     except Exception:
-        # A Stop hook must never break the host. Losing a lesson is cheap.
+        # Recording a lesson must never fail a finished engagement. Losing one is cheap.
         return 0
     return 0
 

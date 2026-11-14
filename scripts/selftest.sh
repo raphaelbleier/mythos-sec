@@ -1,223 +1,174 @@
 #!/usr/bin/env bash
-# Mythos self-test — a repeatable regression check for the skill-driven flow.
+# Mythos repository check. No network, no model, no API key.
 #
-# Starts the ground-truth lab app (lab/vulnapp) and drives the Kali toolbox the
-# same way the skills do, asserting that each expected vulnerability class is
-# found with real tool output, and that a safe endpoint is NOT flagged (no false
-# positive). This is the automated test for the toolbox-driven architecture
-# (there is no Python engine to unit-test).
+#   scripts/selftest.sh                 # offline checks only (what CI runs)
+#   scripts/selftest.sh --with-docker   # also the toolbox flow and the lab target
 #
-#   scripts/selftest.sh                  # full run (starts + stops the lab)
-#   KEEP_LAB=1 scripts/selftest.sh       # leave the lab running afterwards
-#   scripts/selftest.sh --host opencode  # same checks, but the mythos agent
-#                                        # does the work via `opencode run` and
-#                                        # its report is scored
+# It runs, in order:
+#   1. every deterministic script's own --selftest
+#   2. the CLI typecheck and cli/dist/selftest.js
+#   3. the two guards end to end against a temporary scope file
+#   4. with --with-docker: the toolbox, and a loopback lab target via MYTHOS_NET=host
 #
-# --host opencode env: MYTHOS_MODEL (default opencode/glm-5.3-flash-free),
-# MYTHOS_TIMEOUT seconds for the agent run (default 3600).
-#
-# Exit code 0 = all checks passed.
+# The first failure ends the run with a non-zero exit code and the failing
+# command's output.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-# The lab binds to loopback only, so the toolbox reaches vulnapp over the lab
-# network by service name. The probe runs on the host and uses the published port.
-T="${MYTHOS_SELFTEST_TARGET:-http://vulnapp:5000}"
-PASS=0; FAIL=0
-HOST=claude
-[ "${1:-}" = "--host" ] && HOST="${2:-claude}"
 
-ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
-bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %s\n' "$1"; }
+WITH_DOCKER=0
+case "${1:-}" in
+  "") ;;
+  --with-docker) WITH_DOCKER=1 ;;
+  -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "selftest: unknown argument '$1' (use --with-docker)" >&2; exit 2 ;;
+esac
 
-# assert <name> <needle> <command-output...>
-assert_has() { if printf '%s' "$3" | grep -qiF "$2"; then ok "$1"; else bad "$1 (missing: $2)"; fi; }
-assert_not() { if printf '%s' "$3" | grep -qiF "$2"; then bad "$1 (unexpected: $2)"; else ok "$1"; fi; }
-# assert_line <name> <path> <class-regex> <text>: one line names both the path and the class
-assert_line() { if printf '%s' "$4" | grep -iF -- "$2" | grep -qiE -- "$3"; then ok "$1"; else bad "$1 (no line with $2 + /$3/)"; fi; }
+ok()   { printf 'ok    %s\n' "$1"; }
+skip() { printf 'skip  %s\n' "$1"; }
+die()  { printf 'FAIL  %s\n' "$1" >&2; exit 1; }
 
-echo "== Mythos self-test (host: $HOST) =="
-echo "-- starting toolbox + lab --"
-scripts/mythos up >/dev/null 2>&1
-docker compose -f lab/docker-compose.yml up -d vulnapp >/dev/null 2>&1
-scripts/mythos net mythos-lab >/dev/null 2>&1
-for i in $(seq 1 20); do
-  [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/ 2>/dev/null)" = "200" ] && break
-  sleep 1
+# run <name> <command...>: print one line, or print the output and stop.
+run() {
+  local name="$1"; shift
+  local out
+  if out=$("$@" 2>&1); then ok "$name"; else
+    printf '%s\n' "$out" >&2
+    die "$name"
+  fi
+}
+
+# want <name> <expected> <actual>
+want() {
+  [ "$2" = "$3" ] && ok "$1" || die "$1 (expected '$2', got '$3')"
+}
+
+echo "== deterministic scripts =="
+# Every deterministic script and both guards. Keep this list complete: a script
+# without a check here is one whose breakage shows up as a bad engagement rather
+# than as a failing build.
+for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
+         scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
+         scripts/lessons-record scripts/models \
+         hooks/scope-guard.py hooks/budget-guard.py; do
+  run "$s --selftest" python3 "$s" --selftest
 done
 
-echo "-- fast probe (deterministic, no model) --"
-pr=$(timeout 120 scripts/probe "http://127.0.0.1:5001" --depth 2 2>&1)
-assert_has "probe maps the search form"      "form GET /search"              "$pr"
-assert_has "probe reaches /.env"             "/.env"                         "$pr"
-assert_has "probe ranks q as xss/sqli"       "reflected-xss"                 "$pr"
-assert_has "probe ranks file as traversal"   "path-traversal"                "$pr"
-assert_has "probe flags missing headers"     "missing_headers"               "$pr"
-
-echo "-- hypothesis verifier (deterministic, no model) --"
-vf=$(timeout 300 bash -c 'scripts/probe "http://127.0.0.1:5001" --depth 2 --json | scripts/verify --from-probe' 2>&1)
-assert_has "verify proves XSS on q"          "xss via \`q\`"                   "$vf"
-assert_has "verify proves SQLi on id"        "sqli via \`id\`"                 "$vf"
-assert_has "verify proves traversal on file" "traversal via \`file\`"          "$vf"
-assert_has "verify proves redirect on next"  "redirect via \`next\`"           "$vf"
-assert_has "verify proves cmd injection"     "cmdi via \`host\`"               "$vf"
-# negative control: /safe escapes its output, so the canary must not answer there
-sf=$(timeout 90 scripts/verify "http://127.0.0.1:5001/safe" --param q --classes xss 2>&1)
-assert_not "verify silent on escaped /safe"  "xss via"                        "$sf"
-
-if [ "$HOST" = "opencode" ]; then
-  echo "-- running the mythos agent through opencode --"
-  MODEL="${MYTHOS_MODEL:-opencode/glm-5.3-flash-free}"
-  tmp=$(mktemp -d)
-  cat > "$tmp/scope.yaml" <<YAML
-target: $T
-in_scope: [host.docker.internal, 127.0.0.1, localhost]
-out_of_scope: []
-rules:
-  rate_limit_rps: 10
-  max_requests: 20000
-  allow_active: true
-  allow_exploit: true
-notes: "Mythos self-test against the local ground-truth lab app (lab/vulnapp)."
-YAML
-  mkdir -p engagements
-  touch "$tmp/start"
-  log="engagements/selftest-opencode-$(date +%Y%m%d-%H%M%S).jsonl"
-  timeout "${MYTHOS_TIMEOUT:-3600}" opencode run --agent mythos --model "$MODEL" \
-    --format json --auto "$T --scope $tmp/scope.yaml" > "$log" 2>&1 < /dev/null
-  echo "   agent exit $?, event log: $log"
-  # score what the agent claims: its report and findings, not raw tool output
-  corpus=$(find engagements -newer "$tmp/start" -type f \
-    \( -name 'report.md' -o -path '*/findings/*' \) -exec cat {} + 2>/dev/null)
-  [ -n "$corpus" ] || echo "   (no report.md / findings/ written by the agent)"
-
-  echo "-- scoring the agent's report --"
-  assert_has  "fingerprint (Flask detected)"     "Flask" "$corpus"
-  assert_line "reflected XSS /search?q="         "/search"   "xss|cross-site" "$corpus"
-  assert_line "SQLi /user?id="                   "/user"     "sql" "$corpus"
-  assert_line "open redirect /go?next="          "/go"       "redirect" "$corpus"
-  assert_line "path traversal /download?file="   "/download" "traversal|lfi|file (read|inclusion|disclosure)" "$corpus"
-  assert_line "CORS reflects Origin /api/data"   "/api/data" "cors|origin" "$corpus"
-  assert_has  "sensitive exposure /.env"         "/.env" "$corpus"
-  # negative control (ground_truth must_not_flag): /safe escapes its output
-  fp=$(printf '%s' "$corpus" | grep -iF "/safe" | grep -iE "xss|cross-site" \
-       | grep -viE "not |no |false|escaped|negative")
-  if [ -z "$fp" ]; then ok "no false-positive XSS on /safe"; else bad "no false-positive XSS on /safe (claimed: $fp)"; fi
-
-  echo "-- scope-guard core (what the OpenCode plugin calls) --"
-  out=$(MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py --check "nuclei -u https://out-of-scope.example")
-  assert_has "scope-guard warns out-of-scope" "OUT OF SCOPE" "$out"
-  out=$(MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py --check "httpx -u http://host.docker.internal:5001")
-  assert_not "scope-guard silent in-scope" "OUT OF SCOPE" "$out"
-  rm -rf "$tmp"
+echo
+echo "== cli =="
+# Read-only on purpose: this never installs and never builds, so running it
+# cannot disturb a cli/dist an engagement is using. A fresh clone skips both
+# checks and says so.
+if [ -d cli/node_modules ]; then
+  run "cli typecheck (npm run check)" npm run --silent --prefix cli check
 else
-
-echo "-- running checks through the toolbox --"
-
-out=$(scripts/mythos sh "httpx -silent -title -tech-detect -u $T" 2>/dev/null)
-assert_has "fingerprint (Flask detected)" "Flask" "$out"
-
-out=$(scripts/mythos run curl -s -G "$T/search" --data-urlencode "q=<script>alert(1)</script>")
-assert_has "reflected XSS /search?q=" "<script>alert(1)</script>" "$out"
-
-out=$(scripts/mythos run curl -s -G "$T/user" --data-urlencode "id=1'")
-assert_has "SQLi error leak /user?id=" "sqlite" "$out"
-
-out=$(scripts/mythos run curl -s -o /dev/null -w '%{redirect_url}' "$T/go?next=https://evil.example")
-assert_has "open redirect /go?next=" "evil.example" "$out"
-
-out=$(scripts/mythos run curl -s -G "$T/download" --data-urlencode "file=../../../../etc/passwd")
-assert_has "path traversal /download?file=" "root:x:0:0" "$out"
-
-out=$(scripts/mythos sh "curl -s -I -H 'Origin: https://evil.example' $T/api/data")
-assert_has "CORS reflects Origin /api/data" "access-control-allow-origin: https://evil.example" "$out"
-
-out=$(scripts/mythos run curl -s -o /dev/null -w '%{http_code}' "$T/.env")
-assert_has "sensitive exposure /.env" "200" "$out"
-
-# negative control: the home page must NOT reflect an injected marker (no FP)
-out=$(scripts/mythos run curl -s -G "$T/" --data-urlencode "x=<script>alert(777)</script>")
-assert_not "no false-positive XSS on /" "<script>alert(777)</script>" "$out"
-
-echo "-- scope-guard hook --"
-tmp=$(mktemp -d)
-cat > "$tmp/scope.yaml" <<YAML
-in_scope: [host.docker.internal]
-out_of_scope: []
-YAML
-out=$(echo '{"tool_name":"Bash","tool_input":{"command":"nuclei -u https://out-of-scope.example"}}' \
-  | MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py 2>&1)
-assert_has "scope-guard warns out-of-scope" "OUT OF SCOPE" "$out"
-out=$(echo '{"tool_name":"Bash","tool_input":{"command":"httpx -u http://host.docker.internal:5001"}}' \
-  | MYTHOS_SCOPE="$tmp/scope.yaml" python3 hooks/scope-guard.py 2>&1)
-assert_not "scope-guard silent in-scope" "OUT OF SCOPE" "$out"
-rm -rf "$tmp"
+  skip "cli typecheck: no cli/node_modules (npm ci --prefix cli)"
 fi
-
-echo "-- coverage gate --"
-# Stopping early with whole surfaces untested was the measured failure on Vuln Bank
-# (both arms never requested the GraphQL, merchant, bill-payment or card endpoints).
-cov=$(mktemp -d)
-mkdir -p "$cov/eng"
-cat > "$cov/eng/surface.json" <<'JSON'
-{"origin": "http://t", "pages": [{"url": "http://t/login", "forms": []}],
- "reachable_paths": ["/graphql"], "api_endpoints": ["POST /api/v1/charge", "query systemDebug(arg)"],
- "parameters": [{"name": "redirect_to"}]}
-JSON
-printf '# report\nSQLi on /login proven.\n' > "$cov/eng/report.md"
-out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
-assert_has "coverage names the untested GraphQL surface" "OPEN /graphql"      "$out"
-assert_has "coverage names the untested payment API"     "OPEN /api/v1/charge" "$out"
-assert_not "coverage clears a path the report covers"    "OPEN /login"        "$out"
-assert_has "coverage names an untested parameter"        "OPEN param:redirect_to" "$out"
-assert_has "coverage names an untested GraphQL field"    "OPEN query systemDebug" "$out"
-[ "$rc" -eq 1 ] && ok "coverage exits 1 while paths are open" || bad "coverage exits 1 while paths are open (got $rc)"
-printf '# report\nSQLi on /login. /graphql tested, introspection disabled. /api/v1/charge tested, authz enforced. redirect_to is not reflected. systemDebug runs shell commands.\n' > "$cov/eng/report.md"
-out=$(python3 scripts/coverage "$cov/eng" 2>&1); rc=$?
-assert_not "coverage silent once everything is accounted for" "OPEN" "$out"
-[ "$rc" -eq 0 ] && ok "coverage exits 0 when nothing is open" || bad "coverage exits 0 when nothing is open (got $rc)"
-out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
-assert_not "gate silent when the report accounts for the surface" "COVERAGE GATE" "$out"
-printf '# report\n' > "$cov/eng/report.md"; rm -f "$cov/eng/.coverage-gate"
-out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
-assert_has "gate hands the open list back on Stop" "COVERAGE GATE" "$out"
-# the gate must not depend on the agent having run recon: in the benchmark runs it skipped
-# scripts/probe, which left the gate with nothing to check
-mkdir -p "$cov/eng2"
-printf '# report\n' > "$cov/eng2/report.md"
-printf 'target: http://127.0.0.1:5001\nin_scope: [127.0.0.1]\n' > "$cov/scope.yaml"
-out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" MYTHOS_SCOPE="$cov/scope.yaml" python3 hooks/coverage-gate.py)
-assert_has "gate maps the surface itself when recon did not" "OPEN /search" "$out"
-rm -rf "$cov/eng2"
-printf '# report\n' > "$cov/eng/report.md"; rm -f "$cov/eng/.coverage-gate"
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"I tested /login, /graphql, /api/v1/charge, systemDebug and redirect_to."}]}}\n' > "$cov/said.jsonl"
-out=$(printf '{"transcript_path":"%s"}' "$cov/said.jsonl" | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
-assert_not "gate counts what the agent said, not only report.md" "COVERAGE GATE" "$out"
-rm -f "$cov/eng/.coverage-gate"
-echo 3 > "$cov/eng/.coverage-gate"
-out=$(echo '{}' | MYTHOS_ENGAGEMENTS="$cov" python3 hooks/coverage-gate.py)
-assert_not "gate gives up after its nudge limit" "COVERAGE GATE" "$out"
-rm -rf "$cov"
-
-echo "-- plugin manifest --"
-# Claude Code rejects an invalid manifest silently: a string `author` or a string `agents`
-# path cost every claude_mythos cell its scaffolding before 2026-11-05.
-out=$(python3 - <<'PYCHK'
-import json
-d = json.load(open(".claude-plugin/plugin.json"))
-bad = [k for k in ("commands", "agents", "skills") if isinstance(d.get(k), str)]
-if not isinstance(d.get("author", {}), dict):
-    bad.append("author")
-print("manifest ok" if not bad else "invalid fields: " + ", ".join(bad))
-PYCHK
-)
-assert_has "plugin manifest loadable by claude --plugin-dir" "manifest ok" "$out"
-
-if [ "${KEEP_LAB:-0}" != "1" ]; then
-  docker compose -f lab/docker-compose.yml down >/dev/null 2>&1
+if [ -f cli/dist/selftest.js ]; then
+  run "cli/dist/selftest.js" node cli/dist/selftest.js
+else
+  skip "cli selftest: no cli/dist (npm run build --prefix cli)"
 fi
 
 echo
-echo "== result: $PASS passed, $FAIL failed =="
-[ "$FAIL" -eq 0 ]
+echo "== guards =="
+# The guards are no longer host hooks: cli/src/agent/guards.ts shells out to
+# `--check` from inside every tool that can reach the target. So this exercises
+# exactly the interface the agent uses.
+G="$(mktemp -d)"
+TOOLBOX_UP=0
+cleanup() {
+  rm -rf "$G"
+  [ "$TOOLBOX_UP" = 1 ] && MYTHOS_CONTAINER=mythos-selftest scripts/mythos down >/dev/null 2>&1
+  return 0
+}
+trap cleanup EXIT
+
+cat > "$G/scope.yaml" <<'YAML'
+target: http://127.0.0.1:5001
+in_scope: [127.0.0.1, localhost]
+out_of_scope: []
+rules:
+  rate_limit_rps: 10
+YAML
+export MYTHOS_SCOPE="$G/scope.yaml"
+# The defaults are the policy under test, so no inherited mode may change them.
+unset MYTHOS_SCOPE_ENFORCE MYTHOS_BUDGET_ENFORCE MYTHOS_DESTRUCTIVE
+
+scoped() { python3 hooks/scope-guard.py --check "$1"; }
+# The budget guard's verdict for one command.
+action() {
+  python3 hooks/budget-guard.py --check "$1" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action","?"))'
+}
+unrecorded() {
+  python3 hooks/budget-guard.py --check "$1" \
+    | python3 -c 'import json,sys; print("yes" if "unrecorded" in (json.load(sys.stdin).get("message") or "") else "no")'
+}
+
+out=$(scoped "curl -sS https://out-of-scope.example/")
+case "$out" in
+  *"OUT OF SCOPE"*out-of-scope.example*) ok "scope guard names an out-of-scope host" ;;
+  *) printf '%s\n' "$out" >&2; die "scope guard names an out-of-scope host" ;;
+esac
+out=$(scoped "curl -sS http://127.0.0.1:5001/search?q=1")
+case "$out" in
+  *"OUT OF SCOPE"*) printf '%s\n' "$out" >&2; die "scope guard is silent on an in-scope host" ;;
+  *) ok "scope guard is silent on an in-scope host" ;;
+esac
+
+want "a DELETE against the target is refused" block \
+     "$(action 'curl -X DELETE http://127.0.0.1:5001/paste/7')"
+# A denylist shaped like a shell command does not see mass destruction named in
+# a request body; a live run emptied a target's table through exactly this.
+want "a mass-deletion GraphQL operation is refused" block \
+     "$(action 'curl -X POST http://127.0.0.1:5001/graphql -d {"query":"{deleteAllPastes}"}')"
+
+# Recording. With the proxy up a bare host curl sends a request no record shows,
+# while the same curl through the toolbox carries the proxy variables. The first
+# assert is the control: without it the second one passes even when the guard
+# never noticed the proxy at all.
+mkdir -p "$G/traffic" && echo '{}' > "$G/traffic/proxy.json"
+want "a bare curl is flagged unrecorded while the proxy is up" yes \
+     "$(unrecorded 'curl -sS http://127.0.0.1:5001/')"
+want "a toolbox-wrapped curl is not flagged unrecorded" no \
+     "$(unrecorded "scripts/mythos sh 'curl -sS http://127.0.0.1:5001/'")"
+rm -f "$G/traffic/proxy.json"
+
+# scripts/mythos asks scripts/traffic for the proxy variables whenever
+# MYTHOS_SCOPE is set, and refuses to run while the proxy is down.
+unset MYTHOS_SCOPE
+
+echo
+echo "== toolbox =="
+if [ "$WITH_DOCKER" != 1 ]; then
+  skip "toolbox: pass --with-docker to run it"
+elif ! docker info >/dev/null 2>&1; then
+  skip "toolbox: no reachable Docker daemon"
+else
+  # A dedicated container, so this never stops or renetworks the toolbox an
+  # engagement is using.
+  export MYTHOS_CONTAINER=mythos-selftest
+  TOOLBOX_UP=1
+  out=$(scripts/mythos sh 'echo toolbox-ok' 2>&1)
+  case "$out" in
+    *toolbox-ok*) ok "scripts/mythos sh runs a command in the toolbox" ;;
+    *) printf '%s\n' "$out" >&2; die "scripts/mythos sh runs a command in the toolbox" ;;
+  esac
+
+  # The lab binds to the host's loopback, which a bridged container cannot reach
+  # at all. MYTHOS_NET=host is the only way in, and the network is chosen when
+  # the container starts, so the bridged one has to go first.
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/ 2>/dev/null)" = "200" ]; then
+    scripts/mythos down >/dev/null 2>&1
+    code=$(MYTHOS_NET=host scripts/mythos sh \
+      'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5001/' 2>/dev/null)
+    want "MYTHOS_NET=host reaches the loopback lab target" 200 "$code"
+  else
+    skip "lab target on 127.0.0.1:5001 is not up (docker compose -f lab/docker-compose.yml up -d vulnapp)"
+  fi
+fi
+
+echo
+echo "== all checks passed =="

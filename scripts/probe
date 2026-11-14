@@ -10,6 +10,7 @@ about immediately.
 
   scripts/probe <url> [--depth 1] [--max 40] [--timeout 10] [--json]
                       [--header 'Cookie: a=b'] [--insecure]
+  scripts/probe --selftest
 
 It only issues GET requests to the host of <url> (and, with --depth 2, to links
 on that same host), with one exception: GraphQL introspection sends a POST of the
@@ -384,7 +385,71 @@ def render(result):
     return "\n".join(out)
 
 
+def _selftest() -> int:
+    """Asserts over the parsers, with no network.
+
+    The surface map is the backbone of an engagement: the verdict ledger counts
+    endpoints from it, so a parser that quietly drops a form or a parameter
+    shrinks the whole run without any error appearing. These are the three
+    readers whose output becomes that count.
+    """
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # HTML
+    page = Links()
+    page.feed("""<html><!-- TODO: remove debug token abc -->
+      <a href="/login">in</a><a href="/admin?id=1">admin</a>
+      <script src="/static/app.js"></script>
+      <form action="/doLogin" method="POST">
+        <input name="user" type="text"><input name="pw" type="password">
+        <textarea name="note"></textarea><select name="role"></select>
+      </form></html>""")
+    want(page.links, ["/login", "/admin?id=1"], "both links")
+    want(page.scripts, ["/static/app.js"], "script sources")
+    want(len(page.forms), 1, "one form")
+    want(page.forms[0]["action"], "/doLogin", "form action")
+    want(page.forms[0]["method"], "post", "method lowercased")
+    want([i["name"] for i in page.forms[0]["inputs"]], ["user", "pw", "note", "role"],
+         "input, textarea and select all count as parameters")
+    want(any("debug token" in c for c in page.comments), True, "comments kept")
+
+    # A form with no action posts back to the page it is on, and an unclosed form
+    # must still be reported: both shapes appear in real applications.
+    page2 = Links()
+    page2.feed('<form><input name="q"></form><form action="/x"><input name="y">')
+    want(len(page2.forms), 1, "an unclosed form is not emitted, the closed one is")
+    want(page2.forms[0]["action"], "", "a missing action is empty, not dropped")
+
+    # OpenAPI
+    params = {}
+    endpoints = from_openapi({"paths": {
+        "/users/{id}": {"get": {"parameters": [{"name": "id", "in": "path"}]}},
+        "/register": {"post": {"requestBody": {"content": {"application/json": {
+            "schema": {"properties": {"email": {}, "admin": {}}}}}}}},
+        "/ignored": "not a dict",
+    }}, params)
+    want(any("/users/{id}" in e for e in endpoints), True, "path endpoint found")
+    want(any("/register" in e for e in endpoints), True, "body endpoint found")
+    want("id" in params and "email" in params and "admin" in params, True,
+         "path parameters and body fields both become aim points")
+
+    # Class hints
+    want(hypotheses("redirect_url")[0] != "unknown", True, "a known name suggests a class")
+    want(hypotheses("zzz_nothing")[0], "unknown", "an unknown name says so")
+
+    for f in failures:
+        print(f"FAIL {f}")
+    print(f"probe selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
 def main():
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url")

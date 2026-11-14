@@ -7,8 +7,7 @@
   scripts/coverage engagements/<dir> --text FILE  # also count this text as the report
 
 An item counts as covered when its path appears in `report.md`, under `findings/`, or in the
-text passed with `--text` (the gate passes the agent's own transcript, since an engagement
-may report in the conversation and never write a file),
+text passed with `--text`,
 whether as a finding or as an explicit "tested, not vulnerable". That is a text check,
 not proof: it stops the engagement from silently skipping a whole surface, which is the
 failure this exists for (on Vuln Bank both benchmark arms never sent one request to the

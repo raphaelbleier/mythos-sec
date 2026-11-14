@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Read back what past engagements learned, and say what to try first.
 
-`hooks/lessons-record.py` appends one record per finding to a ledger at the end
-of every engagement. This reads that ledger.
+`scripts/lessons-record` appends one record per finding to a ledger at the end
+of every engagement; the CLI runs it when a run finishes. This reads that ledger.
 
 Two questions it answers:
 
