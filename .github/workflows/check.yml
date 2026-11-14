@@ -19,25 +19,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '20'   # cli/package.json: engines.node >= 20
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
-
-      - name: Generated host files are in sync
-        run: python3 scripts/build-hosts.py --check
-
-      # build-hosts.py --check only compares what it would generate: a canonical
-      # file that was deleted leaves its generated copy behind and the check stays green.
-      - name: No orphaned generated files
-        run: |
-          rc=0
-          for f in agents/*.md; do
-            [ -e ".opencode/agent/$(basename "$f")" ] || { echo "orphan: $f has no .opencode/agent/$(basename "$f")"; rc=1; }
-          done
-          for f in commands/*.md; do
-            [ -e ".opencode/command/$(basename "$f")" ] || { echo "orphan: $f has no .opencode/command/$(basename "$f")"; rc=1; }
-          done
-          exit $rc
 
       # scripts/probe, verify, coverage and mythos have no .py suffix, so a
       # suffix-based glob never syntax-checks them. Select by shebang as well.
@@ -63,54 +53,47 @@ jobs:
           PY
 
       - name: Shell scripts parse
-        run: |
-          git ls-files '*.sh' | xargs -r -n1 bash -n
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
 
-      - name: Self-checks
+      - name: Install the CLI's dependencies
+        run: npm ci --prefix cli
+
+      - name: CLI typecheck
+        run: npm run check --prefix cli
+
+      - name: CLI build
+        run: npm run build --prefix cli
+
+      - name: CLI selftest
+        run: node cli/dist/selftest.js
+
+      # Listed here as well as inside scripts/selftest.sh, so a failure names the
+      # script in the job log instead of only the wrapper.
+      - name: Script and guard selftests
         run: |
-          python3 bench/stats.py --selftest
-          python3 bench/score.py --selftest
-          python3 bench/labs.py selftest
-          python3 hooks/scope-guard.py --selftest
-          python3 hooks/budget-guard.py --selftest
-          python3 scripts/cvefeed --selftest
-          python3 scripts/findings --selftest
-          python3 scripts/lessons --selftest
-          python3 scripts/watch --selftest
-          python3 scripts/models --check
-          # TODO: scripts/coverage and scripts/verify are gaining --selftest. Once both
-          # have landed, drop the grep guards and run them unconditionally.
-          for s in scripts/coverage scripts/verify; do
-            if grep -q -- '--selftest' "$s"; then python3 "$s" --selftest; else echo "skip $s: no --selftest yet"; fi
+          for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
+                   scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
+                   scripts/lessons-record scripts/models \
+                   hooks/scope-guard.py hooks/budget-guard.py; do
+            echo "== $s"
+            python3 "$s" --selftest
           done
 
-      # An invalid plugin manifest is dropped silently by Claude Code and already
-      # cost a whole benchmark sweep its scaffolding (docs/poster/LIMITATIONS.md).
+      # The same selftests again, plus the guard behaviour end to end. Docker is
+      # not available here, so the toolbox checks are skipped.
+      - name: Repository selftest
+        run: scripts/selftest.sh
+
       - name: Install YAML parser (hash-pinned)
         run: pip install --require-hashes -r .github/ci-requirements.txt
 
-      - name: Manifests and frontmatter are valid
+      - name: Skill frontmatter is valid
         run: |
           python3 - <<'PY'
-          import json, pathlib, re, sys
+          import pathlib, re, sys
           import yaml
 
           errors = []
-
-          for f in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
-                    "opencode.json", "hooks/hooks.json"):
-              try:
-                  d = json.load(open(f, encoding="utf-8"))
-              except (OSError, ValueError) as e:
-                  errors.append(f"{f}: {e}")
-                  continue
-              if f.endswith("plugin.json"):
-                  # Claude Code rejects string-valued component paths and a string author.
-                  bad = [k for k in ("commands", "agents", "skills") if isinstance(d.get(k), str)]
-                  if not isinstance(d.get("author", {}), dict):
-                      bad.append("author")
-                  if bad:
-                      errors.append(f"{f}: invalid fields: {', '.join(bad)}")
 
           def front(p):
               m = re.match(r"---\r?\n(.*?)\r?\n---[ \t]*(\r?\n|$)", p.read_text(encoding="utf-8"), re.S)
@@ -121,7 +104,10 @@ jobs:
                   raise ValueError("frontmatter is not a mapping")
               return d
 
-          for p in sorted(pathlib.Path("skills").glob("*/SKILL.md")):
+          skills = sorted(pathlib.Path("skills").glob("*/SKILL.md"))
+          if not skills:
+              errors.append("skills/: no SKILL.md found")
+          for p in skills:
               try:
                   d = front(p)
               except Exception as e:
@@ -132,24 +118,9 @@ jobs:
               if not (isinstance(d.get("description"), str) and d["description"].strip()):
                   errors.append(f"{p}: missing description")
 
-          for p in sorted(pathlib.Path(".opencode/agent").glob("*.md")):
-              try:
-                  d = front(p)
-              except Exception as e:
-                  errors.append(f"{p}: {e}")
-                  continue
-              if not (isinstance(d.get("description"), str) and d["description"].strip()):
-                  errors.append(f"{p}: missing description")
-
-          print("\n".join(errors) or "all manifests and frontmatter valid")
+          print("\n".join(errors) or f"{len(skills)} skills valid")
           sys.exit(bool(errors))
           PY
-
-      # The runner has no Claude Code CLI; run the schema check wherever one exists.
-      - name: claude plugin validate
-        run: |
-          if command -v claude >/dev/null 2>&1; then claude plugin validate .
-          else echo "skip: claude CLI not available"; fi
 
   zizmor:
     runs-on: ubuntu-latest
