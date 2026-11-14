@@ -44,7 +44,7 @@ XBOW validates XSS the same way (headless browser checks the payload executed).
    and loads `<oast>/<token>`. Pick the one that fits the render context recon
    or dalfox showed.
 
-2. **Inject as user A** with curl (`$S/userA.headers`) or the browser agent.
+2. **Inject as user A** with curl (`$S/userA.headers`) or the `browser` tool.
    Keep the payload harmless: canary and callback only, no cookie theft beyond
    the callback query string in the lab, no persistence, no worm.
 
@@ -75,4 +75,5 @@ screenshot. A token seen in the OAST log from the **toolbox's own** IP (your
 own verify browser) proves execution in a victim-equivalent context; from the
 admin-bot it proves the privileged-viewer impact.
 
-Hand the result to **exploit** for closure state and the validator pass.
+Write the result into the finding file the **exploit** skill describes; its
+closure state and the validator pass apply unchanged.

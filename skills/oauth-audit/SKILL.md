@@ -15,15 +15,16 @@ the first before step 2.
 Prerequisites: `scope.rules.allow_active`; sessions from **auth-session**
 (`userA`, `userB`, `S=engagements/<dir>/sessions`), run `session_check.py`
 first; an OAST base as in **stored-xss-oast** (lab `http://oast:8080`, else
-`interactsh-client`); the **mythos-browser** agent. Registering clients and
-other state changes also need `allow_exploit` and the user's go (see
+`interactsh-client`); the `browser` tool for the redirect flows. Registering
+clients and other state changes also need `allow_exploit`, and a change you
+cannot make on an object of your own is skipped with that reason (see
 **exploit**). The authorization server is in scope only if `scope.yaml` lists
 it: against a third-party IdP (Google, Microsoft, GitHub) test the target's
 callback and token handling, never the IdP itself.
 
 ## 1. Map the flow
 
-Record one login as `userA` with the browser agent. Write
+Record one login as `userA` with the `browser` tool. Write
 `engagements/<dir>/scan/oauth-flow.md`: authorization and token endpoints,
 `client_id`, `response_type`, `redirect_uri`, `scope`, where `state`/`nonce`
 live, PKCE method, `response_mode`, and the discovery document
@@ -45,8 +46,8 @@ H=$(sed 's/.*/-H "&"/' $S/userA.headers | tr '\n' ' ')     # session for the AS 
 eval curl -s -o /dev/null -D- $H "'<authz>?response_type=code&client_id=<id>&scope=<s>&state=x&redirect_uri=<urlencoded mutation>'"
 ```
 
-`Location` on the mutated URI = `candidate`. Hand that URL to the browser
-agent as `userA`; abort the navigation to the callback and record the URL.
+`Location` on the mutated URI = `candidate`. Open that URL with the `browser`
+tool as `userA`; abort the navigation to the callback and record the URL.
 The code arriving at `<oast>/<token>` (or in `Referer` for an open-redirect
 chain) with the unrelated-host control refused = `reproduced`. Stop at the
 first accepted mutation.

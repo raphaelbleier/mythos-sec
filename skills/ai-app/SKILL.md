@@ -32,7 +32,7 @@ Closure states and the validator pass are those of **exploit**.
 
 ## 1. Recon the AI surface
 
-`scripts/probe <target> --depth 2` first, then with the browser agent log the
+`scripts/probe <target> --depth 2` first, then with the `browser` tool log the
 XHR of the chat widget. Look for:
 
 ```
@@ -158,7 +158,7 @@ product exposes (Langflow `/api/v1/version`, Flowise `/api/v1/ping`; routes
 from tool knowledge, check them) and from `/openapi.json` or the JS bundle.
 `validated` for "vulnerable version exposed" needs the version string plus the
 vendor advisory; RCE itself is only attempted with an OAST or no-op marker, on
-the programme's explicit permission and the user's go. Unauthenticated access
+the programme's explicit permission in `scope.yaml`. Unauthenticated access
 to such a builder's flow list, credentials store or chat history is a finding
 in its own right: read one own-created flow, never list others' secrets.
 

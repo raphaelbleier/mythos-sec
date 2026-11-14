@@ -192,10 +192,10 @@ Write under `engagements/<dir>/source/`:
 - `map.json` and the readable `map.md` from `scripts/sourcemap`;
 - `candidates.md`: one row per source hypothesis with its route, sink, file and
   line, confidence, the oracle you plan, and its closure state;
-- in `surface.md` (from **recon**): the `source_only` routes added to the
+- in `recon.md` (from **recon**): the `source_only` routes added to the
   endpoint list, so the coverage matrix in **web-scan** and `scripts/coverage`
   account for them.
 
-Then hand the candidates to **web-scan** for the aimed probes, the
+Then write the candidates where **web-scan** picks them up, for the aimed probes, the
 authorization rows to **business-logic**, and everything `reproduced` to
 **exploit** for the validator pass.

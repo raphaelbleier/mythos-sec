@@ -6,16 +6,20 @@ description: Reconnaissance playbook for a Mythos web engagement — map the in-
 # Recon — map the attack surface
 
 You are mapping what exists before you attack it. Touch only hosts the engagement
-`scope.yaml` authorizes. All tools run in the Kali toolbox via `scripts/mythos`
-(see the `toolbox` skill). Write everything under `engagements/<dir>/recon/`.
+`scope.yaml` authorizes. Kali tools run in the toolbox through the `shell` tool
+(see the `toolbox` skill), and the target's address inside the container is in
+your system prompt.
 
-A lab target on the host's `localhost:PORT` is reached from the toolbox as
-`http://host.docker.internal:PORT`. A public target is reached by its real host.
+This phase owes the next one three files in the engagement directory:
+`surface.json`, `cve-candidates.json` and `recon.md`. The phase does not close
+without `surface.json` and `recon.md`, and an empty map does not count. Raw tool
+output goes under `recon/`.
 
 ## 0. Read the app by hand first
 
-Start with one call: `scripts/probe <target> --depth 2`. It runs on the host,
-needs no container, and returns the pages, forms, interesting headers, weak
+Start with one call: the `script` tool, name `probe`, args
+`["<target>", "--depth", "2"]`. It runs on the host, needs no container, and
+returns the pages, forms, interesting headers, weak
 cookie flags, reachable paths like `/.env` or `/graphql`, the technology it
 could fingerprint, and every parameter with the bug class its name suggests.
 When it finds an OpenAPI or Swagger document it reads it too, so on a JSON API
@@ -23,26 +27,23 @@ you get every documented endpoint, query parameter, path parameter and request
 body field as an aim point. Add `--header 'Cookie: ...'` to map the
 authenticated surface, `--json` to feed it to another tool. Then read it and only chase what it could not see.
 
-Keep the map: `scripts/probe <target> --depth 2 --json >
-engagements/<dir>/surface.json`. That file is what `scripts/coverage` and the
-coverage gate check the report against at the end, so a whole surface cannot be
-skipped without the report saying so.
+Keep the map: run `probe` again with `--json` and write the result to
+`surface.json` with the `files` tool. Everything downstream counts endpoints
+from that file: the exploit phase needs a verdict for each one and
+`scripts/coverage` checks the report against it, so a thin map silently shrinks
+the whole engagement and a whole surface cannot be skipped without the report
+saying so.
 
 Cheapest evidence first, tools after.
 
-1. `curl -sS -D- <URL>` the entry point. Read the body and the headers.
+1. The `request` tool on the entry point. Read the body and the headers.
 2. Fetch every link and form you saw. Note each parameter, id, redirect,
    error message, and the auth mechanism.
 3. Extract the parameters and ids from the responses you actually read, not
    from a wordlist. Rank what each one suggests.
 4. If that is the whole surface — one host, a handful of pages — the map is
-   done. Hand it to **web-scan** and skip the steps below.
-
-Start the toolbox only when you need a tool from it:
-
-```
-scripts/mythos up
-```
+   done. Write it down and skip the steps below; the scan phase reads your
+   files.
 
 katana, ffuf, arjun and subfinder earn their cost on a large or unknown
 surface: many hosts, an SPA, an API, content you cannot reach by reading
@@ -70,9 +71,8 @@ handful of CISA KEV entries; see `knowledge/techniques/cve-triage-2026.md`).
 any of it, so ask directly. **Get the exact version** — it is the difference
 between a candidate you can rank and a guess:
 
-```
-scripts/cvefeed products          # the full list, with the version endpoint for each
-```
+The `script` tool, name `cvefeed`, args `["products"]`, prints the full list
+with the version endpoint for each.
 
 | Product | Default port | Where the version is |
 |---|---|---|
@@ -88,7 +88,7 @@ scripts/cvefeed products          # the full list, with the version endpoint for
 | Gradio | 7860 | `GET /config` → `{"version": ...}`; `/info`; `/file=` paths |
 | MCP gateway | — | `GET /sse` or `/mcp` (`text/event-stream`); POST JSON-RPC `initialize` → `result.serverInfo` |
 
-No container needed for this — it is one GET per path:
+One `shell` pipeline covers it, one GET per path:
 
 ```
 for p in api/v1/version api/config api/version version config system_stats \
@@ -114,18 +114,23 @@ software, and the ids rot too fast to keep in a skill. `scripts/cvefeed` holds
 the live data (CISA KEV, EPSS, NVD, nuclei templates, GHSA, OSV) and ranks it
 by the pipeline in `knowledge/techniques/cve-triage-2026.md`.
 
+Run it with the `script` tool, name `cvefeed`, and write the JSON it prints to
+`cve-candidates.json` with the `files` tool:
+
 ```
-scripts/cvefeed match --fingerprint langflow@1.6.0 --banner 'nginx@1.18.0' \
-    --product mcp --json > engagements/<dir>/cve-candidates.json
-scripts/cvefeed match --fingerprint langflow@1.6.0            # the readable version
+args: ["match", "--fingerprint", "langflow@1.6.0", "--banner", "nginx@1.18.0",
+       "--product", "mcp", "--json"]
+args: ["match", "--fingerprint", "langflow@1.6.0"]            # the readable version
 ```
 
 `--fingerprint NAME@VERSION` for a version you read off the product,
 `--banner NAME@VERSION` for one you guessed from a header, `--product NAME`
 when you have no version at all. The confidence it prints depends on which you
-used, so do not promote a guess. You can also pipe the surface map straight in:
-`scripts/probe <target> --depth 2 --json | scripts/cvefeed match --from-probe
---json` (everything probe reads off a header counts as a banner).
+used, so do not promote a guess. `--from-probe` reads a probe map on stdin, so
+it needs a `shell` pipeline rather than the `script` tool:
+`python3 /repo/scripts/probe <target> --depth 2 --json | python3
+/repo/scripts/cvefeed match --from-probe --json` (everything probe reads off a
+header counts as a banner).
 
 It refreshes from the feeds at the start of the engagement and falls back to the
 committed snapshot in `knowledge/cve/` with its age printed. Read that header:
@@ -133,11 +138,11 @@ if it says `** STALE **`, say so in the report. It contacts third-party CVE
 APIs, never the target — a scope-guard warning naming `services.nvd.nist.gov`
 or `api.first.org` is this step, not a scope slip.
 
-Hand `cve-candidates.json` to the orchestrator. It is a ranked list of **what
-is worth testing**, never a verdict: a KEV entry means exploited in the wild
+Write `cve-candidates.json` into the engagement directory and name its top rows
+in `recon.md`. It is a ranked list of **what is worth testing**, never a verdict: a KEV entry means exploited in the wild
 somewhere, EPSS is a prediction, and a version match is worth what your
 fingerprint is worth. A row with `nuclei_template` has a non-destructive check
-ready (`scripts/mythos nuclei -id <cve> -u <URL>`); a KEV row without one goes
+ready (`nuclei -id <cve> -u <URL>` through `shell`); a KEV row without one goes
 to the `cve-deep-dive` skill.
 
 ## 2. Subdomains + liveness (domain targets only; skip for a single host/IP)
@@ -157,9 +162,9 @@ scripts/mythos katana -u <URL> -jc -kf all -d 3 -silent  > engagements/<dir>/rec
 scripts/mythos sh 'gau --threads 4 <host> 2>/dev/null | anew engagements/<dir>/recon/urls.txt' || true
 ```
 
-`katana -jc` parses JavaScript for endpoints (crucial for SPAs). For a client-
-rendered SPA where katana under-collects, hand off to the **mythos-browser**
-agent to render the DOM and capture `fetch`/XHR endpoints.
+`katana -jc` parses JavaScript for endpoints, which is what an SPA needs. Where
+katana under-collects on a client-rendered surface, use the `browser` tool: its
+rendered DOM and request log show the `fetch`/XHR endpoints curl never sees.
 
 ## 4. Parameter discovery on interesting endpoints
 
@@ -202,7 +207,7 @@ scripts/mythos sh "curl -s <URL>/graphql -H 'Content-Type: application/json' \
 
 ## Output
 
-Write `engagements/<dir>/recon/surface.md` summarizing:
+Write `recon.md` in the engagement directory summarizing:
 
 - technologies / server / WAF, each with its version and how the version was
   obtained;
@@ -219,7 +224,8 @@ Write `engagements/<dir>/recon/surface.md` summarizing:
 Respect the rate limit in `scope.yaml` (throttle `-t`/`-rate` flags). Do not run
 injection attacks here — that is the **web-scan** / **exploit** phase.
 
-If there is a login: run **auth-session** next (one session per role), then
+If there is a login: follow **auth-session** (one session per role), then
 repeat steps 3 to 6 authenticated (`katana -H engagements/<dir>/sessions/userA.headers`,
 or `-headless -xhr` for an SPA) and add what only a logged-in user sees to
-`surface.md`. Then hand the surface to the scanner.
+`surface.json` and `recon.md`. Say which accounts you created: a second identity
+is what an access-control test needs.

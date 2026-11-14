@@ -1,9 +1,9 @@
 # Mythos knowledge base
 
-Per-bug-class notes the Mythos agents read at runtime to pick confirmation
-steps and cut false positives. Add new notes with the `research-ingest` skill
-(`/cybersecurity research <topic>`). One fact per file; keep them short, dated
-and sourced.
+Per-bug-class notes the agent reads at runtime, with the `reference` tool, to
+pick confirmation steps and cut false positives. A skill points at the file for
+the class it is about. Add new notes by following `skills/research-ingest`. One
+fact per file; keep them short, dated and sourced.
 
 ## Web
 - [SQL Injection](web/sql-injection.md)

@@ -120,9 +120,10 @@ seen in testing) is priority 2, not a page.
 
 ## how scope is enforced
 
-Under an agent host, `hooks/scope-guard.py` and `hooks/budget-guard.py` see the
-agent's Bash calls. They do not see the requests a script makes internally, and
-a cron job or CI step has no hook at all. So `watch` calls the same two modules
+In a `mythos` run, `hooks/scope-guard.py` and `hooks/budget-guard.py` are called
+from inside the tool layer, so they see every call an agent makes that can reach
+the target. They do not see the requests a script makes internally, and a cron
+job or CI step runs no agent at all. So `watch` imports the same two modules
 for every request it sends, redirects included: a request to a host or port
 outside the pinned scope is refused before it is sent, and each request is
 paced through the budget guard's token bucket at `rules.rate_limit_rps`
@@ -184,9 +185,12 @@ esac
 23 5 * * *    flock -n /tmp/watch-example.lock mythos-watch
 ```
 
-The job only produces the list. Acting on it is an agent session started on
-purpose, with `MYTHOS_SCOPE` pinned to the same file, told to follow the
-`continuous` skill on `last-check.json`.
+The job only produces the list. Acting on it is a run started on purpose with
+the same scope file: `mythos -t <url> --scope <that file>`, and `--skip recon`
+when the surface diff already says what changed. `skills/continuous/SKILL.md` is
+the playbook for working `last-check.json`, and the `h` key folds a pointer to
+it into the next phase's prompt. The CLI has no `continuous` phase, so a run
+does not load that skill on its own.
 
 ## GitHub Actions
 
@@ -310,13 +314,14 @@ What one run costs, from this repository's own numbers:
 |---|---|---|---|
 | `watch check`, surface | at most 40 pages + 15 common paths + 1 GraphQL probe, so about 56. Measured: 19 on a 3-page site, 28 on DVGA | 0 | 4 to 12 seconds plus latency |
 | `watch check --signals cve,findings` | 0 | 0 | seconds |
-| replaying one stored proof | 2 (the proof and its negative control), by the protocol in the skill | one small agent session for all due proofs, not measured | seconds |
+| replaying one stored proof | 2 (the proof and its negative control), by the protocol in the skill | one short run for all due proofs, not measured | seconds |
 | a full engagement | thousands. `hooks/budget-guard.py` estimates one default invocation at 2000 (nuclei), 5000 (ffuf), 500 each (katana, arjun), 1500 (sqlmap) and 1000 (dalfox), about 10,500 for those six. These are the guard's over-estimates, not measured counts | many | about 35 minutes of wire time |
 
 Model cost is the number that matters and the one this repository cannot give
-for a real target. The README's benchmark section measures $0.27 to $0.77 per
-run on DVGA, a single small lab app. A real target with several hosts and
-authenticated areas costs more, and that figure is not measured here.
+for a real target. The only figure measured here is $0.27 to $0.77 per run
+against DVGA, a single small lab app, on a predecessor of the current CLI. A
+real target with several hosts and authenticated areas costs more, and that
+figure is not measured here.
 
 Thirty daily checks send at most about 1,700 requests and cost no model calls.
 One full re-run sends several times that and costs model tokens on top, to
@@ -340,8 +345,8 @@ Recommended cadence:
 
 - It sees what `probe` sees: pages and forms reachable by links, the OpenAPI
   document and GraphQL introspection when present. A client-rendered SPA gives
-  a near-empty map and drift only in the shell page; the recon skill hands
-  those to the browser agent, and `watch` does not. A target larger than 40
+  a near-empty map and drift only in the shell page; the recon phase widens
+  such a map with the `browser` tool, and `watch` cannot. A target larger than 40
   pages is mapped partially, and which pages fall inside the cut can vary.
 - It cannot see a behavior change behind an unchanged URL, a new backend
   parameter that no form, link or spec shows, or a logic bug introduced in an
@@ -364,7 +369,7 @@ Recommended cadence:
   program changed. The confirmation interval is the only control for that, and
   it is as good as the person who answers it.
 - Pacing is a token bucket shared through `.budget` in the scope file's
-  directory, so it is shared with an agent session using the same scope file,
+  directory, so it is shared with a `mythos` run using the same scope file,
   not with another machine or another job.
 - It sends no payloads and reports nothing it has not seen in a response. Whether a
   new route is vulnerable is the agent's work, under the proof standard in

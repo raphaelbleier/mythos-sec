@@ -1,22 +1,32 @@
 ---
 name: report
-description: Reporting playbook for a Mythos engagement — turn validated findings into a bug-bounty-ready Markdown report ranked by severity, with reproduction steps, evidence, impact, CVSS and remediation. Use at the end of an engagement; can hand off to the security-lab skill for a German university lab .docx.
+description: Reporting playbook for a Mythos engagement — turn validated findings into a bug-bounty-ready Markdown report ranked by severity, with reproduction steps, evidence, impact, CVSS and remediation. Use in the report phase, at the end of an engagement.
 ---
 
 # Report — produce the deliverable
 
 Turn the findings under `engagements/<dir>/findings/` into a report a triager
-can reproduce in under a minute. Each finding carries a closure state (see the
-**exploit** skill): `candidate`, `reproduced`, `validated(proof)` or
-`rejected(reason)`. **Only `validated` findings enter the main report.**
+can reproduce in under a minute. You start with an empty context: `findings/`,
+`verdicts/`, `recon.md` and `candidates.md` are all you have, and the phase does
+not close until `report.md` and `findings.json` exist. Each finding carries a
+closure state (see the **exploit** skill): `candidate`, `reproduced`,
+`validated(proof)` or `rejected(reason)`. **Only `validated` findings enter the
+main report.**
+
+The verdict ledger is the other half of the deliverable. `verdicts/*.md`, and
+`verdicts.json` built from them, say what happened to every endpoint in the
+surface: `confirmed`, `tested` or `skipped` with a reason. Report them by
+endpoint. "Tested, nothing held" and "never looked at" are different sentences,
+and a report that blurs them is the one a triager stops trusting.
 
 ## Before you write: close out the surface
 
-Run `scripts/coverage engagements/<dir>`. Every `OPEN` line is a mapped path the
-report does not mention yet. Test it, or write it into the **Coverage** section
-with what you sent and what came back. A path that was never requested is
-reported as untested, never silently dropped. The gate nudges at most three
-times, after that it lets you finish, so the honest listing is yours to write.
+Run the `script` tool, name `coverage`, with the engagement directory and
+`--text report.md`. Every `OPEN` line is a mapped path the report does not
+account for yet. Test it, or write it into the **Coverage** section with what you
+sent and what came back. A path that was never requested is reported as
+untested, never silently dropped. Nothing blocks on this count, so the honest
+listing is yours to write.
 
 ## Per finding, in this order
 
@@ -110,9 +120,14 @@ when a validated finding is high or above, for a CI gate.
 
 ## Output
 
-Write `engagements/<dir>/report.md` and give the user a one-line summary: counts
-of validated findings by severity, the count per other state, and the single top
-finding. `findings.json` and, when asked for, `findings.sarif` sit beside it.
+Write `report.md` at the root of the engagement directory. `findings.json` and
+`findings.sarif` sit beside it. The CLI prints the run's own one-line summary
+from the ledger when the run ends, so the report does not need to address an
+operator directly: write it for a triager who has seen none of this.
+
+Say in the report whether the validation pass ran on a different model. A model
+approves its own errors 11.9 percentage points more often when it wrote them, so
+a pass on the authoring model is not independent and a reader has to know that.
 
 The front matter each finding needs for all of this: `id`, `title`, `class`
 (the knowledge-base class name, so the CWE maps), `status`, `asset`, `param`,
@@ -120,5 +135,6 @@ The front matter each finding needs for all of this: `id`, `title`, `class`
 one. A class with no CWE mapping is reported as a problem rather than guessed;
 add it to the table in `scripts/findings` if the class is real.
 
-If the user wants a German university lab report as `.docx`, invoke the
-`security-lab` skill and pass it the findings; do not write the `.docx` yourself.
+The deliverable is Markdown plus `findings.json` and `findings.sarif`. Any other
+format a program or a course wants is converted from those afterwards, outside
+the run.

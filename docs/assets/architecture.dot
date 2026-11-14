@@ -1,50 +1,78 @@
-// Mythos architecture — render: dot -Tsvg architecture.dot -o architecture.svg
+// Mythos architecture. Render: dot -Tsvg architecture.dot -o architecture.svg
+//                               dot -Tpng -Gdpi=160 architecture.dot -o architecture.png
 digraph mythos {
   rankdir=LR;
   bgcolor="transparent";
+  compound=true;
+  ranksep=0.5;
+  nodesep=0.28;
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
         color="#6d5efc", fillcolor="#f3f1ff", fontcolor="#1f2430"];
   edge [color="#6d7086", fontname="Helvetica", fontsize=9, fontcolor="#6d7086"];
 
-  user [label="operator\n/cybersecurity <target> --scope file", fillcolor="#e0f7fb", color="#22d3ee"];
+  operator [label="operator\nmythos -t <url> --scope scope.yaml\nscope.yaml = the authorization boundary,\nthe only human gate", fillcolor="#e0f7fb", color="#22d3ee"];
 
-  cc [label="agent host (OpenCode first,\nClaude Code second)\n= the agent\n(reason → run tool → observe)", fillcolor="#efeaff", color="#6d5efc"];
+  driver [label="driver (cli/src/driver.ts)\nphase order · artifact gate · retries\nbudget = share of the time LEFT:\nrecon .3 · scan .35 · exploit .7 · report 1.0,\nfloor 300s", fillcolor="#efeaff", color="#6d5efc"];
 
-  subgraph cluster_skills {
-    label="phase skills (playbooks)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
-    setup   [label="engagement-setup\nscope.yaml (single human gate)"];
-    recon   [label="recon\nwhatweb · subfinder\nkatana · arjun · ffuf"];
-    scan    [label="web-scan\nnuclei · dalfox · sqlmap\nmanual checks · passive\n+ auth-session · business-logic\nstored-xss-oast · deep-server"];
-    exploit [label="exploit\nminimal PoC · OOB\n(if allow_exploit)"];
-    report  [label="report\nclosure states\nbounty-format report.md"];
+  subgraph cluster_phases {
+    label="one agent per phase · fresh context · handoff only through files";
+    style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica"; fontsize=10;
+    recon   [label="recon\nprobe · cvefeed match\nfingerprint, identities\ngate: surface.json\n+ recon.md"];
+    scan    [label="scan\nverify · nuclei · dalfox\nsqlmap · arjun\ngate: candidates.md"];
+    exploit [label="exploit\n--workers agents in parallel,\nround-robin over endpoints\nwithout a verdict, max 6 rounds\ngate: a verdict per endpoint"];
+    report  [label="report\nCVSS from the vector\ncoverage check\ngate: report.md\n+ findings.json"];
   }
 
-  subgraph cluster_agents {
-    label="sub-agents (model: inherit)"; style="rounded,dashed"; color="#8b93a7"; fontname="Helvetica";
-    planner [label="planner"];
-    browser [label="browser\nPlaywright + Chromium\nDOM-XSS · auth flows"];
-  }
+  ledger    [label="verdict ledger (verdicts.ts)\nconfirmed · tested · skipped\nverdicts.json", fillcolor="#fff7e6", color="#e0a800"];
+  validator [label="validator pass\nvalidator tier, a different model,\nno tools → validation.md", fillcolor="#fff7e6", color="#e0a800"];
 
-  gen [label="build-hosts.py\nAGENTS.md + .opencode/ canonical,\nagents/ commands/ generated", fillcolor="#fff7e6", color="#e0a800"];
-  know [label="knowledge base\nper-class playbooks\nCVE triage · chaining", fillcolor="#eafff0", color="#1faa59"];
+  tools [label="tool layer (cli/src/agent/)\nshell · request · script\nfiles · reference · browser", fillcolor="#eef2ff", color="#3b5bdb"];
+  guards [label="guards.ts → hooks/*.py --check\nCALLED FROM INSIDE EVERY\nTARGET-REACHING TOOL\nscope: warn · rate: warn + sleep\ndestruction · brute force · DoS: refused",
+          fillcolor="#eafff0", color="#1faa59", penwidth=2];
 
-  shim    [label="scripts/mythos\n(docker exec shim)", fillcolor="#fff7e6", color="#e0a800"];
-  toolbox [label="mythos-toolbox (Kali, Docker; ghcr.io image or local build)\nnuclei · sqlmap · dalfox · ffuf · katana\nsubfinder · httpx · commix · interactsh · jwt_tool", fillcolor="#eef2ff", color="#3b5bdb"];
-  hook    [label="scope-guard\nClaude Code hook / OpenCode plugin\nwarn (default) or block", fillcolor="#eafff0", color="#1faa59"];
-  target  [label="target\n(authorized web app / API)", fillcolor="#fff0f0", color="#e03131"];
-  out     [label="engagements/<dir>\nrecon · scan · findings · report.md", fillcolor="#f3f1ff", color="#6d5efc"];
+  toolbox [label="mythos-toolbox (Kali, Docker)\nvia scripts/mythos docker exec\nnuclei · sqlmap · dalfox · ffuf · katana\nhttpx · nikto · arjun · jwt_tool · curl\n/repo read-only, engagements/ writable\nMYTHOS_NET=host for a loopback target",
+           fillcolor="#eef2ff", color="#3b5bdb"];
+  chromium [label="Chromium (playwright-core)\non the host, outside the container\nDOM · console · network log", fillcolor="#eef2ff", color="#3b5bdb"];
+  hostscripts [label="scripts/probe · scripts/verify\non the host, vetted the same way", fillcolor="#eef2ff", color="#3b5bdb"];
 
-  user -> cc;
-  gen -> cc [label="generates host files", style=dashed];
-  know -> cc [label="informs", style=dashed];
-  cc -> planner [label="delegates", style=dashed];
-  cc -> setup; cc -> recon; cc -> scan; cc -> exploit; cc -> report;
-  cc -> browser [style=dashed];
-  recon -> shim; scan -> shim; exploit -> shim;
-  browser -> target [label="renders DOM", style=dashed];
-  shim -> toolbox [label="docker exec"];
-  shim -> hook [label="checked by", style=dashed];
-  toolbox -> target [label="scope-gated tools"];
-  cc -> out;
-  report -> out;
+  skills [label="skills/ · knowledge/\nthe methodology,\nread at runtime", fillcolor="#eafff0", color="#1faa59"];
+  models [label="models.json\ntier per agent,\nmodel per profile", fillcolor="#eafff0", color="#1faa59"];
+  bus    [label="event bus (bus.ts)\nInk view or -n logger\nrun-events.jsonl\np pause · h hint · q abort", fillcolor="#f3f1ff", color="#6d5efc"];
+
+  dir [label="engagements/<dir>/\nsurface.json · cve-candidates.json\nrecon.md · candidates.md\nverdicts/ · verdicts.json\nfindings/ · validation.md\nreport.md · findings.json/.sarif\ntraffic/ · run-events.jsonl",
+       shape=note, style="filled", fillcolor="#f3f1ff", color="#6d5efc"];
+
+  target [label="target\n(authorized web app / API)", fillcolor="#fff0f0", color="#e03131"];
+
+  operator -> driver [label="pins MYTHOS_SCOPE"];
+  driver -> recon;
+  recon -> scan [label="artifact gate"];
+  scan -> exploit [label="artifact gate"];
+  exploit -> report [label="artifact gate"];
+  exploit -> validator [label="findings/*.md"];
+  validator -> report [label="validation.md", constraint=false];
+  models -> driver [label="tier per phase", style=dashed];
+
+  recon -> tools [constraint=false]; scan -> tools [constraint=false];
+  exploit -> tools [constraint=false]; report -> tools [constraint=false];
+  skills -> tools [label="reference tool", style=dashed];
+  exploit -> ledger [label="verdicts/<slug>.md", constraint=false];
+  ledger -> exploit [label="endpoints still open", style=dashed, constraint=false];
+
+  tools -> guards [label="vet, every call", penwidth=2];
+  guards -> toolbox [label="allowed"];
+  guards -> chromium [label="allowed (goto)"];
+  guards -> hostscripts [label="allowed"];
+  hostscripts -> target [label="GET only, paced"];
+  toolbox -> target [label="recorded by scripts/traffic, paced"];
+  chromium -> target [label="renders the DOM", style=dashed];
+
+  tools -> dir [label="files tool"];
+  ledger -> dir [style=dashed, constraint=false];
+  driver -> bus [label="every event", style=dashed, constraint=false];
+  bus -> driver [label="hint · pause · abort", style=dashed, constraint=false];
+  bus -> dir [style=dashed, constraint=false];
+
+  { rank=same; driver; tools; }
+  { rank=same; bus; models; }
 }

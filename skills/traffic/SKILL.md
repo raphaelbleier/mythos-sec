@@ -1,6 +1,6 @@
 ---
 name: traffic
-description: Record, summarize and replay the HTTP an engagement actually sends. Use at the start of an engagement to start the recorder, to answer what was sent, how fast, to which hosts and what came before the target broke, to prove a finding by replaying its stored request byte for byte, and before the report to write run.json and a HAR for the operator.
+description: Read, summarize and replay the HTTP an engagement actually sends. Use to answer what was sent, how fast, to which hosts and what came before the target broke, to prove a finding by replaying its stored request byte for byte, and before the report to write run.json and a HAR for the operator.
 ---
 
 # Traffic: what was actually sent
@@ -10,23 +10,21 @@ request. `scripts/traffic` records the requests themselves, per engagement,
 so an operator can review them in Burp, Caido or a browser's devtools and so a
 stored proof of concept can be checked by sending it again.
 
-## Start it once, after the scope is pinned
+## The driver starts it
 
-```bash
-scripts/traffic start                 # engagements/<dir>/traffic/, proxy on loopback and the docker bridge
-scripts/traffic phase recon           # at each phase boundary: recon, scan, exploit, report
-```
+`scripts/traffic start` runs before the first phase and `scripts/traffic stop`
+after the last one, both from the driver. There is nothing to start, and
+nothing to wrap: the recorder is already in front of you.
 
-Then route traffic through it:
+Which paths it actually captures:
 
 | path | how | recorded |
 |---|---|---|
-| host `curl`, `wget`, any host command | `scripts/traffic exec -- curl -s https://target/` | yes |
-| `scripts/probe`, `scripts/verify` | they read the proxy from the pinned engagement, no prefix needed | yes, they use urllib |
-| toolbox tools | `scripts/mythos` passes `scripts/traffic env --container --json` to every exec | yes for tools that honor `HTTP_PROXY` |
-| the agent host's own WebFetch | nothing in this repository can route it | no, only the scope guard sees the URL |
-| the Playwright MCP browser, headless Chromium | needs `--proxy-server` and a CA flag; plain Chromium refuses the CA and shows up as a `tls_client_rejected` gap | http only, https not verified |
+| the `shell` and `request` tools | `scripts/mythos` passes `scripts/traffic env --container --json` into every exec, so a plain `curl` is recorded | yes for tools that honor `HTTP_PROXY` |
+| the `script` tool's `probe` and `verify` | they read the proxy from the pinned engagement, no prefix needed | yes, they use urllib |
+| the `browser` tool's Chromium | needs `--proxy-server` and a CA flag; plain Chromium refuses the CA and shows up as a `tls_client_rejected` gap | http only, https not verified |
 | nmap, raw sockets, `smuggler.py`, `h2spacex`, anything that ignores the proxy variables | cannot | no |
+| a command an operator runs on the host themselves | `scripts/traffic exec -- curl -s https://target/` | yes |
 
 Measured against the toolbox image, with the proxy variables set: curl, wget,
 python requests and urllib, httpx, ffuf, katana, sqlmap, whatweb, wafw00f,
@@ -39,9 +37,8 @@ capture line after its first run.
 If `scripts/traffic start` ran and the proxy is later down, `scripts/traffic
 env` and `exec` refuse rather than send an unrecorded request.
 
-Do not export the proxy variables into the shell that runs the agent host
-itself: its calls to the model provider would be recorded too, API key
-included.
+Do not export the proxy variables into the shell that runs `mythos` itself: the
+CLI's own calls to the model provider would be recorded too, API key included.
 
 ## Read it
 
@@ -53,8 +50,9 @@ scripts/traffic show 41            # one request and response, credentials redac
 ```
 
 The out-of-scope count comes from `hooks/scope-guard.py --check`, the same code
-the hook runs, so it agrees with the warnings you saw. A request that already
-went out is in the record whether or not the hook warned.
+the tools call before each request, so it agrees with the warnings you saw. A
+request that already went out is in the record whether or not the guard
+warned.
 
 `summary` ends with a capture line. Read it before you rely on the record:
 

@@ -5,9 +5,12 @@ description: Web vulnerability scanning playbook for a Mythos engagement — run
 
 # Web scan — find the vulnerabilities
 
-Find real issues on the surface recon mapped. Run active tools only when
-`scope.rules.allow_active` is true. Everything runs in the toolbox via
-`scripts/mythos`. Save raw output under `engagements/<dir>/scan/`.
+Find real issues on the surface recon mapped. Read `recon.md`, `surface.json`
+and `cve-candidates.json` from the engagement directory first. Run active tools
+only when `scope.rules.allow_active` is true. Everything runs in the toolbox
+through the `shell` tool, which drops the `scripts/mythos` prefix the command
+lines below carry (see the **toolbox** skill). Save raw output under
+`engagements/<dir>/scan/`.
 
 Work one injection point at a time where it matters; the WSL host is RAM-limited,
 so do not run nuclei + sqlmap + a browser at once.
@@ -21,21 +24,23 @@ table there). Run `session_check.py` before each step.
 The ranked parameter list from `scripts/probe` is your work queue: each entry
 names the parameter, where it was seen, and the class to try.
 
-Work the whole queue in one call:
+Work the whole queue in one call: the `script` tool, name `verify`, args
+`["--from-probe"]` with the probe map on stdin, which means a `shell` pipeline:
 
 ```
-scripts/probe <target> --depth 2 --json | scripts/verify --from-probe
+python3 /repo/scripts/probe <target> --depth 2 --json | python3 /repo/scripts/verify --from-probe
 ```
 
 `scripts/verify` sends one benign canary per aim point (GET only, rate-limited,
 nothing destructive) and prints the request/response pair for every class that
 answered, plus the aim points that stayed quiet. Use its output as evidence,
 then work the quiet ones and anything behind a POST or a login by hand.
-`scripts/verify <url> --param <name> --classes xss,sqli` targets one point.
+`verify <url> --param <name> --classes xss,sqli` targets one point and needs no
+pipeline, so it runs through the `script` tool directly.
 
 Start with what recon actually saw. For each promising parameter, id or form,
-name the bug class it suggests and send one aimed `curl` request for it. The
-host's own `curl` is enough; no container needed.
+name the bug class it suggests and send one aimed request with the `request`
+tool. That is cheaper than a scanner and it lands in the record as one request.
 
 Keep probing while the evidence moves. One well-aimed request beats a template
 scan on a small app, and it tells you which class to escalate.
@@ -173,9 +178,15 @@ smuggling, jwt).
 
 ## Output: candidate findings
 
-Write `engagements/<dir>/scan/candidates.md`: each candidate with class,
-severity, affected URL+param, one evidence snippet (the request + the proving
-response), and its closure state (`candidate` / `reproduced` /
-`rejected(reason)`; nothing is `validated` before the exploit validator pass).
-Rank by severity x exploitability. Hand the top candidates to the
-**exploit** skill for a minimal PoC; never weaponize here.
+Write `candidates.md` at the root of the engagement directory, not under
+`scan/`: the phase does not close without that file, and the exploit phase reads
+it there. One entry per thing worth an exploitation attempt, ordered by what you
+would try first, each with class, severity, affected URL and parameter, one
+evidence snippet (the request + the proving response), and its closure state
+(`candidate` / `reproduced` / `rejected(reason)`; nothing is `validated` before
+the exploit validator pass). Everything here is unproven by definition, so do
+not write it as if it were a finding, and never weaponize in this phase.
+
+Write down the classes you looked for and found nothing on. The exploit phase
+starts with an empty context and needs to know what has already been
+eliminated.

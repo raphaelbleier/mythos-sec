@@ -37,7 +37,8 @@ knowledge, not verified against sources in the research; check `--help` /
   lab, no file reads beyond `/etc/hostname`, never poison a cache key or a
   backend connection another user can hit.
 - Requires `scope.rules.allow_active`; proofs with side effects need
-  `allow_exploit` and the user's go (see **exploit**).
+  `allow_exploit`, and anything you cannot prove on an object of your own is
+  skipped with that reason (see **exploit**).
 
 ## Insecure deserialization
 

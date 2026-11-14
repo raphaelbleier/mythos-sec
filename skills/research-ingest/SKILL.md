@@ -1,6 +1,6 @@
 ---
 name: research-ingest
-description: Research a web security topic (a CVE, a technique, a new tool, a bug class) and save a concise, citable note into the Mythos knowledge base that the agents read at runtime. Use when the user runs "/cybersecurity research <topic>" or asks to update the knowledge base with new techniques or papers.
+description: Research a web security topic (a CVE, a technique, a new tool, a bug class) and save a concise, citable note into the Mythos knowledge base that the agents read at runtime. Use when asked to research a topic or to update the knowledge base with new techniques or papers, outside an engagement run.
 ---
 
 # Research ingest

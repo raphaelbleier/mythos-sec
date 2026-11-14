@@ -22,9 +22,9 @@ of the same role** (`userA`, `userB`); `admin` only if the program hands you one
 
 ## 1. Find the login
 
-From recon (`surface.md`): the login form, or the login API the SPA calls
-(watch XHR via the **mythos-browser** agent or `katana -headless -xhr`). An
-API login is faster and more stable than driving the UI; prefer it.
+From recon (`recon.md`, `surface.json`): the login form, or the login API the
+SPA calls (watch the `browser` tool's request log, or `katana -headless -xhr`).
+An API login is faster and more stable than driving the UI; prefer it.
 
 ## 2. Log in, once per role
 
@@ -91,7 +91,7 @@ C=$(sed -n 's/^Cookie: //p' $S/userA.headers)              # raw cookie string
 | dalfox | `--cookie "$C"` and `-H "Authorization: ..."` | the image pins v2 (`dalfox url ...`); v3 (Rust) uses `dalfox scan ...`. Run `scripts/mythos dalfox --help` and use the flags it lists |
 | jwt_tool | `-t <URL> -rc "$C"` (cookie) or `-rh "Authorization: Bearer <JWT>"` | then `-M pb` / `-X a` etc. on the authed request |
 | curl | `eval curl -s $H <URL>` | ad-hoc checks |
-| Playwright / browser agent | `browser.new_context(storage_state="$S/userA.state.json")` | two contexts = two users in one run |
+| the `browser` tool | load `$S/userA.state.json` into the page before navigating; it drives one context, so switch roles in sequence | a second role needs its own navigation, not a second context |
 | bola_diff.py, race.py, xss_verify.py | `--a/--b/--headers $S/<role>.headers`, `--state $S/<role>.state.json` | see business-logic and stored-xss-oast |
 
 Flag syntax for ffuf, sqlmap and dalfox is from tool knowledge, not re-verified
