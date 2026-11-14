@@ -37,7 +37,7 @@ services:
     networks: [mythos-lab]
 
   juiceshop:
-    image: bkimminich/juice-shop:v17.1.1@sha256:9e437b456e444ff001d1663e4f6f05c796fe02f1058dd2651d6791a15b43dfeb
+    image: bkimminich/juice-shop:v20.3.0@sha256:cea5a4af4aacee498c491491af0408934ec81d004035c0a02ef3e54395e3bf27
     container_name: mythos-juiceshop
     ports:
       - "${MYTHOS_LAB_BIND:-127.0.0.1}:3000:3000"
