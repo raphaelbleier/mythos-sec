@@ -64,9 +64,15 @@ BOILERPLATE = re.compile(r"(executive summary|summary|scope|methodology|method|i
                          r"\s*:?\s*", re.I)
 # Tokens that name the arm. Removed from what a blinded rater reads. Partial by nature: the
 # report's own wording can still reveal which arm wrote it.
+# Every arm's name and its artifact paths. The third-party arms were missing
+# until Strix actually ran: a rater reported that the `strix-coverage/` prefix
+# in a rendered SARIF told them which framework they were grading, which is the
+# blinding failing for the arm the comparison exists to measure.
 ARM_TOKENS = re.compile(r"mythos[-_a-z]*|claude[ _-]?code|opencode|/cybersecurity|cybersecurity|"
                         r"sub-?agent|toolbox|scope guard|scope-guard|coverage gate|coverage-gate|"
-                        r"engagements?/", re.I)
+                        r"engagements?/|"
+                        r"strix[-_a-z]*|penetration_test_report|caido|"
+                        r"pentestgpt|shannon|\bcai\b|hexstrike|xbow", re.I)
 
 
 def truth(target):
