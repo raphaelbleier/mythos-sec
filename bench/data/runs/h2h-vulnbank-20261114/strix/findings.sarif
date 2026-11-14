@@ -1,0 +1,387 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Strix",
+          "informationUri": "https://strix.ai",
+          "rules": [
+            {
+              "id": "strix-coverage/content-discovery-attack-surface-mapping",
+              "name": "Content discovery / attack-surface mapping",
+              "shortDescription": {
+                "text": "Coverage: Content discovery / attack-surface mapping"
+              },
+              "fullDescription": {
+                "text": "Coverage of Content discovery / attack-surface mapping across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Content discovery / attack-surface mapping across the assessed attack surface.",
+                "markdown": "Coverage of Content discovery / attack-surface mapping across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/technology-fingerprinting-auth-model-mapping",
+              "name": "Technology fingerprinting / auth model mapping",
+              "shortDescription": {
+                "text": "Coverage: Technology fingerprinting / auth model mapping"
+              },
+              "fullDescription": {
+                "text": "Coverage of Technology fingerprinting / auth model mapping across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Technology fingerprinting / auth model mapping across the assessed attack surface.",
+                "markdown": "Coverage of Technology fingerprinting / auth model mapping across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/werkzeug-debug-console-exposure-potential-rce",
+              "name": "Werkzeug debug console exposure (potential RCE)",
+              "shortDescription": {
+                "text": "Coverage: Werkzeug debug console exposure (potential RCE)"
+              },
+              "fullDescription": {
+                "text": "Coverage of Werkzeug debug console exposure (potential RCE) across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Werkzeug debug console exposure (potential RCE) across the assessed attack surface.",
+                "markdown": "Coverage of Werkzeug debug console exposure (potential RCE) across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/password-reset-pin-weakness-account-takeover",
+              "name": "Password reset PIN weakness / account takeover",
+              "shortDescription": {
+                "text": "Coverage: Password reset PIN weakness / account takeover"
+              },
+              "fullDescription": {
+                "text": "Coverage of Password reset PIN weakness / account takeover across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Password reset PIN weakness / account takeover across the assessed attack surface.",
+                "markdown": "Coverage of Password reset PIN weakness / account takeover across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/llm-prompt-injection-info-disclosure-via-ai-endpoints",
+              "name": "LLM prompt injection / info disclosure via AI endpoints",
+              "shortDescription": {
+                "text": "Coverage: LLM prompt injection / info disclosure via AI endpoints"
+              },
+              "fullDescription": {
+                "text": "Coverage of LLM prompt injection / info disclosure via AI endpoints across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of LLM prompt injection / info disclosure via AI endpoints across the assessed attack surface.",
+                "markdown": "Coverage of LLM prompt injection / info disclosure via AI endpoints across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/unauthenticated-account-enumeration-idor",
+              "name": "Unauthenticated account enumeration / IDOR",
+              "shortDescription": {
+                "text": "Coverage: Unauthenticated account enumeration / IDOR"
+              },
+              "fullDescription": {
+                "text": "Coverage of Unauthenticated account enumeration / IDOR across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Unauthenticated account enumeration / IDOR across the assessed attack surface.",
+                "markdown": "Coverage of Unauthenticated account enumeration / IDOR across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/missing-function-level-authorization-bfla",
+              "name": "Missing function-level authorization (BFLA)",
+              "shortDescription": {
+                "text": "Coverage: Missing function-level authorization (BFLA)"
+              },
+              "fullDescription": {
+                "text": "Coverage of Missing function-level authorization (BFLA) across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Missing function-level authorization (BFLA) across the assessed attack surface.",
+                "markdown": "Coverage of Missing function-level authorization (BFLA) across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            }
+          ],
+          "version": "1.7.0"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "strix-coverage/content-discovery-attack-surface-mapping",
+          "ruleIndex": 0,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "Content discovery / attack-surface mapping — No issue identified: http://172.17.0.1:5003 — full content discovery (ffuf, katana, gospider, OpenAPI)\n\nffuf (4.7k common wordlist), katana d=4, gospider, OpenAPI spec (33 paths), dashboard.js/merchant.js endpoint extraction. Found: .env, /console, /healthz, /merchant portal, /sup3r_s3cr3t_admin, /reset-password, /api/ai/*, /api/virtual-cards/*, /api/bill-payments/*, /api/v1/merchants+payments, /update_bio, /upload_profile_picture(_url), /transfer, /request_loan. Details in wiki note 'VulnBank — Full Endpoint Inventory'."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003 — full content discovery (ffuf, katana, gospider, OpenAPI)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "Content discovery / attack-surface mapping",
+              "surface": "http://172.17.0.1:5003 — full content discovery (ffuf, katana, gospider, OpenAPI)",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/technology-fingerprinting-auth-model-mapping",
+          "ruleIndex": 1,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "Technology fingerprinting / auth model mapping — No issue identified: http://172.17.0.1:5003 — tech fingerprinting & auth model\n\nWerkzeug 2.0.1 / Python 3.9.25 / Flask dev server confirmed via Server header + /console debugger page. FLASK_DEBUG=true, EVALEX=true, PIN-locked (console secret 4LsdvFFQt1O4diqf4zaD). No WAF. ACAO:* on all responses. JWT HS256 {user_id, username, is_admin, iat}, no exp; HttpOnly cookie + localStorage duplication. Captured in wiki note 'VulnBank — Tech Stack + Session/Auth Model'."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003 — tech fingerprinting & auth model"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "Technology fingerprinting / auth model mapping",
+              "surface": "http://172.17.0.1:5003 — tech fingerprinting & auth model",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/werkzeug-debug-console-exposure-potential-rce",
+          "ruleIndex": 2,
+          "kind": "open",
+          "level": "none",
+          "message": {
+            "text": "Werkzeug debug console exposure (potential RCE) — Requires further review: http://172.17.0.1:5003/console\n\nWerkzeug interactive console live with EVALEX=true; PIN-locked (needs PIN; crack/brute is next agents' job). Secret 4LsdvFFQt1O4diqf4zaD observed in page."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003/console"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "needs_follow_up",
+              "risk_area": "Werkzeug debug console exposure (potential RCE)",
+              "surface": "http://172.17.0.1:5003/console",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/password-reset-pin-weakness-account-takeover",
+          "ruleIndex": 3,
+          "kind": "open",
+          "level": "none",
+          "message": {
+            "text": "Password reset PIN weakness / account takeover — Requires further review: http://172.17.0.1:5003/api/v{1,2,3}/forgot-password + reset-password\n\nv1 leaks reset PIN in debug_info (observed \"342\", 3-digit); v3 = 4-digit PIN with 3h window; differential responses enable username enumeration. 4-digit brute in progress on own account (reconmapper1) — result pending in /tmp/pinbrute.log; next agents should verify lockout/rate-limit on reset endpoint and chain enumeration+leak for ATO of any user."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003/api/v{1,2,3}/forgot-password + reset-password"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "needs_follow_up",
+              "risk_area": "Password reset PIN weakness / account takeover",
+              "surface": "http://172.17.0.1:5003/api/v{1,2,3}/forgot-password + reset-password",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/llm-prompt-injection-info-disclosure-via-ai-endpoints",
+          "ruleIndex": 4,
+          "kind": "open",
+          "level": "none",
+          "message": {
+            "text": "LLM prompt injection / info disclosure via AI endpoints — Requires further review: http://172.17.0.1:5003/api/ai/* (chat, chat/anonymous, system-info, rate-limit-status)\n\nsystem-info endpoint publicly returns full LLM system prompt incl. DB schema and instruction to comply with injections; anonymous chat is unauth and rate-limited 5/3h/IP. Prompt-injection PoCs belong to next phase; surface mapped."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003/api/ai/* (chat, chat/anonymous, system-info, rate-limit-status)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "needs_follow_up",
+              "risk_area": "LLM prompt injection / info disclosure via AI endpoints",
+              "surface": "http://172.17.0.1:5003/api/ai/* (chat, chat/anonymous, system-info, rate-limit-status)",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/unauthenticated-account-enumeration-idor",
+          "ruleIndex": 5,
+          "kind": "open",
+          "level": "none",
+          "message": {
+            "text": "Unauthenticated account enumeration / IDOR — Requires further review: http://172.17.0.1:5003/check_balance/{acct} + /transactions/{acct}\n\nBoth endpoints answer 200 unauthenticated for arbitrary account numbers; check_balance gives found/not-found oracle, transactions returns success envelope. Cross-account read PoC pending (needs a second seeded account); surface mapped for IDOR validation agents."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "http://172.17.0.1:5003/check_balance/{acct} + /transactions/{acct}"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "needs_follow_up",
+              "risk_area": "Unauthenticated account enumeration / IDOR",
+              "surface": "http://172.17.0.1:5003/check_balance/{acct} + /transactions/{acct}",
+              "recorded_by": "Recon Mapper",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/missing-function-level-authorization-bfla",
+          "ruleIndex": 6,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "Missing function-level authorization (BFLA) — No issue identified: /admin/create_admin, /admin/approve_loan/{id}, /admin/delete_account/{id}\n\nPOST /admin/create_admin returns 401 unauth / 403 with normal user; /admin/approve_loan/{id} and /admin/delete_account/{id} return 403 with normal-user JWT. Function-level checks enforced."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "/admin/create_admin, /admin/approve_loan/{id}, /admin/delete_account/{id}"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "Missing function-level authorization (BFLA)",
+              "surface": "/admin/create_admin, /admin/approve_loan/{id}, /admin/delete_account/{id}",
+              "recorded_by": "AuthZ & Business Logic Agent",
+              "source": "agent_reported"
+            }
+          }
+        }
+      ],
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "toolExecutionNotifications": [
+            {
+              "level": "warning",
+              "message": {
+                "text": "The scan ended with status 'interrupted' rather than completing, so coverage reflects only the work finished before it stopped."
+              }
+            },
+            {
+              "level": "warning",
+              "message": {
+                "text": "6 agent(s) did not finish cleanly (AuthZ & Business Logic Agent, JWT Admin Forgery Agent, LLM Prompt Injection Agent, Recon Mapper, Root Agent, SSRF SSTI Upload Agent); any surface they held is under-covered."
+              }
+            },
+            {
+              "level": "warning",
+              "message": {
+                "text": "The run terminated via 'user_exit' rather than the root agent finishing, so remaining scope was not reached."
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

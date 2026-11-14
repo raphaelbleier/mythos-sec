@@ -1,0 +1,845 @@
+{
+ "target_id": "vulnbank",
+ "rater": "raterB",
+ "rubric": "bench/data/triage-rubric.md",
+ "rubric_sha256": "148d66a5b92908218c70622106097a16dfd5da023ab5e3a288028f91e81c0927",
+ "report_sha256": "647a13ee218ab7caeb1927f7d58acc326cf96886e682ce3a2c787ea8907cf5c6",
+ "blinded": false,
+ "scored": 76,
+ "truth": [
+  {
+   "id": "vb-01",
+   "title": "SQL Injection in login",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "VB-002: `POST /login` `{\"username\":\"' OR 1=1 LIMIT 1--\",\"password\":\"x\"}` -> `200` with `username: \"admin\"`, `is_admin: true`, `user_id: 1` and a **working admin JWT**. Control: `admin`/`wrongpass` -> `Invalid credentials`.",
+   "note": ""
+  },
+  {
+   "id": "vb-02",
+   "title": "Weak JWT implementation",
+   "class": "jwt_weak",
+   "bench_tag": "jwt",
+   "status": "found",
+   "evidence": "VB-007: HS256 token signed offline, payload `{\"user_id\":10,\"username\":\"attacker_a\",\"is_admin\":true,\"iat\":...}` -> `GET /sup3r_s3cr3t_admin` -> full admin panel HTML; \"issued tokens carry **no `exp` claim**\"; control: legitimate non-admin token -> `Access Denied`.",
+   "note": "Weak implementation proven: client-trusted `is_admin` claim, no `exp`, signature forgeable once the key is read. The key itself was not shown to be guessable (see vb-29)."
+  },
+  {
+   "id": "vb-03",
+   "title": "Broken object level authorization (BOLA)",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "found",
+   "evidence": "VB-008: as userA `/api/v3/user/11` -> attacker_b's `{username, account_number, balance}`; `/api/v3/user/1` -> admin's, balance 1,000,000. Control: no token -> 401. Also VB-010: userA's token + `account_number=1073024486` (userB) -> B's transactions.",
+   "note": ""
+  },
+  {
+   "id": "vb-04",
+   "title": "Broken object property level authorization (BOPLA)",
+   "class": "bopla",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-006: `POST /register` `{\"username\":\"attacker_c\",\"password\":\"...\",\"is_admin\":true,\"balance\":999999}` -> `is_admin: true, balance: 999999.0, fields_registered:[...,is_admin,balance]`. Control: registering without the fields yields `is_admin: false`.",
+   "note": "Credited from the same request as vb-05: a client wrote object properties (`is_admin`, `balance`) it is not authorized to write, which is what BOPLA names. Rubric allows one request to prove two entries; noted because the overlap with vb-05/vb-06 is real."
+  },
+  {
+   "id": "vb-05",
+   "title": "Mass assignment",
+   "class": "mass_assignment",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-006: `{\"username\":\"attacker_c\",...,\"is_admin\":true,\"balance\":999999}` -> `is_admin: true, balance: 999999.0, fields_registered:[...,is_admin,balance]`; login returns `isAdmin: true` and the token opens `/sup3r_s3cr3t_admin` (200, 57 kB admin panel).",
+   "note": ""
+  },
+  {
+   "id": "vb-06",
+   "title": "Excessive data exposure",
+   "class": "excessive_data_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-021: \"`/register` and `/login` responses echo the submitted **password** (`raw_data.password`) plus `user_id`, `server_info`; merchant register echoes password + API key\"; Coverage: \"`POST /api/virtual-cards/create` ... response returns full PAN+CVV\".",
+   "note": ""
+  },
+  {
+   "id": "vb-07",
+   "title": "Weak password reset mechanism (3-digit PIN)",
+   "class": "weak_password_reset",
+   "bench_tag": "brute_force",
+   "status": "missed",
+   "evidence": "",
+   "note": "Report saw a 4-digit PIN on the v3 flow and no in-band leak (`forgot-b.json`, 'PIN emailed, no in-band leak'); the documented 3-digit PIN and an actual reset-based takeover were not shown. Brute force was out of bounds per rules, so it stays in the denominator."
+  },
+  {
+   "id": "vb-08",
+   "title": "Token stored in localStorage",
+   "class": "token_storage",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "localStorage is never mentioned."
+  },
+  {
+   "id": "vb-09",
+   "title": "No server-side token invalidation",
+   "class": "session_management",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No logout-then-replay test; only the absence of `exp` is shown (vb-10)."
+  },
+  {
+   "id": "vb-10",
+   "title": "No session expiration",
+   "class": "session_management",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-007: \"permanent, unexpiring admin access (issued tokens carry **no `exp` claim**)\".",
+   "note": "Weakness reproduced by observing the issued token payload; no long-lived-session replay test, but the absence of `exp` is the documented weakness."
+  },
+  {
+   "id": "vb-11",
+   "title": "Information disclosure",
+   "class": "information_disclosure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-021: `/register`/`/login` echo `raw_data.password`, `user_id`, `server_info`; VB-017 `/api/ai/system-info` returns the full system prompt incl. the `users` schema; VB-001 `/.env` served.",
+   "note": ""
+  },
+  {
+   "id": "vb-12",
+   "title": "Sensitive data exposure",
+   "class": "excessive_data_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-001: `curl -sS http://172.17.0.1:5003/.env` -> `JWT_SECRET=00af85a8f47d41f7bfb9ce45ad1130aa`, `DB_PASSWORD=VbProd_2026_DbAccess!`, `REDIS_URL=redis://:VbRedis_2026!@...`, `SMTP_PASSWORD=MailRelay_2026!`, `DEEPSEEK_API_KEY=ds_live_...`. Control: `/.env.bak` -> 404.",
+   "note": ""
+  },
+  {
+   "id": "vb-13",
+   "title": "Plaintext password storage",
+   "class": "plaintext_passwords",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Never shows a stored password value. The password echo in `/register` responses is transport echo, not at-rest storage; the report only infers 'a stored password column exists'."
+  },
+  {
+   "id": "vb-14",
+   "title": "Additional SQL injection points beyond login",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "VB-003 `POST /api/v1/merchants/login` `{\"email\":\"' OR 1=1--\"}` -> merchant `id 1` + live API key; VB-004 `/check_balance/x%27%20OR%20%271%27=%271` -> `{\"username\":\"admin\",\"balance\":1000000.0}` with a working boolean oracle (`...OR '1'='2` -> `Account not found`) and `substr(version(),1,6)='Postgr` -> admin row; VB-005 `?account_number=1073024486%27` -> `syntax error at or near \"1073024486\" ... WHERE from_account='1073024486''`.",
+   "note": ""
+  },
+  {
+   "id": "vb-15",
+   "title": "Debug information exposure",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-019: `GET /console` -> `200`, the Werkzeug Debugger console UI; `?__debugger__=yes&cmd=resource&f=debugger.js` also 200. Consistent with `FLASK_DEBUG=true` in `.env`. VB-021: debug data (`server_info`, `user_id`, raw submitted password) echoed in API responses.",
+   "note": ""
+  },
+  {
+   "id": "vb-16",
+   "title": "Detailed error messages exposed",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-021: unknown field `role` -> raw `INSERT INTO users (username, password, account_number, is_admin, balance, role)` error; VB-004: a lone `'` -> raw SQL error echoing `WHERE account_number='241627199...'`; VB-005: `syntax error at or near \"1073024486\" ... WHERE from_account=...`.",
+   "note": ""
+  },
+  {
+   "id": "vb-17",
+   "title": "No amount validation in transfers",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-013: `POST /transfer` `{\"to_account\":\"1073024486\",\"amount\":-1}` as userA -> `Transfer Completed`, balance 1110 -> 1111 (**sender credited**). Control: a normal `+1` transfer behaves correctly.",
+   "note": "The accepted negative amount is the observation that no amount validation runs on /transfer."
+  },
+  {
+   "id": "vb-18",
+   "title": "Negative amount transfers possible",
+   "class": "business_logic",
+   "bench_tag": "business_logic",
+   "status": "found",
+   "evidence": "VB-013: `POST /transfer` `{\"to_account\":\"1073024486\",\"amount\":-1}` -> `Transfer Completed`, balance 1110 -> 1111; recipient debited (B: 1000 -> 990 over the earlier -10 test).",
+   "note": ""
+  },
+  {
+   "id": "vb-19",
+   "title": "No transaction limits",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No transfer-limit probe; only the negative-amount case and login/PIN throttling."
+  },
+  {
+   "id": "vb-20",
+   "title": "Race conditions in transfers and balance updates",
+   "class": "race_condition",
+   "bench_tag": "race_condition",
+   "status": "missed",
+   "evidence": "",
+   "note": "No concurrency testing at all; 'Brute force / DoS / data destruction - not performed'. Stays in the denominator."
+  },
+  {
+   "id": "vb-21",
+   "title": "Transaction history information disclosure",
+   "class": "information_disclosure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-009: `curl http://172.17.0.1:5003/check_balance/2416271994` (no headers) -> `{\"username\":\"attacker_a\",\"balance\":1000.0}`; \"`GET /transactions/2416271994` likewise returns the full history\". VB-010: cross-user read of userB's transactions with userA's token.",
+   "note": ""
+  },
+  {
+   "id": "vb-22",
+   "title": "No validation on recipient accounts",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "All transfers went to accounts the tester owned; no nonexistent/invalid recipient probe."
+  },
+  {
+   "id": "vb-23",
+   "title": "Unrestricted file upload",
+   "class": "unrestricted_upload",
+   "bench_tag": "arbitrary_file_upload",
+   "status": "found",
+   "evidence": "VB-015: `POST /upload_profile_picture` with `x.html` = `<script>alert(document.domain)</script>` (normal user) -> stored at `static/uploads/840065_x.html`, served `Content-Type: text/html`, `Content-Disposition: inline`. **Browser-executed:** Playwright captured dialog `alert`, message `172.17.0.1`.",
+   "note": ""
+  },
+  {
+   "id": "vb-24",
+   "title": "Path traversal / directory traversal in file operations",
+   "class": "path_traversal",
+   "bench_tag": "path_traversal",
+   "status": "missed",
+   "evidence": "",
+   "note": "Path traversal is not in the findings, the appendix or the classes-tested table."
+  },
+  {
+   "id": "vb-25",
+   "title": "No file type validation on upload",
+   "class": "unrestricted_upload",
+   "bench_tag": "arbitrary_file_upload",
+   "status": "found",
+   "evidence": "VB-015: `.html` with `<script>` accepted and served back as `text/html` inline; \"no extension/MIME validation\".",
+   "note": ""
+  },
+  {
+   "id": "vb-26",
+   "title": "No file size limits on upload",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No size-limit probe."
+  },
+  {
+   "id": "vb-27",
+   "title": "Unsafe file naming on upload",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "The stored name `840065_x.html` is shown but the attacker-controlled filename/extension is not called out or tested as a weakness of its own; credited instead under vb-23/vb-25."
+  },
+  {
+   "id": "vb-28",
+   "title": "SSRF via URL-based profile image import (/upload_profile_picture_url)",
+   "class": "ssrf",
+   "bench_tag": "ssrf",
+   "status": "missed",
+   "evidence": "",
+   "note": "Explicitly wrong: 'GET-canary classes (SSRF, open redirect, ...) - No signal; no url/file/template parameters exist on the surface'. `/upload_profile_picture_url` was not exercised."
+  },
+  {
+   "id": "vb-29",
+   "title": "Weak secret keys",
+   "class": "jwt_weak",
+   "bench_tag": "jwt",
+   "status": "missed",
+   "evidence": "",
+   "note": "The signing key was read out of an exposed `/.env` (a 32-hex random value), not shown to be weak or guessable. Key exposure is credited under vb-12 and the forgery under vb-02."
+  },
+  {
+   "id": "vb-30",
+   "title": "Token exposure in URLs",
+   "class": "token_storage",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No token-in-URL observation."
+  },
+  {
+   "id": "vb-31",
+   "title": "Cross Site Scripting (stored; reflected scenarios in the testing guide)",
+   "class": "xss",
+   "bench_tag": "xss",
+   "status": "found",
+   "evidence": "VB-015 (stored): uploaded `x.html` executed in a headless browser, dialog captured. VB-016 (reflected/DOM): `GET /blog?q=<img src=x onerror=\"window.__XSS_CANARY__=1;console.log('XSS-BLOG-EXECUTED')\">` -> \"executed in headless browser - `window.__XSS_CANARY__ === 1` and console line captured\"; sink `searchInfo.innerHTML = 'Searching for: <strong>' + query + '</strong>'`.",
+   "note": ""
+  },
+  {
+   "id": "vb-32",
+   "title": "Cross Site Request Forgery (CSRF)",
+   "class": "csrf",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Explicitly not proven: 'State-changing routes are JSON + Bearer; classic CSRF not demonstrable'."
+  },
+  {
+   "id": "vb-34",
+   "title": "No rate limiting",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-020: \"8 rapid failed logins -> all 401, no 429/lockout; 8 rapid wrong 4-digit reset PINs -> all 400 `Invalid reset PIN`\". AI endpoints by contrast are limited (5/3h IP).",
+   "note": "Proven as absence of throttle with a negative control, which is what the ground-truth note asks for; no brute force performed."
+  },
+  {
+   "id": "vb-35",
+   "title": "Mass assignment in card limit updates",
+   "class": "mass_assignment",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "`update-limit` returns a server-side SQL syntax error on every call; no mass assignment demonstrated."
+  },
+  {
+   "id": "vb-36",
+   "title": "Mass assignment in card funding exchange-rate handling",
+   "class": "mass_assignment",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Card funding / exchange rate never exercised."
+  },
+  {
+   "id": "vb-37",
+   "title": "Predictable card number generation",
+   "class": "predictable_ids",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "PAN+CVV are returned on creation but no predictability analysis of the number is attempted."
+  },
+  {
+   "id": "vb-38",
+   "title": "Plaintext storage of card details",
+   "class": "plaintext_passwords",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Only retrieval of a full PAN over the API is shown (vb-42); at-rest storage format is not established. Same bar applied to vb-13 and vb-55."
+  },
+  {
+   "id": "vb-39",
+   "title": "No validation on card limits",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No card-limit validation probe (endpoint broken server-side)."
+  },
+  {
+   "id": "vb-40",
+   "title": "BOLA in card operations",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "found",
+   "evidence": "VB-011: as userB `POST /api/virtual-cards/5/toggle-freeze` (card 5 belongs to userA) -> `Card frozen successfully`; userA's card list then shows `is_frozen: true`. `GET /api/virtual-cards/5/transactions` as B also 200. Control: B's own card list returns only B's cards.",
+   "note": ""
+  },
+  {
+   "id": "vb-41",
+   "title": "Race conditions in balance updates (card funding)",
+   "class": "race_condition",
+   "bench_tag": "race_condition",
+   "status": "missed",
+   "evidence": "",
+   "note": "No concurrency testing."
+  },
+  {
+   "id": "vb-42",
+   "title": "Card detail information disclosure",
+   "class": "information_disclosure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-012: \"Merchant B's key lists merchant A's payments, incl. `card_number: 5531202218041773` in clear\"; Coverage: `POST /api/virtual-cards/create` \"response returns full PAN+CVV\".",
+   "note": ""
+  },
+  {
+   "id": "vb-43",
+   "title": "No transaction verification (cards)",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Not probed."
+  },
+  {
+   "id": "vb-44",
+   "title": "Lack of card activity monitoring",
+   "class": "monitoring_gap",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Not probed; no monitoring/alerting observation."
+  },
+  {
+   "id": "vb-45",
+   "title": "Client-controlled currency conversion during card funding",
+   "class": "business_logic",
+   "bench_tag": "business_logic",
+   "status": "missed",
+   "evidence": "",
+   "note": "`currency` is listed as 'exercised' in the coverage paragraph but no observation or outcome is given; no client-controlled conversion shown."
+  },
+  {
+   "id": "vb-46",
+   "title": "No validation on bill payment amounts",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "VB-014: `POST /api/bill-payments/create` `{\"biller_id\":1,\"amount\":-100,\"payment_method\":\"balance\"}` -> `Payment processed successfully`, reference `BILL1794622786`; balance 1010 -> 1110. \"Also below the biller's `minimum_amount: 10` - no validation at all\". Control: over-balance positive amount -> `Insufficient balance`.",
+   "note": ""
+  },
+  {
+   "id": "vb-47",
+   "title": "SQL injection in biller queries",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "missed",
+   "evidence": "",
+   "note": "Tested and negative: '`/api/billers/by-category/1'` -> 404 (int path converter) - not injectable'."
+  },
+  {
+   "id": "vb-48",
+   "title": "Information disclosure in payment history",
+   "class": "information_disclosure",
+   "bench_tag": "information_disclosure",
+   "status": "missed",
+   "evidence": "",
+   "note": "Tested and negative: bill-payment history 'returns only the caller's own payments - control present'."
+  },
+  {
+   "id": "vb-49",
+   "title": "Predictable payment reference numbers",
+   "class": "predictable_ids",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "One reference (`BILL1794622786`) is shown but predictability is not analysed."
+  },
+  {
+   "id": "vb-51",
+   "title": "No validation on biller accounts",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No invalid-biller probe."
+  },
+  {
+   "id": "vb-52",
+   "title": "Race conditions in payment processing",
+   "class": "race_condition",
+   "bench_tag": "race_condition",
+   "status": "missed",
+   "evidence": "",
+   "note": "No concurrency testing."
+  },
+  {
+   "id": "vb-53",
+   "title": "BOLA in payment history access",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "missed",
+   "evidence": "",
+   "note": "Tested and negative: 'Bill-payment history isolation - Only A's own payments returned'."
+  },
+  {
+   "id": "vb-54",
+   "title": "Missing payment limits (bills)",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Over-balance payment was correctly rejected; the `minimum_amount` bypass is credited under vb-46. No max/daily-limit observation."
+  },
+  {
+   "id": "vb-55",
+   "title": "Plaintext merchant passwords and API keys",
+   "class": "plaintext_passwords",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Merchant password is echoed back in the register response and the API key is returned by login, but at-rest plaintext storage is not established. Disclosure credited under vb-56."
+  },
+  {
+   "id": "vb-56",
+   "title": "API keys returned in registration and login responses",
+   "class": "excessive_data_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-003: response is merchant `id 1` (`bookstore@vulnbank.org`) \"with its **live API key** `vk_fe675f...` and JWT\"; VB-021: \"merchant register echoes password + API key\".",
+   "note": ""
+  },
+  {
+   "id": "vb-57",
+   "title": "Raw card number/CVV accepted by merchant payment APIs",
+   "class": "excessive_data_exposure",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "Coverage: \"`POST /api/v1/payments/charge` (tested with 3 card numbers; declines leak card state - covered under VB-021's debug echo)\".",
+   "note": "Terse, but it names the endpoint, the payload type (raw card numbers) and the observed outcome (the API processes them and returns card-state-specific declines). Credited as the weakness 'merchant payment API takes raw PAN/CVV' being reproduced."
+  },
+  {
+   "id": "vb-58",
+   "title": "SQL injection-prone merchant and card lookups",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "VB-003: `POST /api/v1/merchants/login` `{\"email\":\"' OR 1=1--\",\"password\":\"x\"}` -> merchant `id 1` (`bookstore@vulnbank.org`) with its live API key `vk_fe675f...` and JWT. Control: wrong password -> `Invalid credentials`.",
+   "note": "Merchant-lookup half proven by injection; the card-lookup half only shows the concatenated `SET limit = ...` SQL in an error (VB-021)."
+  },
+  {
+   "id": "vb-59",
+   "title": "Missing idempotency, replay protection, payment limits and rate limiting on merchant charges",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No replay/idempotency/limit probe on merchant charges."
+  },
+  {
+   "id": "vb-60",
+   "title": "Object-level authorization gaps in merchant payment lookup",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "found",
+   "evidence": "VB-012: \"Merchant B's key lists merchant A's payments, incl. `card_number: 5531202218041773` in clear\". Control: `GET /api/v1/payments/6` as B -> `Payment not found` (ownership enforced there).",
+   "note": ""
+  },
+  {
+   "id": "vb-61",
+   "title": "Detailed payment decline reasons and debug data exposure",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "Coverage: \"`POST /api/v1/payments/charge` (tested with 3 card numbers; declines leak card state - covered under VB-021's debug echo)\" plus VB-021's `debug_info`/`server_info` echo on the merchant APIs.",
+   "note": "Terse; credited because an endpoint, a payload and an observed outcome (card-state-revealing decline reasons) are named."
+  },
+  {
+   "id": "vb-62",
+   "title": "Predictable authorization code generation",
+   "class": "predictable_ids",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Authorization codes never observed or analysed."
+  },
+  {
+   "id": "vb-63",
+   "title": "Prompt injection in AI customer support (CWE-77)",
+   "class": "prompt_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Reported as a 'candidate' in the 'not validated' appendix: 'Lethal-trifecta data leg unproven'. By its own admission not a demonstration."
+  },
+  {
+   "id": "vb-64",
+   "title": "AI-based information disclosure (CWE-200)",
+   "class": "prompt_injection",
+   "bench_tag": "information_disclosure",
+   "status": "missed",
+   "evidence": "",
+   "note": "No AI-returned data; the report states 'no database content is returned in-band'."
+  },
+  {
+   "id": "vb-65",
+   "title": "Broken authorization in AI context (CWE-862)",
+   "class": "prompt_injection",
+   "bench_tag": "idor",
+   "status": "missed",
+   "evidence": "",
+   "note": "No cross-user access via the AI."
+  },
+  {
+   "id": "vb-66",
+   "title": "AI system information exposure (CWE-209)",
+   "class": "prompt_injection",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-017: `GET /api/ai/system-info` (no auth) -> \"complete system prompt documenting `users(id, username, password, account_number, balance, is_admin...)` and `transactions`, `database_access: true`, demo-attack list, `model: deepseek-chat`, `api_key_configured: false`\".",
+   "note": ""
+  },
+  {
+   "id": "vb-67",
+   "title": "Insufficient input validation for AI prompts (CWE-20)",
+   "class": "input_validation",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No observation about validation of the prompt input itself."
+  },
+  {
+   "id": "vb-68",
+   "title": "Direct database access through AI manipulation",
+   "class": "prompt_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "No DB content obtained through the AI."
+  },
+  {
+   "id": "vb-69",
+   "title": "AI role override attacks",
+   "class": "prompt_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "The injection acknowledgement is only in the unvalidated appendix (candidate)."
+  },
+  {
+   "id": "vb-70",
+   "title": "Context injection vulnerabilities",
+   "class": "prompt_injection",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Not attempted."
+  },
+  {
+   "id": "vb-71",
+   "title": "AI-assisted unauthorized data access",
+   "class": "prompt_injection",
+   "bench_tag": "idor",
+   "status": "missed",
+   "evidence": "",
+   "note": "Not attempted."
+  },
+  {
+   "id": "vb-72",
+   "title": "Exposed AI system prompts and configurations",
+   "class": "prompt_injection",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "VB-017: `GET /api/ai/system-info` returns the complete AI system prompt and configuration (`model: deepseek-chat`, `database_access: true`, `api_key_configured: false`).",
+   "note": ""
+  },
+  {
+   "id": "vb-73",
+   "title": "Enabled schema introspection on /graphql",
+   "class": "information_disclosure",
+   "bench_tag": "graphql",
+   "status": "found",
+   "evidence": "Classes-tested table: \"Introspection open (informational)\"; Coverage: \"`/graphql` (authz enforced, introspection open)\".",
+   "note": "Reported only as an informational coverage line, not as a finding, so it has no `reported[]` row; still an observation of the endpoint and the outcome, which is what this weakness entry needs."
+  },
+  {
+   "id": "vb-74",
+   "title": "Weak JWT-based authentication inherited by /graphql",
+   "class": "jwt_weak",
+   "bench_tag": "jwt",
+   "status": "missed",
+   "evidence": "",
+   "note": "No forged/weak token exercised against `/graphql`; only a legitimate token for the authz control."
+  },
+  {
+   "id": "vb-75",
+   "title": "SQL injection in GraphQL resolver query construction (e.g. accountNumber)",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "missed",
+   "evidence": "",
+   "note": "No injection attempted in GraphQL arguments."
+  },
+  {
+   "id": "vb-76",
+   "title": "Missing GraphQL depth / complexity controls",
+   "class": "graphql_dos",
+   "bench_tag": "graphql",
+   "status": "missed",
+   "evidence": "",
+   "note": "No depth/complexity query."
+  },
+  {
+   "id": "vb-77",
+   "title": "Raw GraphQL error disclosure",
+   "class": "debug_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "missed",
+   "evidence": "",
+   "note": "No GraphQL error response shown."
+  },
+  {
+   "id": "vb-78",
+   "title": "Transaction analytics exposure through admin-scoped queries",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "missed",
+   "evidence": "",
+   "note": "GraphQL is reported as authz-enforced for non-admins; no admin-scoped analytics query executed."
+  }
+ ],
+ "reported": [
+  {
+   "n": 2,
+   "heading": "VB-001 \u2014 Production `.env` with all secrets exposed at `/.env` (secrets-exposure, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-12",
+   "note": "`/.env` served with the signing key, DB/SMTP/Redis credentials and the DeepSeek key; data shown, not asserted. Chains to VB-007."
+  },
+  {
+   "n": 3,
+   "heading": "VB-002 \u2014 SQL injection in `POST /login` `username` \u2192 admin auth bypass (sql-injection, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-01",
+   "note": ""
+  },
+  {
+   "n": 4,
+   "heading": "VB-003 \u2014 SQL injection in `POST /api/v1/merchants/login` `email` \u2192 merchant #1 takeover (sql-injection, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-58",
+   "note": "Injection in the merchant-lookup query; response contains merchant 1's live API key."
+  },
+  {
+   "n": 5,
+   "heading": "VB-004 \u2014 Unauthenticated SQLi in `GET /check_balance/{account_number}` (sql-injection, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-14",
+   "note": "Unauthenticated injection with a working boolean oracle and version() extraction."
+  },
+  {
+   "n": 6,
+   "heading": "VB-006 \u2014 Mass assignment in `POST /register`: `is_admin` + `balance` (mass-assignment, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-05,vb-04",
+   "note": "One request proves the mass assignment and the property-level authorization break."
+  },
+  {
+   "n": 7,
+   "heading": "VB-007 \u2014 Admin JWT forgery with the leaked `JWT_SECRET` (jwt, CVSS 9.8)",
+   "status": "tp",
+   "maps_to": "vb-02,vb-10",
+   "note": "Forged HS256 admin token accepted; tokens carry no `exp`."
+  },
+  {
+   "n": 8,
+   "heading": "VB-019 \u2014 Werkzeug debugger console enabled in production (information-disclosure, CVSS 9.0)",
+   "status": "tp",
+   "maps_to": "vb-15",
+   "note": "Exposure confirmed, RCE explicitly left unconfirmed - correct hedge, and the exposure itself is real."
+  },
+  {
+   "n": 10,
+   "heading": "VB-005 \u2014 SQLi in `GET /api/transactions?account_number` (sql-injection, CVSS 8.8)",
+   "status": "tp",
+   "maps_to": "vb-14",
+   "note": "Error-based, unparameterized concatenation shown in the response."
+  },
+  {
+   "n": 11,
+   "heading": "VB-009 \u2014 Unauthenticated balance/transaction disclosure for any account (access-control, CVSS 7.5)",
+   "status": "tp",
+   "maps_to": "vb-03,vb-21",
+   "note": "Unauthenticated read of any account's balance and history; negative control given (`/api/transactions` demands a token)."
+  },
+  {
+   "n": 12,
+   "heading": "VB-011 \u2014 BOLA on virtual cards: cross-user freeze + transaction read (bola, CVSS 8.8)",
+   "status": "tp",
+   "maps_to": "vb-40",
+   "note": "Cross-user write (freeze) plus cross-user read, with a negative control."
+  },
+  {
+   "n": 13,
+   "heading": "VB-013 \u2014 Negative-amount transfer mints balance / drains victims (business-logic, CVSS 8.8)",
+   "status": "tp",
+   "maps_to": "vb-18,vb-17",
+   "note": ""
+  },
+  {
+   "n": 14,
+   "heading": "VB-014 \u2014 Negative-amount bill payment credits the payer (business-logic, CVSS 8.8)",
+   "status": "tp",
+   "maps_to": "vb-46",
+   "note": ""
+  },
+  {
+   "n": 15,
+   "heading": "VB-015 \u2014 Stored XSS via unrestricted upload served inline `text/html` (stored-xss, CVSS 8.7)",
+   "status": "tp",
+   "maps_to": "vb-23,vb-25,vb-31",
+   "note": "Execution observed in a browser, not inferred from a sink."
+  },
+  {
+   "n": 16,
+   "heading": "VB-016 \u2014 DOM XSS via `?q=` \u2192 `innerHTML` on `/blog` and `/careers` (dom-xss, CVSS 8.3)",
+   "status": "tp",
+   "maps_to": "vb-31",
+   "note": "Separate instance from VB-015 (reflected/DOM on two public pages), not a duplicate."
+  },
+  {
+   "n": 17,
+   "heading": "VB-017 \u2014 `/api/ai/system-info` leaks full system prompt + DB schema (information-disclosure, CVSS 7.5)",
+   "status": "tp",
+   "maps_to": "vb-72,vb-66",
+   "note": ""
+  },
+  {
+   "n": 19,
+   "heading": "VB-008 \u2014 BOLA: `GET /api/v3/user/{user_id}` returns any user's profile/balance to a normal user (bola, CVSS 6.5)",
+   "status": "tp",
+   "maps_to": "vb-03",
+   "note": ""
+  },
+  {
+   "n": 20,
+   "heading": "VB-010 \u2014 BOLA: `GET /api/transactions?account_number=` cross-user read (bola, CVSS 6.5)",
+   "status": "tp",
+   "maps_to": "vb-03",
+   "note": "Distinct from VB-005 (injection) on the same endpoint: this is the authorization gap."
+  },
+  {
+   "n": 21,
+   "heading": "VB-012 \u2014 BOLA: `GET /api/v1/payments/merchant_id/{merchant_id}` + unmasked card numbers (bola, CVSS 6.5)",
+   "status": "tp",
+   "maps_to": "vb-60,vb-42",
+   "note": ""
+  },
+  {
+   "n": 22,
+   "heading": "VB-020 \u2014 No rate limiting/lockout on login and reset-PIN (auth-flows-ato, CVSS 5.3)",
+   "status": "tp",
+   "maps_to": "vb-34",
+   "note": "Absence of throttle shown with a control, no brute force."
+  },
+  {
+   "n": 23,
+   "heading": "VB-021 \u2014 Debug data & credentials echoed; raw SQL errors leak schema (information-disclosure, CVSS 5.3)",
+   "status": "tp",
+   "maps_to": "vb-15,vb-16,vb-06,vb-56,vb-11,vb-61",
+   "note": "Bundled disclosure finding; the disclosed data is quoted, so it clears the rubric's information-disclosure bar."
+  },
+  {
+   "n": 25,
+   "heading": "VB-022 \u2014 Missing CSP/HSTS/X-Content-Type-Options, `Access-Control-Allow-Origin: *` (headers-cors, CVSS 3.7)",
+   "status": "tp",
+   "maps_to": "out-of-list",
+   "note": "Missing CSP/HSTS/X-Content-Type-Options and `ACAO: *` are real, verifiable weaknesses but are not entries in the documented list."
+  }
+ ],
+ "note": "raterB. Deleted 8 mechanically extracted rows that are not findings: the four severity headers (Critical/High/Medium/Low), 'Appendix - not validated', 'Classes tested and not proven', 'Coverage' and 'Chained impact summary'. 21 findings remain, matching the report's own count of 21 validated findings. Policy applied across all three runs: plaintext-storage entries (vb-13/vb-38/vb-55) need at-rest evidence, not a value the API returns; the corresponding disclosure entries take that credit. Entries hedged as candidate/unvalidated are truth-row misses but can still be reported-row tps."
+}

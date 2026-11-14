@@ -1,0 +1,18 @@
+{
+ "argv": [
+  "uv",
+  "run",
+  "--project",
+  "/mnt/linux-data/mythos-bench/strix",
+  "strix",
+  "-n",
+  "-t",
+  "http://172.17.0.1:5003",
+  "--instruction",
+  "<prompt>"
+ ],
+ "exit_code": 1,
+ "timed_out": true,
+ "stalled": false,
+ "wall_s": 905.0
+}
