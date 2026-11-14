@@ -50,6 +50,47 @@ the report for the path's name, which a run satisfies by listing the paths it
 did not test. That fallback is why the "all mapped paths accounted for" claim
 was withdrawn.
 
+## 1a. The proxy still records nothing in a cell, for a reason not yet found
+
+**Status:** open, narrowed.
+
+With the pin fix in place the resolution failure is gone: `traffic exec` went
+from ten calls (each exiting "no engagement", hence the retries) to two, and
+`proxy.json`, `ca.crt` and `events.jsonl` are all written. Still no
+`log.jsonl`, and `proxy.err` is empty, which is itself a signal: a refused or
+failed exchange should leave something there.
+
+Outside a cell the same sequence records correctly, including logging a request
+that failed before a response. So what differs is inside the cell, and the
+remaining candidates are the proxy's bind and client-address rules against a
+target on the docker bridge gateway rather than loopback, and whether the
+agent's requests went through the environment at all. Diagnosing it needs the
+proxy's own view, which currently writes nothing when it declines a connection.
+
+**What to do first.** Make the proxy log every connection it declines and why,
+before guessing again. The absence of a log line is the only clue there is.
+
+## 1c. Four nominally identical cells spanned 144 to 389 seconds and 33 to 851 report lines
+
+**Status:** a measurement property, not a bug, and the reason the
+early-termination hypothesis stays untested.
+
+Same scaffolding, same target, same model, same 900 second budget, four cells:
+
+| cell | wall clock | tool calls | report |
+|---|---|---|---|
+| 1 | 144 s | 23 | 33 lines |
+| 2 | 172 s | 26 | — |
+| 3 | 195 s | 25 | — |
+| 4 | 389 s | 39 | 851 lines |
+
+A single cell therefore cannot test whether a mechanism changed the agent's
+persistence, and the fourth cell was nearly read as confirmation of the
+evidence-based gate when that gate had no evidence to work with in any of the
+four. Testing the hypothesis needs repeats per condition, which is the same
+lesson the published variance figures of 2.2 to 6.0 points already carry: more
+cells beat more cleverness.
+
 ## 1b. The recorder leaks a process and a CA directory per engagement
 
 **Status:** open, and it compounds defect 1.
