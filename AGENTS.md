@@ -13,17 +13,36 @@ Start a run with `mythos -t <url> [--scope scope.yaml]`. Other commands:
 
 ## How a run works
 
-`cli/src/driver.ts` owns the phase order, in code: recon, scan, exploit,
-report. Each phase is a separate agent with a fresh context, so nothing carries
-over except the files in the engagement directory. A phase closes on an
-artifact, not on the agent's opinion that it is finished:
+`cli/src/driver.ts` owns the phase order, in code: recon, triage, scan,
+exploit, validate, report. Each phase is a separate agent with a fresh context,
+so nothing carries over except the files in the engagement directory. A phase
+closes on an artifact, not on the agent's opinion that it is finished:
 
 | Phase | Closes when |
 |---|---|
 | recon | `surface.json` exists and maps at least one endpoint, and `recon.md` exists |
+| triage | `plan.json` exists and selected at least one skill |
 | scan | `candidates.md` exists |
 | exploit | every endpoint in `surface.json` has a verdict |
+| validate | no candidate is left unresolved, and every finding's evidence replays |
 | report | `report.md` and `findings.json` exist |
+
+Two of those phases are not agents in the usual sense.
+
+**Triage has no model in it at all.** It runs `scripts/triage`, which matches
+the mapped surface against the triggers every skill declares in
+`skills/registry.yaml` and writes `plan.json`. The same surface therefore always
+selects the same skills, and a wrong selection is a bug in a file under version
+control rather than one agent's judgement on one afternoon. Before it existed,
+fourteen of this repository's skills were named in no prompt anywhere, so no run
+ever opened them.
+
+**Validate exists because an agent must not confirm its own finding.** The
+exploit workers may write only `candidate`, `tested` or `skipped`; a validator
+on a different model, with a fresh context, replays the recorded bytes and
+decides `confirmed` or `rejected`. A rejection is a result and goes in the
+report. The measurement behind this: a naive "the JavaScript executed" verifier
+let an agent claim 111 cross-site scripting findings, of which ten were real.
 
 A phase that does not produce its artifact runs again with what it left behind
 (`--retries`, default 2). After that it is recorded as `incomplete` and the run
@@ -45,16 +64,27 @@ to 6, until every endpoint has one. A worker records its verdict by writing
 into `verdicts.json`:
 
     endpoint: <the endpoint exactly as assigned>
-    state: confirmed | tested | skipped
+    state: candidate | tested | skipped
     note: <one or two sentences>
 
-`confirmed` means a flaw was proven and `findings/<id>.md` carries the
-evidence. `tested` means real requests went at it for the classes its shape
-suggests and none held; name those classes. `skipped` means you deliberately
-did not test it, with a reason a reader can check: out of scope, needs an
-identity you could not get, only provable destructively, no budget left. "Did
-not get to it" is a legitimate reason and far better than silence. An endpoint
-with no verdict is not a decision, it is an omission.
+`candidate` means you believe you proved a flaw, and `candidates/<id>.md`
+carries the claim with the traffic record ID of the proof and of its negative
+control. You cannot write `confirmed`: that word belongs to the validate phase,
+which replays those bytes and then writes `confirmed` or `rejected` over your
+verdict. A worker that writes it anyway is demoted to `candidate` in code, not
+asked nicely.
+
+`tested` means real requests went at it for the classes its shape suggests and
+none held; name those classes. `skipped` means you deliberately did not test
+it, with a reason a reader can check: out of scope, needs an identity you could
+not get, only provable destructively, no budget left. "Did not get to it" is a
+legitimate reason and far better than silence. An endpoint with no verdict is
+not a decision, it is an omission.
+
+Read `plan.md` when you reach your phase. The triage phase wrote it from the
+mapped surface, and the skills it names for your phase are the ones to read: it
+also records what it did not select and why, which saves you looking for a
+surface that is not there.
 
 Load the skill for your phase when you reach it; do not read them all.
 `knowledge/` holds per-class confirmation playbooks: read the one a skill points
@@ -69,20 +99,29 @@ settled before the run started.
 
 ## Tools
 
-An agent has six tools and nothing else.
+An agent has seven tools and nothing else.
 
 | Tool | What it does |
 |---|---|
 | `shell` | one shell pipeline inside the Kali toolbox container |
 | `request` | one HTTP request, with the status line, headers and body back |
+| `raw` | byte-exact bytes on a fresh socket, for framing a parser would fix |
 | `script` | one of the deterministic Python tools below |
 | `files` | read, write, append and list inside the engagement directory only |
 | `reference` | read `skills/`, `knowledge/` and this file |
-| `browser` | a real Chromium: navigate, click, type, read the DOM or HTML, run JavaScript, read the console and the request log |
+| `browser` | a real Chromium, behind the recording proxy: navigate, click, type, read the DOM or HTML, run JavaScript, install a script that runs before the page's own, open a second browser context as a victim role, drive CDP, read the console, the request log and WebSocket frames, and save a screenshot as evidence |
 
 The set is small on purpose. `script` is where most of the work happens: probe, verify,
 coverage, findings and cvefeed each collapse what would otherwise be dozens of
 model round trips into one deterministic call.
+
+`raw` exists for one reason and should be used for almost nothing else. Modern
+HTTP desync depends on framing that is ambiguous on purpose, and both `request`
+and the recording proxy are HTTP parsers: they would resolve the ambiguity that
+is the whole experiment, and a 0.CL probe would deadlock the proxy outright. So
+`raw` writes the bytes itself, on a connection it never reuses, and keeps its own
+record of what it sent. Every other request belongs on `request` or `shell`,
+where the proxy records it and `traffic replay` can send it again.
 
 ## Scope rules
 
@@ -159,8 +198,20 @@ models without them did not. So reach for these before writing a paragraph.
 | `traffic` | what was recorded: summary, one request, a byte-for-byte replay, a HAR |
 | `lessons` | class priors from past engagements; see its own caveat, it is an untested hypothesis |
 | `watch` | what changed on a tested target since last time, and what that makes worth re-testing |
+| `triage` | which skills this target's surface selects, from `skills/registry.yaml`. The driver runs it; no model decides membership |
+| `evidence` | build and check the per-finding bundle a human replays before submitting |
+| `clientside` | source-map and bundle recovery, bundle secrets, prototype-pollution read-back, postMessage listeners, what a CSP is missing, service workers, DOM clobbering |
+| `apiproto` | GraphQL with a per-field role matrix, JSON-RPC and tRPC batch authorization, gRPC over reflection or a recovered bundle, Next.js Server Actions per role, spec-versus-traffic diffing |
+| `authflows` | reset poisoning, MFA bypass, session fixation and rotation, email change, passkeys through the CDP virtual authenticator. The agent's own accounts only |
+| `ssrfprobe` | what an SSRF actually controls, the cloud metadata surfaces with their real header and method requirements, blind SSRF through OAST, DNS rebinding |
+| `aiplatform` | AI platform version fingerprints, MCP `tools/list` diffing and descriptor scanning, a prompt-injection runner with per-variant controls and interval reporting, denial-of-wallet capability checks |
 
 Every one has a `--selftest` that needs no network. Run it after changing one.
+
+Four of them emit rather than act: `clientside protopollute` and `postmessage`,
+and `authflows webauthn`, produce the init script or the CDP call for the
+`browser` tool to run and then grade what comes back through `--judge`. Python
+drives no browser in this repository.
 
 ## Proof standard
 
