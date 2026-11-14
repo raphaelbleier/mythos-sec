@@ -33,7 +33,7 @@ digraph mythos {
   toolbox [label="mythos-toolbox (Kali, Docker)\nvia scripts/mythos docker exec\nnuclei · sqlmap · dalfox · ffuf · katana\nhttpx · nikto · arjun · jwt_tool · curl\n/repo read-only, engagements/ writable\nMYTHOS_NET=host for a loopback target",
            fillcolor="#eef2ff", color="#3b5bdb"];
   chromium [label="Chromium (playwright-core)\non the host, outside the container\nDOM · console · network log", fillcolor="#eef2ff", color="#3b5bdb"];
-  hostscripts [label="scripts/probe · scripts/verify\non the host, vetted the same way", fillcolor="#eef2ff", color="#3b5bdb"];
+  hostscripts [label="scripts/probe · scripts/verify\non the host, vetted the same way\nrun through scripts/traffic exec", fillcolor="#eef2ff", color="#3b5bdb"];
 
   skills [label="skills/ · knowledge/\nthe methodology,\nread at runtime", fillcolor="#eafff0", color="#1faa59"];
   models [label="models.json\ntier per agent,\nmodel per profile", fillcolor="#eafff0", color="#1faa59"];
@@ -63,7 +63,7 @@ digraph mythos {
   guards -> toolbox [label="allowed"];
   guards -> chromium [label="allowed (goto)"];
   guards -> hostscripts [label="allowed"];
-  hostscripts -> target [label="GET only, paced"];
+  hostscripts -> target [label="GET only, paced, recorded"];
   toolbox -> target [label="recorded by scripts/traffic, paced"];
   chromium -> target [label="renders the DOM", style=dashed];
 
