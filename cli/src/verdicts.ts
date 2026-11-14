@@ -38,6 +38,24 @@ export interface VerdictRow {
   at: string;
 }
 
+/**
+ * The key two endpoint strings are compared on.
+ *
+ * A worker is asked to repeat the endpoint exactly as it was assigned and
+ * mostly does, but "http://host/login", "/login" and "/login/" are the same
+ * endpoint and a worker that writes any of them has done the work. Matching on
+ * the raw string would leave the endpoint open, and the phase would spend all
+ * six rounds reassigning something that was already decided.
+ */
+export function endpointKey(e: string): string {
+  let k = e.trim();
+  const m = /^[a-z]+:\/\/[^/]+(\/.*)?$/i.exec(k);
+  if (m) k = m[1] ?? "/";
+  k = k.replace(/\s+/g, " ");
+  if (k.length > 1) k = k.replace(/\/+$/, "");
+  return k.toLowerCase();
+}
+
 export class Ledger {
   private rows = new Map<string, VerdictRow>();
   private file: string;
@@ -47,7 +65,7 @@ export class Ledger {
     if (existsSync(this.file)) {
       try {
         const data = JSON.parse(readFileSync(this.file, "utf8")) as VerdictRow[];
-        for (const r of data) this.rows.set(r.endpoint, r);
+        for (const r of data) this.rows.set(endpointKey(r.endpoint), r);
       } catch {
         /* a corrupt ledger is rebuilt rather than inherited */
       }
@@ -55,7 +73,13 @@ export class Ledger {
   }
 
   record(endpoint: string, state: VerdictState, note: string, by: string) {
-    this.rows.set(endpoint, { endpoint, state, note, by, at: new Date().toISOString() });
+    this.rows.set(endpointKey(endpoint), {
+      endpoint,
+      state,
+      note,
+      by,
+      at: new Date().toISOString(),
+    });
     this.flush();
   }
 
@@ -68,7 +92,7 @@ export class Ledger {
   }
 
   has(endpoint: string) {
-    return this.rows.has(endpoint);
+    return this.rows.has(endpointKey(endpoint));
   }
 
   /**
@@ -99,7 +123,7 @@ export class Ledger {
 
   /** Endpoints with no verdict yet, which is the work the driver still owes. */
   async open(): Promise<string[]> {
-    return (await this.surface()).filter((e) => !this.rows.has(e));
+    return (await this.surface()).filter((e) => !this.rows.has(endpointKey(e)));
   }
 
   summary(): { confirmed: number; tested: number; skipped: number } {

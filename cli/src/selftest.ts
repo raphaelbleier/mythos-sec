@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chunk } from "./driver.js";
 import { parseYaml, readScope } from "./scope.js";
-import { surfaceFromMap } from "./verdicts.js";
+import { endpointKey, surfaceFromMap } from "./verdicts.js";
 import { shq, summariseJson } from "./agent/tools.js";
 import { splitModel } from "./providers/registry.js";
 import { needsHostNetwork, toolboxTarget } from "./prompts.js";
@@ -141,6 +141,18 @@ test("a map written to a file is described rather than echoed", () => {
   );
   assert.equal(summariseJson("[1,2]"), "array of 2");
   assert.equal(summariseJson("nope"), "not valid JSON");
+});
+
+test("the same endpoint written three ways counts once", () => {
+  const same = ["http://127.0.0.1:5001/login", "/login", "/login/", " /Login "];
+  assert.equal(new Set(same.map(endpointKey)).size, 1);
+  assert.notEqual(endpointKey("/login"), endpointKey("/logout"));
+  assert.equal(endpointKey("http://h/"), "/", "a bare origin is the root");
+  assert.equal(
+    endpointKey("mutation importPaste(a, b)"),
+    "mutation importpaste(a, b)",
+    "a GraphQL entry keeps its argument list",
+  );
 });
 
 process.stdout.write(`\n${ran} checks passed\n`);
