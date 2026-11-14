@@ -246,16 +246,42 @@ def report_file(workdir):
 
 
 def final_report(transcript, final, workdir=None):
-    """The text `detected` is matched against: report.md, else Strix's report, else the final
-    message, else the whole transcript."""
+    """Everything the arm delivered, so the medium does not decide the score.
+
+    The two arms deliver differently. The scaffolded arm writes
+    `engagements/<dir>/report.md`; the control cannot write files at all, so its
+    deliverable is the final message. Taking only one of the two biases the
+    comparison, and it has now done so in both directions: matching the last
+    text event alone penalised the arm that writes a report, and taking
+    report.md alone penalised a run whose report.md said "findings as delivered
+    in the final chat report" and left the findings in the message.
+
+    So both are returned, labelled and in that order, with the final message
+    dropped when the report already contains it. A rater or matcher then judges
+    everything the arm produced rather than whichever half the harness happened
+    to prefer.
+    """
     wd = Path(workdir) if workdir else Path(transcript).parent
+    parts = []
     f = report_file(wd)
     if f:
-        return f.read_text(errors="replace")
+        parts.append(("report.md", f.read_text(errors="replace")))
+    else:
+        strix = sorted(wd.glob("cwd/strix_runs/*/penetration_test_report.md"))
+        if strix:
+            parts.append(("penetration_test_report.md",
+                          strix[-1].read_text(errors="replace")))
     if final is not None:
-        return final
-    reports = sorted(wd.glob("cwd/strix_runs/*/penetration_test_report.md"))
-    return reports[-1].read_text(errors="replace") if reports else Path(transcript).read_text(errors="replace")
+        body = parts[0][1] if parts else ""
+        # Skip it only when the written report already carries it, which is the
+        # common case where the message is a short summary of the file.
+        if final.strip() and final.strip() not in body:
+            parts.append(("final message", final))
+    if not parts:
+        return Path(transcript).read_text(errors="replace")
+    if len(parts) == 1:
+        return parts[0][1]
+    return "\n\n".join(f"===== {name} =====\n{text}" for name, text in parts)
 
 
 def score(flag, transcript, tags, workdir, canaries=(), target_url=None):
