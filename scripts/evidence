@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""Assemble one self-contained evidence bundle per finding, and check it.
+
+Every major platform now requires a named human to have personally verified a
+finding before it is submitted: Bugcrowd suspends for ten consecutive invalid
+automated reports without pre-submission validation, Intigriti requires the
+researcher to have reproduced it, HackerOne keeps the researcher responsible
+for validating model output. So the deliverable of a run is not a report, it is
+a report plus something a person can replay in ten minutes without reading the
+engagement directory. That is what this builds.
+
+  scripts/evidence build <engagement-dir> [--id <finding>] [--keep-secrets]
+  scripts/evidence check <engagement-dir> [--all]
+
+`build` writes, per finding, `evidence/<id>/` holding:
+
+  README.md          what the finding claims, the exact commands to replay it,
+                     the oracle, the models, and a sign-off block for the
+                     person who replays it
+  finding.md         the finding record itself
+  requests/          every request and response the finding cites, as the bytes
+                     that crossed the wire, pulled from the traffic store
+  oracle.json        the predicate that was checked and what it returned
+  screenshots/       the files under evidence/ that belong to this finding
+  manifest.json      all of the above, machine-readable, with digests
+
+`check` is the gate. It exits non-zero when a finding has nothing behind it: no
+cited request, or a cited request that is not in the store. A finding whose
+proof cannot be found is not a finding, and the point of failing here is that
+it never reaches a report.
+
+Findings cite a recorded exchange the way the engagements already do, as
+`traffic/<id>` or `traffic/<first>-<last>` (see `scripts/findings` for the
+front matter and `scripts/traffic` for the store). Nothing new is invented
+here; both formats are read from their own files.
+
+Credentials. The traffic store is raw on purpose — a replay that cannot send
+the real Cookie proves nothing — but a bundle is an attachment, and an
+attachment travels. So `Authorization`, `Cookie`, `Set-Cookie`, tokens and
+anything else the patterns in `scripts/findings` recognise are redacted, the
+README says they were, and `--keep-secrets` turns it off for the case where the
+bundle stays inside the engagement. Redaction rewrites bytes, so a redacted
+bundle is no longer byte-exact and the README says how to replay it anyway.
+
+Stdlib only, no network. `--selftest` runs the asserts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shutil
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+REPO = Path(__file__).resolve().parent.parent
+
+# How a finding names a recorded exchange. This is the form the engagements
+# already write, in `proof:` and in prose: `traffic/422`, an inclusive range
+# `traffic/422-424`, and a comma list carrying on from one prefix,
+# `traffic/422-424, 224-229, 282-285`. All three are read because all three
+# appear in real findings; none of it is invented for this tool.
+CITE = re.compile(r"\btraffic[/#](\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)")
+RANGE_CAP = 64           # a range wider than this is a typo, not a citation
+
+
+def load_script(path: Path):
+    """Import an extensionless sibling script, so its tables stay the only copy."""
+    loader = importlib.machinery.SourceFileLoader(path.stem.replace("-", "_"), str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+_findings = _traffic = None
+
+
+def findings_mod():
+    global _findings
+    if _findings is None:
+        _findings = load_script(REPO / "scripts" / "findings")
+    return _findings
+
+
+def traffic_mod():
+    global _traffic
+    if _traffic is None:
+        _traffic = load_script(REPO / "scripts" / "traffic")
+    return _traffic
+
+
+def redact_bytes(raw: bytes, keep: bool) -> bytes:
+    """Redaction works on text, so the bytes are decoded latin-1 and put back.
+
+    latin-1 round-trips every byte, which utf-8 does not: a binary body must
+    survive this unchanged apart from what the patterns rewrite.
+
+    It is done line by line with the terminators held back, because the
+    patterns that redact to the end of a line (`Cookie: .*`) match a lone CR
+    too and would eat it. The file would then be an HTTP message with LF line
+    endings — not what crossed the wire, and not what a header-smuggling or
+    desync proof is about."""
+    if keep:
+        return raw
+    f = findings_mod()
+    out = []
+    for line in raw.decode("latin-1").splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body, end = line[:-2], line[-2:]
+        elif line[-1:] in ("\n", "\r"):
+            body, end = line[:-1], line[-1:]
+        else:
+            body, end = line, ""
+        out.append(f.redact(body) + end)
+    return "".join(out).encode("latin-1", "replace")
+
+
+def cited_ids(text: str) -> list[int]:
+    """The record ids a finding cites, in the order they first appear."""
+    out: list[int] = []
+    for group in CITE.findall(text):
+        for part in group.split(","):
+            first, _, last = part.partition("-")
+            start = int(first.strip())
+            end = int(last.strip()) if last.strip() else start
+            if end < start or end - start > RANGE_CAP:
+                end = start       # a nonsense range cites its first id only
+            for rid in range(start, end + 1):
+                if rid not in out:
+                    out.append(rid)
+    return out
+
+
+def finding_files(engagement: Path) -> list[Path]:
+    f = findings_mod()
+    d = engagement / "findings"
+    if not d.is_dir():
+        return []
+    return [p for p in sorted(d.glob("*.md")) if p.name.lower() not in f.NOT_A_FINDING]
+
+
+def run_facts(engagement: Path) -> dict:
+    """The models that ran and when, from the driver's own event log.
+
+    A bundle has to say which model produced the finding and which model
+    validated it: Intigriti requires the submission to disclose how AI was
+    used, and "a model" is not a disclosure."""
+    facts = {"models": {}, "phases": {}, "start": None, "end": None,
+             "events": None, "traffic_window": None}
+    events = engagement / "run-events.jsonl"
+    if events.exists():
+        stamps, models = [], {}
+        for line in events.read_text(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("ts"):
+                stamps.append(row["ts"])
+            kind, model = row.get("t"), row.get("model")
+            if not model:
+                continue
+            if kind == "run:start":
+                models["run"] = model
+            elif row.get("phase"):
+                facts["phases"].setdefault(row["phase"], model)
+        facts["models"] = models
+        facts["events"] = str(events.relative_to(engagement))
+        if stamps:
+            facts["start"], facts["end"] = min(stamps), max(stamps)
+    run = engagement / "run.json"
+    if run.exists():
+        try:
+            facts["traffic_window"] = json.loads(run.read_text()).get("window")
+        except ValueError:
+            pass
+    return facts
+
+
+def oracle_facts(engagement: Path, fm_oracle: str, negative_control: str) -> dict:
+    """The predicate that was checked and what it returned.
+
+    `oracle:` in the front matter points at a `scripts/verify --json` file,
+    which carries the predicate, what came back and the negative control. With
+    no such file the bundle still records the control the finding states, and
+    says that the predicate was prose rather than a tool's."""
+    out = {"source": "the finding's front matter", "file": None, "predicate": None,
+           "result": None, "negative_control": negative_control or None, "checks": []}
+    if not fm_oracle:
+        return out
+    path = engagement / fm_oracle
+    if not path.exists():
+        out["problem"] = f"oracle: {fm_oracle} does not exist"
+        return out
+    out["file"] = fm_oracle
+    try:
+        doc = json.loads(path.read_text(errors="replace"))
+    except ValueError as exc:
+        out["problem"] = f"oracle: {fm_oracle} is not JSON ({exc})"
+        return out
+    out["source"] = f"{fm_oracle} (scripts/verify)"
+    checks = doc.get("checks") if isinstance(doc, dict) else doc
+    if isinstance(checks, list):
+        out["checks"] = checks
+        wanted = [c for c in checks if isinstance(c, dict)
+                  and c.get("result") in ("evidence", "ambiguous")] or \
+                 [c for c in checks if isinstance(c, dict)]
+        if wanted:
+            out["predicate"] = wanted[0].get("predicate")
+            out["result"] = wanted[0].get("result")
+            control = wanted[0].get("negative_control")
+            if isinstance(control, dict):
+                out["negative_control"] = (
+                    f"{control.get('request', {}).get('url', 'control request')} -> "
+                    f"oracle fired: {control.get('fired')}")
+    if isinstance(doc, dict) and doc.get("oracle"):
+        out["oracle"] = doc["oracle"]
+    return out
+
+
+def screenshots_for(engagement: Path, fid: str, text: str, other_ids: set[str]) -> list[Path]:
+    """Files already under evidence/ that belong to this finding.
+
+    Two deterministic rules, because guessing wrong either way is worse than a
+    short list: the finding names the file, or the file is named after the
+    finding. Bundles themselves are skipped — evidence/<id>/ lives in here too."""
+    root = engagement / "evidence"
+    if not root.is_dir():
+        return []
+    out = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if rel.parts[0] in other_ids or rel.parts[0] == fid:
+            continue              # another finding's bundle, or this one's
+        if path.name in text or fid in path.stem or fid in str(rel):
+            out.append(path)
+    return out
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def collect_citation(d: Path, rid: int, log: dict) -> dict:
+    """One cited record, as far as the store can account for it."""
+    t = traffic_mod()
+    rec = log.get(rid)
+    if rec is None:
+        return {"id": rid, "present": False,
+                "problem": f"traffic/{rid} is cited but is not in the traffic store"}
+    kind = rec.get("kind")
+    if kind not in ("exchange", "raw") or not rec.get("req"):
+        return {"id": rid, "present": False, "kind": kind,
+                "problem": f"traffic/{rid} is a {kind} record, not a request "
+                           f"({rec.get('reason') or rec.get('error') or 'nothing was recorded'})"}
+    req, res = t.raw_of(rec, "req"), t.raw_of(rec, "res")
+    out = {"id": rid, "present": True, "kind": kind,
+           "t": t.iso(rec["t"]), "host": f"{rec.get('host')}:{rec.get('port')}",
+           "scheme": rec.get("scheme"), "client": rec.get("client"),
+           "request_bytes": len(req), "response_bytes": len(res),
+           "sha256": {"request": digest(req), "response": digest(res)},
+           "truncated": {"request": bool(rec.get("req_cut")),
+                         "response": bool(rec.get("res_cut"))},
+           "error": rec.get("error")}
+    if kind == "raw":
+        # A raw record was never parsed, and saying otherwise in a bundle a
+        # human reads would invite them to rebuild the request by hand.
+        out.update(label=t.raw_label(rec),
+                   url=f"{rec.get('scheme')}://{rec.get('host')}:{rec.get('port')}",
+                   note="byte-exact exchange, never parsed: replay it, do not rebuild it",
+                   half_close=bool(rec.get("half_close")),
+                   writes=rec.get("writes"))
+    else:
+        out.update(method=rec.get("m"), status=rec.get("s"), url=t.url_of(rec))
+    if not res:
+        out["problem"] = (f"traffic/{rid} has no recorded response "
+                          f"({rec.get('error') or 'the exchange did not complete'})")
+    return out
+
+
+def readme(engagement: Path, finding: dict, cites: list[dict], oracle: dict,
+           facts: dict, shots: list[str], keep: bool) -> str:
+    """The page a person works from. Everything needed to replay, nothing else."""
+    fid = finding["id"]
+    eng = engagement.name
+    good = [c for c in cites if c.get("present")]
+    lines = [
+        f"# Evidence bundle: {finding['title']}",
+        "",
+        f"- finding      `{fid}`  (`findings/{finding['file']}`)",
+        f"- class        {finding['class'] or 'unclassified'}"
+        + (f"  (CWE-{finding['cwe']})" if finding.get("cwe") else ""),
+        f"- state        {finding['state_detail'] or finding['state']}",
+        f"- asset        {finding['asset'] or '(none recorded)'}"
+        + (f"   parameter `{finding['param']}`" if finding.get("param") else ""),
+        f"- CVSS 3.1     {finding['cvss_score']}  {finding['cvss_vector'] or '(no vector)'}",
+    ]
+    if finding.get("cvss4_vector"):
+        lines.append(f"- CVSS 4.0     {finding['cvss4_score']}  {finding['cvss4_vector']}")
+    lines += [
+        f"- engagement   `{eng}`",
+        f"- bundle built {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}",
+        "",
+        "## Who ran this, and when",
+        "",
+        "This finding was produced by an automated run. Every platform that",
+        "accepts it requires a named human to have reproduced it first, and",
+        "several require the submission to say how AI was used. The models and",
+        "the run window are therefore part of the evidence, not a footnote.",
+        "",
+    ]
+    models = facts.get("models") or {}
+    phases = facts.get("phases") or {}
+    if models or phases:
+        if models.get("run"):
+            lines.append(f"- run model      `{models['run']}`")
+        for phase, model in phases.items():
+            lines.append(f"- {phase:<13} `{model}`")
+    else:
+        lines.append("- models       NOT RECORDED for this run "
+                     "(no run-events.jsonl): say so in the submission")
+    window = facts.get("start") and f"{facts['start']} .. {facts['end']}"
+    traffic_window = facts.get("traffic_window") or {}
+    lines += [
+        f"- run window   {window or '(not recorded)'}",
+        f"- traffic      {traffic_window.get('start', '(not recorded)')} .. "
+        f"{traffic_window.get('end', '')}",
+        "",
+        "Replayed and verified by: ______________________  date: ____________",
+        "",
+    ]
+    if keep:
+        lines += ["## Credentials: PRESENT", "",
+                  "This bundle was built with `--keep-secrets`. The stored bytes",
+                  "are exactly what crossed the wire, live session cookies and",
+                  "tokens included. Keep it inside the engagement directory; do",
+                  "not attach it to a report.", ""]
+    else:
+        lines += ["## Credentials: redacted", "",
+                  "`Authorization`, `Cookie`, `Set-Cookie`, bearer tokens, API",
+                  "keys, JWTs and password-shaped values have been replaced with",
+                  "`[REDACTED]` in every file here. That is a rewrite, so the",
+                  "stored bytes are no longer byte-exact and will not",
+                  "authenticate as they stand. To replay with the real values,",
+                  "use the traffic store in the engagement directory (the first",
+                  "command below), which keeps the unredacted record.", ""]
+    lines += ["## The claim", "",
+              f"**{finding['title']}**", ""]
+    if finding.get("negative_control"):
+        lines += ["Negative control stated in the finding:", "",
+                  f"> {finding['negative_control']}", ""]
+    lines += ["## The oracle", "",
+              f"- source       {oracle['source']}",
+              f"- predicate    {oracle['predicate'] or '(prose, not a tool predicate)'}",
+              f"- result       {oracle['result'] or finding['state']}",
+              f"- control      {oracle['negative_control'] or '(none recorded)'}"]
+    if oracle.get("problem"):
+        lines.append(f"- PROBLEM      {oracle['problem']}")
+    lines += ["", "## Replay it by hand", "",
+              "Run these from the repository root. The first one is the",
+              "authoritative replay: it resends the recorded bytes from the",
+              "engagement's own store, unredacted, and diffs the response",
+              "against what was recorded.", ""]
+    if not good:
+        lines += ["**There is no recorded request behind this finding.** Nothing",
+                  "here can be replayed, which is the one thing a bundle has to",
+                  "be able to say out loud. Do not submit it.", ""]
+    for c in good:
+        where = c.get("url") or c["host"]
+        what = (f"RAW {where}  ({c.get('label', 'raw bytes')})" if c["kind"] == "raw"
+                else f"{c.get('method')} {where}")
+        lines += [f"### traffic/{c['id']}  {what}",
+                  "",
+                  "```sh",
+                  f"scripts/traffic --dir engagements/{eng} show {c['id']}",
+                  f"scripts/traffic --dir engagements/{eng} replay {c['id']}",
+                  "```",
+                  ""]
+        if c["kind"] == "raw":
+            lines += ["This is a raw record: byte-exact, never parsed (a desync",
+                      "probe has deliberately ambiguous framing). Replay it as",
+                      "above. Do not rebuild it from the bytes — a proof that",
+                      "goes through a parser is not a proof.", ""]
+        lines += [f"The bytes are in `requests/{c['id']}.request.http` and "
+                  f"`requests/{c['id']}.response.http`"
+                  f" ({c['request_bytes']} and {c['response_bytes']} bytes).", ""]
+        if c["truncated"]["request"] or c["truncated"]["response"]:
+            lines += ["WARNING: this record was truncated when it was stored, so",
+                      "the bytes here are a prefix of what was sent or received.", ""]
+        if c.get("problem"):
+            lines += [f"WARNING: {c['problem']}", ""]
+    if finding.get("proof"):
+        lines += ["### The stored proof of concept", "",
+                  f"The finding names `{finding['proof']}`. If that is a script in the",
+                  "engagement directory, run it there; it is the probe that proved",
+                  "the bug rather than a new one derived afterwards.", ""]
+    if shots:
+        lines += ["## Screenshots and captures", ""] + [f"- `{s}`" for s in shots] + [""]
+    lines += ["## What is in this bundle", "",
+              "```",
+              "README.md            this page",
+              "finding.md           the finding record, front matter included",
+              "manifest.json        every file here with its sha256, machine-readable",
+              "oracle.json          the predicate, the result and the control",
+              "requests/            the cited requests and responses, as bytes",
+              *(["screenshots/         the captures above"] if shots else []),
+              "```", ""]
+    return "\n".join(lines)
+
+
+def build_one(d: Path, path: Path, keep: bool, other_ids: set[str], log: dict,
+              facts: dict) -> dict:
+    """One bundle. Returns its manifest."""
+    f = findings_mod()
+    finding = f.parse(path)
+    fid = finding["id"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    cites = [collect_citation(d, rid, log) for rid in cited_ids(text)]
+    oracle = oracle_facts(d, finding_field(text, "oracle"), finding["negative_control"] or "")
+    shots = screenshots_for(d, fid, text, other_ids)
+
+    out = d / "evidence" / fid
+    for sub in ("requests", "screenshots"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
+    if not shots:
+        (out / "screenshots").rmdir()
+
+    t = traffic_mod()
+    files = {}
+    for c in cites:
+        if not c.get("present"):
+            continue
+        rec = log[c["id"]]
+        for key, name in (("req", "request"), ("res", "response")):
+            raw = t.raw_of(rec, key)
+            if not raw and key == "res":
+                continue
+            rel = f"requests/{c['id']}.{name}.http"
+            (out / rel).write_bytes(redact_bytes(raw, keep))
+            files[rel] = digest((out / rel).read_bytes())
+        c["files"] = [k for k in files if k.startswith(f"requests/{c['id']}.")]
+
+    shot_names = []
+    for src in shots:
+        rel = f"screenshots/{src.name}"
+        shutil.copy2(src, out / rel)
+        files[rel] = digest((out / rel).read_bytes())
+        shot_names.append(str(src.relative_to(d)))
+
+    (out / "finding.md").write_text(
+        f.redact(text) if not keep else text, encoding="utf-8")
+    files["finding.md"] = digest((out / "finding.md").read_bytes())
+    (out / "oracle.json").write_text(json.dumps(oracle, indent=2) + "\n")
+    files["oracle.json"] = digest((out / "oracle.json").read_bytes())
+
+    problems = [c["problem"] for c in cites if c.get("problem")]
+    if not [c for c in cites if c.get("present")]:
+        problems.insert(0, "no cited request: nothing in this bundle can be replayed")
+    if oracle.get("problem"):
+        problems.append(oracle["problem"])
+    problems += finding["problems"]
+
+    manifest = {
+        "tool": "evidence", "version": 1, "engagement": d.name,
+        "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "redacted": not keep,
+        "finding": {k: finding[k] for k in
+                    ("id", "file", "title", "class", "state", "state_detail", "asset",
+                     "param", "route", "cwe", "cvss_vector", "cvss_score", "cvss4_vector",
+                     "cvss4_score", "cvss4_severity", "severity", "proof",
+                     "negative_control", "fingerprint")},
+        "run": facts,
+        "citations": cites,
+        "oracle": oracle,
+        "screenshots": shot_names,
+        "files": files,
+        "problems": problems,
+        "reproducible": bool([c for c in cites if c.get("present")]) and not any(
+            c.get("problem") for c in cites),
+    }
+    text_readme = readme(d, finding, cites, oracle, facts, shot_names, keep)
+    (out / "README.md").write_text(text_readme, encoding="utf-8")
+    manifest["files"]["README.md"] = digest((out / "README.md").read_bytes())
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
+def finding_field(text: str, name: str) -> str:
+    """One front-matter field, read straight from the file.
+
+    `scripts/findings` parses the fields it reports on; this needs one it does
+    not, and reading the line here is smaller than widening that record."""
+    m = re.search(rf"(?im)^{name}\s*:\s*(.+?)\s*$", text.split("\n---", 1)[0])
+    return m.group(1).strip().strip("'\"") if m else ""
+
+
+def log_index(d: Path) -> dict:
+    t = traffic_mod()
+    return {i: r for i, r in t.read_log(d)}
+
+
+def cmd_build(d: Path, a) -> int:
+    paths = finding_files(d)
+    if a.id:
+        paths = [p for p in paths if findings_mod().parse(p)["id"] == a.id or p.stem == a.id]
+        if not paths:
+            print(f"evidence: no finding '{a.id}' under {d / 'findings'}", file=sys.stderr)
+            return 2
+    if not paths:
+        print(f"evidence: no per-finding files under {d / 'findings'}. "
+              f"skills/exploit requires one findings/<id>.md per finding; "
+              f"report.md is the deliverable and is not parsed.", file=sys.stderr)
+        return 3
+    log, facts = log_index(d), run_facts(d)
+    ids = {findings_mod().parse(p)["id"] for p in finding_files(d)}
+    built = []
+    for path in paths:
+        manifest = build_one(d, path, a.keep_secrets, ids, log, facts)
+        built.append(manifest)
+        where = d / "evidence" / manifest["finding"]["id"]
+        cited = [c["id"] for c in manifest["citations"] if c.get("present")]
+        print(f"{where}: {len(cited)} cited exchange(s) {cited or '- NONE'}, "
+              f"{len(manifest['screenshots'])} capture(s), "
+              f"{'redacted' if manifest['redacted'] else 'WITH LIVE CREDENTIALS'}")
+        for problem in manifest["problems"]:
+            print(f"  problem  {manifest['finding']['id']}: {problem}", file=sys.stderr)
+    if a.json:
+        print(json.dumps(built, indent=2))
+    return 0
+
+
+def cmd_check(d: Path, a) -> int:
+    """The gate: a finding with nothing behind it must not reach a report."""
+    f = findings_mod()
+    paths = finding_files(d)
+    if not paths:
+        print(f"evidence: no per-finding files under {d / 'findings'}: nothing to check",
+              file=sys.stderr)
+        return 3
+    log = log_index(d)
+    rows, failed = [], 0
+    for path in paths:
+        finding = f.parse(path)
+        if not a.all and finding["state"] not in f.REPORTED_STATES:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        cites = [collect_citation(d, rid, log) for rid in cited_ids(text)]
+        reasons = [c["problem"] for c in cites if c.get("problem")]
+        if not cites:
+            # A browser-only proof lands here honestly: DOM XSS proven in
+            # Chromium has a screenshot and no proxy record, and a screenshot
+            # is not something a triager can replay. The fix is to cite the
+            # request that loaded the page, not to exempt the class.
+            shots = screenshots_for(d, finding["id"], text,
+                                    {f.parse(q)["id"] for q in paths} - {finding["id"]})
+            hint = (f" The captures {[s.name for s in shots]} are here, but a capture is "
+                    f"not a request: cite the exchange that set it up." if shots else "")
+            reasons.insert(0, "cites no recorded request at all "
+                              "(name it as traffic/<id>, as the proof field does)." + hint)
+        elif not any(c.get("present") for c in cites):
+            reasons.insert(0, "cites records, none of which is a request in the store")
+        truncated = [c["id"] for c in cites if c.get("present")
+                     and (c["truncated"]["request"] or c["truncated"]["response"])]
+        row = {"id": finding["id"], "state": finding["state"],
+               "cited": [c["id"] for c in cites],
+               "in_store": [c["id"] for c in cites if c.get("present")],
+               "truncated": truncated, "problems": reasons,
+               "reproducible": not reasons}
+        rows.append(row)
+        if reasons:
+            failed += 1
+    if a.json:
+        print(json.dumps({"tool": "evidence", "engagement": d.name,
+                          "checked": len(rows), "not_reproducible": failed,
+                          "findings": rows}, indent=2))
+    else:
+        for row in rows:
+            mark = "ok      " if row["reproducible"] else "NO PROOF"
+            print(f"{mark}  {row['id']:<40} {row['state']:<10} "
+                  f"traffic {row['in_store'] or '-'}"
+                  + (f"  (truncated: {row['truncated']})" if row["truncated"] else ""))
+            for problem in row["problems"]:
+                print(f"            {problem}", file=sys.stderr)
+        scope = "every state" if a.all else "validated findings"
+        print(f"{d.name}: {len(rows)} {scope} checked, {failed} with no reproducible evidence")
+    if not rows:
+        print("evidence: no findings in the states checked "
+              "(use --all to check every state)", file=sys.stderr)
+        return 3
+    return 1 if failed else 0
+
+
+def _selftest() -> int:
+    import contextlib
+    import io
+    import tempfile
+    failures = []
+
+    def quiet(fn, *args):
+        """Run a command without its progress and problem lines: this selftest
+        deliberately builds broken bundles, and their complaints are not failures."""
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = fn(*args)
+        return rc, out.getvalue()
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # citations are read in the form the engagements already write
+    want(cited_ids("proof: traffic/422-424 and traffic/282"), [422, 423, 424, 282],
+         "ids and inclusive ranges, in order of appearance")
+    # the form a real finding used: one prefix, then a comma list
+    want(cited_ids("proof: poc.sh + traffic/422-424, 227-229, 282"),
+         [422, 423, 424, 227, 228, 229, 282], "a comma list carries on from one prefix")
+    want(cited_ids("traffic/7, and then nothing"), [7],
+         "a comma not followed by a number ends the list")
+    want(cited_ids("see traffic#17 twice: traffic/17"), [17], "traffic#id too, deduped")
+    want(cited_ids("traffic/5-99999"), [5], "a nonsense range cites its first id only")
+    want(cited_ids("no citation here"), [], "prose with no citation")
+
+    t = traffic_mod()
+    req = (b"GET /api/account?id=2 HTTP/1.1\r\nHost: app.test\r\n"
+           b"Cookie: session=SECRETCOOKIE\r\nAuthorization: Bearer SECRETBEARER\r\n\r\n")
+    res = (b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'
+           b'Set-Cookie: s=SECRETSET\r\nContent-Length: 44\r\n\r\n'
+           b'{"balance":15,"iban":"AT61","user":"bob"}xxxx')
+    raw_req = b"POST /x HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\n\r\n"
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "eng"
+        (d / "findings").mkdir(parents=True)
+        (d / "traffic").mkdir(parents=True)
+        (d / "evidence").mkdir(parents=True)
+        t.append(d / "traffic" / "log.jsonl",
+                 t.exchange_record(1763130000.0, 0.1, 0.05, "127.0.0.1",
+                                   ("https", "app.test", 443), "10.0.0.1", req, res,
+                                   {"via": "proxy"}))
+        t.append(d / "traffic" / "log.jsonl",
+                 t.raw_record(1763130001.0, 0.2, ("http", "app.test", 80), "10.0.0.1",
+                              raw_req, b"HTTP/1.1 200 OK\r\n\r\n",
+                              {"tool": "desync", "label": "0.CL probe"}))
+        t.append(d / "traffic" / "log.jsonl",
+                 {"kind": "gap", "t": 1763130002.0, "reason": "tls_client_rejected",
+                  "host": "app.test", "port": 443})
+        (d / "run-events.jsonl").write_text(
+            '{"ts":"2026-11-14T11:42:44.915Z","t":"run:start","model":"zai/glm-5.3"}\n'
+            '{"ts":"2026-11-14T11:50:00.000Z","t":"phase:start","phase":"exploit",'
+            '"model":"zai/glm-5.3-flash"}\n'
+            '{"ts":"2026-11-14T12:00:00.000Z","t":"phase:start","phase":"validate",'
+            '"model":"openai/gpt-5.2"}\n')
+        (d / "run.json").write_text(json.dumps(
+            {"window": {"start": "2026-11-14T11:42:45Z", "end": "2026-11-14T12:32:35Z"}}))
+        (d / "evidence" / "bola-account-id.png").write_bytes(b"\x89PNG\r\n\x1a\nnot really")
+        (d / "evidence" / "unrelated.txt").write_text("another finding's capture")
+        (d / "verdicts").mkdir()
+        (d / "oracle-bola.json").write_text(json.dumps({
+            "tool": "verify", "oracle": "readback", "checks": [
+                {"oracle": "readback", "result": "evidence",
+                 "predicate": "the marker is present when read back as the other principal",
+                 "negative_control": {"request": {"url": "https://app.test/api/account?id=2"},
+                                      "fired": False}}]}))
+        (d / "findings" / "bola-account-id.md").write_text(
+            "---\nid: bola-account-id\ntitle: BOLA on /api/account\nclass: bola\n"
+            "status: validated(proof)\nasset: https://app.test/api/account\nparam: id\n"
+            "severity: high\ncvss: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N\n"
+            "cvss4: CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N\n"
+            "proof: findings/bola.poc.sh + traffic/1-2\n"
+            "oracle: oracle-bola.json\n"
+            "negative_control: id=1 returns the owner's record with the same shape\n---\n"
+            "Any caller reads every account (traffic/1), and the desync probe is "
+            "traffic/2.\nCookie: session=SECRETCOOKIE\n")
+        (d / "findings" / "ghost.md").write_text(
+            "---\nid: ghost\ntitle: Cites a request nobody recorded\nclass: idor\n"
+            "status: validated\nasset: https://app.test/x\nparam: id\nseverity: high\n"
+            "cvss: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N\nproof: traffic/99\n"
+            "negative_control: none\n---\nproven in traffic/99 and traffic/3\n")
+        (d / "findings" / "prose.md").write_text(
+            "---\nid: prose\ntitle: No citation at all\nclass: xss\nstatus: validated\n"
+            "asset: https://app.test/s\nparam: q\nseverity: medium\n"
+            "cvss: CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N\nproof: by inspection\n"
+            "negative_control: none\n---\nI am confident this is exploitable.\n")
+        (d / "findings" / "report.md").write_text("# the deliverable, not a finding\n")
+
+        args = argparse.Namespace(id=None, keep_secrets=False, json=False)
+        want(quiet(cmd_build, d, args)[0], 0, "build runs")
+        bundle = d / "evidence" / "bola-account-id"
+        manifest = json.loads((bundle / "manifest.json").read_text())
+
+        # the cited pairs come out of the store, byte for byte apart from redaction
+        stored_req = (bundle / "requests" / "1.request.http").read_bytes()
+        want(stored_req.startswith(b"GET /api/account?id=2 HTTP/1.1\r\n"), True,
+             "the request line is the recorded one")
+        want(len(stored_req.split(b"\r\n")), len(req.split(b"\r\n")),
+             "redaction rewrites values, never the structure")
+        for leak in (b"SECRETCOOKIE", b"SECRETBEARER", b"SECRETSET"):
+            if leak in stored_req or leak in (bundle / "requests" / "1.response.http").read_bytes():
+                failures.append(f"the bundle leaks {leak!r}")
+        want(b'"iban":"AT61"' in (bundle / "requests" / "1.response.http").read_bytes(), True,
+             "the response body that proves it is kept")
+        want((bundle / "requests" / "2.request.http").read_bytes(), raw_req,
+             "a raw record's bytes are copied exactly, framing and bare LF included")
+        want("SECRETCOOKIE" in (bundle / "finding.md").read_text(), False,
+             "the finding copy is redacted too")
+
+        # the README is what a person works from
+        page = (bundle / "README.md").read_text()
+        for needed in (f"scripts/traffic --dir engagements/{d.name} replay 1",
+                       "Credentials: redacted", "Replayed and verified by",
+                       "zai/glm-5.3-flash", "openai/gpt-5.2",
+                       "2026-11-14T11:42:45Z", "CVSS 4.0", "8.7",
+                       "never parsed", "0.CL probe"):
+            if needed not in page:
+                failures.append(f"the README does not say {needed!r}")
+        want("SECRETCOOKIE" in page, False, "the README carries no credential")
+
+        want([c["id"] for c in manifest["citations"]], [1, 2], "both cited records")
+        want(manifest["citations"][0]["sha256"]["request"], digest(req),
+             "the manifest digests the recorded bytes, not the redacted copy")
+        want(manifest["oracle"]["predicate"] is not None, True,
+             "the oracle predicate came from the verify output")
+        want(manifest["oracle"]["result"], "evidence", "and its result")
+        want(manifest["screenshots"], ["evidence/bola-account-id.png"],
+             "the capture named after the finding, and not the other one")
+        want(manifest["finding"]["cvss4_score"], 8.7, "both scores travel with the bundle")
+        want(manifest["run"]["phases"]["validate"], "openai/gpt-5.2",
+             "the validating model is named")
+        want(manifest["reproducible"], True, "a bundle with its requests is reproducible")
+        for rel, sha in manifest["files"].items():
+            want(digest((bundle / rel).read_bytes()), sha, f"manifest digest for {rel}")
+
+        # --keep-secrets is byte-exact, and says so
+        want(quiet(cmd_build, d, argparse.Namespace(id="bola-account-id", keep_secrets=True,
+                                                   json=False))[0], 0,
+         "build --keep-secrets runs")
+        want((bundle / "requests" / "1.request.http").read_bytes(), req,
+             "with --keep-secrets the bytes are exactly what crossed the wire")
+        want("Credentials: PRESENT" in (bundle / "README.md").read_text(), True,
+             "and the README warns instead of claiming redaction")
+
+        # a bundle for a finding with nothing behind it still says so, loudly
+        want(quiet(cmd_build, d, argparse.Namespace(id="prose", keep_secrets=False,
+                                                    json=False))[0], 0,
+             "build does not refuse a finding with no citation")
+        empty = json.loads((d / "evidence" / "prose" / "manifest.json").read_text())
+        want(empty["reproducible"], False, "and marks it not reproducible")
+        want("no cited request" in empty["problems"][0], True, "with the reason")
+        want("There is no recorded request behind this finding"
+             in (d / "evidence" / "prose" / "README.md").read_text(), True,
+             "the README refuses to pretend")
+
+        # the gate
+        rc, printed = quiet(cmd_check, d, argparse.Namespace(all=False, json=True))
+        out = json.loads(printed)
+        want(rc, 1, "check fails when a finding has no reproducible evidence")
+        want(out["not_reproducible"], 2, "the two broken findings are counted")
+        by_id = {r["id"]: r for r in out["findings"]}
+        want(by_id["bola-account-id"]["reproducible"], True, "the real one passes")
+        want(by_id["ghost"]["in_store"], [], "a cited id that is not in the store")
+        want(any("not in the traffic store" in p for p in by_id["ghost"]["problems"]), True,
+             "and the reason names it")
+        want(any("3" in str(p) and "gap" in p for p in by_id["ghost"]["problems"]), True,
+             "a gap record is not a request either")
+        want(by_id["prose"]["problems"][0].startswith("cites no recorded request"), True,
+             "a finding citing nothing fails for that reason")
+        want("report.md" in by_id, False, "the deliverable is not checked as a finding")
+
+        # with the broken findings removed the gate passes
+        (d / "findings" / "ghost.md").unlink()
+        (d / "findings" / "prose.md").unlink()
+        want(quiet(cmd_check, d, argparse.Namespace(all=False, json=False))[0], 0,
+             "check passes when every validated finding can be replayed")
+
+    for f in failures:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"evidence selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Assemble and check a per-finding evidence bundle.",
+        epilog="`build` writes evidence/<id>/ per finding; `check` exits non-zero "
+               "when a finding has no reproducible evidence behind it.")
+    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("build", help="write an evidence bundle per finding")
+    p.add_argument("engagement", help="engagements/<dir>")
+    p.add_argument("--id", help="one finding only")
+    p.add_argument("--keep-secrets", action="store_true", dest="keep_secrets",
+                   help="do not redact credentials (the bundle then stays in the engagement)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_build)
+    p = sub.add_parser("check", help="fail when a finding has no reproducible evidence")
+    p.add_argument("engagement", help="engagements/<dir>")
+    p.add_argument("--all", action="store_true",
+                   help="check every state, not only validated findings")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_check)
+    # exit codes: 0 ok, 1 the gate failed, 2 bad arguments or unreadable input,
+    # 3 nothing to do (no per-finding files, or none in the states checked).
+    a = ap.parse_args()
+    if a.selftest:
+        return _selftest()
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    d = Path(a.engagement)
+    if not d.is_dir():
+        print(f"evidence: not a directory: {d}", file=sys.stderr)
+        return 2
+    return a.fn(d.resolve(), a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -12,65 +12,109 @@ evidence pair for whatever answered.
                        [--json] [--insecure]
   scripts/probe <url> --depth 2 --json | scripts/verify --from-probe
 
+Three oracle shapes, `--oracle`:
+
+  canary        (default) one payload per class, judged by a narrow predicate,
+                and every hit followed by the same request with a benign value
+                of the same shape. A page that answers the oracle whatever it
+                is sent comes back `ambiguous`, not `evidence`.
+  differential  the same request with and without the one varied element:
+                `--param id --value 2 [--control-value 1]`, or
+                `--vary-header 'X-Role: admin'`. It measures the noise floor
+                first (`--baseline`), masks the fields that always change, and
+                refuses to call a difference a signal when the baseline is not
+                stable or when the only difference is the response repeating
+                the value that was varied. A similarity-only diff is the single
+                most common way a false positive is manufactured.
+  readback      did the change persist, read back as another principal:
+                `--write <url> [--method POST --data ...] --read <url>
+                [--as 'Cookie: session=other'] [--marker ...]`. The write's own
+                response is never the oracle, so the read before the write is
+                the negative control. DELETE is refused in code.
+
+`--json` is what the validate phase stores next to a finding: it carries the
+predicate that was checked, what came back and the negative control, not only
+a verdict. A verdict nobody can restate is not reproducible.
+
 For **authorized** targets only: it sends payloads. Only to the host in <url>,
-only GET, never a destructive verb, and nothing that writes or deletes. A hit
-is evidence to keep, not a finished finding: the closure rules in the `exploit`
-skill still apply, and a canary that merely appears in the response is a
-reflection, not yet an exploit.
+and only GET except for the one write `--oracle readback` is asked to send;
+never a destructive verb, and nothing that deletes. A hit is evidence to keep,
+not a finished finding: the closure rules in the `exploit` skill still apply,
+and a canary that merely appears in the response is a reflection, not yet an
+exploit.
 """
 import os
 import pathlib
-import argparse, json, re, ssl, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, datetime as dt, hashlib, json, re, ssl, sys, time
+import urllib.error, urllib.parse, urllib.request
 
 UA = "mythos-verify/1.0 (authorized security testing)"
 CANARY = "mythos7a3f"
 
-# One probe per class: payload, what proves it, and what the proof means.
-# The oracle is deliberately narrow — a 200 is never a proof.
+# One probe per class: payload, the oracle, the predicate the oracle checks in
+# words, and what a hit means. The oracle is deliberately narrow — a 200 is
+# never a proof. The predicate is carried through to `--json` because the
+# validate phase has to record *what was checked*, not only that something
+# answered: an oracle nobody can restate is not reproducible.
 PROBES = {
     "xss": [
         ("<mythos7a3f>", lambda b, h, s, u: "<mythos7a3f>" in b,
+         "the exact string `<mythos7a3f>` appears in the response body",
          "payload reflected unescaped into the body: HTML injection context"),
         ('"mythos7a3f"', lambda b, h, s, u: '"mythos7a3f"' in b,
+         'the exact string `"mythos7a3f"` appears in the response body',
          "payload reflected inside a quoted attribute"),
     ],
     "sqli": [
         ("1'", lambda b, h, s, u: bool(SQL_ERR.search(b)),
+         "a database engine error signature matches in the response body",
          "database error from an unbalanced quote: the value reaches a query"),
         ("mythos7a3f'", lambda b, h, s, u: bool(SQL_ERR.search(b)),
+         "a database engine error signature matches in the response body",
          "database error from an unbalanced quote in a string context"),
     ],
     "traversal": [
         ("../../../../etc/passwd", lambda b, h, s, u: "root:x:0:0" in b,
+         "the line `root:x:0:0` appears in the response body",
          "/etc/passwd contents returned: arbitrary file read"),
         ("....//....//etc/passwd", lambda b, h, s, u: "root:x:0:0" in b,
+         "the line `root:x:0:0` appears in the response body",
          "/etc/passwd returned through a doubled-dot bypass"),
     ],
     "redirect": [
         ("//mythos7a3f.invalid/", lambda b, h, s, u: REDIR(h, u),
+         "the Location header names mythos7a3f.invalid",
          "redirect to an attacker-controlled host"),
         ("https://mythos7a3f.invalid/", lambda b, h, s, u: REDIR(h, u),
+         "the Location header names mythos7a3f.invalid",
          "absolute off-site redirect accepted"),
     ],
     "ssti": [
         ("{{7*7}}", lambda b, h, s, u: "49" in b and "{{7*7}}" not in b,
+         "`49` appears in the body and the literal `{{7*7}}` does not",
          "template expression evaluated: server-side template injection"),
         ("${7*7}", lambda b, h, s, u: "49" in b and "${7*7}" not in b,
+         "`49` appears in the body and the literal `${7*7}` does not",
          "expression language evaluated"),
     ],
     "cmdi": [
         (";echo mythos7a3f", lambda b, h, s, u: CANARY in b,
+         f"the canary {CANARY} appears in the response body",
          "shell echo returned: command injection"),
         ("|echo mythos7a3f", lambda b, h, s, u: CANARY in b,
+         f"the canary {CANARY} appears in the response body",
          "shell echo returned through a pipe"),
     ],
     "ssrf": [
         ("http://127.0.0.1:1/", lambda b, h, s, u: bool(CONN_ERR.search(b)),
+         "a server-side connection error signature matches in the response body",
          "server-side connection error for a host we chose: the server fetches our URL"),
     ],
     "crlf": [
         ("%0d%0aX-Mythos:%20mythos7a3f", lambda b, h, s, u: "mythos7a3f" in str(
-            h.get("x-mythos", "")), "injected response header: CRLF injection"),
+            h.get("x-mythos", "")),
+         f"the response carries an X-Mythos header holding {CANARY}",
+         "injected response header: CRLF injection"),
     ],
 }
 CLASS_OF = {"reflected-xss": "xss", "sqli": "sqli", "path-traversal": "traversal",
@@ -89,8 +133,12 @@ def REDIR(headers, final):
     return "mythos7a3f.invalid" in str(headers.get("location", ""))
 
 
-def request(url, headers, timeout, insecure):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, **headers})
+def request(url, headers, timeout, insecure, method="GET", data=None):
+    """(status, headers, body, final url). `data` makes it a write, so the method
+    has to be named: a silent POST is how a "read-only" tool changes something."""
+    body = data.encode() if isinstance(data, str) else data
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers={"User-Agent": UA, **headers})
     handlers = [NoRedirect]
     if insecure:
         handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
@@ -104,6 +152,62 @@ def request(url, headers, timeout, insecure):
         return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, body, url
     except Exception as e:
         return None, {}, f"{type(e).__name__}: {e}", url
+
+
+def observed(status, hdrs, body, echo=()):
+    """What came back, in the shape the validate phase stores.
+
+    `normalized_sha256` is the digest after the always-changing fields are
+    masked out, which is the only body digest two responses can be compared on."""
+    return {"status": status, "bytes": len(body),
+            "sha256": hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:16],
+            "normalized_sha256": hashlib.sha256(
+                normalize(body, echo).encode("utf-8", "replace")).hexdigest()[:16],
+            "location": hdrs.get("location", ""),
+            "content_type": hdrs.get("content-type", ""),
+            "snippet": body[:300].replace("\n", " ")}
+
+
+# The mask list from knowledge/techniques/oracle-building.md. Comparing two
+# responses is wrong until the parts that always change are gone: without this
+# every pair differs on a CSRF token, a trace id or a timestamp, and a
+# similarity-only diff is exactly the ambiguity that manufactures false
+# positives.
+MASK = [(re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:?\d\d)?"), "<TS>"),
+        (re.compile(r"\b1\d{9}(\d{3})?\b"), "<EPOCH>"),
+        (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<UUID>"),
+        (re.compile(r"\b[A-Za-z0-9+/_=-]{24,}\b"), "<BLOB>")]
+
+
+def normalize(body, echo=()):
+    """A response reduced to what a comparison may look at."""
+    try:
+        body = json.dumps(json.loads(body), sort_keys=True)
+    except ValueError:
+        pass
+    for value in echo:
+        # Only a payload-sized echo is masked. A short value — an id, a flag —
+        # is usually the very thing a differential varies, and masking it would
+        # erase the signal instead of the noise. `differential` handles a short
+        # echo separately, by asking whether it is the *only* difference.
+        if value and len(str(value)) >= 8:
+            body = body.replace(str(value), "<ECHO>")
+    for pattern, replacement in MASK:
+        body = pattern.sub(replacement, body)
+    return re.sub(r"\s+", " ", body)
+
+
+def with_param(endpoint, name, value):
+    """`endpoint` with one parameter set, or removed when `value` is None."""
+    split = urllib.parse.urlsplit(endpoint)
+    query = dict(urllib.parse.parse_qsl(split.query, keep_blank_values=True))
+    if value is None:
+        query.pop(name, None)
+    else:
+        query[name] = value
+    return urllib.parse.urlunsplit(
+        (split.scheme, split.netloc, split.path,
+         urllib.parse.urlencode(query, safe="/{}$|;%"), ""))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -154,49 +258,239 @@ def aim_points(args):
     return [(name, args.url, classes) for name in (args.param or [])]
 
 
+CONTROL = "mythos0000"     # a benign value of the same shape: the negative control
+
+
 def verify(points, rate, timeout, headers, insecure):
     results, delay = [], (1.0 / rate if rate else 0)
+
+    def send(url, **kw):
+        out = request(url, headers, timeout, insecure, **kw)
+        if delay:
+            time.sleep(delay)
+        return out
+
     for name, endpoint, classes in points:
         for klass in classes:
-            for payload, oracle, meaning in PROBES.get(klass, []):
-                split = urllib.parse.urlsplit(endpoint)
-                query = dict(urllib.parse.parse_qsl(split.query))
-                query[name] = payload
-                url = urllib.parse.urlunsplit(
-                    (split.scheme, split.netloc, split.path,
-                     urllib.parse.urlencode(query, safe="/{}$|;%"), ""))
-                status, hdrs, body, final = request(url, headers, timeout, insecure)
-                if delay:
-                    time.sleep(delay)
+            for payload, oracle, predicate, meaning in PROBES.get(klass, []):
+                url = with_param(endpoint, name, payload)
+                status, hdrs, body, final = send(url)
+                check = {"param": name, "class": klass, "oracle": "canary",
+                         "predicate": predicate, "payload": payload,
+                         "url": url, "request": {"method": "GET", "url": url},
+                         "status": status}
                 if status is None:
-                    results.append({"param": name, "class": klass, "url": url,
-                                    "result": "error", "detail": body})
+                    results.append({**check, "result": "error", "detail": body})
                     continue
-                if oracle(body, hdrs, status, final):
-                    snippet = body[:300].replace("\n", " ")
-                    results.append({"param": name, "class": klass, "url": url,
-                                    "status": status, "result": "evidence",
-                                    "meaning": meaning,
-                                    "location": hdrs.get("location", ""),
-                                    "snippet": snippet})
-                    break                                  # one proof per class is enough
-                results.append({"param": name, "class": klass, "url": url,
-                                "status": status, "result": "no-signal"})
+                check["observed"] = observed(status, hdrs, body, echo=(payload,))
+                if not oracle(body, hdrs, status, final):
+                    results.append({**check, "result": "no-signal",
+                                    "negative_control": {"sent": False,
+                                                         "why": "the oracle did not fire, so "
+                                                                "there is nothing to control for"}})
+                    continue
+                # The control: the same request with a benign value of the same
+                # shape. A WAF page, an error template or a 404 body that fires
+                # the oracle whatever is sent is not evidence, and only the
+                # control can tell the two apart.
+                curl = with_param(endpoint, name, CONTROL)
+                cstatus, chdrs, cbody, cfinal = send(curl)
+                fired = bool(cstatus is not None
+                             and oracle(cbody, chdrs, cstatus, cfinal))
+                control = {"sent": True, "payload": CONTROL,
+                           "request": {"method": "GET", "url": curl},
+                           "observed": (observed(cstatus, chdrs, cbody, echo=(CONTROL,))
+                                        if cstatus is not None else
+                                        {"status": None, "error": cbody}),
+                           "fired": fired}
+                results.append({**check, "negative_control": control,
+                                "result": "ambiguous" if fired else "evidence",
+                                "meaning": meaning if not fired else
+                                           f"{meaning} — BUT the negative control fired too, "
+                                           f"so this endpoint answers the oracle whatever is "
+                                           f"sent and the signal proves nothing",
+                                "location": hdrs.get("location", ""),
+                                "snippet": body[:300].replace("\n", " ")})
+                if not fired:
+                    break                              # one proof per class is enough
     return results
+
+
+def differential(endpoint, name, value, control_value, vary_header, baseline, rate,
+                 timeout, headers, insecure):
+    """The same request with and without the one varied element.
+
+    A similarity-only diff is the ambiguity that produces false positives, so
+    this does the three things that make a difference mean something: it masks
+    the fields that always change, it measures the noise floor first by fetching
+    the baseline several times, and it says `ambiguous` rather than `evidence`
+    when the baseline is not stable."""
+    delay = 1.0 / rate if rate else 0
+
+    def send(url, extra=None):
+        out = request(url, {**headers, **(extra or {})}, timeout, insecure)
+        if delay:
+            time.sleep(delay)
+        return out
+
+    if vary_header:
+        element = f"header {next(iter(vary_header))}"
+        a_url = b_url = endpoint
+        a_extra, b_extra = {}, vary_header
+    else:
+        element = (f"parameter {name} = {value!r} instead of "
+                   + (f"{control_value!r}" if control_value is not None else "absent"))
+        a_url, b_url = with_param(endpoint, name, control_value), with_param(endpoint, name, value)
+        a_extra = b_extra = {}
+
+    # Noise floor: whatever differs between identical requests is noise, and a
+    # signal inside the noise is not a signal.
+    seen = set()
+    for _ in range(baseline):
+        status, hdrs, body, _ = send(a_url, a_extra)
+        if status is None:
+            return {"oracle": "differential", "element": element, "result": "error",
+                    "detail": body}
+        seen.add((status, normalize(body, echo=(control_value,))))
+    stable = len(seen) == 1
+
+    astatus, ahdrs, abody, _ = send(a_url, a_extra)
+    bstatus, bhdrs, bbody, _ = send(b_url, b_extra)
+    if astatus is None or bstatus is None:
+        return {"oracle": "differential", "element": element, "result": "error",
+                "detail": abody if astatus is None else bbody}
+    echo = tuple(str(v) for v in (value, control_value) if v is not None)
+    anorm, bnorm = normalize(abody, echo), normalize(bbody, echo)
+    if astatus == bstatus and anorm == bnorm:
+        body_verdict = "SAME"
+    elif astatus == bstatus and len(anorm) == len(bnorm):
+        body_verdict = "SIMILAR"       # same shape, values moved
+    else:
+        body_verdict = "DIFFERENT"
+    differs = astatus != bstatus or anorm != bnorm
+    # An endpoint that repeats the value you varied differs for that reason
+    # alone. That is not a finding, and calling it one is the false positive a
+    # similarity diff hands you most often, so mask both values whatever their
+    # length and see whether anything is left.
+    def blank(text):
+        for v in echo:
+            text = text.replace(v, "<VARIED>")
+        return normalize(text, echo)
+    echo_only = bool(differs and astatus == bstatus and blank(abody) == blank(bbody))
+    return {
+        "oracle": "differential", "element": element,
+        "predicate": f"the response changes when only {element} changes, with the "
+                     f"always-changing fields masked out",
+        "baseline_noise": {"samples": baseline, "stable": stable,
+                           "distinct_responses": len(seen)},
+        "control": {"request": {"method": "GET", "url": a_url, "headers": a_extra},
+                    "observed": observed(astatus, ahdrs, abody, echo)},
+        "varied": {"request": {"method": "GET", "url": b_url, "headers": b_extra},
+                   "observed": observed(bstatus, bhdrs, bbody, echo)},
+        "difference": {"status_changed": astatus != bstatus, "body": body_verdict,
+                       "normalized_equal": anorm == bnorm, "echo_only": echo_only},
+        "result": ("ambiguous" if not stable or echo_only else
+                   "evidence" if differs else "no-signal"),
+        "meaning": ("the baseline is not stable, so this endpoint is not an oracle: "
+                    "pick another field or a state read-back"
+                    if not stable else
+                    "the only difference is the response repeating the value that was "
+                    "varied, which any endpoint that echoes its input does"
+                    if echo_only else
+                    f"only {element} changed and the response moved with it"
+                    if differs else
+                    f"changing {element} changed nothing observable"),
+    }
+
+
+# A read-back writes. Destruction is refused in code here as it is everywhere
+# else in this repository: no scope file and no flag makes a DELETE acceptable.
+WRITE_METHODS = {"POST", "PUT", "PATCH"}
+
+
+def readback(write_url, method, data, read_url, as_headers, marker, rate, timeout,
+             headers, insecure):
+    """Did the change persist, read back as another principal?
+
+    The write's own response is never the oracle: an endpoint that answers 200
+    and stores nothing is the most common way a logic finding is wrong. This
+    reads the authoritative state afterwards, through a different request and a
+    different identity, and reads it *before* the write as the control."""
+    delay = 1.0 / rate if rate else 0
+
+    def send(url, hdrs, **kw):
+        out = request(url, hdrs, timeout, insecure, **kw)
+        if delay:
+            time.sleep(delay)
+        return out
+
+    if method.upper() not in WRITE_METHODS:
+        raise SystemExit(f"verify: --method {method} is not a write this tool will send. "
+                         f"Allowed: {', '.join(sorted(WRITE_METHODS))}. Destructive verbs are "
+                         f"refused in code, not by configuration.")
+    read_headers = {**headers, **as_headers}
+    before = send(read_url, read_headers)
+    control = {"request": {"method": "GET", "url": read_url, "headers": as_headers},
+               "observed": (observed(*before[:3]) if before[0] is not None
+                            else {"status": None, "error": before[2]}),
+               "fired": bool(before[0] is not None and marker in before[2]),
+               "why": "the same read, before the write: the marker must not be there yet"}
+    wstatus, whdrs, wbody, _ = send(write_url, headers, method=method.upper(), data=data)
+    after = send(read_url, read_headers)
+    present = bool(after[0] is not None and marker in after[2])
+    if control["fired"]:
+        result, meaning = "ambiguous", (f"the marker {marker!r} was already in the read before "
+                                        f"the write, so the read-back proves nothing about it")
+    elif present:
+        result, meaning = "evidence", (f"the marker {marker!r} written by the write request is "
+                                       f"present when the state is read back as the other "
+                                       f"principal: the change persisted and crossed the boundary")
+    else:
+        result, meaning = "no-signal", (f"the marker {marker!r} is not in the state read back; "
+                                        f"the write's own response says nothing about that")
+    return {
+        "oracle": "readback", "marker": marker,
+        "predicate": f"the marker {marker!r} written by {method.upper()} {write_url} is present "
+                     f"when {read_url} is read back"
+                     + (" as the second principal" if as_headers else " (same identity: this is "
+                                                                      "persistence, not a "
+                                                                      "boundary crossing)"),
+        "negative_control": control,
+        "write": {"request": {"method": method.upper(), "url": write_url,
+                              "body": data if isinstance(data, str) else None},
+                  "observed": (observed(wstatus, whdrs, wbody) if wstatus is not None
+                               else {"status": None, "error": wbody}),
+                  "note": "the write's own response is not the oracle"},
+        "read": {"request": {"method": "GET", "url": read_url, "headers": as_headers},
+                 "observed": (observed(*after[:3]) if after[0] is not None
+                              else {"status": None, "error": after[2]}),
+                 "marker_present": present},
+        "result": result, "meaning": meaning,
+    }
 
 
 def render(results):
     hits = [r for r in results if r["result"] == "evidence"]
+    odd = [r for r in results if r["result"] == "ambiguous"]
     errs = [r for r in results if r["result"] == "error"]
     out = [f"# verified {len({(r['param'], r['class']) for r in results})} aim points, "
-           f"{len(hits)} answered", ""]
+           f"{len(hits)} answered" + (f", {len(odd)} ambiguous" if odd else ""), ""]
     for r in hits:
         out += [f"## {r['class']} via `{r['param']}`  [{r['status']}]",
-                f"request:  {r['url']}",
-                f"meaning:  {r['meaning']}"]
+                f"request:   {r['url']}",
+                f"predicate: {r['predicate']}",
+                f"control:   {r['negative_control']['request']['url']} "
+                f"-> oracle did not fire",
+                f"meaning:   {r['meaning']}"]
         if r.get("location"):
-            out.append(f"location: {r['location']}")
-        out += [f"response: {r['snippet'][:200]}", ""]
+            out.append(f"location:  {r['location']}")
+        out += [f"response:  {r['snippet'][:200]}", ""]
+    for r in odd:
+        out += [f"## AMBIGUOUS: {r['class']} via `{r['param']}`  [{r['status']}]",
+                f"request:   {r['url']}",
+                f"predicate: {r['predicate']}",
+                f"control:   {r['negative_control']['request']['url']} -> the oracle fired here "
+                f"too, so this is not evidence", ""]
     quiet = sorted({f"{r['param']}:{r['class']}" for r in results
                     if r["result"] == "no-signal"}
                    - {f"{r['param']}:{r['class']}" for r in hits})
@@ -208,6 +502,43 @@ def render(results):
     out.append("Keep each request/response pair as the evidence. A reflection is not yet an "
                "exploit: finish it under the closure rules in the exploit skill.")
     return "\n".join(out)
+
+
+def render_one(check):
+    """A single oracle result, for a person. `--json` is what the validate phase reads."""
+    out = [f"# {check['oracle']} oracle: {check['result'].upper()}",
+           f"element:   {check.get('element', check.get('marker', ''))}",
+           f"predicate: {check.get('predicate', '(none: the request failed)')}",
+           f"meaning:   {check.get('meaning', check.get('detail', ''))}", ""]
+    noise = check.get("baseline_noise")
+    if noise:
+        out.append(f"baseline:  {noise['samples']} identical requests gave "
+                   f"{noise['distinct_responses']} distinct response(s) "
+                   f"({'stable' if noise['stable'] else 'NOT STABLE: no oracle here'})")
+    for key in ("negative_control", "control", "write", "read", "varied"):
+        part = check.get(key)
+        if not isinstance(part, dict) or "observed" not in part:
+            continue
+        req, obs = part.get("request", {}), part["observed"]
+        out.append(f"{key:<17} {req.get('method', '')} {req.get('url', '')}")
+        out.append(f"{'':<17} -> {obs.get('status')}  {obs.get('bytes', 0)} bytes  "
+                   f"body {obs.get('normalized_sha256', '-')}"
+                   + (f"  location {obs['location']}" if obs.get("location") else "")
+                   + (f"  marker present: {part['marker_present']}"
+                      if "marker_present" in part else "")
+                   + (f"  oracle fired: {part['fired']}" if "fired" in part else ""))
+    return "\n".join(out)
+
+
+def envelope(oracle, target, checks):
+    """What `--json` prints. The validate phase stores this next to the finding, so
+    it carries the predicate and the control, not only the verdict."""
+    return {"tool": "verify", "version": 1, "oracle": oracle, "target": target,
+            "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "canary": CANARY,
+            "results": {r: sum(1 for c in checks if c.get("result") == r)
+                        for r in sorted({c.get("result", "error") for c in checks})},
+            "checks": checks}
 
 
 def parse_headers(raw):
@@ -230,7 +561,166 @@ def _selftest():
             assert "Name: value" in str(e) and repr(bad) in str(e)
         else:
             raise AssertionError(bad)
-    print("selftest ok")
+
+    # Every probe carries a predicate, because --json has to say what was checked.
+    for klass, probes in PROBES.items():
+        for payload, oracle, predicate, meaning in probes:
+            assert predicate and meaning, klass
+            assert callable(oracle), klass
+
+    assert with_param("http://h/x?a=1&b=2", "a", "9") == "http://h/x?a=9&b=2"
+    assert with_param("http://h/x?a=1&b=2", "a", None) == "http://h/x?b=2"
+    assert with_param("http://h/x", "a", "1") == "http://h/x?a=1"
+
+    # Normalization: two responses that differ only in the fields that always
+    # differ must compare equal, or every differential is a false positive.
+    a = '{"t": "2026-11-14T10:00:00Z", "id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301", "v": 1}'
+    b = '{"t": "2026-11-14T11:30:01Z", "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "v": 1}'
+    assert normalize(a) == normalize(b), "timestamps and uuids must be masked"
+    assert normalize(a) != normalize(a.replace('"v": 1', '"v": 2')), "a real change must survive"
+    assert normalize("csrf=AAAAAAAAAAAAAAAAAAAAAAAAAAAA") == \
+           normalize("csrf=BBBBBBBBBBBBBBBBBBBBBBBBBBBB"), "long tokens are masked"
+    # The echo: a response repeating the payload differs trivially from its
+    # control, so a payload-sized echo is masked and a short value is not.
+    assert normalize("said <mythos7a3f>", echo=("<mythos7a3f>",)) == \
+           normalize("said <mythos0000>", echo=("<mythos0000>",))
+    assert normalize("id 7", echo=("7",)) != normalize("id 8", echo=("8",)), \
+        "a short value is the signal, not the noise"
+
+    failures = _live_selftest()
+    for f in failures:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"verify selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+def _live_selftest():
+    """The oracles against a target with known behaviour, on the loopback interface.
+
+    Each case is one the oracle has to get right to be worth having: a
+    reflection that is real, a page that answers the oracle whatever is sent, a
+    response that moves with one parameter, an endpoint too noisy to be an
+    oracle at all, and a write that is only visible on a later read."""
+    import http.server
+    import threading
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    notes, counter = [], [0]
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def reply(self, body, status=200):
+            raw = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            q = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+            if path == "/echo":                     # a real reflection
+                self.reply(f"<p>you said {q.get('v', '')}</p>")
+            elif path == "/always":                 # answers the oracle whatever is sent
+                self.reply("<p>error page: <mythos7a3f></p>")
+            elif path == "/item":                   # the body moves with one parameter
+                i = q.get("id", "0")
+                self.reply(f'{{"id": {i}, "owner": "u{i}", '
+                           f'"balance": {4200 if i == "1" else 15}}}')
+            elif path == "/echoback":               # differs only by echoing the input
+                self.reply(f'{{"you asked for": "{q.get("id", "")}"}}')
+            elif path == "/noisy":                  # too noisy to be an oracle
+                counter[0] += 1
+                self.reply(f'{{"v": 1, "hit": {counter[0]}}}')
+            elif path == "/notes":                  # the authoritative state
+                self.reply(json.dumps(notes))
+            else:
+                self.reply("not found", 404)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            notes.append(self.rfile.read(n).decode())
+            self.reply('{"ok": true}', 201)         # says nothing about persistence
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        # canary: a real reflection, with the control that makes it evidence
+        hits = verify([("v", base + "/echo", ["xss"])], 0, 5, {}, False)
+        hit = next(h for h in hits if h["result"] == "evidence")
+        want(hit["class"], "xss", "the reflection is evidence")
+        want(hit["negative_control"]["sent"], True, "a hit carries its negative control")
+        want(hit["negative_control"]["fired"], False, "the control did not fire")
+        want(bool(hit["predicate"]), True, "the predicate that was checked is recorded")
+
+        # canary: a page that fires the oracle whatever is sent is not evidence
+        odd = verify([("v", base + "/always", ["xss"])], 0, 5, {}, False)
+        want([o["result"] for o in odd][:1], ["ambiguous"],
+             "an oracle that fires on the control too is ambiguous, not evidence")
+        want(odd[0]["negative_control"]["fired"], True, "and it says why")
+
+        # differential: one parameter varied, against a stable baseline
+        diff = differential(base + "/item", "id", "2", "1", {}, 3, 0, 5, {}, False)
+        want((diff["result"], diff["baseline_noise"]["stable"]), ("evidence", True),
+             "a stable endpoint whose body moves with the parameter is evidence")
+        want(diff["difference"]["normalized_equal"], False, "and the bodies differ after masking")
+        same = differential(base + "/item", "id", "1", "1", {}, 3, 0, 5, {}, False)
+        want(same["result"], "no-signal", "varying nothing changes nothing")
+        echoed = differential(base + "/echoback", "id", "2", "1", {}, 3, 0, 5, {}, False)
+        want((echoed["result"], echoed["difference"]["echo_only"]), ("ambiguous", True),
+             "a response that only repeats the varied value is not evidence")
+        noisy = differential(base + "/noisy", "id", "2", "1", {}, 3, 0, 5, {}, False)
+        want((noisy["result"], noisy["baseline_noise"]["stable"]), ("ambiguous", False),
+             "an endpoint that will not repeat itself is no oracle")
+
+        # readback: the write's 201 is not the oracle, the later read is
+        rb = readback(base + "/note", "POST", "note mythos7a3f", base + "/notes",
+                      {"Cookie": "session=other"}, CANARY, 0, 5, {}, False)
+        want(rb["negative_control"]["fired"], False, "the marker was not there before the write")
+        want(rb["write"]["observed"]["status"], 201, "the write was accepted")
+        want((rb["result"], rb["read"]["marker_present"]), ("evidence", True),
+             "the change is visible when read back as the other principal")
+        rb2 = readback(base + "/note", "POST", "nothing stored under the marker",
+                       base + "/item?id=1", {}, "mythosZZZZ", 0, 5, {}, False)
+        want(rb2["result"], "no-signal", "a write that does not reach the read-back is no proof")
+        # a second run of the first case: the marker is already there, so the
+        # read-back cannot attribute it to this write
+        rb3 = readback(base + "/note", "POST", "note mythos7a3f", base + "/notes",
+                       {}, CANARY, 0, 5, {}, False)
+        want(rb3["result"], "ambiguous", "a marker already present proves nothing")
+        try:
+            readback(base + "/note", "DELETE", None, base + "/notes", {}, CANARY, 0, 5, {}, False)
+            failures.append("a destructive verb must be refused in code")
+        except SystemExit as e:
+            want("refused in code" in str(e), True, "and the refusal says so")
+
+        # the envelope the validate phase stores
+        env = envelope("canary", base, hits)
+        want((env["tool"], env["oracle"], "evidence" in env["results"]),
+             ("verify", "canary", True), "the json envelope carries the counts")
+        json.dumps(env)                       # must be serializable, every field
+        json.dumps(envelope("readback", base, [rb]))
+        json.dumps(envelope("differential", base, [diff]))
+        want(isinstance(render_one(diff), str) and isinstance(render_one(rb), str), True,
+             "both oracles render for a person too")
+    except Exception as e:  # noqa: BLE001 - a selftest reports, it does not raise
+        import traceback
+        failures.append(f"live: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return failures
 
 
 def main():
@@ -245,21 +735,62 @@ def main():
                     help="read `scripts/probe --json` on stdin and verify its aim points")
     ap.add_argument("--max-endpoints", type=int, default=3,
                     help="how many places per parameter to verify (--from-probe)")
+    ap.add_argument("--oracle", choices=["canary", "differential", "readback"],
+                    default="canary",
+                    help="which oracle shape to use (default: the canary sweep)")
+    ap.add_argument("--value", help="differential: the varied value")
+    ap.add_argument("--control-value", dest="control_value",
+                    help="differential: what to compare against (default: the parameter absent)")
+    ap.add_argument("--vary-header", dest="vary_header",
+                    help="differential: vary this header instead of a parameter, 'Name: value'")
+    ap.add_argument("--baseline", type=int, default=5,
+                    help="differential: identical requests sent first to measure the noise floor")
+    ap.add_argument("--write", help="readback: the URL the change is sent to")
+    ap.add_argument("--method", default="POST", help="readback: the write's method (POST/PUT/PATCH)")
+    ap.add_argument("--data", help="readback: the write's body")
+    ap.add_argument("--read", dest="read_url", help="readback: the URL the state is read back from")
+    ap.add_argument("--as", dest="as_header", action="append", default=[],
+                    help="readback: a header for the reading principal, repeatable "
+                         "('Cookie: session=other')")
+    ap.add_argument("--marker", default=CANARY,
+                    help="readback: the value that must appear in the read-back state")
     ap.add_argument("--rate", type=float, default=10, help="requests per second, 0 = unlimited")
     ap.add_argument("--timeout", type=float, default=10)
     ap.add_argument("--header", action="append", default=[])
     ap.add_argument("--insecure", action="store_true")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    headers = parse_headers(a.header)
+
+    if a.oracle == "differential":
+        if not a.url or not (a.vary_header or (a.param and a.value is not None)):
+            ap.error("--oracle differential needs <url> with --param and --value, "
+                     "or with --vary-header")
+        vary = parse_headers([a.vary_header]) if a.vary_header else {}
+        check = differential(a.url, (a.param or [None])[0], a.value, a.control_value, vary,
+                             max(a.baseline, 1), a.rate, a.timeout, headers, a.insecure)
+        print(json.dumps(envelope("differential", a.url, [check]), indent=1)
+              if a.json else render_one(check))
+        return 0 if check["result"] != "error" else 1
+
+    if a.oracle == "readback":
+        if not (a.write and a.read_url):
+            ap.error("--oracle readback needs --write <url> and --read <url>")
+        check = readback(a.write, a.method, a.data, a.read_url, parse_headers(a.as_header),
+                         a.marker, a.rate, a.timeout, headers, a.insecure)
+        print(json.dumps(envelope("readback", a.read_url, [check]), indent=1)
+              if a.json else render_one(check))
+        return 0 if check["result"] != "error" else 1
+
     if not a.from_probe and not (a.url and a.param):
         ap.error("give <url> with --param, or --from-probe on stdin")
-    headers = parse_headers(a.header)
     points = aim_points(a)
     if not points:
         print("no aim points: nothing to verify", file=sys.stderr)
         return 1
     results = verify(points, a.rate, a.timeout, headers, a.insecure)
-    print(json.dumps(results, indent=1) if a.json else render(results))
+    print(json.dumps(envelope("canary", a.url or "(from probe)", results), indent=1)
+          if a.json else render(results))
     return 0
 
 
