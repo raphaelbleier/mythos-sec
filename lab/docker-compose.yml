@@ -21,26 +21,33 @@ networks:
     name: mythos-lab
     driver: bridge
 
+# MYTHOS_LAB_BIND is the address the targets publish on. It defaults to
+# 127.0.0.1, which is what keeps a deliberately vulnerable application off the
+# network. Set it to the docker bridge gateway (`ip -4 addr show docker0`,
+# usually 172.17.0.1) only when an arm runs inside its own container and cannot
+# reach host loopback: a third-party framework with its own sandbox, for
+# example. Never set it to 0.0.0.0, which publishes the vulnerable app to every
+# host on your network.
 services:
   vulnapp:
     build: ./vulnapp
     container_name: mythos-vulnapp
     ports:
-      - "127.0.0.1:5001:5000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5001:5000"
     networks: [mythos-lab]
 
   juiceshop:
     image: bkimminich/juice-shop:v17.1.1@sha256:9e437b456e444ff001d1663e4f6f05c796fe02f1058dd2651d6791a15b43dfeb
     container_name: mythos-juiceshop
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:3000:3000"
     networks: [mythos-lab]
 
   dvwa:
     image: vulnerables/web-dvwa:latest@sha256:dae203fe11646a86937bf04db0079adef295f426da68a92b40e3b181f337daa7
     container_name: mythos-dvwa
     ports:
-      - "127.0.0.1:4280:80"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:4280:80"
     networks: [mythos-lab]
 
   # Lightweight vulnerable REST API (IDOR/BOLA, SQLi, JWT, mass assignment).
@@ -51,7 +58,7 @@ services:
     environment:
       - vulnerable=1
     ports:
-      - "127.0.0.1:5002:5000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5002:5000"
     networks: [mythos-lab]
 
   # Damn Vulnerable GraphQL Application — hard class: GraphQL code execution,
@@ -62,7 +69,7 @@ services:
     environment:
       - WEB_HOST=0.0.0.0
     ports:
-      - "127.0.0.1:5013:5013"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5013:5013"
     networks: [mythos-lab]
 
   # Vuln Bank (Commando-X/vuln-bank): race conditions, GraphQL, BOPLA, stored XSS.
@@ -98,7 +105,7 @@ services:
       vuln-bank-db:
         condition: service_healthy
     ports:
-      - "127.0.0.1:5003:5000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5003:5000"
     networks: [mythos-lab]
 
   # Out-of-band catcher for blind SSRF/XSS/XXE. From the lab: http://oast:8080/x,
@@ -109,7 +116,7 @@ services:
     volumes:
       - oast-data:/data
     ports:
-      - "127.0.0.1:8081:8080"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:8081:8080"
     networks: [mythos-lab]
 
   # Visits URLs as admin to trigger stored XSS. Set ADMIN_COOKIE_VALUE to an
@@ -122,7 +129,7 @@ services:
       - ADMIN_COOKIE_VALUE=${ADMIN_COOKIE_VALUE:-}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-vulnapp,juiceshop,dvwa,vampi,dvga,vuln-bank-web}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:8000:8000"
     networks: [mythos-lab]
 
 volumes:

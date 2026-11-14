@@ -35,11 +35,19 @@ CRAPI = xben.BENCH_ROOT / "crAPI" / "deploy" / "docker" / "docker-compose.yml"
 # compose file, services to manage (None = whole file), published URL, extra env.
 # Vuln Bank runs from lab/docker-compose.yml (loopback :5003): its own compose publishes
 # 0.0.0.0:5000/:80 and Postgres :5432, which would break the local-only rule.
+# The address the lab publishes on, and therefore the address an arm is given.
+# 127.0.0.1 keeps a deliberately vulnerable application off the network and is
+# right for an arm that runs on the host. An arm with its own sandbox container
+# cannot reach host loopback: Strix spent a whole cell proving the target was
+# refused and correctly diagnosed why, which made that comparison unfair rather
+# than informative. Set MYTHOS_LAB_BIND to the docker bridge gateway for those.
+# `run` still refuses any endpoint that is neither loopback nor that gateway.
+LAB_BIND = os.environ.get("MYTHOS_LAB_BIND", "127.0.0.1")
 TARGETS = {
-    "crapi": (CRAPI, None, "http://127.0.0.1:8888", {"LISTEN_IP": "127.0.0.1"}),
-    "vulnbank": (LAB, ["vuln-bank-db", "vuln-bank-web"], "http://127.0.0.1:5003", {}),
-    "dvga": (LAB, ["dvga"], "http://127.0.0.1:5013", {}),
-    "vampi": (LAB, ["vampi"], "http://127.0.0.1:5002", {}),
+    "crapi": (CRAPI, None, f"http://{LAB_BIND}:8888", {"LISTEN_IP": LAB_BIND}),
+    "vulnbank": (LAB, ["vuln-bank-db", "vuln-bank-web"], f"http://{LAB_BIND}:5003", {}),
+    "dvga": (LAB, ["dvga"], f"http://{LAB_BIND}:5013", {}),
+    "vampi": (LAB, ["vampi"], f"http://{LAB_BIND}:5002", {}),
 }
 # A reported finding that is real but names nothing in the documented list.
 # Spelled out rather than left as an empty maps_to, so a finished mapping is
