@@ -4,10 +4,19 @@ Deliberately vulnerable targets on the isolated docker network `mythos-lab`. Loc
 
     docker compose -f lab/docker-compose.yml up -d            # everything
     docker compose -f lab/docker-compose.yml up -d vulnapp    # one target
-    scripts/mythos net mythos-lab                             # toolbox joins the lab network
+    mythos -t http://127.0.0.1:5001                           # run against one
 
-From the toolbox, targets resolve by service name (`http://vulnapp:5000`, `http://juiceshop:3000`),
-or via `http://host.docker.internal:<published port>`.
+Every service publishes on the host's loopback only. A bridged container cannot
+reach the host loopback at any address, so the CLI puts the toolbox in the host's
+network namespace for a `127.0.0.1` target (`MYTHOS_NET=host`), and the target
+keeps its `127.0.0.1` address inside the container. Host networking removes the
+isolation between the container and this machine, which is acceptable for a local
+lab and for nothing else.
+
+To work inside the lab's own network instead, attach the bridged toolbox with
+`scripts/mythos net mythos-lab`; targets then resolve by service name
+(`http://vulnapp:5000`, `http://juiceshop:3000`), and the host is reached as
+`host.docker.internal:<published port>`.
 
 | service | host port | notes |
 |---|---|---|

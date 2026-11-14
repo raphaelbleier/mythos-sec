@@ -809,16 +809,26 @@ def proxy_env(d: Path, container=False):
     if not alive:
         sys.exit(f"traffic: the capture proxy for {d.name} is not running, so a request now would go unrecorded.\n"
                  f"  scripts/traffic --dir {d} start     (or `stop` to end recording for this engagement)")
+    # A toolbox on the host's network namespace (MYTHOS_NET=host, which the CLI
+    # sets for a target bound to 127.0.0.1) shares the host's loopback. Two
+    # things follow, and both were wrong before: host.docker.internal does not
+    # exist there, so the proxy has to be named 127.0.0.1; and excluding
+    # loopback from proxying would exclude the target itself, which is how a
+    # whole engagement against a lab app recorded not one request while the
+    # agent was told recording was on.
+    host_net = container and os.environ.get("MYTHOS_NET") == "host"
     if container:
         try:
             ca = "/repo/engagements/" + str(d.relative_to(REPO / "engagements")) + "/traffic/ca.crt"
         except ValueError:
             sys.exit("traffic: the toolbox only mounts engagements/, and this engagement is outside it")
-        url = f"http://host.docker.internal:{info['port']}"
+        url = f"http://127.0.0.1:{info['port']}" if host_net else f"http://host.docker.internal:{info['port']}"
     else:
         ca, url = str(tdir(d) / "ca.crt"), f"http://127.0.0.1:{info['port']}"
     env = {"HTTP_PROXY": url, "HTTPS_PROXY": url, "http_proxy": url, "https_proxy": url}
-    if container:  # loopback inside the toolbox is the toolbox, never the host behind the proxy
+    if container and not host_net:
+        # Bridged: loopback inside the toolbox is the toolbox, never the host
+        # behind the proxy, so it must not be proxied.
         env.update({"NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1"})
     if info["tls_intercept"]:
         env.update({k: ca for k in ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")})
@@ -1421,6 +1431,36 @@ def _selftest() -> int:
     def want(got, expect, label):
         if got != expect:
             failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # proxy_env: the variables a toolbox exec is handed. The bridged and the
+    # host-network cases differ in both the proxy's address and whether loopback
+    # is proxied at all, and getting the second one wrong records nothing while
+    # the agent is told recording is on.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory(dir=str(REPO / "engagements")) as _td:
+        _d = Path(_td)
+        tdir(_d).mkdir(parents=True, exist_ok=True)
+        (tdir(_d) / "proxy.json").write_text(json.dumps(
+            {"port": 4000, "pid": os.getpid(), "tls_intercept": True}))
+        _saved = os.environ.pop("MYTHOS_NET", None)
+        try:
+            bridged = proxy_env(_d, container=True)
+            want(bridged["http_proxy"], "http://host.docker.internal:4000",
+                 "bridged: the host is reached through the docker alias")
+            want("127.0.0.1" in bridged.get("NO_PROXY", ""), True,
+                 "bridged: loopback is the container, so it is not proxied")
+            os.environ["MYTHOS_NET"] = "host"
+            hostnet = proxy_env(_d, container=True)
+            want(hostnet["http_proxy"], "http://127.0.0.1:4000",
+                 "host network: the alias does not exist, so the proxy is on loopback")
+            want("NO_PROXY" in hostnet, False,
+                 "host network: loopback is the target, so it must stay proxied")
+            want(hostnet["CURL_CA_BUNDLE"].startswith("/repo/engagements/"), True,
+                 "the CA is named by its path inside the container")
+        finally:
+            os.environ.pop("MYTHOS_NET", None)
+            if _saved is not None:
+                os.environ["MYTHOS_NET"] = _saved
 
     # framing: the cases a proxy must refuse to guess about
     want(framing([("Content-Length", "5")]), ("length", 5), "content-length")

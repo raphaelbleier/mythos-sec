@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# Mythos toolbox: Kali-based image with a curated web red-team tool belt. Mythos
-# is skill-driven — Claude Code is the agent and runs these tools via the
-# scripts/mythos shim; the image ships no engine.
+# Mythos toolbox: Kali-based image with a curated web red-team tool belt. The
+# agent (cli/) runs these tools through the scripts/mythos shim; the image ships
+# no agent and no model of its own.
 #
 #   build:  docker build -t mythos-toolbox -f toolbox/Dockerfile .   (context = repo root)
 #   run:    scripts/mythos up  (cap-drop ALL + NET_RAW, no docker.sock)

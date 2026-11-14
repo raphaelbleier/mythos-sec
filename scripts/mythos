@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Mythos toolbox driver: a thin stdlib-only shim over the Kali toolbox container.
 
-Mythos is skill-driven: Claude Code is the agent and runs REAL security tools
-inside the container via the subcommands below. No engine, no second LLM.
+The agent (`cli/`, the `shell` tool) runs REAL security tools inside the
+container via the subcommands below. Nothing runs on the operator's machine.
 
   scripts/mythos up                  pull (or build) the image, verify its cosign signature, start the toolbox
   scripts/mythos tools               show key tools and versions
@@ -13,7 +13,9 @@ inside the container via the subcommands below. No engine, no second LLM.
   scripts/mythos down                stop + remove the toolbox
   scripts/mythos --timeout N <cmd>   kill this one exec after N seconds (0 = no limit)
 
-Env: MYTHOS_IMAGE (default: the digest in toolbox/IMAGE_DIGEST, updated per release),
+Env: MYTHOS_NET (host = share the host's network namespace, needed for a target bound
+     to 127.0.0.1; a docker network name = also attach the bridged toolbox to it),
+     MYTHOS_IMAGE (default: the digest in toolbox/IMAGE_DIGEST, updated per release),
      MYTHOS_BUILD=1 (force local build), MYTHOS_CONTAINER (default mythos-toolbox),
      MYTHOS_TIMEOUT (default 900 s per exec; a hung sqlmap or ffuf must not eat an
      unattended engagement's budget. Exit 124/137 = hit the limit).
@@ -82,6 +84,12 @@ def image():
     """Pick the image to run: pulled GHCR image, else local build."""
     global IMG
     if os.environ.get("MYTHOS_BUILD") != "1":
+        # An image the operator pinned by hand is the one they want, so a local
+        # copy is used as it is. Pulling it first printed "pull access denied"
+        # for every local tag before falling back to the same image anyway, which
+        # reads like a failure in the middle of a working start.
+        if os.environ.get("MYTHOS_IMAGE") and have(IMG):
+            return IMG
         # A digest is content-addressed, so a local copy needs no refresh; a tag does.
         if ("@sha256:" in IMG and have(IMG)) or docker("pull", IMG, quiet=False).returncode == 0 or have(IMG):
             return IMG
@@ -121,10 +129,27 @@ def up():
     AUDIT.touch()
     args = ["run", "-d", "--rm", "--init", "--name", NAME,
             "--cap-drop", "ALL", "--cap-add", "NET_RAW",
-            "--security-opt", "no-new-privileges",
-            "--add-host=host.docker.internal:host-gateway",
-            "-v", f"{REPO}:/repo:ro", "-v", f"{AUDIT.parent}:/repo/engagements",
-            "-v", f"{AUDIT}:/repo/engagements/audit.jsonl:ro", "-w", "/repo"]
+            "--security-opt", "no-new-privileges"]
+    # A target bound to the host's loopback is not reachable from a bridged
+    # container at all: host-gateway reaches the host's external address, and a
+    # service listening only on 127.0.0.1 does not answer there. Every lab app in
+    # lab/docker-compose.yml binds that way on purpose, so a bridged toolbox can
+    # never test one, which is how a benchmark arm spent its budget hunting for an
+    # address that does not exist. MYTHOS_NET=host puts the toolbox in the host's
+    # network namespace, where 127.0.0.1 is the same loopback.
+    #
+    # It also removes the isolation between container and host, so it is for a
+    # local lab target and nothing else. The CLI sets it only for a loopback
+    # target; for a routable target the bridge is correct and stays.
+    net = os.environ.get("MYTHOS_NET")
+    if net == "host":
+        args += ["--network", "host"]
+    else:
+        args += ["--add-host=host.docker.internal:host-gateway"]
+        if net:
+            args += ["--network", net]
+    args += ["-v", f"{REPO}:/repo:ro", "-v", f"{AUDIT.parent}:/repo/engagements",
+             "-v", f"{AUDIT}:/repo/engagements/audit.jsonl:ro", "-w", "/repo"]
     if sys.platform.startswith("linux"):  # keep bind-mount files owned by the host user
         args += ["--user", f"{os.getuid()}:{os.getgid()}"]
     docker(*args, img, check=True)
