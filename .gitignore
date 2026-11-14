@@ -26,3 +26,7 @@ nuclei-output/
 
 # the active engagement's scope pin, written by engagement-setup
 .mythos-scope
+
+# cli build output and dependencies
+cli/node_modules/
+cli/dist/

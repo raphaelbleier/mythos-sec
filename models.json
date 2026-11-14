@@ -1,109 +1,101 @@
 {
-  "$comment": "Per-agent model assignment. Read by scripts/models; semantics in docs/models.md. A consumer reads agents.<id>.tier, then profiles.<profile>.models.<tier>. The validator tier must differ from strong: a model approves its own errors 11.9 points more often when it wrote them, and that bias follows authorship, not the context window, so a fresh context on the same model is not an independent check. Where a profile cannot provide a second model it sets single_model_validation true, and the finding must say the validator pass was not independent.",
-  "default_profile": "zai",
-  "tiers": [
-    "fast",
-    "mid",
-    "strong",
-    "validator"
-  ],
-  "agents": {
-    "mythos": {
-      "primary": true,
-      "tier": "strong",
-      "reason": "longest prompt, runs the whole engagement unattended and owns scope and closure decisions, so an error here costs the run"
-    },
-    "mythos-planner": {
-      "tier": "mid",
-      "reason": "one structured plan from scope and surface, no long tool loop"
-    },
-    "mythos-recon": {
-      "tier": "fast",
-      "reason": "drives httpx, katana and ffuf and summarises the surface; later phases check what it finds"
-    },
-    "mythos-scanner": {
-      "tier": "fast",
-      "reason": "runs nuclei, dalfox and sqlmap and records candidates, which are unproven by definition"
-    },
-    "mythos-browser": {
-      "tier": "mid",
-      "reason": "long Playwright tool loops, and its verdict on a client-rendered finding is evidence"
-    },
-    "mythos-exploiter": {
-      "tier": "strong",
-      "reason": "decides validated versus unconfirmed under the exploit skill: exact request, negative control, validator pass"
-    },
-    "mythos-reporter": {
-      "tier": "mid",
-      "reason": "turns validated findings into severity and CVSS and must not claim past the evidence"
-    }
+ "$comment": "Per-agent model assignment, read by cli/src/model.ts and scripts/models. A consumer reads agents.<id>.tier, then profiles.<profile>.models.<tier>. Model specs are 'provider/model', where provider is an id from cli/src/providers/registry.ts ('mythos providers' lists them). The validator tier must differ from strong: a model approves its own errors 11.9 points more often when it wrote them, and that bias follows authorship, not the context window, so a fresh context on the same model is not an independent check. A profile that cannot provide a second model sets single_model_validation true, and the report must say the validator pass was not independent.",
+ "default_profile": "openrouter",
+ "tiers": [
+  "fast",
+  "mid",
+  "strong",
+  "validator"
+ ],
+ "agents": {
+  "mythos": {
+   "primary": true,
+   "tier": "strong",
+   "reason": "the whole-run tier: it is what --model pins and what an unlisted agent falls back to"
   },
-  "profiles": {
-    "zai": {
-      "needs": "ZHIPU_API_KEY or `opencode auth login` (Z.AI Coding Plan)",
-      "models": {
-        "fast": "zai-coding-plan/glm-5.3-flash",
-        "mid": "zai-coding-plan/glm-5.3",
-        "strong": "zai-coding-plan/glm-5.3",
-        "validator": "zai-coding-plan/glm-5.3"
-      },
-      "single_model_validation": true,
-      "validator_note": "This profile has no second model fit to re-check a proof, so the validator pass runs on the hunting model and is not independent. Set a cross-provider validator, or record the limitation in the finding."
-    },
-    "zai-api": {
-      "needs": "ZHIPU_API_KEY or `opencode auth login` (Z.AI), pay per token",
-      "models": {
-        "fast": "zai/glm-5.3-flash",
-        "mid": "zai/glm-5.3",
-        "strong": "zai/glm-5.3",
-        "validator": "zai/glm-5.3"
-      },
-      "single_model_validation": true,
-      "validator_note": "This profile has no second model fit to re-check a proof, so the validator pass runs on the hunting model and is not independent. Set a cross-provider validator, or record the limitation in the finding."
-    },
-    "zen": {
-      "needs": "OPENCODE_API_KEY or `opencode auth login` (OpenCode Zen), pay per token, same GLM models hosted in the US and EU",
-      "models": {
-        "fast": "opencode/glm-5.3-flash",
-        "mid": "opencode/glm-5.3",
-        "strong": "opencode/glm-5.3",
-        "validator": "opencode/glm-5.3"
-      },
-      "single_model_validation": true,
-      "validator_note": "The only second model here is Flash, which models.json already keeps out of the exploit phase, so it cannot be trusted to re-check a proof either. Validation is not independent on this profile."
-    },
-    "anthropic": {
-      "needs": "ANTHROPIC_API_KEY",
-      "models": {
-        "fast": "anthropic/claude-haiku-5-5",
-        "mid": "anthropic/claude-sonnet-5-5",
-        "strong": "anthropic/claude-opus-5-5",
-        "validator": "anthropic/claude-sonnet-5-5"
-      },
-      "single_model_validation": false
-    },
-    "openai": {
-      "needs": "OPENAI_API_KEY",
-      "models": {
-        "fast": "openai/gpt-6-luna",
-        "mid": "openai/gpt-6.1-terra",
-        "strong": "openai/gpt-6.1-sol",
-        "validator": "openai/gpt-6.1-terra"
-      },
-      "single_model_validation": false
-    }
+  "mythos-recon": {
+   "tier": "fast",
+   "reason": "drives httpx, katana and ffuf and summarises the surface; later phases check what it finds"
   },
-  "claude_code": {
-    "$comment": "Aliases for the Claude Code `model:` frontmatter field. Not consumed yet: scripts/build-hosts.py still writes `model: inherit`.",
-    "fast": "haiku",
-    "mid": "sonnet",
-    "strong": "opus"
+  "mythos-scanner": {
+   "tier": "fast",
+   "reason": "runs nuclei, dalfox and sqlmap and records candidates, which are unproven by definition"
   },
-  "validation": {
-    "$comment": "Which model re-checks a stored proof of concept.",
-    "agent": "mythos-exploiter",
-    "tier": "validator",
-    "why": "A fresh context does not remove self-preference: it is tied to authorship. Measured at 11.9 percentage points over 64,800 calls. Where validator equals strong, the pass is a re-run, not an independent check, and skills/exploit requires the finding to say so.",
-    "cross_provider_example": "OPENCODE_CONFIG_CONTENT=\"$(scripts/models anthropic)\" for the validator pass while the hunt runs on the default profile"
+  "mythos-exploiter": {
+   "tier": "strong",
+   "reason": "decides confirmed, tested or skipped per endpoint under the exploit skill, and writes the evidence a triager will read, so an error here is a wrong finding rather than a slow phase"
+  },
+  "mythos-reporter": {
+   "tier": "mid",
+   "reason": "turns verdicts and findings into the deliverable, and computes nothing itself: a severity it cannot derive from a vector is caught by scripts/findings, not by the model"
   }
+ },
+ "profiles": {
+  "openrouter": {
+   "label": "One OpenRouter login, a cross-provider validator",
+   "needs": "mythos login openrouter",
+   "models": {
+    "fast": "openrouter/z-ai/glm-5.3-flash",
+    "mid": "openrouter/z-ai/glm-5.3",
+    "strong": "openrouter/z-ai/glm-5.3",
+    "validator": "openrouter/openai/gpt-5.2-mini"
+   },
+   "single_model_validation": false,
+   "note": "The default. One account reaches every model above, so the validator is a genuinely different model without a second subscription."
+  },
+  "zai": {
+   "label": "Z.ai coding plan only",
+   "needs": "ZAI_API_KEY (or GLM_API_KEY)",
+   "models": {
+    "fast": "zai/glm-5.3-flash",
+    "mid": "zai/glm-5.3",
+    "strong": "zai/glm-5.3",
+    "validator": "zai/glm-5.3"
+   },
+   "single_model_validation": true,
+   "validator_note": "No second model fit to re-check a proof, so the validator pass runs on the hunting model and is not independent. Add a second provider, or accept that every finding carries the limitation."
+  },
+  "anthropic": {
+   "label": "Anthropic API keys",
+   "needs": "ANTHROPIC_API_KEY",
+   "models": {
+    "fast": "anthropic/claude-haiku-5-5",
+    "mid": "anthropic/claude-sonnet-5-5",
+    "strong": "anthropic/claude-opus-5-5",
+    "validator": "anthropic/claude-sonnet-5-5"
+   },
+   "single_model_validation": false,
+   "note": "Validator is a different model in the same family, which is weaker evidence of independence than a different vendor but still not self-review."
+  },
+  "openai": {
+   "label": "OpenAI API keys",
+   "needs": "OPENAI_API_KEY",
+   "models": {
+    "fast": "openai/gpt-5.2-mini",
+    "mid": "openai/gpt-5.2",
+    "strong": "openai/gpt-5.2",
+    "validator": "openai/gpt-5.2-mini"
+   },
+   "single_model_validation": false
+  },
+  "local": {
+   "label": "Ollama, nothing leaves the machine",
+   "needs": "ollama serve, and the models pulled",
+   "models": {
+    "fast": "ollama/qwen3:8b",
+    "mid": "ollama/qwen3:32b",
+    "strong": "ollama/qwen3:32b",
+    "validator": "ollama/qwen3:32b"
+   },
+   "single_model_validation": true,
+   "validator_note": "One local model does every tier. Useful for a target whose traffic may not leave the network; not useful for independent validation."
+  }
+ },
+ "validation": {
+  "$comment": "Which model re-checks a finding before the report is written.",
+  "runs": "cli/src/driver.ts, before the report phase; writes validation.md",
+  "tier": "validator",
+  "why": "A fresh context does not remove self-preference: it is tied to authorship. Measured at 11.9 percentage points over 64,800 calls. Where validator equals strong the pass is a re-run, not an independent check, and the report has to say so.",
+  "cross_provider_example": "mythos -t <url> --profile openrouter  (validator is openai/gpt-5.2-mini while the hunt runs on z-ai/glm-5.3; `scripts/models <profile>` prints what a profile resolves to)"
+ }
 }

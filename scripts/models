@@ -1,55 +1,108 @@
 #!/usr/bin/env python3
-"""Per-agent model assignment for OpenCode, read from models.json.
+"""Which model each agent runs on, read from models.json.
 
-  scripts/models                          # JSON for the default profile
-  scripts/models anthropic                # JSON for another profile
-  scripts/models zai-coding-plan/glm-5.3  # every agent on one model
-  scripts/models --write                  # copy the default profile into opencode.json
-  scripts/models --check                  # exit 1 if opencode.json drifted from models.json
+  scripts/models                       # the default profile, as a table
+  scripts/models anthropic             # another profile
+  scripts/models openrouter/z-ai/glm-5.3   # every agent on one model
+  scripts/models --json [profile]      # machine-readable
+  scripts/models --selftest
 
-The output is a config fragment. OPENCODE_CONFIG_CONTENT beats opencode.json and
-the agent frontmatter, so this runs the whole suite on another provider:
+The CLI reads models.json itself (cli/src/model.ts), so this is for looking at a
+profile before a run and for scripting; it writes nothing. The `--write` and
+`--check` modes are gone with opencode.json, which they kept in sync.
 
-  OPENCODE_CONFIG_CONTENT="$(scripts/models anthropic)" opencode
+A model spec is `provider/model`, where provider is an id from
+cli/src/providers/registry.ts (`mythos providers` lists them).
+
+The validator tier must differ from the strong tier. A model approves its own
+errors 11.9 percentage points more often when it wrote them, and that bias
+follows authorship rather than the context window, so re-asking the same model in
+a fresh conversation is not an independent check. A profile that cannot offer a
+second model sets single_model_validation, and this prints that as a warning,
+because a report from such a run has to carry the limitation.
 """
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-M = json.loads((ROOT / "models.json").read_text())
 
 
-def render(arg=None):
+def load(root=None):
+    return json.loads((Path(root or ROOT) / "models.json").read_text())
+
+
+def resolve(m, arg=None):
+    """{agent: model} for a profile name, or for one model spec applied to all."""
     if arg and "/" in arg:
-        def pick(tier):
-            return arg
-    else:
-        name = arg or M["default_profile"]
-        if name not in M["profiles"]:
-            sys.exit(f"models: unknown profile '{name}' (have: {', '.join(M['profiles'])})")
-        pick = M["profiles"][name]["models"].__getitem__
-    # The primary agent follows the top-level model, so `--model` still moves it.
-    primary = next(n for n, a in M["agents"].items() if a.get("primary"))
-    return {"model": pick(M["agents"][primary]["tier"]),
-            "agent": {n: {"model": pick(a["tier"])}
-                      for n, a in M["agents"].items() if n != primary}}
+        return {name: arg for name in m["agents"]}, arg, False
+    name = arg or m["default_profile"]
+    if name not in m["profiles"]:
+        raise KeyError(f"unknown profile '{name}' (have: {', '.join(m['profiles'])})")
+    profile = m["profiles"][name]
+    models = profile["models"]
+    missing = [t for t in m["tiers"] if t not in models]
+    if missing:
+        raise KeyError(f"profile '{name}' has no model for tier(s): {', '.join(missing)}")
+    single = bool(profile.get("single_model_validation")) or models["validator"] == models["strong"]
+    return ({n: models[a["tier"]] for n, a in m["agents"].items()}, name, single)
 
 
 def main(argv):
-    arg = argv[0] if argv else None
-    if arg in ("--check", "--write"):
-        path = ROOT / "opencode.json"
-        cfg, want = json.loads(path.read_text()), render()
-        if arg == "--write":
-            cfg.update(want)
-            path.write_text(json.dumps(cfg, indent=2) + "\n")
-        elif {k: cfg.get(k) for k in want} != want:
-            print("opencode.json differs from models.json (run scripts/models --write)")
-            return 1
+    if argv[:1] == ["--selftest"]:
+        return _selftest()
+    as_json = "--json" in argv
+    rest = [a for a in argv if a != "--json"]
+    try:
+        per_agent, label, single = resolve(load(), rest[0] if rest else None)
+    except KeyError as e:
+        sys.exit(f"models: {e.args[0]}")
+    if as_json:
+        print(json.dumps({"profile": label, "agents": per_agent,
+                          "single_model_validation": single}, indent=1))
         return 0
-    print(json.dumps(render(arg), indent=2))
+    print(f"profile: {label}")
+    width = max(len(n) for n in per_agent)
+    for name, model in per_agent.items():
+        print(f"  {name.ljust(width)}  {model}")
+    if single:
+        print("\nwarning: the validator runs on the same model as the hunting tier, so the\n"
+              "         validation pass is not independent and every report must say so.")
     return 0
+
+
+def _selftest() -> int:
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    m = load()
+    # Every tier an agent asks for must exist in every profile, or a run picks a
+    # model at random the first time that agent is spawned.
+    for name, profile in m["profiles"].items():
+        for tier in m["tiers"]:
+            want(tier in profile["models"], True, f"profile {name} has tier {tier}")
+
+    per_agent, label, single = resolve(m)
+    want(label, m["default_profile"], "default profile resolved")
+    want(sorted(per_agent) == sorted(m["agents"]), True, "every agent got a model")
+    want(all("/" in s for s in per_agent.values()), True, "every spec names its provider")
+    want(resolve(m, "openrouter/z-ai/glm-5.3")[0]["mythos"], "openrouter/z-ai/glm-5.3",
+         "one spec overrides every agent")
+    want(single, False, "the default profile validates on a second model")
+
+    try:
+        resolve(m, "no-such-profile")
+        failures.append("an unknown profile should raise")
+    except KeyError:
+        pass
+
+    for f in failures:
+        print(f"FAIL {f}")
+    print(f"models selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
