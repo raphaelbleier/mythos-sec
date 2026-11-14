@@ -47,6 +47,10 @@ A command-line agent that runs a web application assessment end to end:
 mythos -t https://target.example.com --scope engagements/acme/scope.yaml
 ```
 
+<p align="center">
+  <img src="docs/assets/cli.png" alt="Mythos running an engagement: the phase bar, two parallel exploit workers and the guard output" width="880">
+</p>
+
 It brings its own agent loop, its own tools and its own phase driver. You bring a
 model: an API key for any of sixteen providers, or one OpenRouter login that
 reaches most of them.
