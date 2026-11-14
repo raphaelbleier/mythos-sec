@@ -134,13 +134,14 @@ doubt, exclude rather than include. Record the program name and URL in `notes`.
 
 ## What the scope file actually controls
 
-> **The guards do not run under `--dangerously-skip-permissions`.** Confirmed
-> 14 November 2026: that flag disables a plugin's PreToolUse hooks, so with it
-> the scope guard, the rate limiting, the exploitation notice and the
-> non-destructive denylist are all inert. Everything in the table below holds
-> in an interactive session and in any unattended run that does not use the
-> flag. It does not hold in the benchmark harness, which uses it on every cell.
-> See `docs/research/2026-11-14-known-defects.md`, defect 0.
+> **The guards need the plugin to be installed, not merely pointed at.**
+> Measured 14 November 2026: the hooks fire in a normal session where the
+> plugin is installed, and they do not fire in a session started with a fresh
+> HOME and `--plugin-dir`, which is how the benchmark harness runs every cell.
+> `--dangerously-skip-permissions` also suppresses them. So everything in the
+> table below holds in an ordinary installed session, and has never held in a
+> benchmark cell. See `docs/research/2026-11-14-known-defects.md`, defect 0,
+> for the six configurations that were tested.
 
 
 The scope file is the authorization boundary, and two hooks read it on every

@@ -1,0 +1,7 @@
+{
+  "$comment": "Permissions for a benchmark cell. A cell runs unattended, so it cannot answer a prompt, and the obvious way to achieve that was --dangerously-skip-permissions. That flag also disables a plugin's PreToolUse hooks, which are the framework's scope guard, rate limiting and non-destructive denylist, so every cell measured the framework without its enforcement. Pre-granting the tools here instead keeps the hooks live: verified by the guard firing on a bare curl in a cell configured this way, and staying silent under the flag.",
+  "permissions": {
+    "allow": ["Bash", "WebFetch", "WebSearch", "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep", "Task", "Skill", "TodoWrite"],
+    "defaultMode": "acceptEdits"
+  }
+}

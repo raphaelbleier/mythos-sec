@@ -29,7 +29,8 @@ def grants(workdir, model=None):
 def run(target_url, workdir, model, budget_s):
     workdir, cwd, home = base.dirs(workdir)
     argv = ["claude", "-p", base.objective(target_url), "--model", model,
-            "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose",
+            "--settings", str(base.cell_settings(cwd)), "--permission-mode", "acceptEdits",
             "--allowed-tools", *ALLOWED,
             "--disallowed-tools", *DENIED]
     return base.run_proc(argv, cwd, base.claude_env(home), budget_s, workdir)

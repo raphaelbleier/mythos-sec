@@ -8,7 +8,10 @@ in the prompt, which is the orchestrator's non-interactive gate.
 Output is streamed as JSON lines, not one object at the end: the harness watches the
 transcript for progress, and a single trailing object would look like a stalled provider.
 
-Permissions are skipped for the run (`--dangerously-skip-permissions`): the cell is the
+Permissions are pre-granted by `bench/data/cell-settings.json` rather than skipped.
+`--dangerously-skip-permissions` also disables a plugin's PreToolUse hooks, so a cell run
+with it measures the framework without its scope guard, rate limiting or non-destructive
+denylist. The cell is the
 single human gate, the target is a local throwaway container, and an interactive prompt would
 hang an unattended sweep. The scope guard still runs as a PreToolUse hook. Both arms skip
 permissions in the same way, so the grant is symmetric; what it means for the ground truth is
@@ -52,7 +55,8 @@ def run(target_url, workdir, model, budget_s):
     text = (f"/mythos-sec:cybersecurity {target_url} --scope {scope}\n\n{base.objective(target_url)}")
     env = dict(base.claude_env(home), MYTHOS_SCOPE=str(scope))
     argv = ["claude", "-p", text, "--model", model, "--output-format", "stream-json", "--verbose",
-            "--dangerously-skip-permissions", "--plugin-dir", str(stage),
+            "--settings", str(base.cell_settings(stage)), "--permission-mode", "acceptEdits",
+            "--plugin-dir", str(stage),
             "--add-dir", str(stage)]
     t = base.run_proc(argv, cwd, env, budget_s, workdir)
     if not plugin_loaded(t):

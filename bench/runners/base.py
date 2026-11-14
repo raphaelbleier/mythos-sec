@@ -104,6 +104,26 @@ def stage_assets(assets, commit=None):
     return dest
 
 
+def cell_settings(stage):
+    """The permissions file a cell runs with, staged beside the assets.
+
+    A cell cannot answer a permission prompt, and the obvious way to achieve
+    that was --dangerously-skip-permissions. That flag also disables a plugin's
+    PreToolUse hooks, so every cell this project ever ran measured the framework
+    with its scope guard, rate limiting and non-destructive denylist inert.
+    Pre-granting the tools keeps the hooks live instead: verified by the guard
+    firing on a bare curl under this file and staying silent under the flag.
+    """
+    src = Path(__file__).resolve().parent.parent / "data" / "cell-settings.json"
+    dest = Path(stage) / "cell-settings.json"
+    if src.exists() and not dest.exists():
+        try:
+            dest.write_text(src.read_text())
+        except OSError:
+            return src
+    return dest if dest.exists() else src
+
+
 def coverage_gate_wired(root):
     """Whether the coverage gate is wired as a Stop hook in the assets this cell will load.
 

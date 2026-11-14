@@ -6,25 +6,43 @@
 
 ## 0. The guards appear not to run in a benchmark cell at all
 
-**Status:** CONFIRMED 14 November 2026. `--dangerously-skip-permissions`
-disables a plugin's PreToolUse hooks. Every benchmark cell this project has
-run, tonight's and every earlier sweep, ran with the scope guard, the budget
-guard, the rate limiting and the non-destructive denylist completely inert.
+**Status:** open. The cause is a fresh HOME, not a flag. An earlier version of
+this note said `--dangerously-skip-permissions` was confirmed as the cause.
+That was wrong and is corrected here: removing the flag changed nothing in a
+cell.
 
-**The test that settled it.** The same one-command prompt twice against the
-same prepared engagement, with a recorder marker in place so the
-unrecorded-request rule applies:
+**What the tests actually show.** Same one-command prompt, same prepared
+engagement with a recorder marker so the unrecorded-request rule applies:
 
-- With `--dangerously-skip-permissions`: no guard message of any kind.
-- Without it: the guard fires verbatim, "This engagement records its traffic,
-  and a bare curl/wget would not appear in it. Run it as: scripts/traffic exec
-  -- curl ...", naming the correct scope file.
+| configuration | guard fires |
+|---|---|
+| operator's real HOME, `--plugin-dir` the repo, no flag | yes |
+| operator's real HOME, `--plugin-dir` the staged copy, no flag | yes |
+| operator's real HOME, with the flag | no |
+| **fresh HOME**, `--plugin-dir` the staged copy, no flag | **no** |
+| fresh HOME, plus `enabledPlugins` in the settings file | no |
+| fresh HOME, plus the hooks inlined into `--settings` with absolute paths | no |
 
-**What has to change.** The harness cannot both run unattended with that flag
-and measure a framework whose safety rests on hooks. Either the cells
-pre-grant permissions through a settings file and drop the flag, or every
-enforcement claim is qualified as interactive-only. The first is the real fix;
-the second is what the documentation must say until it lands.
+So the flag suppresses the hooks in an interactive HOME, which is real but is
+not what was happening in the cells. The cells fail for a different reason: a
+plugin's hooks appear to register only when the plugin is known to the HOME
+configuration, and `--plugin-dir` alone does not make it known. Every cell runs
+with a clean HOME by design, for reproducibility, so no benchmark cell this
+project has ever run had its guards active. The slash command still resolves
+from the directory, which is why the cells looked scaffolded.
+
+**Not yet established.** Which file in HOME records a plugin as known, and
+whether a cell can be given that without reintroducing the state the clean HOME
+exists to avoid. Inlining the hooks into `--settings` was the obvious
+workaround and did not work, so the shape a settings-level hook needs is also
+unknown. Four `claude` invocations were spent narrowing this; the next person
+should start from the table above rather than repeat them.
+
+**What has to change.** Until a cell can run with its hooks live, every
+enforcement claim is interactive-only and the documentation says so. Dropping
+the flag in favour of a pre-granting settings file was done anyway and is worth
+keeping: it is the right configuration, it removes one confound, and it means
+the only remaining obstacle is the plugin-registration question above.
 
 **The evidence, from one cell traced end to end.**
 
