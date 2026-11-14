@@ -11,6 +11,14 @@ authorization matrix as the application actually writes it, and the sinks a
 value can reach. None of that is a finding. Every row stays a hypothesis until
 a live request proves it, under the proof standard in **exploit**.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+reachable `/.git/config` or a published `.js.map` — the two cases where the
+code can be had from the target itself. The normal case, where the program
+handed the source over or the product is open source, is not visible in
+`surface.json`, so the operator selects it instead. It drives `sourcemap`,
+`probe` and `verify`. Sources recovered from a JavaScript bundle come from
+**client-side** step 1, which hands the tree to `sourcemap` and arrives here.
+
 ## 0. Authorization — having the source does not widen the scope
 
 - `engagements/<dir>/scope.yaml` is still the only authorization boundary for

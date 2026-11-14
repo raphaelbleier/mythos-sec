@@ -11,9 +11,16 @@ business-logic skills (usestrix/strix, Apache-2.0:
 `strix/skills/vulnerabilities/idor.md`, `business_logic.md`); Auth Analyzer's
 SAME/SIMILAR/DIFFERENT triage (PortSwigger/auth-analyzer).
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows an
+object id in a parameter, a money, role, quantity or status parameter, a `PUT`,
+`PATCH` or `DELETE` on any endpoint, an OpenAPI document, or a checkout, cart,
+order, transfer, payment, redeem, coupon, invite, approve, refund or billing
+route. It drives `bola-diff`, `mass-assign`, `race` and `session-check`, and
+needs **auth-session** first.
+
 Prerequisites: `scope.rules.allow_active`, sessions from **auth-session**
 (`S=engagements/<dir>/sessions`, roles `userA`, `userB`, optionally `admin`),
-recon's endpoint list or OpenAPI spec. Run `session_check.py` first. Output to
+recon's endpoint list or OpenAPI spec. Run `session-check` first. Output to
 `engagements/<dir>/scan/`.
 
 ## 1. Build the Subject x Object x Action matrix
@@ -35,7 +42,7 @@ candidate. The same table feeds the coverage matrix in **web-scan**.
 List A's object URLs, one per line (`URL` or `METHOD URL [JSON]`), then:
 
 ```
-scripts/mythos python3 skills/business-logic/scripts/bola_diff.py --endpoints scan/ids-A.txt \
+scripts/mythos python3 /repo/skills/business-logic/scripts/bola_diff.py --endpoints scan/ids-A.txt \
   --a $S/userA.headers --b $S/userB.headers --marker <A-only string, e.g. A's email> \
   --rps <scope rps> --out engagements/<dir>/scan/bola.jsonl
 ```
@@ -43,6 +50,15 @@ scripts/mythos python3 skills/business-logic/scripts/bola_diff.py --endpoints sc
 It sends each request as A (baseline), B and anon, classifies SAME/SIMILAR/
 DIFFERENT and prints `candidate`/`enforced`/`review`. This is **triage**. For
 BFLA, run the admin-only endpoints with `--a $S/admin.headers --b $S/userA.headers`.
+
+For one candidate at a time, `scripts/verify --oracle differential` turns the
+triage row into a predicate: the same request with and without one varied
+element (`--param id --value <B's id> --control-value <A's id>`, or
+`--vary-header 'X-Role: admin'`). It measures the noise floor first with
+`--baseline`, masks the fields that always change, and returns `ambiguous`
+rather than a verdict when the baseline is unstable or when the only difference
+is the response echoing the value back — which is the single most common false
+BOLA. Keep its `--json` output and cite it as `oracle:`.
 
 Variations the script does not do, try them by hand on candidates and on
 `review` rows: id in body vs path vs query, numeric neighbour vs UUID from a
@@ -61,7 +77,7 @@ the owner's view).
 ## 3. Mass assignment
 
 ```
-scripts/mythos python3 skills/business-logic/scripts/mass_assign.py fields engagements/<dir>/recon/openapi.json
+scripts/mythos python3 /repo/skills/business-logic/scripts/mass_assign.py fields engagements/<dir>/recon/openapi.json
 ```
 
 For each write operation it lists fields the resource returns but the request
@@ -71,7 +87,7 @@ the fields from a GET response of the object, and use `arjun -m JSON` for
 hidden ones. Then prove one on **your own** object:
 
 ```
-scripts/mythos python3 skills/business-logic/scripts/mass_assign.py probe --headers $S/userA.headers \
+scripts/mythos python3 /repo/skills/business-logic/scripts/mass_assign.py probe --headers $S/userA.headers \
   --method PUT --url <URL of A's object> --body '<normal body>' --field role=admin --get-url <same object>
 ```
 
@@ -80,13 +96,31 @@ did not. A 200 on the write is not enough (many frameworks drop unknown fields
 silently). Then show the effect: the new role reaches an admin function, the
 new balance buys something.
 
+`scripts/verify --oracle readback` is that exact shape as a deterministic
+predicate, and it is what the finding should cite:
+
+```
+scripts/verify --oracle readback --write <URL of A's object> --method PUT \
+  --data '<normal body with the injected field>' --read <same object> \
+  --marker '<the injected value>' --header "$(sed -n 1p $S/userA.headers)" --json \
+  > engagements/<dir>/scan/oracle-massassign.json
+```
+
+Read, write, read again as the reading principal (`--as 'Cookie: ...'` for a
+cross-principal read). **The read before the write is the control, and the
+write's own response is explicitly not the oracle.** A marker already present
+in the first read comes back `ambiguous`, not `evidence`. Keep the `--json`
+file and name its path in the finding's `oracle:` front matter, so
+`scripts/evidence build` puts the predicate, the result and the control into
+the bundle instead of falling back to your prose.
+
 ## 4. Race conditions
 
 Only on a **one-shot resource the agent created** (own coupon, own gift card,
 own small balance, own invite), N <= 20, 2 repeats:
 
 ```
-scripts/mythos python3 skills/business-logic/scripts/race.py --headers $S/userA.headers \
+scripts/mythos python3 /repo/skills/business-logic/scripts/race.py --headers $S/userA.headers \
   --method POST --url <redeem URL> --data '{"code":"{{R}}"}' \
   --setup '<shell cmd that creates a fresh code and prints it>' \
   --success-regex '<what a success looks like>' --state-url <balance/usage URL> \

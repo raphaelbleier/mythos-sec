@@ -36,7 +36,7 @@ candidates.
 
 ## How to confirm (non-destructive)
 Sink reached is not execution. Execution proof reuses `skills/stored-xss-oast/SKILL.md`: mint a
-token with `xss_verify.py token --point 'GET /page#hash'`, put the matching payload (HTML,
+token with `xss-verify token --point 'GET /page#hash'`, put the matching payload (HTML,
 attribute, JS-string or URL variant) in the source, load it in a real browser context, and take
 the `MYTHOS-XSS:<token>` console line or an OAST hit on `<oast>/<token>` as the oracle.
 - **postMessage**: host a page on a different origin you control (`python3 -m http.server 9001`

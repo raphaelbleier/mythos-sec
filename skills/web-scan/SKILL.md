@@ -17,7 +17,7 @@ so do not run nuclei + sqlmap + a browser at once.
 
 If the target has a login, run **auth-session** first and repeat steps 1 to 5
 with the session (`nuclei -sf`, `dalfox --cookie/-H`, `sqlmap --cookie`, see the
-table there). Run `session_check.py` before each step.
+table there). Run `session-check` before each step.
 
 ## 0. Probe your hypotheses first
 
@@ -114,8 +114,8 @@ scripts/mythos sh "curl -s -G '<URL>' --data-urlencode 'q={{7*7}}' | grep -o '49
 - **API excessive data exposure**: diff what the UI needs vs what the endpoint
   returns (extra PII, internal fields).
 - **BOLA / IDOR, BFLA, mass assignment, races, workflow abuse**: run the
-  **business-logic** skill (Subject x Object x Action matrix, `bola_diff.py`,
-  `mass_assign.py`, `race.py`) with the userA/userB sessions from
+  **business-logic** skill (Subject x Object x Action matrix, `bola-diff`,
+  `mass-assign`, `race`) with the userA/userB sessions from
   **auth-session**. Guard against token/auth params that just break the session
   (not a real finding).
 
@@ -163,10 +163,10 @@ and `n/a` (class does not apply to this endpoint):
 | class | endpoint (method path param) | role(s) | tool / check | state | evidence / reason |
 |---|---|---|---|---|---|
 | sqli | GET /search q | anon | sqlmap BT | rejected(no boolean diff) | scan/sqlmap-search.log |
-| xss-stored | POST /api/comments text | userA->userB | xss_verify | reproduced | scan/xss-mx1a2b3c4d.png |
-| bola | GET /api/orders/{id} | userA,userB,anon | bola_diff | candidate | scan/bola.jsonl line 4 |
-| mass-assign | PUT /api/users/{id} role | userA | mass_assign probe | untested | |
-| race | POST /api/redeem code | userA | race.py threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
+| xss-stored | POST /api/comments text | userA->userB | xss-verify | reproduced | scan/xss-mx1a2b3c4d.png |
+| bola | GET /api/orders/{id} | userA,userB,anon | bola-diff | candidate | scan/bola.jsonl line 4 |
+| mass-assign | PUT /api/users/{id} role | userA | mass-assign probe | untested | |
+| race | POST /api/redeem code | userA | race threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
 | smuggling | * front proxy | anon | smuggler | n/a(single server, no proxy) | |
 ```
 

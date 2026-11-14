@@ -7,9 +7,18 @@ description: Log in once per role (userA, userB, admin) via form, JSON API or Pl
 
 Unauthenticated scans see the login page and little else. This skill makes
 every later phase run as a real user, and gives BOLA testing its two principals.
-Scripts run in the toolbox (`scripts/mythos python3 skills/auth-session/scripts/...`);
+`auth-login` and `session-check` run in the toolbox as `scripts/mythos python3
+/repo/scripts/<name>`, or through the `script` tool by name;
 sessions live in `engagements/<dir>/sessions/` (git-ignored; the `.login.json`
 recipe contains the test credentials).
+
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+login or session route, a password field, a session identifier in `Set-Cookie`
+(including a JWT in a cookie), or a `WWW-Authenticate` header. It drives
+`auth-login` and `session-check`, reachable through the `script` tool by those
+names. Everything authenticated lists it as a prerequisite: **business-logic**,
+**tenant-isolation**, **account-takeover**, **stored-xss-oast**,
+**api-protocols**, **oauth-audit** and **ai-app**.
 
 ## 0. Accounts
 
@@ -31,17 +40,17 @@ An API login is faster and more stable than driving the UI; prefer it.
 ```
 S=engagements/<dir>/sessions
 # JSON API (token auto-detected: access_token/token/jwt/... or any JWT; else --token-path data.auth_token)
-scripts/mythos python3 skills/auth-session/scripts/auth_login.py --role userA --out $S \
+scripts/mythos python3 /repo/skills/auth-session/scripts/auth_login.py --role userA --out $S \
   --base http://vampi:5000 --mode json --login-url /users/v1/login --user mythos-a --password '...'
 # HTML form (hidden CSRF inputs are carried over automatically)
-scripts/mythos python3 skills/auth-session/scripts/auth_login.py --role userB --out $S \
+scripts/mythos python3 /repo/skills/auth-session/scripts/auth_login.py --role userB --out $S \
   --base http://dvwa --mode form --login-url /login.php --user mythos-b --password '...'
 # SPA / JS-only login: Playwright fills the first password form
-scripts/mythos python3 skills/auth-session/scripts/auth_login.py --role admin --out $S \
+scripts/mythos python3 /repo/skills/auth-session/scripts/auth_login.py --role admin --out $S \
   --base http://juiceshop:3000 --mode browser --login-url /#/login --user admin@juice-sh.op --password '...' \
   --user-selector '#email' --pass-selector '#password'
 # Token obtained elsewhere (OAuth PKCE, SSO, TOTP done by hand): just store it
-scripts/mythos python3 skills/auth-session/scripts/auth_login.py --role userA --out $S \
+scripts/mythos python3 /repo/skills/auth-session/scripts/auth_login.py --role userA --out $S \
   --base https://app.example --mode token --token 'eyJ...' [--cookie 'sid=...']
 ```
 
@@ -64,7 +73,7 @@ Pick a cheap authenticated baseline (`/api/me`, `/profile`). Before every tool
 batch:
 
 ```
-scripts/mythos python3 skills/auth-session/scripts/session_check.py --sessions $S \
+scripts/mythos python3 /repo/skills/auth-session/scripts/session_check.py --sessions $S \
   --check-url http://vampi:5000/me [--dead-regex 'please log in'] userA userB admin
 ```
 
@@ -92,14 +101,14 @@ C=$(sed -n 's/^Cookie: //p' $S/userA.headers)              # raw cookie string
 | jwt_tool | `-t <URL> -rc "$C"` (cookie) or `-rh "Authorization: Bearer <JWT>"` | then `-M pb` / `-X a` etc. on the authed request |
 | curl | `eval curl -s $H <URL>` | ad-hoc checks |
 | the `browser` tool | load `$S/userA.state.json` into the page before navigating; it drives one context, so switch roles in sequence | a second role needs its own navigation, not a second context |
-| bola_diff.py, race.py, xss_verify.py | `--a/--b/--headers $S/<role>.headers`, `--state $S/<role>.state.json` | see business-logic and stored-xss-oast |
+| bola-diff, race, xss-verify | `--a/--b/--headers $S/<role>.headers`, `--state $S/<role>.state.json` | see business-logic and stored-xss-oast |
 
 Flag syntax for ffuf, sqlmap and dalfox is from tool knowledge, not re-verified
 against the pinned versions; if a flag errors, check `--help` in the toolbox.
 
 ## Rules
 
-- A role is "logged in" only when `session_check.py` says `valid: true`, not
+- A role is "logged in" only when `session-check` says `valid: true`, not
   when the login call returned 200.
 - Scanning as a logged-in user sends authenticated state-changing requests
   (nuclei, ffuf on POST). Respect `scope.rules`; exclude logout, delete-account

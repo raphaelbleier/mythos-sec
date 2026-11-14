@@ -9,7 +9,7 @@ rate limit or invite quota exceeded. Most common on redeem, transfer, vote,
 signup-bonus and "one per user" endpoints.
 
 ## How Mythos detects it
-- `skills/business-logic/scripts/race.py`: sequential wave vs parallel wave on a
+- `scripts/race`: sequential wave vs parallel wave on a
   fresh one-shot resource, N <= 20, 2 repeats; HTTP/2 single-packet via
   h2spacex when installed (not in the image), else stdlib last-byte sync.
 - Single-packet attack (Kettle, BH USA 2023): many HTTP/2 requests completed in

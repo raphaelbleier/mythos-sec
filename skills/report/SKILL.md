@@ -76,10 +76,10 @@ engagements/<dir>/
 ```
 
 Each `findings/<id>.md` carries `id`, `title`, `class` (a knowledge-base class
-name, so the CWE maps), `status`, `asset`, `param`, `severity`, `cvss`, `proof`,
-`negative_control`, and `reason` for a rejected one. Write these before the
-prose, not after: the prose is assembled from them, and `scripts/findings`
-refuses to run without them with exit code 3.
+name, so the CWE maps), `status`, `asset`, `param`, `severity`, `cvss`,
+`cvss4`, `proof`, `oracle`, `negative_control`, and `reason` for a rejected
+one. Write these before the prose, not after: the prose is assembled from them,
+and `scripts/findings` refuses to run without them with exit code 3.
 
 ## Machine-readable output
 
@@ -97,6 +97,19 @@ you must not do by eye:
   the severity word. If it reports `severity says critical but the vector
   computes medium (6.1)`, fix one of the two before writing the report. A
   severity nobody can derive from the vector is an inflated report.
+- **It scores a CVSS 4.0 vector too**, from the `cvss4:` field, and emits
+  `cvss4_vector`, `cvss4_score` and `cvss4_severity`. `severity` still comes
+  from 3.1 alone. Ask every finding for both vectors and quote both in the
+  report: HackerOne, Bugcrowd and Intigriti all accept 4.0 alongside 3.1 and
+  some programs prefer it.
+
+  **A number without its scheme is a wrong number, because the two schemes
+  disagree in both directions.** Unauthenticated full read is 9.8 under 3.1 but
+  9.3 under 4.0. Unauthenticated confidentiality-only read is 7.5 under 3.1 but
+  8.7 under 4.0. Reflected XSS is 6.1 under 3.1 but 5.1 under 4.0. So write
+  "9.3 (CVSS 4.0) / 9.8 (CVSS 3.1)" and never a bare figure; a triager who
+  assumes the other scheme reads the severity wrong in whichever direction
+  happens to apply.
 - **It deduplicates** on class plus endpoint template plus parameter, with
   numeric and UUID path segments collapsed, so the same flaw on `/users/1`
   and `/users/9823` is one finding with two affected assets. Use its merged
@@ -131,7 +144,8 @@ a pass on the authoring model is not independent and a reader has to know that.
 
 The front matter each finding needs for all of this: `id`, `title`, `class`
 (the knowledge-base class name, so the CWE maps), `status`, `asset`, `param`,
-`severity`, `cvss`, `proof`, `negative_control`, and `reason` for a rejected
+`severity`, `cvss`, `cvss4`, `proof`, `oracle` (the path to a
+`scripts/verify --json` file), `negative_control`, and `reason` for a rejected
 one. A class with no CWE mapping is reported as a problem rather than guessed;
 add it to the table in `scripts/findings` if the class is real.
 

@@ -88,7 +88,7 @@ object id on an already-open socket).
 ## Fill and run
 1. Collect real ids per principal first (`auth-session`: own objects only).
 2. Order of work, cheapest first: anonymous sweep of every row; peer swap
-   (`bola_diff.py`); lower-role calls (BFLA, `--a admin --b userA`);
+   (`bola-diff`); lower-role calls (BFLA, `--a admin --b userA`);
    cross-tenant; then write verbs.
 3. Write verbs only on objects the agent created; delete last.
 4. Prioritize rows where deny is expected and the object is money, PII,

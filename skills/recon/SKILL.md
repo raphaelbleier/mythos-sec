@@ -15,6 +15,13 @@ This phase owes the next one three files in the engagement directory:
 without `surface.json` and `recon.md`, and an empty map does not count. Raw tool
 output goes under `recon/`.
 
+`surface.json` decides more than coverage. The **triage** phase runs after this
+one, reads that file against `skills/registry.yaml` and writes `plan.json`: the
+skills this target gets, each with the trigger that selected it. That decision
+is code, not judgement, so what you leave out of the map is a skill that never
+runs. A surface you widened by hand — a route out of a bundle, a GraphQL field,
+a login the crawler missed — belongs in `surface.json`, not only in `recon.md`.
+
 ## 0. Read the app by hand first
 
 Start with one call: the `script` tool, name `probe`, args

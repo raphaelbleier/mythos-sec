@@ -11,6 +11,11 @@ in it, so everything below is what those two tools execute. The driver runs
 `scripts/mythos up` before the first phase, so the container is already started
 when you get your first turn.
 
+Triage never selects this skill; every phase that runs a tool reads it on
+demand. It drives no script of its own: `scripts/mythos` is what the `shell`
+tool wraps. Its entry in `skills/registry.yaml` carries no triggers for that
+reason.
+
 ## Commands
 
 ```

@@ -12,8 +12,15 @@ arrives at an OAST host the agent controls, or a token endpoint that answers
 `knowledge/web/oauth-oidc.md`; token checks in `knowledge/web/jwt.md`. Read
 the first before step 2.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows
+`/.well-known/openid-configuration`, an authorize, token, introspect, userinfo
+or device endpoint, a `client_id`, `redirect_uri`, `response_type` or
+`code_challenge` parameter, or a redirect whose `Location` carries one of
+those. It drives `authflows`, and needs **auth-session** first. Reset, MFA,
+email change and session rotation are **account-takeover**, not this skill.
+
 Prerequisites: `scope.rules.allow_active`; sessions from **auth-session**
-(`userA`, `userB`, `S=engagements/<dir>/sessions`), run `session_check.py`
+(`userA`, `userB`, `S=engagements/<dir>/sessions`), run `session-check`
 first; an OAST base as in **stored-xss-oast** (lab `http://oast:8080`, else
 `interactsh-client`); the `browser` tool for the redirect flows. Registering
 clients and other state changes also need `allow_exploit`, and a change you

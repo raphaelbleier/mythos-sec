@@ -18,7 +18,7 @@ user" to "object of another tenant".
   file/attachment, search index, cache, export/report job, audit log,
   notification, webhook target, background-job result, RAG/embedding index.
 - Run `skills/tenant-isolation` (tenant-scoped matrix on top of
-  `skills/business-logic/scripts/bola_diff.py`).
+  `scripts/bola-diff`).
 - Candidate vectors, each tried with tenant B's identifiers while logged in as
   tenant A:
   - tenant selector in a header (`X-Tenant-Id`, `X-Org-Id`, `X-Workspace`), a

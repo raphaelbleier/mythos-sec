@@ -9,6 +9,19 @@ These are the classes open agents miss most (Strix's unsolved XBEN set
 includes smuggling and PHP deserialization). Every tool below is a
 **candidate generator**; nothing it prints is a finding on its own.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+`Via` header or a CDN, load balancer or caching proxy in `Server`, an
+`X-AspNet-Version` header, an XML, XSD, WSDL, SVG or Office document path, a
+`viewstate`, `xml`, `soap`, `serialized`, `template` or redirect-target
+parameter, or a Java, .NET or ColdFusion application server in the fingerprint.
+It drives `ssrfprobe` (`probe`, `metadata`, `blind`, `rebind`) and `verify`.
+
+**Modern HTTP desync has its own skill.** 0.CL, CL.0, the Expect-based
+variants, H2.TE, CRLF-powered desync, the baseline-versus-trigger detection
+standard and the `raw` tool are in **desync**. The CL.TE/TE.CL recipe below is
+the 2019 subset: run it as one pass inside that skill, not as the whole
+class.
+
 | tool | role | in the toolbox image? |
 |---|---|---|
 | Web-Cache-Vulnerability-Scanner (`wcvs`) | candidates only | no. Kali package `web-cache-vulnerability-scanner` or `go install github.com/Hackmanit/Web-Cache-Vulnerability-Scanner@latest` |
@@ -129,6 +142,54 @@ EOF
 ```
 
 See `knowledge/web/request-smuggling.md`.
+
+## SSRF: classify the primitive before claiming impact
+
+"SSRF confirmed" is half an answer. What the finding is worth depends entirely
+on what the primitive controls, so `ssrfprobe` reports method control and
+header control as separate, explicit facts rather than printing "cloud
+credentials reachable" off one callback.
+
+```
+script: name "ssrfprobe",
+        args ["probe", "<URL>", "<parameter>",
+              "--oast", "<a host you control and scope.yaml authorizes>",
+              "--control", "<a destination the application is meant to allow>",
+              "--marker", "<a string your OAST host serves in its body>",
+              "--oast-log", "http://oast:8080/__log"]
+```
+
+One request per URL form, then it reads the OAST log. `--marker` is what makes
+"response visible" answerable at all: without it that stays `unknown` rather
+than being reported as no. `--control` is the negative control.
+
+```
+script: name "ssrfprobe",
+        args ["blind", "<URL>", "<parameter>", "<another parameter>",
+              "--oast", "<your OAST host>", "--wait", "60",
+              "--oast-log-file", "engagements/<dir>/scan/interactsh.jsonl"]
+script: name "ssrfprobe",
+        args ["metadata", "<URL>", "<parameter>"]
+script: name "ssrfprobe", args ["rebind", "<host>", "--samples", "3"]
+```
+
+`blind` mints one token per injection point and runs a control arm, so a late
+callback is attributable. `metadata` points at the **lab emulator** by default
+(`http://cloud-metadata`, and `http://cloud-metadata-v2` for the IMDSv2 shape)
+on the lab's internal network with no published port, which is the point: it is
+only reachable through the SSRF sink itself. A real link-local target needs
+`--real` and `--i-have-authorization` and is still subject to the scope check
+and the programme's rules. `rebind` is **detection only**: does the target
+resolve the name more than once, and does it honour a short TTL.
+
+Two rules that are not this skill's to relax. **The destination is in scope or
+it is refused**, not warned about: a request the target makes on your behalf
+counts as yours, so the OAST host belongs in `scope.yaml`, added in an editor
+before the run. And **nothing here reads or stores a credential** — the
+metadata paths are the instance listings, a path naming a credential surface is
+refused, and the proof stops at "the metadata endpoint answered, with this much
+method and header control". `knowledge/web/ssrf.md` has the sink list and the
+bypass forms.
 
 ## Output
 

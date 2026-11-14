@@ -8,6 +8,12 @@ description: Prove stored and blind XSS with execution evidence instead of scann
 A dalfox "V" line, a reflected `<script>` in the HTML source or a 200 on the
 injecting POST is not a finding. Proof is one of:
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+persisted text field (`comment`, `body`, `text`, `message`, `description`,
+`title`, `name`, `bio`, `review`, `filename`) or a comments, posts, messages,
+tickets, reviews, feedback, profile, support, notes or upload route. It drives
+`xss-verify`, and needs **auth-session** first.
+
 1. the canary **fired in a browser** (dialog or console message carrying the
    token) on the page where the payload renders, viewed as a different role; or
 2. an **OAST hit** whose token maps to exactly one injection point.
@@ -35,7 +41,7 @@ XBOW validates XSS the same way (headless browser checks the payload executed).
    cannot be attributed):
 
    ```
-   scripts/mythos python3 skills/stored-xss-oast/scripts/xss_verify.py token \
+   scripts/mythos python3 /repo/skills/stored-xss-oast/scripts/xss_verify.py token \
      --map engagements/<dir>/scan/xss-tokens.jsonl --point 'POST /api/comments body.text' --oast http://oast:8080
    ```
 
@@ -51,7 +57,7 @@ XBOW validates XSS the same way (headless browser checks the payload executed).
 3. **Render as another role and listen:**
 
    ```
-   scripts/mythos python3 skills/stored-xss-oast/scripts/xss_verify.py verify --token <token> \
+   scripts/mythos python3 /repo/skills/stored-xss-oast/scripts/xss_verify.py verify --token <token> \
      --url <page that renders it> --state $S/userB.state.json \
      --oast http://oast:8080 --shot engagements/<dir>/scan/xss-<token>.png
    ```
@@ -65,7 +71,7 @@ XBOW validates XSS the same way (headless browser checks the payload executed).
 
 ## Verdict
 
-`xss_verify.py verify` reports evidence (`browser_hit`, `oast_hit`, nonce, timestamps) and
+`xss-verify verify` reports evidence (`browser_hit`, `oast_hit`, nonce, timestamps) and
 sets no closure state; set it yourself from that evidence. Exit 1 = no evidence observed.
 The OAST callback carries the nonce and `location.origin` only; `--include-cookies` on `token`
 adds `document.cookie` and needs the program's authorization. Evidence for the
@@ -74,6 +80,17 @@ the render URL and role, the dialog/console text or the OAST log line, and the
 screenshot. A token seen in the OAST log from the **toolbox's own** IP (your
 own verify browser) proves execution in a victim-equivalent context; from the
 admin-bot it proves the privileged-viewer impact.
+
+**Cite the request, not only the screenshot.** The `browser` tool now runs
+behind the recording proxy, so the navigation that rendered the payload is in
+`traffic/log.jsonl` like any other request. The finding names
+`proof: traffic/<id>` for that navigation **as well as** the screenshot and the
+dialog or console canary: the screenshot is the oracle, the traffic record is
+what a human replays. `scripts/evidence check` refuses a finding that cites no
+request, in those words — *a capture is not a request: cite the exchange that
+set it up* — and it has already rejected real DOM-XSS findings that were proven
+in Chromium and cited nothing. Run `scripts/evidence build engagements/<dir>`
+and then `scripts/evidence check engagements/<dir>` before the report.
 
 Write the result into the finding file the **exploit** skill describes; its
 closure state and the validator pass apply unchanged.

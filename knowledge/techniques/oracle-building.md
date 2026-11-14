@@ -64,7 +64,7 @@ until the parts that always change are removed.
    decompression; recompute length after masking.
 4. Compare in tiers: status, then headers that matter (`Location`,
    `Content-Type`), then normalized body. Label the result SAME (identical),
-   SIMILAR (same structure, values differ), DIFFERENT. `bola_diff.py` uses
+   SIMILAR (same structure, values differ), DIFFERENT. `bola-diff` uses
    the same labels.
 5. If the 5 baselines already disagree after masking, the endpoint is not a
    stable oracle: pick another field or a state read-back.
@@ -106,7 +106,7 @@ noise = {norm(fetch()) for _ in range(5)}   # fetch() is your request; len(noise
 ## Confounders to rule out
 Caches (add a buster); load-balancer variance (repeat); a WAF or error page
 identical for payload and control; A/B or personalized content; session expiry
-mid-test (`session_check.py`); rate limiting turning later requests into `429`;
+mid-test (`session-check`); rate limiting turning later requests into `429`;
 gzip and chunking changing `Content-Length`; clock skew in timing tests.
 
 ## When no safe oracle exists

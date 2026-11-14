@@ -38,20 +38,33 @@ wiki page bodies, marketing-tool merge fields. Client-side template injection
   baseline plus 3 repeats.
 - Tools: `tplmap`/`sstimap` and `nuclei` are candidate generators only.
 
-## Relation to skills/exploit
-`skills/exploit` escalates SSTI toward code execution and proves it by reading
-a benign file; this note used to say "stop before RCE". Both hold, scoped:
+## Relation to skills/exploit — this note wins
+`skills/exploit` shows a Jinja2 gadget chain that calls `popen('id')` and says
+to read a file as proof. This note said "stop before RCE". **Where the two
+disagree, the stricter rule applies, and it is this one.** Scoped:
+
 1. Detection and engine identification (above) need only active scope
-   (`allow_active`). They change nothing on the target.
-2. The proof step in `skills/exploit` (one read-only command or file read,
-   or an OAST callback carrying a nonce) runs only when
-   `scope.rules.allow_exploit` is true. If it is false the finding stays
-   `reproduced` at arithmetic or engine identification, with that stated.
-3. "Stop before RCE" means: no shell, no write, no state change, no second
-   command, no enumeration, no reading beyond the one proof. In a lab an
-   `id`-equivalent is fine. On a real target prefer an OAST callback with the
-   nonce or a no-op marker over reading a file; `/etc/hostname` is the most
-   that is read, never config, env or secrets.
+   (`allow_active`). They change nothing on the target and are where most
+   findings should end.
+2. The proof step runs only when `scope.rules.allow_exploit` is true. If it is
+   false the finding stays `reproduced` at arithmetic or engine
+   identification, with that stated.
+3. When it does run, the proof is **one** of: an OAST callback carrying the
+   run's nonce, a no-op marker, or a single read of `/etc/hostname`. In that
+   order of preference. Never a shell, never a write, never a state change,
+   never a second command, never enumeration, never config, env or secrets,
+   and never `id` outside a lab.
+
+Why the stricter rule wins, rather than splitting the difference. A template
+engine with a gadget chain is arbitrary code on the target, and arbitrary code
+is the one class where the agent cannot undo what it did and cannot know in
+advance what the command touches — a run already emptied a target's table with
+one well-formed request, which is why destruction is refused in code rather
+than left to judgement. And the extra command buys nothing: about 44% of proofs
+of concept that passed exit-code, marker and trace checks were invalid, so a
+second command is another chance to be confidently wrong, not more proof. The
+callback with a nonce is a deterministic oracle; `id` output in a transcript
+is a reading of a transcript.
 
 ## How to confirm (non-destructive)
 Negative control: the same field with the expression escaped or replaced by a

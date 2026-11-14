@@ -35,11 +35,11 @@ victims' browsers. Variants and where each is handled:
 ## How to confirm (non-destructive)
 1. Mint a token for the injection point and take the payload for the observed context:
    ```
-   scripts/mythos python3 skills/stored-xss-oast/scripts/xss_verify.py token \
+   scripts/mythos python3 /repo/skills/stored-xss-oast/scripts/xss_verify.py token \
      --map engagements/<dir>/scan/xss-tokens.jsonl --point 'GET /search q' --oast <oast base>
    ```
    The payload logs `MYTHOS-XSS:<token>` and loads `<oast>/<token>`; it carries no cookie theft.
-2. Open the single PoC URL in a real browser context (`xss_verify.py verify --url ... --state ...`
+2. Open the single PoC URL in a real browser context (`xss-verify verify --url ... --state ...`
    or the browser agent). Evidence = the console line or OAST hit carrying the token, plus the
    screenshot and the reflection context. A scanner "V" line, a payload visible in view-source
    or a 200 does not execute anything.
