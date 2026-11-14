@@ -41,6 +41,10 @@ TARGETS = {
     "dvga": (LAB, ["dvga"], "http://127.0.0.1:5013", {}),
     "vampi": (LAB, ["vampi"], "http://127.0.0.1:5002", {}),
 }
+# A reported finding that is real but names nothing in the documented list.
+# Spelled out rather than left as an empty maps_to, so a finished mapping is
+# distinguishable from an unfinished one by eye.
+OUT_OF_LIST = "out-of-list"
 TRUTH_STATUSES = ("found", "missed")
 REPORTED_STATUSES = ("tp", "fp", "duplicate")
 # Report structure, not findings. Matched against the whole heading, so "Findings" is dropped
@@ -405,18 +409,29 @@ def tally(target, rundir, rater=None):
             mapped.update(str(x).strip() for x in raw if str(x).strip())
         else:
             mapped.update(x.strip() for x in str(raw).split(",") if x.strip())
-    # A tp pointing at an entry the rater did not mark found is a contradiction
-    # inside one triage, so precision is refused. The reverse is not: an entry
-    # can be demonstrated inside another section of a report without getting a
-    # heading of its own, and recall is computed from the truth rows while
-    # precision is computed from the reported rows. Refusing precision because a
-    # found entry has no heading conflated the two measures and rejected a
-    # triage that had followed the rubric exactly.
+    # Precision and recall ask different questions, and tying them together
+    # rejected correct work twice. Recall asks whether the report demonstrated a
+    # documented entry to the truth-row bar. Precision asks whether what the
+    # report claimed was true. A claim can be true without meeting the recall
+    # bar, which is the ordinary case of a real finding the report hedges as
+    # unproven, and a claim can be true about something the ground truth does
+    # not list at all.
+    #
+    # So a tp may map to any real ground-truth id, whether or not that entry is
+    # marked found, or to the sentinel out-of-list. What still refuses is a
+    # maps_to naming nothing that exists, because that is a typo rather than a
+    # judgement, and an unclassified row, because precision cannot be computed
+    # from an incomplete accounting.
+    unknown = {m for m in mapped if m and m != OUT_OF_LIST and m not in gt_ids}
     c["precision_refused"] = (
         f"{unset} reported finding(s) unclassified" if unset else
         "no reported findings recorded" if not t["reported"] else
-        f"tp rows map to {sorted(mapped - found_ids)}, which are not marked found"
-        if mapped - found_ids else "")
+        f"tp rows map to {sorted(unknown)}, which are not ground-truth ids"
+        if unknown else "")
+    c["tp_out_of_list"] = sum(
+        1 for r in t["reported"]
+        if r.get("status") == "tp" and str(r.get("maps_to", "")).strip() == OUT_OF_LIST)
+    c["tp_below_recall_bar"] = sorted(mapped & gt_ids - found_ids)
     c["found_without_reported_row"] = sorted(found_ids - mapped)
     return c
 
@@ -564,13 +579,30 @@ def cmd_selftest(a):
         assert not c2["precision_refused"], c2["precision_refused"]
         assert c2["found_without_reported_row"], c2
 
-        # A tp pointing at an entry the rater did not mark found IS a
-        # contradiction inside one triage, and still refuses.
+        # A tp whose entry is not marked found is the ordinary case of a real
+        # finding the report hedges as unproven: precision asks whether the
+        # claim was true, recall whether the entry was demonstrated.
         t3 = json.loads(json.dumps(t))
         for truth_row in t3["truth"]:
             truth_row["status"] = "missed"
         (d / "triage-r1.json").write_text(json.dumps(t3))
-        assert "not marked found" in tally("vampi", d)["precision_refused"]
+        c3 = tally("vampi", d)
+        assert not c3["precision_refused"], c3["precision_refused"]
+        assert c3["tp_below_recall_bar"], c3
+
+        # out-of-list is a real finding the ground truth does not list
+        t5 = json.loads(json.dumps(t))
+        t5["reported"][0]["maps_to"] = OUT_OF_LIST
+        (d / "triage-r1.json").write_text(json.dumps(t5))
+        c5 = tally("vampi", d)
+        assert not c5["precision_refused"], c5["precision_refused"]
+        assert c5["tp_out_of_list"] == 1, c5
+
+        # a maps_to naming nothing that exists is a typo, and still refuses
+        t6 = json.loads(json.dumps(t))
+        t6["reported"][0]["maps_to"] = "vampi-999"
+        (d / "triage-r1.json").write_text(json.dumps(t6))
+        assert "not ground-truth ids" in tally("vampi", d)["precision_refused"]
 
         # maps_to may name several entries, because one request can prove two
         t4 = json.loads(json.dumps(t))
