@@ -112,7 +112,31 @@ DESTRUCTIVE = [
      "HTTP TRACE/CONNECT via curl: use a dedicated differential probe instead"),
     (re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"),
      "fork bomb"),
+    # Mass destruction expressed as an operation name rather than a command
+    # shape. The denylist above reads the shell: it caught `curl -X DELETE` and
+    # sqlmap --dump and missed `{deleteAllPastes}` in a GraphQL body, which a
+    # real run then executed against a live target and emptied its table. These
+    # names have no scoped, self-owned-object reading: there is no version of
+    # deleteAll or dropDatabase that touches only what the tester created.
+    (re.compile(r"\b(deleteAll\w*|removeAll\w*|purgeAll\w*|destroyAll\w*|"
+                r"truncate(?:Table|All)?\w*|dropDatabase|dropCollection|dropTable|"
+                r"resetDatabase|reset_?db|wipe(?:All|Database|Data)?\w*|"
+                r"deleteEverything|clearAll\w*|flushAll|factoryReset)\b", re.I),
+     "an operation that destroys every record, not one you created. Prove the "
+     "authorization flaw on an object you made yourself, and report the "
+     "mass-destruction endpoint as reachable without exercising it"),
+    (re.compile(r"\b(DROP\s+(?:TABLE|DATABASE|SCHEMA)|TRUNCATE\s+TABLE|"
+                r"DELETE\s+FROM\s+\w+\s*(?:;|$))", re.I),
+     "unbounded SQL deletion"),
 ]
+
+# Destructive-looking operations that DO have a legitimate scoped use: deleting
+# the object you just created is how an access-control finding gets proven
+# without touching anyone else's data. These warn rather than refuse, because
+# refusing them would block the non-destructive proof the rules ask for.
+DESTRUCTIVE_SCOPED = re.compile(
+    r"\b(delete\w+|remove\w+|destroy\w+|revoke\w+|deactivate\w+|"
+    r"cancel\w+|refund\w+|transfer\w+)\s*\(", re.I)
 
 # Exploitation, as distinct from active scanning. Gated on rules.allow_exploit.
 EXPLOIT_TOOLS = re.compile(
@@ -277,6 +301,16 @@ def check(command: str, charge: bool = False) -> dict:
     if not loaded:
         return out
     scope_file, rules = loaded
+
+    if DESTRUCTIVE_SCOPED.search(command):
+        out["message"] = (
+            "⚠️  MYTHOS BUDGET GUARD: this call names an operation that changes or "
+            "removes something.\n"
+            "    That is allowed on an object you created yourself, which is how "
+            "an access-control finding gets proven without touching another "
+            "user's data. It is not allowed on anyone else's. If the object is "
+            "not yours, stop and report the endpoint as reachable instead.")
+        out["action"] = "warn"
     out["scope"] = str(scope_file)
     mode = os.environ.get("MYTHOS_BUDGET_ENFORCE", "block")
 
@@ -368,6 +402,18 @@ def _selftest() -> int:
              "block", "brute force blocked")
         want(check("curl -X DELETE https://a.test/paste/7")["action"], "block",
              "DELETE blocked")
+        # The hole a live run walked through: mass destruction as an operation
+        # name in a request body, invisible to a shell-shaped denylist.
+        want(check("""curl -X POST https://a.test/graphql -d '{"query":"{deleteAllPastes}"}'""")["action"],
+             "block", "deleteAllPastes blocked")
+        want(check("curl -s https://a.test/api --data 'q=DROP TABLE users'")["action"],
+             "block", "DROP TABLE blocked")
+        want(check("curl -X POST https://a.test/g -d 'mutation{dropDatabase}'")["action"],
+             "block", "dropDatabase blocked")
+        # Deleting what you created yourself is the non-destructive proof, so it
+        # warns and runs.
+        want(check("""curl -X POST https://a.test/graphql -d '{"query":"mutation{deletePaste(id:9001)}"}'""")["action"],
+             "warn", "scoped delete warns, does not block")
         # exploitation is never blocked: an explicit false only warns
         want(check("msfconsole -q -x exploit")["action"], "warn",
              "allow_exploit false warns, does not block")
