@@ -160,7 +160,16 @@ What this phase owes the next one:
 
 Fingerprint before you guess. Authenticate if the application allows
 registration, and say which accounts you created: a second identity is what an
-access-control test needs.`,
+access-control test needs.
+
+Before you order the surfaces, ask what past engagements learned:
+
+    script: name "lessons", args ["prior", "--stack", "<the fingerprint tokens>"]
+
+Read its caveat in the output. The denominator is findings reported, not classes
+attempted, so it measures precision among the classes this framework spoke up
+about and not how often a class pays off. Use it to break a tie, never to decide
+what to skip.`,
   };
 }
 
