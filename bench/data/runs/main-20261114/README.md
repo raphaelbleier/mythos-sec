@@ -103,6 +103,38 @@ review, and it is the clearest evidence in the run that the scaffolding does
 something the bare agent does not. It is also not a recall difference, so it
 does not appear in any number above.
 
+## Neither arm ran out of time, and both stopped at a quarter of the budget
+
+Checked after the fact, because a null result from two arms that were cut off
+mid-work would mean something different from one where both decided they were
+finished:
+
+| target | arm | wall clock | budget | cut off |
+|---|---|---|---|---|
+| VAmPI | control | 51.6 s | 600 s | no |
+| VAmPI | mythos | 84.9 s | 600 s | no |
+| DVGA | control | 264.5 s | 600 s | no |
+| DVGA | mythos | 273.9 s | 600 s | no |
+| Vuln Bank | control | 75.0 s | 1200 s | no |
+| Vuln Bank | mythos | 269.7 s | 1200 s | no |
+
+Zero of six cells hit the budget. The no-difference result is therefore not a
+time limit, which makes it a stronger finding than it would otherwise be.
+
+It also exposes the thing worth fixing next, which is not recall and not the
+scaffolding's breadth. On a target with 76 documented vulnerabilities, of which
+they found about a third, the control arm stopped after 75 seconds of a 1200
+second budget and the scaffolded arm after 270. Both believed they were done
+with three quarters of the budget unspent. The coverage gate exists for exactly
+this, it was wired and effective on these cells, it nudged, and they stopped
+anyway.
+
+This is model-dependent rather than universal: in a later head-to-head on GLM
+5.3, the same scaffolding used its full 900 second budget and was cut off, while
+the bare control finished early again. So the early stop is a property of the
+pairing of model and scaffolding, and a stronger anti-early-termination
+mechanism is a better target for the next round of work than more playbooks.
+
 ## What this does not establish
 
 - **It does not show the scaffolding beats a bare agent.** p = 1.0000 and
