@@ -149,6 +149,12 @@ URL_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s'\"<>|;`)]+")
 MAX_SLEEP = 30.0
 # `scripts/traffic exec -- curl ...`: the form that sends through the engagement's recording proxy.
 TRAFFIC_EXEC = re.compile(r"scripts/traffic\s+(?:--dir\s+\S+\s+)?exec\b")
+# A command run through the toolbox driver is recorded too: `scripts/mythos` asks
+# `scripts/traffic env --container` for the proxy variables, passes them into the
+# exec, and exits rather than run the command when the proxy is down. So a curl
+# inside the container cannot be an unrecorded request, and warning about it would
+# train the agent to ignore the one guard that matters.
+TOOLBOX_EXEC = re.compile(r"scripts/mythos\s+(?:--timeout\s+\S+\s+)?(?:sh|run)\b")
 
 
 def _segments(command: str) -> list[str]:
@@ -406,12 +412,14 @@ def check(command: str, charge: bool = False) -> dict:
 
     # When this engagement records its traffic (scripts/traffic start), a bare host curl or wget
     # would send a request that no record shows. Refuse it and name the form that is recorded.
-    if (scope_file.parent / "traffic" / "proxy.json").exists() and not TRAFFIC_EXEC.search(command) \
+    if (scope_file.parent / "traffic" / "proxy.json").exists() \
+            and not TRAFFIC_EXEC.search(command) and not TOOLBOX_EXEC.search(command) \
             and any(Path(t).name in SINGLE_SHOT for t in _tokens(command)):
         out.update(action="warn" if mode != "block" else "block", message=(
             "⛔ MYTHOS BUDGET GUARD: unrecorded request.\n"
             "    This engagement records its traffic, and a bare curl/wget would not appear in it.\n"
-            "    Run it as: scripts/traffic exec -- curl ...\n"
+            "    Run it as: scripts/traffic exec -- curl ..., or in the toolbox\n"
+            "    (scripts/mythos sh 'curl ...'), which carries the proxy variables.\n"
             f"    Active scope: {scope_file}"))
         if out["action"] == "block":
             return out
@@ -472,6 +480,22 @@ def _selftest() -> int:
         os.environ.pop("MYTHOS_BUDGET_ENFORCE", None)
 
         want(check("curl https://a.test/")["action"], "allow", "plain curl")
+
+        # Recording. When the proxy is up, a bare host curl sends a request no
+        # record shows and is warned about; the same curl inside the toolbox
+        # carries the proxy variables, so it must not be. Warning about a
+        # recorded request teaches the agent to read past every guard message.
+        (scope.parent / "traffic").mkdir(exist_ok=True)
+        (scope.parent / "traffic" / "proxy.json").write_text("{}")
+        want("unrecorded" in (check("curl https://a.test/")["message"] or ""), True,
+             "a bare curl is warned about while recording")
+        want("unrecorded" in (check("scripts/mythos sh 'curl -sS https://a.test/'")["message"] or ""),
+             False, "a toolbox curl counts as recorded")
+        want("unrecorded" in (check("scripts/mythos --timeout 60 sh 'curl https://a.test/'")["message"] or ""),
+             False, "--timeout before the subcommand is still a toolbox exec")
+        want("unrecorded" in (check("scripts/traffic exec -- curl https://a.test/")["message"] or ""),
+             False, "the host form through the proxy counts as recorded")
+        (scope.parent / "traffic" / "proxy.json").unlink()
         want(check("sqlmap -u https://a.test/ --dump")["action"], "block",
              "sqlmap dump blocked")
         want(check("hydra -l admin -P list.txt a.test http-post-form")["action"],
