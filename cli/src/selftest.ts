@@ -11,10 +11,12 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chunk } from "./driver.js";
+import { chunk, verdictState } from "./driver.js";
 import { parseYaml, readScope } from "./scope.js";
-import { endpointKey, surfaceFromMap } from "./verdicts.js";
+import { Ledger, endpointKey, isResolved, surfaceFromMap } from "./verdicts.js";
 import { shq, summariseJson } from "./agent/tools.js";
+import { shotName } from "./agent/browser.js";
+import { rawRecord, requestLine, statusOf, unescapeBytes } from "./agent/raw.js";
 import { splitModel } from "./providers/registry.js";
 import { needsHostNetwork, toolboxTarget } from "./prompts.js";
 
@@ -153,6 +155,92 @@ test("the same endpoint written three ways counts once", () => {
     "mutation importpaste(a, b)",
     "a GraphQL entry keeps its argument list",
   );
+});
+
+test("raw bytes are framed exactly as the caller typed them", () => {
+  assert.deepEqual(
+    [...unescapeBytes("GET / HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n")],
+    [...Buffer.from("GET / HTTP/1.1\r\nHost: h\r\n\r\n")],
+    "the escapes are resolved and nothing else is added",
+  );
+  assert.equal(unescapeBytes("\\x41\\x42").toString(), "AB", "a byte can be given in hex");
+  assert.equal(unescapeBytes("a\\0b").length, 3, "a NUL survives");
+  assert.equal(unescapeBytes("C:\\path").toString(), "C:\\path", "an unknown escape stays as typed");
+  assert.equal(unescapeBytes("x\\").toString(), "x\\", "a trailing backslash is not an escape");
+});
+
+test("a raw probe is recorded the way the proxy records a request", () => {
+  const bytes = Buffer.from("HTTP/1.1 501 Not Implemented\r\n\r\n");
+  const rec = rawRecord(
+    { host: "t.lab", port: 443, tls: true, half_close: true, why: "0.CL probe" },
+    [
+      { bytes: "POST /x HTTP/1.1\\r\\nHost: t.lab\\r\\n\\r\\n" },
+      { bytes: "GET /y HTTP/1.1\\r\\n\\r\\n", delay_ms: 50 },
+    ],
+    { sent: [33, 19], received: bytes.length, bytes, dur: 0.5, cut: false },
+    "probe",
+    1_000_000_000_000,
+  );
+  assert.equal(rec.kind, "raw", "scripts/traffic selects records by kind");
+  assert.equal(rec.scheme, "https");
+  assert.equal(rec.host, "t.lab");
+  assert.equal(rec.port, 443);
+  assert.equal(rec.m, "POST");
+  assert.equal(rec.p, "/x", "the first request line is the index line");
+  assert.equal(rec.s, 501, "the status is read out of what came back");
+  assert.equal(rec.t, 999_999_999.5, "t is when the connection opened, in seconds");
+  assert.equal(rec.half_close, true);
+  assert.deepEqual(rec.writes, [{ bytes: 33, delay_ms: 0 }, { bytes: 19, delay_ms: 50 }]);
+  assert.equal(
+    Buffer.from(rec.req as string, "base64").toString(),
+    "POST /x HTTP/1.1\r\nHost: t.lab\r\n\r\nGET /y HTTP/1.1\r\n\r\n",
+    "the record replays byte for byte",
+  );
+  assert.deepEqual(requestLine(Buffer.from("POST /x?a=1 HTTP/1.1\r\n")), { m: "POST", p: "/x?a=1" });
+  assert.equal(statusOf(Buffer.from("nothing came back")), null, "no status is null, not a guess");
+});
+
+test("a screenshot is named after the page it shows", () => {
+  assert.equal(
+    shotName("http://127.0.0.1:5001/a/b?q=1", "victim", new Date("2026-11-14T10:20:30Z")),
+    "2026-11-14T10-20-30-victim-127-0-0-1-5001-a-b-q-1.png",
+  );
+  assert.equal(
+    shotName("about:blank", "default", new Date("2026-11-14T10:20:30Z")),
+    "2026-11-14T10-20-30-default-blank.png",
+  );
+});
+
+test("an exploit worker cannot confirm its own finding", () => {
+  // The prompt forbids it, but a prompt is not a control. A worker that writes
+  // `confirmed` anyway must land as a candidate, or the validate phase is
+  // optional in practice and the one measured safeguard is gone.
+  assert.equal(verdictState("confirmed", "exploit"), "candidate");
+  assert.equal(verdictState("confirmed", "validate"), "confirmed");
+  assert.equal(verdictState("rejected", "validate"), "rejected");
+  assert.equal(verdictState(" Candidate ", "exploit"), "candidate");
+  assert.equal(verdictState("nonsense", "exploit"), "tested", "an unreadable state means it was looked at");
+  assert.equal(isResolved("candidate"), false);
+  assert.equal(isResolved("rejected"), true, "a rejection is an answer, not an omission");
+});
+
+test("the validator resolves a candidate and nothing walks it back", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mythos-ledger-"));
+  const ledger = new Ledger(dir);
+  ledger.record("/transfer", "candidate", "negative amount seems to credit", "exploit-w1");
+  assert.equal(ledger.unresolved().length, 1);
+  assert.equal(ledger.summary().candidate, 1);
+
+  ledger.record("/transfer", "confirmed", "replayed, control differs", "validator");
+  assert.equal(ledger.unresolved().length, 0);
+  assert.equal(ledger.summary().confirmed, 1);
+  assert.equal(ledger.summary().candidate, 0);
+
+  // A second Ledger over the same directory reads the resolved state back, so a
+  // resumed or retried phase cannot reopen a finding that was reproduced.
+  const reread = new Ledger(dir);
+  assert.equal(reread.get("/transfer")?.state, "confirmed");
+  assert.equal(reread.unresolved().length, 0);
 });
 
 process.stdout.write(`\n${ran} checks passed\n`);
