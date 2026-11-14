@@ -245,6 +245,29 @@ def report_file(workdir):
     return reports[-1] if reports else None
 
 
+def _render_sarif(path):
+    """A SARIF file as the text a rater can read, or "" if it cannot be parsed."""
+    try:
+        doc = json.loads(Path(path).read_text(errors="replace"))
+    except Exception:
+        return ""
+    out = []
+    for run in doc.get("runs") or []:
+        for r in run.get("results") or []:
+            msg = ((r.get("message") or {}).get("text") or "").strip()
+            rule = r.get("ruleId") or ""
+            level = r.get("level") or ""
+            locs = []
+            for loc in r.get("locations") or []:
+                uri = (((loc.get("physicalLocation") or {}).get("artifactLocation")
+                        or {}).get("uri") or "")
+                if uri:
+                    locs.append(uri)
+            head = " ".join(x for x in (rule, f"[{level}]" if level else "") if x)
+            out.append(f"## {head}\n{msg}" + (f"\nlocation: {', '.join(locs)}" if locs else ""))
+    return "\n\n".join(out)
+
+
 def final_report(transcript, final, workdir=None):
     """Everything the arm delivered, so the medium does not decide the score.
 
@@ -271,6 +294,17 @@ def final_report(transcript, final, workdir=None):
         if strix:
             parts.append(("penetration_test_report.md",
                           strix[-1].read_text(errors="replace")))
+        else:
+            # Cut off before it wrote the report, but it files findings as SARIF
+            # throughout. Without this the fallback is the whole transcript,
+            # which for this arm is a half-megabyte log: handing a rater that
+            # against a 17 KB report is not a fair read of what either
+            # framework delivered.
+            sarif = sorted(wd.glob("cwd/strix_runs/*/findings.sarif"))
+            if sarif:
+                rendered = _render_sarif(sarif[-1])
+                if rendered:
+                    parts.append(("findings.sarif", rendered))
     if final is not None:
         body = parts[0][1] if parts else ""
         # Skip it only when the written report already carries it, which is the
