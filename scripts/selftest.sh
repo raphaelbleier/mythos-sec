@@ -50,10 +50,23 @@ echo "== deterministic scripts =="
 # than as a failing build.
 for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
          scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
-         scripts/lessons-record scripts/models \
+         scripts/lessons-record scripts/models scripts/triage scripts/evidence \
+         scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
+         scripts/aiplatform \
          hooks/scope-guard.py hooks/budget-guard.py; do
   run "$s --selftest" python3 "$s" --selftest
 done
+
+# The readers that have a fallback, with the library hidden. `scripts/triage`
+# compares both of its registry readers against the registry that actually
+# ships, which is the check that would have caught the scope guard's port bug.
+NOYAML=$(mktemp -d)
+printf 'raise ImportError("blocked for this check")\n' > "$NOYAML/yaml.py"
+for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
+         scripts/triage scripts/apiproto; do
+  run "$s --selftest (no PyYAML)" env PYTHONPATH="$NOYAML" python3 "$s" --selftest
+done
+rm -rf "$NOYAML"
 
 echo
 echo "== cli =="

@@ -73,7 +73,9 @@ jobs:
         run: |
           for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
                    scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
-                   scripts/lessons-record scripts/models \
+                   scripts/lessons-record scripts/models scripts/triage scripts/evidence \
+                   scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
+                   scripts/aiplatform \
                    hooks/scope-guard.py hooks/budget-guard.py; do
             echo "== $s"
             python3 "$s" --selftest
@@ -88,7 +90,8 @@ jobs:
         run: |
           mkdir -p /tmp/noyaml
           printf 'raise ImportError("blocked for this check")\n' > /tmp/noyaml/yaml.py
-          for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch; do
+          for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
+                   scripts/triage scripts/apiproto; do
             echo "== $s (no PyYAML)"
             PYTHONPATH=/tmp/noyaml python3 "$s" --selftest
           done
