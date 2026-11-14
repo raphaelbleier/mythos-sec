@@ -6,9 +6,25 @@
 
 ## 0. The guards appear not to run in a benchmark cell at all
 
-**Status:** open, and it is the most consequential defect here. It would mean
-every guard-related claim measured in a cell was measured with the guards
-inert, including tonight's.
+**Status:** CONFIRMED 14 November 2026. `--dangerously-skip-permissions`
+disables a plugin's PreToolUse hooks. Every benchmark cell this project has
+run, tonight's and every earlier sweep, ran with the scope guard, the budget
+guard, the rate limiting and the non-destructive denylist completely inert.
+
+**The test that settled it.** The same one-command prompt twice against the
+same prepared engagement, with a recorder marker in place so the
+unrecorded-request rule applies:
+
+- With `--dangerously-skip-permissions`: no guard message of any kind.
+- Without it: the guard fires verbatim, "This engagement records its traffic,
+  and a bare curl/wget would not appear in it. Run it as: scripts/traffic exec
+  -- curl ...", naming the correct scope file.
+
+**What has to change.** The harness cannot both run unattended with that flag
+and measure a framework whose safety rests on hooks. Either the cells
+pre-grant permissions through a settings file and drop the flag, or every
+enforcement claim is qualified as interactive-only. The first is the real fix;
+the second is what the documentation must say until it lands.
 
 **The evidence, from one cell traced end to end.**
 

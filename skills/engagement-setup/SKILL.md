@@ -134,6 +134,15 @@ doubt, exclude rather than include. Record the program name and URL in `notes`.
 
 ## What the scope file actually controls
 
+> **The guards do not run under `--dangerously-skip-permissions`.** Confirmed
+> 14 November 2026: that flag disables a plugin's PreToolUse hooks, so with it
+> the scope guard, the rate limiting, the exploitation notice and the
+> non-destructive denylist are all inert. Everything in the table below holds
+> in an interactive session and in any unattended run that does not use the
+> flag. It does not hold in the benchmark harness, which uses it on every cell.
+> See `docs/research/2026-11-14-known-defects.md`, defect 0.
+
+
 The scope file is the authorization boundary, and two hooks read it on every
 Bash and WebFetch call. Knowing which rule is enforced and which is only
 advice matters, because the two failure modes are different:
