@@ -21,12 +21,20 @@ playbooks, and `scripts/*` are the deterministic tools. The CLI reads them.
 | Chromium | `playwright-core`, launched by the CLI | the client-rendered surface. Not in the container |
 
 The model never touches the target: it emits tool calls and the CLI executes
-them. Two things reach the target from the host rather than from the container:
-Chromium, because the recording proxy terminates TLS with a per-run CA and
-teaching a browser to trust it would mean shipping a root certificate
-(`cli/src/agent/browser.ts`), and the Python scripts that send their own
-requests, `probe` and `verify`. Both are vetted by the same guards as everything
-else.
+them. Two things reach the target from the host rather than from the container,
+and both are vetted by the same guards as everything else.
+
+`probe` and `verify` send their own requests. The `script` tool runs them
+through `scripts/traffic exec`, which hands them the proxy variables a host
+command needs, so the surface map and the canary pass appear in the recording
+like everything else. They used to run without it, which left the two calls a
+reader would most want to replay as the only unrecorded traffic in an
+engagement.
+
+Chromium is the exception that stays unrecorded: the proxy terminates TLS with a
+per-run CA, and teaching a browser to trust it would mean shipping a root
+certificate (`cli/src/agent/browser.ts`). Its console and network log are read
+back through the `browser` tool instead.
 
 ## The driver
 
