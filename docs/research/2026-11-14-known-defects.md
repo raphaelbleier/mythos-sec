@@ -67,8 +67,25 @@ target on the docker bridge gateway rather than loopback, and whether the
 agent's requests went through the environment at all. Diagnosing it needs the
 proxy's own view, which currently writes nothing when it declines a connection.
 
-**What to do first.** Make the proxy log every connection it declines and why,
-before guessing again. The absence of a log line is the only clue there is.
+**Corrected diagnosis.** The proxy already records a failed upstream
+connection, not only a successful one: an isolated run against a dead target
+logged `1 recorded, 1 failed before a response`. So an empty `log.jsonl` with a
+proxy running does not mean the proxy declined anything. It means **not one
+request reached it**. The requests went around the proxy, which is a different
+problem from the one the first four cells were read as showing.
+
+**Instrumented.** `scripts/traffic summary` now says exactly that, and names the
+three ways it happens in the order worth checking: the proxy variables missing
+from the shell that sent the request (every tool call is a fresh shell, so one
+`eval` does not carry into the next), a tool that ignores HTTP_PROXY at all
+(nikto, nmap, and dalfox without `--proxy`), or a request from inside the
+toolbox without the container variables. It ends with the command that settles
+which applies, `scripts/traffic exec -- env | grep -i proxy`.
+
+**What to do next.** Run one cell and read that line. Candidate 1 is the
+likeliest given what the transcripts show, and if it holds, the fix is for
+`scripts/mythos` and the skills to route every request rather than asking the
+agent to remember per call.
 
 ## 1c. Four nominally identical cells spanned 144 to 389 seconds and 33 to 851 report lines
 

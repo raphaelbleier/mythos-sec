@@ -1098,7 +1098,31 @@ def cmd_summary(d, a):
         return 0
     w, c, rq, rt, sc = run["window"], run["capture"], run["requests"], run["rate"], run["scope"]
     if not (rq["total"] or c["gaps"] or c["opaque_tunnels"]):
-        print(f"{d.name}: nothing recorded. Either no proxy ran, or nothing reached it.")
+        # Distinguish the two causes, because they need different fixes and the
+        # one-line version cost four measured cells to tell apart. The proxy
+        # records a failed upstream connection as well as a successful one, so
+        # an empty log with a proxy running means nothing reached it: the
+        # requests went around it, they were not declined by it.
+        running = (d / "traffic" / "proxy.json").exists()
+        if not running:
+            print(f"{d.name}: nothing recorded, and no proxy ran. Start it with "
+                  f"`scripts/traffic start`.")
+            return 0
+        print(f"{d.name}: the proxy ran and NOT ONE REQUEST REACHED IT.")
+        print("  This is not the proxy declining anything: a refused or failed")
+        print("  upstream connection is recorded too, so an empty log means the")
+        print("  requests went around the proxy rather than through it.")
+        print("  The three ways that happens, in the order worth checking:")
+        print("    1. The proxy variables were not in the shell that sent the")
+        print("       request. Every tool call is a fresh shell, so `eval \"$(scripts/traffic")
+        print("       env)\"` in one call does not carry into the next. Use")
+        print("       `scripts/traffic exec -- curl ...` per call, or re-eval each time.")
+        print("    2. The request was sent by a tool that ignores HTTP_PROXY.")
+        print("       nikto and nmap do; dalfox needs --proxy.")
+        print("    3. The request came from inside the toolbox without the")
+        print("       container variables: `scripts/traffic env --container --json`")
+        print("       is what scripts/mythos must pass to docker exec.")
+        print("  Check which applies: `scripts/traffic exec -- env | grep -i proxy`")
         return 0
     print(f"engagement   {d.name}   {w['start']} .. {w['end']}{' (proxy running)' if w['running'] else ''}"
           f"   {w['duration_s']}s")
