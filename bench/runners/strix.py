@@ -44,7 +44,11 @@ def run(target_url, workdir, model, budget_s):
         raise RuntimeError("strix needs a model: pass --strix-model or set STRIX_LLM (+ LLM_API_KEY)")
     argv = ["uv", "run", "--project", STRIX_DIR, "strix", "-n", "-t", target_url,
             "--instruction", base.prompt(target_url)]
-    transcript = base.run_proc(argv, cwd, env, budget_s, workdir)
+    # Strix writes into cwd/strix_runs/ while it runs and its transcript is
+    # assembled afterwards, so the stall detector has to watch the directory
+    # or it kills every cell at the stall deadline.
+    transcript = base.run_proc(argv, cwd, env, budget_s, workdir,
+                               progress_roots=[Path(cwd) / "strix_runs"])
     with open(transcript, "a") as t:
         for p in sorted((cwd / "strix_runs").rglob("*")):
             if p.is_file() and p.suffix in (".md", ".json", ".jsonl", ".txt", ".log"):

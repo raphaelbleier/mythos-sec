@@ -172,8 +172,39 @@ def clean_env(home):
                 XDG_STATE_HOME=str(home / ".state"), OPENCODE_DISABLE_CLAUDE_CODE="1")
 
 
-def run_proc(argv, cwd, env, budget_s, workdir):
-    """Run argv under a hard wall clock (whole process group), return the transcript path."""
+def progress_size(transcript, extra_roots=()):
+    """How much the arm has written, across everything it actually writes to.
+
+    The stall detector used to watch the transcript alone. That works for an arm
+    whose output streams there, and it silently kills one whose does not: Strix
+    writes into `cwd/strix_runs/` while it runs and its runner appends the
+    transcript only afterwards, so the transcript never grew, the 420 second
+    deadline always fired, and the harness recorded a competitor as stalling
+    while it was filing findings. Every Strix cell this project ever ran hit
+    that deadline, which is very likely the whole of the "2 of 12 valid cells"
+    it reported about Strix rather than anything about Strix.
+    """
+    total = transcript.stat().st_size if transcript.exists() else 0
+    for root in extra_roots:
+        root = Path(root)
+        if not root.exists():
+            continue
+        for f in root.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def run_proc(argv, cwd, env, budget_s, workdir, progress_roots=()):
+    """Run argv under a hard wall clock (whole process group), return the transcript path.
+
+    `progress_roots` names directories the arm writes to while it runs, for arms
+    whose output does not stream to the transcript. Growth in any of them counts
+    as progress.
+    """
     workdir = Path(workdir)
     transcript = workdir / "transcript.jsonl"
     t0, timed_out, stalled = time.monotonic(), False, False
@@ -192,7 +223,7 @@ def run_proc(argv, cwd, env, budget_s, workdir):
                 break
             except subprocess.TimeoutExpired:
                 pass
-            size = transcript.stat().st_size if transcript.exists() else 0
+            size = progress_size(transcript, progress_roots)
             if size != last_size:
                 last_size, last_change = size, time.monotonic()
             now = time.monotonic()
