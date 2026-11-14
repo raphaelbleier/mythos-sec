@@ -1,0 +1,41 @@
+===== report.md =====
+# Report: VAmPI http://127.0.0.1:5002
+
+Findings 1-9 as delivered in the final chat report: plaintext credential dump at /users/v1/_debug; SQLi in GET /users/v1/{username} (UNION, 5 columns); Werkzeug debugger and /console exposed; mass assignment of admin at /users/v1/register; any user can change another user's password (PUT /users/v1/{username}/password); BOLA on GET /books/v1/{book_title}; forgeable JWT (HS256 secret "random"); user enumeration on login; no login rate limit (15 wrong logins, all 200).
+
+## Per-path coverage
+- /openapi.json (and /ui/): GET 200, 29537 B. Public API spec disclosure (low). Not otherwise vulnerable.
+- /books/v1: GET lists all books unauthenticated (200). POST with extra "user":"admin" ignored, book owned by name1. Not vulnerable to mass assignment.
+- /books/v1/{book_title}: no token -> 401. Token of name1 reading name2's book -> 200 with secret (BOLA, finding 6). SQLi probes `x'` and `x' OR '1'='1` -> "Book not found!" (parameterized, not vulnerable).
+- /createdb: GET 200 "Database populated." Unauthenticated state-changing GET that re-seeds the DB (design flaw, not exploited further).
+- /me: no token -> 401; valid token -> own profile; forged token -> admin (finding 7); alg:none -> rejected.
+- /users/v1: GET unauthenticated lists usernames and emails (information disclosure).
+- /users/v1/_debug: finding 1.
+- /users/v1/login: wrong user vs wrong password messages differ (enumeration). SQLi `name1' OR '1'='1` and `name1'--` -> "Username does not exist" (not injectable). No rate limit.
+- /users/v1/register: admin mass assignment confirmed. Duplicate username -> "User already exists" (also enumeration).
+- /users/v1/{username}: SQLi confirmed (finding 2). DELETE: refused by the guard as destructive, unconfirmed.
+- /users/v1/{username}/email: PUT with name1's token on name2 returned 204 but GET showed no change, so cross-user write is unproven. Email with quote -> 400 "valid email" (validated, no injection seen).
+- /users/v1/{username}/password: finding 5 (cross-user change, then restored).
+- param:book_title, param:username: see SQLi results above (username injectable, book_title not).
+- param:password: login password compared against a stored plaintext value; no injection signal; weak storage noted in finding 1.
+
+## Not tested
+DELETE /users/v1/{username} (destructive), regex DoS on email (DoS), Werkzeug console PIN (RCE path), token replay after expiry.
+
+
+===== final message =====
+I wrote a per-path coverage list to `[ARM]127.0.0.1-20261114/report.md`. It names every mapped path and parameter with what was tested and the result. The findings themselves are only summarised there in one paragraph. The full write-up with exact requests and responses is the chat report I gave earlier. I did not rerun `scripts/coverage`, so I haven't confirmed the gate now passes.
+
+I ran a few more checks to close the gaps.
+
+- **Login SQL injection:** `name1' OR '1'='1` and `name1'--` as the username both returned "Username does not exist". Login is not injectable this way.
+- **Book title SQL injection:** `GET /books/v1/x' OR '1'='1` returned "Book not found!", so `book_title` is not injectable.
+- **Email field SQL injection:** an email ending in a quote returned 400 "Please Provide a valid email address.", so it is validated and showed no injection.
+- **Missing token:** `GET /books/v1/bookTitle95` and `GET /me` without a token both returned 401.
+- **Duplicate registration:** registering `name1` again returned "User already exists. Please Log in." This is another way to enumerate usernames.
+- **Spec exposure:** `/openapi.json` (200, 29,537 bytes) and `/ui/` (200) are public.
+
+Three things are still untested:
+- **User deletion:** `DELETE /users/v1/{username}` is untested because the guard refuses it as destructive.
+- **Email change on another user:** the cross-user `PUT .../email` returned 204, but the email did not change when I read it back. I can't claim it as a finding.
+- **Out-of-bounds checks:** I did not try the Werkzeug console PIN, the email regex DoS, or token replay after expiry.

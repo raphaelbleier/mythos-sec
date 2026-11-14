@@ -1,0 +1,181 @@
+{
+ "target_id": "vampi",
+ "rater": "raterA",
+ "rubric": "bench/data/triage-rubric.md",
+ "rubric_sha256": "148d66a5b92908218c70622106097a16dfd5da023ab5e3a288028f91e81c0927",
+ "report_sha256": "86c22bf7e439fd38d79f497f3b751e576f2db83833ee5d197c386fee0dea9d9b",
+ "blinded": false,
+ "scored": 9,
+ "truth": [
+  {
+   "id": "vampi-01",
+   "title": "SQL Injection",
+   "class": "sql_injection",
+   "bench_tag": "sqli",
+   "status": "found",
+   "evidence": "Request: GET /users/v1/x' UNION SELECT username,password,email,1,1 FROM users--  Response: {\"username\": \"pass1\", \"email\": \"1\"}. A column from another table came back through the UNION.",
+   "note": "UNION output from another table returned; no dump.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "vampi-02",
+   "title": "Unauthorized Password Change",
+   "class": "broken_user_authentication",
+   "bench_tag": "privilege_escalation",
+   "status": "found",
+   "evidence": "PUT /users/v1/bob/password with Authorization: Bearer <name1 token> and body {\"password\":\"hacked\"} -> 204 NO CONTENT. Login as bob/hacked then returns a token, and bob/pw fails.",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "vampi-03",
+   "title": "Broken Object Level Authorization",
+   "class": "bola",
+   "bench_tag": "idor",
+   "status": "found",
+   "evidence": "GET /books/v1/bobbook with the name1 token ... {\"book_title\":\"bobbook\",\"owner\":\"bob\",\"secret\":\"bobsecret\"}",
+   "note": "Proved on the books endpoint (cross-user secret read), not the email endpoint the ground truth says was disproved. Entry title is generic BOLA, so found. The report itself says the email endpoint uses the token identity.",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "vampi-04",
+   "title": "Mass Assignment",
+   "class": "mass_assignment",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "POST /users/v1/register with {\"username\":\"evil\",...,\"admin\":true} -> \"Successfully registered\"; GET /me with that token returns {\"admin\": true, \"username\":\"evil\"}.",
+   "note": "",
+   "hint": ""
+  },
+  {
+   "id": "vampi-05",
+   "title": "Excessive Data Exposure through debug endpoint",
+   "class": "excessive_data_exposure",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "GET /users/v1/_debug with no auth. 200 with every user's username, email, plaintext password and admin flag. Examples: admin / pass1 / admin:true, name1 / pass1.",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "vampi-06",
+   "title": "User and Password Enumeration",
+   "class": "enumeration",
+   "bench_tag": "information_disclosure",
+   "status": "found",
+   "evidence": "POST /users/v1/login with a non-existent user returns \"Username does not exist\". An existing user with a wrong password returns \"Password is not correct for the given username.\"",
+   "note": "",
+   "hint": "class named in the report"
+  },
+  {
+   "id": "vampi-07",
+   "title": "RegexDOS (Denial of Service)",
+   "class": "regex_dos",
+   "bench_tag": null,
+   "status": "missed",
+   "evidence": "",
+   "note": "Email-validation ReDoS: 'not tested, because it would risk denial of service'. The ground truth dos_rule (single bounded regex payload) was not attempted either.",
+   "hint": ""
+  },
+  {
+   "id": "vampi-08",
+   "title": "Lack of Resources & Rate Limiting",
+   "class": "rate_limiting",
+   "bench_tag": null,
+   "status": "found",
+   "evidence": "15 consecutive bad POST /users/v1/login attempts for name1. All 15 returned HTTP 200 (failure message in the body), with no throttling, lockout or delay.",
+   "note": "Absence-of-throttle proof, 15 requests, no brute force.",
+   "hint": ""
+  },
+  {
+   "id": "vampi-09",
+   "title": "JWT authentication bypass via weak signing key",
+   "class": "jwt_forge",
+   "bench_tag": "jwt",
+   "status": "found",
+   "evidence": "The secret `random` matched the HS256 signature of a token I obtained. I forged {\"sub\":\"admin\",...} and sent GET /me ... Response: {\"data\": {\"admin\": true, \"email\": \"admin@mail.com\", \"username\":\"admin\"}}.",
+   "note": "",
+   "hint": "class named in the report"
+  }
+ ],
+ "reported": [
+  {
+   "n": 1,
+   "heading": "1. Unauthenticated sensitive data exposure: `/users/v1/_debug`",
+   "status": "tp",
+   "maps_to": "vampi-05",
+   "note": ""
+  },
+  {
+   "n": 2,
+   "heading": "2. Mass assignment: admin self-registration",
+   "status": "tp",
+   "maps_to": "vampi-04",
+   "note": ""
+  },
+  {
+   "n": 3,
+   "heading": "3. SQL injection: `GET /users/v1/{username}`",
+   "status": "tp",
+   "maps_to": "vampi-01",
+   "note": ""
+  },
+  {
+   "n": 4,
+   "heading": "4. Werkzeug interactive debugger and verbose errors exposed",
+   "status": "tp",
+   "maps_to": "out-of-list",
+   "note": "Werkzeug debugger page, stack trace, SQL statement and debugger SECRET shown; EVALEX=true. RCE honestly hedged as unproven. Not a documented entry (vampi-05 is the /_debug endpoint)."
+  },
+  {
+   "n": 5,
+   "heading": "5. Broken access control: password change for any user (BFLA/IDOR)",
+   "status": "tp",
+   "maps_to": "vampi-02",
+   "note": ""
+  },
+  {
+   "n": 6,
+   "heading": "6. Weak JWT signing secret, forgeable admin tokens",
+   "status": "tp",
+   "maps_to": "vampi-09",
+   "note": ""
+  },
+  {
+   "n": 7,
+   "heading": "7. Broken object-level authorization: reading other users' book secrets",
+   "status": "tp",
+   "maps_to": "vampi-03",
+   "note": ""
+  },
+  {
+   "n": 8,
+   "heading": "8. User enumeration",
+   "status": "tp",
+   "maps_to": "vampi-06",
+   "note": ""
+  },
+  {
+   "n": 9,
+   "heading": "9. No rate limiting or lockout on login",
+   "status": "tp",
+   "maps_to": "vampi-08",
+   "note": ""
+  },
+  {
+   "n": 10,
+   "heading": "10. Plaintext password storage",
+   "status": "duplicate",
+   "maps_to": "1",
+   "note": "No evidence of its own: it restates the plaintext passwords already shown by finding 1 (and the SQLi output). Counted once."
+  },
+  {
+   "n": 11,
+   "heading": "11. Weak password policy and credential reuse",
+   "status": "fp",
+   "maps_to": "",
+   "note": "Close call. 'Credential reuse' is a property of the seed data, not application behaviour; the policy half rests on one accepted password ('pw') with no policy test. Strict option taken."
+  }
+ ],
+ "note": "Deleted row 12 'Classes tested and not proven'."
+}
