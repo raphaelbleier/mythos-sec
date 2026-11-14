@@ -4,6 +4,51 @@
 > found these, so the next one starts from evidence rather than rediscovering
 > them. Each entry has a reproduction.
 
+## 0. The guards appear not to run in a benchmark cell at all
+
+**Status:** open, and it is the most consequential defect here. It would mean
+every guard-related claim measured in a cell was measured with the guards
+inert, including tonight's.
+
+**The evidence, from one cell traced end to end.**
+
+- The cell made 19 Bash calls. Fifteen contained a bare `curl`. None used
+  `scripts/traffic exec`.
+- Called by hand with the environment the runner sets, the budget guard
+  **blocks** exactly such a call: `action: block`,
+  `MYTHOS BUDGET GUARD: unrecorded request`.
+- The transcript contains **zero** guard messages of any kind. Not the
+  unrecorded-request rule, not the pacing rule, not the destructive denylist.
+- So fifteen commands that the guard demonstrably refuses went through
+  unrefused. The hooks did not run.
+
+**What is not the cause.** All of these were checked and are fine: the plugin
+manifest declares `hooks: ./hooks/hooks.json`; that file is present in the
+staged assets; `--plugin-dir` is passed; the plugin loads, which the namespaced
+slash command `/mythos-sec:cybersecurity` proves; the scope resolves correctly
+from the environment the runner sets; and the guard's own selftests pass.
+
+**The remaining candidate.** Every cell runs with
+`--dangerously-skip-permissions`. If Claude Code treats a plugin's PreToolUse
+hooks as part of the permission system, that flag disables them. That would
+explain all of it: no refusals, no pacing, no denylist, nothing recorded, and
+a coverage gate reduced to its text fallback.
+
+**How to settle it in one run.** Run a cell without
+`--dangerously-skip-permissions` and grep the transcript for
+`MYTHOS BUDGET GUARD`. If the messages appear, the flag is the cause and the
+harness needs a different way to run unattended, because a benchmark that
+disables the framework's enforcement is not measuring the framework. If they
+still do not appear, the problem is in how a plugin's hooks are registered and
+that is where to look next.
+
+**What it does not change.** The measured recall and precision figures stand:
+they are about what each arm found, and the guards do not help an arm find
+things. What it does change is every statement about enforcement under
+benchmark conditions, and it is the reason the non-destructive rule did not
+stop the control arm's `deleteAllPastes` even after that hole was closed in
+code.
+
 ## 1. `scripts/traffic exec` records nothing inside a benchmark cell
 
 **Status:** FIXED 14 November 2026. Cause confirmed, not guessed: every Bash
@@ -66,6 +111,12 @@ remaining candidates are the proxy's bind and client-address rules against a
 target on the docker bridge gateway rather than loopback, and whether the
 agent's requests went through the environment at all. Diagnosing it needs the
 proxy's own view, which currently writes nothing when it declines a connection.
+
+**Superseded by defect 0.** The agent never routed its requests because nothing
+made it: the rule that refuses an unrecorded request never ran. In the traced
+cell it used `traffic exec` zero times out of fifteen curl calls. The recorder
+and its resolution are working; a direct curl through the live proxy from that
+cell's own engagement recorded immediately.
 
 **Corrected diagnosis.** The proxy already records a failed upstream
 connection, not only a successful one: an isolated run against a dead target
