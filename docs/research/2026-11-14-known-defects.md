@@ -44,6 +44,31 @@ the report for the path's name, which a run satisfies by listing the paths it
 did not test. That fallback is why the "all mapped paths accounted for" claim
 was withdrawn.
 
+## 1b. The recorder leaks a process and a CA directory per engagement
+
+**Status:** open, and it compounds defect 1.
+
+Three `scripts/traffic serve` processes were still running at the end of the
+session, one per gate test, each holding a port and a `/tmp/mythos-ca-*`
+directory containing a per-run TLS signing key. Nothing stops them: the agent
+is told to start the recorder and never told to stop it, and the harness does
+not tear it down when a cell ends.
+
+Two consequences. A long-lived process holding a signing key is a worse leak
+than an idle port. And several proxies bound to the same addresses on different
+ports make it harder to establish which one a later `traffic exec` should be
+talking to, which is exactly the territory of defect 1.
+
+**What to do.** `start` should refuse or adopt when a proxy for that engagement
+is already running, the harness should stop it when a cell ends, and `stop`
+should remove the CA directory. `stop` already cleans up after a crashed
+proxy; nothing calls it.
+
+**A warning for whoever cleans these up.** `pkill -f "scripts/traffic serve"`
+matches the shell running that very command and kills it. Match on the full
+argument form instead, for example `ps -eo pid,args | grep -E 'traffic[ ]serve
+--dir'`.
+
 ## 2. The recorder is started by the agent, which is the wrong layer
 
 Both `engagement-setup` and the orchestrator ask the agent to run
