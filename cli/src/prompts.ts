@@ -227,6 +227,11 @@ can close:
 
 ${endpoints.map((e) => `- ${e}`).join("\n")}
 
+Write each verdict the moment you have decided it, not at the end. Your round
+has a wall clock, and an endpoint you investigated without recording the outcome
+is indistinguishable from one nobody looked at: the driver will hand it to
+another worker and the budget pays for the work twice.
+
 A verdict is one of three things, and you record it by writing
 \`verdicts/<slug>.md\` with the \`files\` tool, where <slug> is the endpoint with
 non-alphanumeric characters replaced by dashes:
