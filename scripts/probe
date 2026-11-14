@@ -55,6 +55,17 @@ SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|secret|passwd|password|token|bearer|aws_access_key_id|"
     r"private[_-]?key|BEGIN [A-Z ]*PRIVATE KEY)\b")
 VERSION_RE = re.compile(r"(?i)\b([a-z][a-z0-9_.+-]{1,30})[/ ]v?(\d+\.\d+(?:\.\d+)?)")
+# A product that announces itself without a version still decides which skill
+# applies, and until now the map dropped it: only a versioned `Server` or
+# `X-Powered-By` reached `technology`, so a bare `Server: cloudflare` or
+# `X-Powered-By: Next.js` left `scripts/triage` with nothing to match. The CVE
+# work needs the version; selecting a playbook does not.
+PRODUCT_RE = re.compile(
+    r"(?i)\b(cloudflare|akamai(?:ghost)?|varnish|fastly|cloudfront|awselb|envoy|haproxy|"
+    r"big-?ip|squid|openresty|tengine|nginx|apache|iis|gunicorn|uvicorn|waitress|jetty|"
+    r"tomcat|jboss|wildfly|weblogic|websphere|coldfusion|express|next\.?js|nuxt|django|"
+    r"flask|rails|laravel|symfony|wordpress|drupal|joomla|hasura|apollo|graphql|grpc|"
+    r"langflow|flowise|n8n|ollama|vllm|gradio|streamlit|jupyter|litellm|dify|phusion)\b")
 INTERESTING_HEADERS = ("server", "x-powered-by", "x-aspnet-version", "via", "x-generator",
                        "access-control-allow-origin", "access-control-allow-credentials",
                        "content-security-policy", "strict-transport-security",
@@ -62,10 +73,22 @@ INTERESTING_HEADERS = ("server", "x-powered-by", "x-aspnet-version", "via", "x-g
 MISSING_HEADERS = ("content-security-policy", "strict-transport-security",
                    "x-content-type-options")
 # Paths worth one GET each: cheap, high signal, no payload.
+# The well-known paths are here for a reason beyond discovery: `scripts/triage`
+# selects skills from this map, and a skill whose trigger is a path nobody ever
+# requests can never be selected. The OAuth audit was unreachable for exactly
+# that reason — its trigger named a document this list did not fetch.
 COMMON_PATHS = ("/robots.txt", "/.env", "/.git/config", "/sitemap.xml", "/openapi.json",
                 "/swagger.json", "/static/openapi.json", "/api/openapi.json", "/v1/openapi.json",
                 "/api-docs", "/graphql", "/api", "/admin", "/server-status",
-                "/.well-known/security.txt")
+                "/.well-known/security.txt",
+                "/.well-known/openid-configuration",
+                "/.well-known/oauth-authorization-server",
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/webauthn",
+                "/.well-known/assetlinks.json",
+                "/.well-known/mcp.json",
+                "/sw.js", "/service-worker.js",
+                "/actuator/health", "/.well-known/apple-app-site-association")
 
 
 class Links(HTMLParser):
@@ -251,8 +274,16 @@ def probe(url, depth, max_pages, timeout, headers, insecure):
             page["redirected_to"] = final
 
         for key, value in low.items():
-            for m in VERSION_RE.finditer(value if key in ("server", "x-powered-by") else ""):
+            if key not in ("server", "x-powered-by", "x-generator", "via", "x-aspnet-version"):
+                continue
+            for m in VERSION_RE.finditer(value):
                 tech.add(f"{m.group(1)}/{m.group(2)}")
+            # Unversioned too, so a product that hides its version is still a
+            # product the plan can route on.
+            for m in PRODUCT_RE.finditer(value):
+                name = m.group(1)
+                if not any(t.lower().startswith(name.lower() + "/") for t in tech):
+                    tech.add(name)
         if SECRET_RE.search(body):
             page["secret_like"] = sorted({m.group(0).lower()
                                           for m in SECRET_RE.finditer(body)})[:6]
@@ -440,6 +471,33 @@ def _selftest() -> int:
     # Class hints
     want(hypotheses("redirect_url")[0] != "unknown", True, "a known name suggests a class")
     want(hypotheses("zzz_nothing")[0], "unknown", "an unknown name says so")
+
+    # Fingerprints. `scripts/triage` selects skills from `technology`, so a
+    # product that reaches this list is a playbook that can run and one that
+    # does not is a playbook that never will.
+    def fingerprint(headers):
+        tech = set()
+        for key, value in headers.items():
+            if key not in ("server", "x-powered-by", "x-generator", "via", "x-aspnet-version"):
+                continue
+            for m in VERSION_RE.finditer(value):
+                tech.add(f"{m.group(1)}/{m.group(2)}")
+            for m in PRODUCT_RE.finditer(value):
+                name = m.group(1)
+                if not any(t.lower().startswith(name.lower() + "/") for t in tech):
+                    tech.add(name)
+        return tech
+
+    want(fingerprint({"server": "nginx/1.25.3"}), {"nginx/1.25.3"},
+         "a versioned product keeps its version and is not also listed bare")
+    want(fingerprint({"server": "cloudflare"}), {"cloudflare"},
+         "an unversioned product is still recorded")
+    want("next.js" in {t.lower() for t in fingerprint({"x-powered-by": "Next.js"})}, True,
+         "the header that names a framework without a version counts")
+    want(fingerprint({"via": "1.1 varnish"}), {"varnish"},
+         "Via names the cache in front, which is the desync precondition")
+    want(fingerprint({"content-type": "text/html; nginx"}), set(),
+         "a header that is not a fingerprint header is not read as one")
 
     for f in failures:
         print(f"FAIL {f}")

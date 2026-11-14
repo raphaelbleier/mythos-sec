@@ -1,0 +1,310 @@
+# Which skill applies to which target, decided in code.
+#
+# `scripts/triage` runs after recon. It reads `surface.json` and this file and
+# writes `plan.json`: the skills that apply to this target, in phase order, each
+# with the trigger that selected it and the `why` line a human reads when
+# auditing the plan. No model decides membership, so two runs against the same
+# surface produce the same plan.
+#
+# A wrong trigger costs more than a missing one: it spends a phase on a surface
+# that is not there. So every trigger below is a signal the target actually
+# emitted, never a guess about what it might do.
+#
+## Entry shape
+#
+#   - name:     the skill's directory name, and what `plan.json` calls it
+#     skill:    path to its SKILL.md, from the repository root
+#     phase:    recon | scan | exploit | validate | report | setup
+#     triggers: list of one-key conditions (below). Any one matching selects the
+#               skill. An empty list means triage never selects it: the operator
+#               does, or the driver does.
+#     scripts:  the script names this skill drives, from the `script` tool's
+#               allowlist
+#     needs:    skills that must have run first, by name
+#     why:      one line, lands in `plan.json`
+#
+## Trigger forms, and what each one is matched against
+#
+# Every regex is matched with a search (not a full match) and the pattern itself
+# carries its own case flag, so the parser needs no options.
+#
+#   path: <regex>        against the mapped-path set of `surface.json`:
+#                        the path component of every `pages[].url`, every
+#                        `reachable_paths[].path`, every `pages[].forms[].action`,
+#                        every `pages[].scripts[]` entry, and every
+#                        `api_endpoints[]` entry both verbatim (so a GraphQL
+#                        operation line such as `query me(id)` is matchable) and
+#                        as its path component when it reads `METHOD /path`.
+#   header: {Name: <regex>}
+#                        a one-key map: header name to regex, matched against the
+#                        value of that header in any `pages[].headers`. Names are
+#                        compared case-insensitively. `probe` keeps only the
+#                        headers in its INTERESTING_HEADERS list, so a trigger
+#                        naming anything else can never fire.
+#   tech: <regex>        against every `technology[]` entry (`product/version`).
+#   param: <regex>       against every `parameters[].name`.
+#   method: <METHOD>     exact, uppercase: the method is present on some endpoint,
+#                        from `pages[].forms[].method` or the method prefix of an
+#                        `api_endpoints[]` entry.
+#   always: true         applies to every target.
+#
+version: 1
+
+phases: [setup, recon, scan, exploit, validate, report]
+
+skills:
+  # ---------------------------------------------------------------- setup
+  # Not part of a run. Triage skips `phase: setup` entirely, which is why these
+  # carry no triggers.
+  - name: engagement-setup
+    skill: skills/engagement-setup/SKILL.md
+    phase: setup
+    triggers: []
+    scripts: []
+    needs: []
+    why: Scope is settled by a human before any traffic, so no surface can select it.
+
+  - name: toolbox
+    skill: skills/toolbox/SKILL.md
+    phase: setup
+    triggers: []
+    scripts: []
+    needs: []
+    why: How to run a tool in the Kali container; read on demand, in every phase.
+
+  - name: traffic
+    skill: skills/traffic/SKILL.md
+    phase: setup
+    triggers: []
+    scripts: [traffic]
+    needs: []
+    why: What the run actually sent; read when a proof has to be replayed byte for byte.
+
+  - name: research-ingest
+    skill: skills/research-ingest/SKILL.md
+    phase: setup
+    triggers: []
+    scripts: []
+    needs: []
+    why: Writes knowledge notes between engagements, never during one.
+
+  - name: continuous
+    skill: skills/continuous/SKILL.md
+    phase: setup
+    triggers: []
+    scripts: [watch, findings, lessons, cvefeed]
+    needs: []
+    why: Driven by a `watch` work list for an already-tested target, not by a fresh surface.
+
+  # ---------------------------------------------------------------- recon
+  - name: recon
+    skill: skills/recon/SKILL.md
+    phase: recon
+    triggers:
+      - always: true
+    scripts: [probe, cvefeed, lessons, triage]
+    needs: []
+    why: Every run starts by mapping the surface every later phase counts from.
+
+  - name: source-review
+    skill: skills/source-review/SKILL.md
+    phase: recon
+    triggers:
+      - path: '(?i)/\.git/config$'
+      - path: '(?i)\.js\.map$'
+    scripts: [sourcemap, probe, verify]
+    needs: []
+    why: A reachable .git or a published source map hands over the code the routes and sinks come from.
+
+  # ---------------------------------------------------------------- scan
+  - name: web-scan
+    skill: skills/web-scan/SKILL.md
+    phase: scan
+    triggers:
+      - always: true
+    scripts: [verify]
+    needs: []
+    why: The per-parameter canary pass over the whole surface map; every target gets one.
+
+  - name: auth-session
+    skill: skills/auth-session/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)/(log[-_]?in|sign[-_]?in|session|auth|authenticate|users?/login|account/login)(/|$|\.)'
+      - param: '(?i)^(pass|passwd|password|pwd|user_?password)$'
+      - header: {Set-Cookie: '(?i)\b(session|sess|sid|jsessionid|phpsessid|asp\.net_sessionid|connect\.sid|_session|csrftoken|remember_?token)\b'}
+      - header: {Set-Cookie: '(?i)=ey[A-Za-z0-9_-]{8,}\.'}
+      - header: {WWW-Authenticate: '.'}
+    scripts: [auth-login, session-check]
+    needs: []
+    why: A login means the unauthenticated map is the lobby; two accounts of the same role are what an authorization test needs.
+
+  - name: oauth-audit
+    skill: skills/oauth-audit/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)/\.well-known/(openid-configuration|oauth-authorization-server)'
+      - path: '(?i)/(oauth2?|connect|identity|idp|auth)/(authorize|authorization|token|introspect|revoke|userinfo|device|device_authorization)'
+      - path: '(?i)/(authorize|signin-oidc|login/oauth|oauth/callback|saml2?/acs)(/|$)'
+      - param: '(?i)^(client_id|redirect_uri|response_type|response_mode|code_challenge|code_challenge_method|grant_type|id_token_hint)$'
+      - header: {Location: '(?i)[?&](client_id|response_type|code_challenge)='}
+    scripts: [authflows]
+    needs: [auth-session]
+    why: An authorization server is a second trust boundary, and its happy path is the only path most implementations test.
+
+  - name: api-protocols
+    skill: skills/api-protocols/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)/graph(ql|iql)'
+      - path: '(?i)^(query|mutation|subscription)\s'
+      - path: '(?i)/api/trpc/'
+      - path: '(?i)/(jsonrpc|json-rpc|rpc)(/|$)'
+      - path: '(?i)/[a-z0-9_]+(\.[a-z0-9_]+)+Service/[A-Za-z0-9_]+$'
+      - path: '(?i)/(odata|\$metadata)(/|$)'
+      - path: '(?i)\.(asmx|svc|wsdl)$'
+      - path: '(?i)/(openapi\.(json|ya?ml)|swagger\.json|api-docs)$'
+      - path: '(?i)/_next/static/'
+      - tech: '(?i)(next\.?js|hasura|apollo|graphql|grpc|trpc|connectrpc)'
+      - header: {X-Powered-By: '(?i)next\.?js'}
+    scripts: [apiproto, verify]
+    needs: [auth-session]
+    why: An RPC or GraphQL surface moves every authorization decision inside one endpoint, where a per-route guard cannot see it.
+
+  - name: client-side
+    skill: skills/client-side/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)(/_next/static/|/static/js/|/assets/.*\.js|[.-]chunk\.js|bundle\.js|\.js\.map)$'
+      - path: '(?i)(service-?worker|sw|workbox[-a-z0-9.]*)\.js$'
+      - path: '(?i)/(socket\.io|sockjs|ws|websocket|events|stream)(/|$)'
+      - header: {Content-Security-Policy: '.'}
+      - tech: '(?i)(next\.?js|nuxt|react|vue|angular|svelte|ember|gatsby|remix|webpack|vite)'
+      - header: {X-Powered-By: '(?i)next\.?js'}
+      - header: {X-Generator: '.'}
+    scripts: [clientside, sourcemap]
+    needs: []
+    why: A bundle carries the routes, the parameter names and sometimes the secrets that no response body shows.
+
+  - name: cve-deep-dive
+    skill: skills/cve-deep-dive/SKILL.md
+    phase: scan
+    triggers:
+      - tech: '.'
+      - header: {Server: '[0-9]+\.[0-9]+'}
+      - header: {X-Powered-By: '[0-9]+\.[0-9]+'}
+      - header: {X-Aspnet-Version: '.'}
+    scripts: [cvefeed, verify]
+    needs: []
+    why: A product and a version is the one input that turns a guess into a ranked candidate list.
+
+  # ---------------------------------------------------------------- exploit
+  - name: exploit
+    skill: skills/exploit/SKILL.md
+    phase: exploit
+    triggers:
+      - always: true
+    scripts: [verify, ssrfprobe, evidence]
+    needs: []
+    why: The closure rules and the proof standard every other exploit-phase skill defers to.
+
+  - name: business-logic
+    skill: skills/business-logic/SKILL.md
+    phase: exploit
+    triggers:
+      - param: '(?i)(^|_)(id|uid|uuid|guid|user_?id|account_?id|order_?id|invoice_?id|object_?id|file_?id|doc_?id|customer_?id)$'
+      - param: '(?i)^(role|roles|is_?admin|admin|balance|price|amount|total|quantity|qty|currency|discount|coupon|voucher|status|owner|verified)$'
+      - path: '(?i)/(checkout|cart|orders?|transfers?|payments?|redeem|coupons?|invites?|approve|refunds?|subscriptions?|billing)(/|$)'
+      - path: '(?i)/(openapi\.(json|ya?ml)|swagger\.json|api-docs)$'
+      - method: PUT
+      - method: PATCH
+      - method: DELETE
+    scripts: [bola-diff, mass-assign, race, session-check]
+    needs: [auth-session]
+    why: An object id in a parameter and a write verb on it is the whole precondition for BOLA, mass assignment and a race.
+
+  - name: tenant-isolation
+    skill: skills/tenant-isolation/SKILL.md
+    phase: exploit
+    triggers:
+      - param: '(?i)^(org|org_?id|orgid|organi[sz]ation_?id|workspace|workspace_?id|tenant|tenant_?id|team|team_?id|account_?id|company_?id|project_?id|group_?id)$'
+      - path: '(?i)/(orgs?|organi[sz]ations?|workspaces?|tenants?|teams?|accounts?|companies|projects)/'
+      - header: {Set-Cookie: '(?i)\b(tenant|org|workspace)'}
+    scripts: [bola-diff, session-check]
+    needs: [auth-session]
+    why: One missing tenant filter at one layer exposes a whole customer, and the identifier in the path says the layers exist.
+
+  - name: account-takeover
+    skill: skills/account-takeover/SKILL.md
+    phase: exploit
+    triggers:
+      - path: '(?i)/(forgot|reset|recover)[-_]?(password|pwd|account)?(/|$)'
+      - path: '(?i)/(password/reset|account/recover|users?/password|auth/forgot)'
+      - path: '(?i)/(verify|verification|confirm[-_]?email|email[-_]?change|change[-_]?email|change[-_]?password)(/|$)'
+      - path: '(?i)/(mfa|2fa|two[-_]?factor|totp|otp|webauthn|passkeys?|security[-_]?keys?)(/|$)'
+      - path: '(?i)/(log[-_]?in|sign[-_]?in|log[-_]?out|sign[-_]?out|session)(/|$)'
+      - param: '(?i)^(reset_?token|otp|totp|mfa_?code|two_?factor_?code|new_?password|confirm_?password|current_?password|old_?password|new_?email)$'
+      - header: {Set-Cookie: '(?i)\b(session|sess|sid|jsessionid|phpsessid|connect\.sid|remember_?token)\b'}
+    scripts: [authflows, session-check]
+    needs: [auth-session]
+    why: Reset, MFA, email change and session rotation are one chain, and a break anywhere in it is a whole account.
+
+  - name: stored-xss-oast
+    skill: skills/stored-xss-oast/SKILL.md
+    phase: exploit
+    triggers:
+      - param: '(?i)^(comment|comments|body|text|message|content|description|title|name|display_?name|nickname|bio|about|subject|note|notes|feedback|review|filename|file_?name|website|homepage|avatar_?url)$'
+      - path: '(?i)/(comments?|posts?|messages?|tickets?|reviews?|feedback|profile|settings/profile|support|notes?|uploads?)(/|$)'
+    scripts: [xss-verify]
+    needs: [auth-session]
+    why: A field rendered to another user or an admin is the only place XSS pays more than a reflection.
+
+  - name: ai-app
+    skill: skills/ai-app/SKILL.md
+    phase: exploit
+    triggers:
+      - path: '(?i)/(chat|chats|conversations?|completions?|messages|assistant|agent|copilot|llm|rag|embeddings?|prompt)(/|$)'
+      - path: '(?i)/v1/(chat/)?completions$'
+      - path: '(?i)/api/(generate|tags|chat|embed|embeddings)$'
+      - path: '(?i)/(mcp|\.well-known/mcp)(/|$)'
+      - param: '(?i)^(prompt|system_?prompt|messages|message|max_tokens|temperature|model|conversation_?id|thread_?id|assistant_?id)$'
+      - tech: '(?i)(langflow|flowise|n8n|ollama|vllm|gradio|streamlit|jupyter|open-?webui|litellm|dify|langserve|chainlit|anythingllm|chroma|qdrant|weaviate|milvus)'
+      - header: {X-Powered-By: '(?i)(langflow|flowise|n8n|gradio|streamlit)'}
+      - header: {Server: '(?i)(ollama|gradio|jupyter|tornadoserver)'}
+    scripts: [aiplatform]
+    needs: [auth-session]
+    why: A model that reads untrusted content and can act is an exfiltration channel with a confused deputy at the end of it.
+
+  - name: deep-server
+    skill: skills/deep-server/SKILL.md
+    phase: exploit
+    triggers:
+      - header: {Via: '.'}
+      - header: {Server: '(?i)(cloudflare|akamai|akamaighost|varnish|fastly|cloudfront|awselb|elb|envoy|haproxy|big-?ip|squid|apache[- ]traffic[- ]server|ats/)'}
+      - header: {X-Aspnet-Version: '.'}
+      - path: '(?i)\.(xml|xsd|wsdl|svg|docx|xlsx|pptx)$'
+      - param: '(?i)^(xml|soap|wsdl|__viewstate|viewstate|serialized|payload|template|redirect_?url|next|return_?to)$'
+      - tech: '(?i)(tomcat|jboss|wildfly|jetty|weblogic|websphere|coldfusion|iis|asp\.net)'
+    scripts: [ssrfprobe, verify]
+    needs: []
+    why: A proxy chain, a cache or an XML parser is where a single malformed message reaches a tier that was never meant to see it.
+
+  - name: desync
+    skill: skills/desync/SKILL.md
+    phase: exploit
+    triggers:
+      - header: {Via: '.'}
+      - header: {Server: '(?i)(cloudflare|akamai|akamaighost|varnish|fastly|cloudfront|awselb|elb|envoy|haproxy|big-?ip|squid|apache[- ]traffic[- ]server|ats/|openresty|tengine)'}
+    scripts: [evidence]
+    needs: []
+    why: Desync needs two tiers that disagree about where a request ends, so a proxy chain is the entire precondition.
+
+  # ---------------------------------------------------------------- report
+  - name: report
+    skill: skills/report/SKILL.md
+    phase: report
+    triggers:
+      - always: true
+    scripts: [findings, coverage, evidence]
+    needs: []
+    why: The deliverable, and the only phase that turns per-finding files into a score and a coverage check.

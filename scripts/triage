@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Pick the skills this target actually needs, in code rather than by opinion.
+
+Eighteen skills exist in this repository and until now four of them were ever
+named in a prompt. The rest were readable but undiscoverable: nothing told the
+agent they were there, so no run ever opened them. Writing "read the skill that
+fits" into a prompt does not fix that, because the model then has to guess the
+catalogue from memory, and a guess that misses costs a whole phase.
+
+So the selection is a program. It reads the surface the recon phase mapped,
+matches it against the triggers each skill declares in `skills/registry.yaml`,
+and writes `plan.json`: which skills apply, which scripts they drive, in what
+order, and the one line of why that a human can audit afterwards. The model
+receives a list it did not choose, which is the point — the same surface always
+selects the same skills, and a wrong selection is a bug in a file under version
+control rather than a bad day for an agent.
+
+Trigger forms, deliberately few so this parser stays small and reviewable:
+
+    path:   regex over every mapped path, page URL, form action and API endpoint
+    header: "Name: regex" over the response headers the probe kept
+    tech:   regex over the fingerprinted technology list
+    param:  regex over discovered parameter names
+    method: an HTTP method that appears on any mapped endpoint
+    always: true, for the skills that apply to every target
+
+A skill is selected when any one of its triggers matches. `needs:` then orders
+the result, because authenticating comes before anything that needs a session
+and no amount of enthusiasm reverses that.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised by the CI step
+    # ImportError, not ModuleNotFoundError: the CI step hides PyYAML by putting
+    # a stub on the path that raises ImportError, and the narrower class does
+    # not catch it. Caught narrowly, this script crashed on exactly the machine
+    # the fallback exists for.
+    yaml = None
+
+REPO = Path(__file__).resolve().parent.parent
+REGISTRY = REPO / "skills" / "registry.yaml"
+
+PHASE_ORDER = ["setup", "recon", "scan", "exploit", "validate", "report"]
+
+
+# --------------------------------------------------------------------- registry
+
+
+def load_registry(path: Path) -> list[dict]:
+    """Read the registry, with a fallback for a machine without PyYAML.
+
+    The fallback is not theory. A CI runner without PyYAML found a real scope
+    guard bug in this repository, where the hand-rolled reader and the library
+    disagreed and the hand-rolled one silently dropped a port restriction. So
+    both paths are tested, and the fallback refuses rather than guesses when it
+    meets something it cannot read.
+    """
+    text = path.read_text(encoding="utf-8")
+    if yaml is not None:
+        data = yaml.safe_load(text) or {}
+    else:
+        data = _crude_registry(text)
+    entries = data.get("skills") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise SystemExit(f"{path}: expected a list under 'skills'")
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _crude_registry(text: str) -> dict:
+    """A deliberately narrow YAML reader for the registry's own shape.
+
+    It understands a list of mappings whose values are scalars, inline lists, or
+    a list of single-key mappings (which is how the triggers are written). Any
+    construct outside that is an error, not a shrug: a trigger this reader drops
+    is a skill that silently never runs.
+    """
+    skills: list[dict] = []
+    cur: dict | None = None
+    key: str | None = None
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip() if " #" in raw else raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.strip() in ("skills:",):
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = line.strip()
+
+        if body.startswith("- ") and indent <= 2:
+            cur = {}
+            skills.append(cur)
+            body = body[2:].strip()
+            key = None
+            if not body:
+                continue
+        if cur is None:
+            continue
+
+        if body.startswith("- "):
+            # An item of the list named by the last key seen.
+            item = body[2:].strip()
+            if key is None:
+                raise SystemExit(f"triage: list item with no key: {raw!r}")
+            if ":" in item and not item.startswith(("'", '"')):
+                k, v = item.split(":", 1)
+                cur.setdefault(key, []).append({k.strip(): _inline(v.strip())})
+            else:
+                cur.setdefault(key, []).append(_scalar(item))
+            continue
+
+        if ":" not in body:
+            raise SystemExit(f"triage: cannot read registry line: {raw!r}")
+        k, v = body.split(":", 1)
+        key = k.strip()
+        v = v.strip()
+        if not v:
+            cur[key] = []
+        elif v.startswith("["):
+            inner = v[1:].split("]", 1)[0]
+            cur[key] = [_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+        else:
+            cur[key] = _scalar(v)
+    return {"skills": skills}
+
+
+def _inline(v: str):
+    """A scalar, or a one-key flow mapping, which is how a header trigger is written.
+
+    `header: {Set-Cookie: '<regex>'}` is the natural way to say it in YAML and
+    it is what the registry uses, so the fallback has to produce the same nested
+    dictionary PyYAML does. Reading it as a string instead was a real bug here:
+    the two readers disagreed, and on the PyYAML path the trigger silently
+    matched nothing at all, so a skill selected only by a response header would
+    never have run. This repository has shipped that exact shape of bug once
+    before, in the scope guard, which is why both readers are compared against
+    the real registry in the selftest rather than against a sample.
+    """
+    if v.startswith("{") and v.endswith("}"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return {}
+        k, _, rest = inner.partition(":")
+        return {k.strip().strip("'\""): _scalar(rest.strip())}
+    return _scalar(v)
+
+
+def _scalar(v: str):
+    v = v.strip().strip("'\"")
+    if v in ("true", "True"):
+        return True
+    if v in ("false", "False"):
+        return False
+    return v
+
+
+# ---------------------------------------------------------------------- surface
+
+
+class Surface:
+    """The parts of `surface.json` a trigger can be matched against."""
+
+    def __init__(self, data: dict):
+        self.target = str(data.get("target") or "")
+        origin = str(data.get("origin") or "")
+        self.paths: list[str] = []
+        self.methods: set[str] = set()
+        self.headers: list[tuple[str, str]] = []
+        self.tech: list[str] = [str(t) for t in (data.get("technology") or [])]
+        self.params: list[str] = [
+            str(p.get("name", "")) for p in (data.get("parameters") or []) if isinstance(p, dict)
+        ]
+
+        def add(u: str) -> None:
+            u = (u or "").strip()
+            if not u:
+                return
+            if origin and u.startswith(origin):
+                u = u[len(origin):] or "/"
+            self.paths.append(u)
+
+        for page in data.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            add(str(page.get("url") or page.get("path") or ""))
+            for form in page.get("forms") or []:
+                if isinstance(form, dict):
+                    add(str(form.get("action") or ""))
+                    self.methods.add(str(form.get("method") or "GET").upper())
+            for name, value in (page.get("headers") or {}).items():
+                self.headers.append((str(name), str(value)))
+
+        for r in data.get("reachable_paths") or []:
+            add(r.get("path", "") if isinstance(r, dict) else str(r))
+
+        for e in data.get("api_endpoints") or []:
+            s = str(e).strip()
+            if not s:
+                continue
+            head, _, rest = s.partition(" ")
+            if head.upper() in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+                self.methods.add(head.upper())
+                add(rest or s)
+            else:
+                add(s)
+
+        if not self.methods:
+            self.methods.add("GET")
+        self.paths = sorted(set(self.paths))
+
+    @classmethod
+    def load(cls, path: Path) -> "Surface":
+        return cls(json.loads(path.read_text(encoding="utf-8")))
+
+
+def matches(trigger: dict, s: Surface) -> str | None:
+    """Return the matched evidence, or None. The evidence lands in plan.json."""
+    if trigger.get("always") is True:
+        return "every target"
+
+    if "path" in trigger:
+        rx = re.compile(str(trigger["path"]), re.I)
+        for p in s.paths:
+            if rx.search(p):
+                return f"path {p}"
+        return None
+
+    if "header" in trigger:
+        # Two spellings, one meaning: `header: "Name: regex"` and the flow
+        # mapping `header: {Name: regex}`. The registry uses the mapping; the
+        # string form is accepted because it is what the first entries used and
+        # a reader that quietly matched neither is how this went wrong once.
+        spec = trigger["header"]
+        if isinstance(spec, dict):
+            if len(spec) != 1:
+                raise SystemExit(f"triage: a header trigger names one header, got {sorted(spec)!r}")
+            name, pattern = next(iter(spec.items()))
+            name, pattern = str(name), str(pattern)
+        else:
+            name, _, pattern = str(spec).partition(":")
+        rx = re.compile(pattern.strip() or ".", re.I)
+        for hname, hvalue in s.headers:
+            if hname.lower() == name.strip().lower() and rx.search(hvalue):
+                return f"header {hname}: {hvalue}"
+        return None
+
+    if "tech" in trigger:
+        rx = re.compile(str(trigger["tech"]), re.I)
+        for t in s.tech:
+            if rx.search(t):
+                return f"technology {t}"
+        return None
+
+    if "param" in trigger:
+        rx = re.compile(str(trigger["param"]), re.I)
+        for p in s.params:
+            if rx.search(p):
+                return f"parameter {p}"
+        return None
+
+    if "method" in trigger:
+        m = str(trigger["method"]).upper()
+        return f"method {m}" if m in s.methods else None
+
+    raise SystemExit(f"triage: unknown trigger form {sorted(trigger)!r}")
+
+
+# ------------------------------------------------------------------------- plan
+
+
+def order(selected: list[dict]) -> list[dict]:
+    """Topologically order by `needs`, phase order as the tie-break.
+
+    A cycle is reported rather than resolved, because a cycle in the registry is
+    a mistake in a file somebody can fix, and quietly picking an order would
+    hide it until a run behaved oddly at four in the morning.
+    """
+    by_name = {e["name"]: e for e in selected}
+    out: list[dict] = []
+    done: set[str] = set()
+    pending = sorted(
+        selected,
+        key=lambda e: (PHASE_ORDER.index(e["phase"]) if e["phase"] in PHASE_ORDER else 99, e["name"]),
+    )
+    while pending:
+        progressed = False
+        for e in list(pending):
+            unmet = [n for n in e.get("needs", []) if n in by_name and n not in done]
+            if unmet:
+                continue
+            out.append(e)
+            done.add(e["name"])
+            pending.remove(e)
+            progressed = True
+        if not progressed:
+            names = ", ".join(e["name"] for e in pending)
+            raise SystemExit(f"triage: cycle or missing prerequisite among: {names}")
+    return out
+
+
+def build(surface: Surface, registry: list[dict]) -> dict:
+    selected: list[dict] = []
+    rejected: list[dict] = []
+
+    for entry in registry:
+        skill = str(entry.get("skill", ""))
+        name = entry.get("name") or Path(skill).parent.name
+        triggers = entry.get("triggers") or []
+        hits = [m for m in (matches(t, surface) for t in triggers) if m]
+        row = {
+            "name": name,
+            "skill": skill,
+            "phase": str(entry.get("phase", "exploit")),
+            "scripts": [str(x) for x in (entry.get("scripts") or [])],
+            "needs": [str(x) for x in (entry.get("needs") or [])],
+            "why": str(entry.get("why", "")),
+            "evidence": hits[:4],
+        }
+        (selected if hits else rejected).append(row)
+
+    return {
+        "target": surface.target,
+        "selected": order(selected),
+        "not_selected": [
+            {"name": r["name"], "why_not": "no trigger matched this surface"} for r in rejected
+        ],
+        "surface": {
+            "paths": len(surface.paths),
+            "parameters": len(surface.params),
+            "technology": surface.tech,
+            "methods": sorted(surface.methods),
+        },
+    }
+
+
+def render(plan: dict) -> str:
+    out = [f"# Plan for {plan['target']}", ""]
+    out.append(
+        f"{len(plan['selected'])} skills selected from the surface: "
+        f"{plan['surface']['paths']} paths, {plan['surface']['parameters']} parameters."
+    )
+    out.append("")
+    for phase in PHASE_ORDER:
+        rows = [s for s in plan["selected"] if s["phase"] == phase]
+        if not rows:
+            continue
+        out.append(f"## {phase}")
+        out.append("")
+        for s in rows:
+            ev = "; ".join(s["evidence"]) or "selected"
+            out.append(f"- **{s['name']}** — {s['why']}")
+            out.append(f"  - matched: {ev}")
+            out.append(f"  - read: `{s['skill']}`")
+            if s["scripts"]:
+                out.append(f"  - scripts: {', '.join(s['scripts'])}")
+        out.append("")
+    skipped = ", ".join(s["name"] for s in plan["not_selected"])
+    if skipped:
+        out.append(f"Not selected, no trigger matched: {skipped}.")
+        out.append("")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------------- main
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="triage",
+        description="Select the skills a target's mapped surface calls for, deterministically.",
+    )
+    ap.add_argument("dir", nargs="?", help="engagement directory holding surface.json")
+    ap.add_argument("--registry", default=str(REGISTRY), help="skills/registry.yaml")
+    ap.add_argument("--json", action="store_true", help="print plan.json to stdout instead of prose")
+    ap.add_argument("--write", action="store_true", help="write plan.json and plan.md into the directory")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+    if not args.dir:
+        ap.error("an engagement directory is required")
+
+    d = Path(args.dir)
+    sfile = d / "surface.json"
+    if not sfile.exists():
+        print(f"triage: {sfile} does not exist; recon has to run first", file=sys.stderr)
+        return 2
+
+    registry = load_registry(Path(args.registry))
+    plan = build(Surface.load(sfile), registry)
+
+    if args.write:
+        (d / "plan.json").write_text(json.dumps(plan, indent=1) + "\n", encoding="utf-8")
+        (d / "plan.md").write_text(render(plan), encoding="utf-8")
+        print(f"triage: {len(plan['selected'])} skills selected, plan.json and plan.md written")
+    elif args.json:
+        print(json.dumps(plan, indent=1))
+    else:
+        print(render(plan))
+    # A target that selects nothing beyond the always-on skills is a signal: the
+    # surface map is probably thin, and exploitation will be thin with it.
+    return 0 if plan["selected"] else 1
+
+
+# --------------------------------------------------------------------- selftest
+
+SAMPLE_SURFACE = {
+    "target": "http://app.test",
+    "origin": "http://app.test",
+    "pages": [
+        {
+            "url": "http://app.test/login",
+            "headers": {"server": "nginx/1.25.3", "x-powered-by": "Next.js"},
+            "forms": [{"action": "/login", "method": "post"}],
+        }
+    ],
+    "reachable_paths": [{"path": "/graphql"}],
+    "api_endpoints": ["POST /api/transfer", "/.well-known/openid-configuration"],
+    "parameters": [{"name": "redirect_uri"}, {"name": "org_id"}],
+    "technology": ["nginx/1.25.3", "Next.js/15.1.0"],
+}
+
+SAMPLE_REGISTRY = """
+skills:
+  - name: recon
+    skill: skills/recon/SKILL.md
+    phase: recon
+    triggers:
+      - always: true
+    scripts: [probe, cvefeed]
+    why: every engagement maps its surface first
+  - name: auth-session
+    skill: skills/auth-session/SKILL.md
+    phase: scan
+    triggers:
+      - path: /login
+    scripts: [auth-login, session-check]
+    why: a login means every later phase needs a session
+  - name: api-protocols
+    skill: skills/api-protocols/SKILL.md
+    phase: exploit
+    needs: [auth-session]
+    triggers:
+      - path: /graphql
+      - tech: Next\\.js
+    scripts: [apiproto]
+    why: a GraphQL endpoint needs a per-field role matrix
+  - name: tenant-isolation
+    skill: skills/tenant-isolation/SKILL.md
+    phase: exploit
+    needs: [auth-session]
+    triggers:
+      - param: org_id|tenant
+    scripts: [bola-diff]
+    why: an organization identifier is a tenant boundary to test
+  - name: desync
+    skill: skills/desync/SKILL.md
+    phase: exploit
+    triggers:
+      - header: {Via: '.'}
+    scripts: []
+    why: a proxy chain is what makes desync apply at all
+  - name: cached
+    skill: skills/deep-server/SKILL.md
+    phase: exploit
+    triggers:
+      - header: "x-powered-by: Next"
+    scripts: []
+    why: the string spelling of a header trigger still has to work
+"""
+
+
+def selftest() -> int:
+    import tempfile
+
+    fails: list[str] = []
+
+    def check(name: str, got, want) -> None:
+        if got != want:
+            fails.append(f"FAIL {name}\n  got  {got!r}\n  want {want!r}")
+
+    surface = Surface(SAMPLE_SURFACE)
+    check("paths include the form action", "/login" in surface.paths, True)
+    check("paths are origin-stripped", any(p == "/graphql" for p in surface.paths), True)
+    check("api endpoint method is kept", "POST" in surface.methods, True)
+    check("api endpoint path is stripped of its method", "/api/transfer" in surface.paths, True)
+    check("technology is read", "Next.js/15.1.0" in surface.tech, True)
+    check("parameters are read", sorted(surface.params), ["org_id", "redirect_uri"])
+    check("headers are pairs", ("server", "nginx/1.25.3") in surface.headers, True)
+
+    # Both registry readers must agree. The fallback dropping a trigger would
+    # silently stop a skill from ever being selected, which is exactly the bug
+    # this project already shipped once in its scope guard.
+    crude = _crude_registry(SAMPLE_REGISTRY)["skills"]
+    check("fallback reads every entry", len(crude), 6)
+    check("fallback reads an inline list", crude[0]["scripts"], ["probe", "cvefeed"])
+    check("fallback reads a trigger mapping", crude[1]["triggers"], [{"path": "/login"}])
+    check("fallback reads two triggers", len(crude[2]["triggers"]), 2)
+    check("fallback reads a flow mapping", crude[4]["triggers"], [{"header": {"Via": "."}}])
+    check("fallback reads the string spelling", crude[5]["triggers"], [{"header": "x-powered-by: Next"}])
+    check("fallback reads an empty list", crude[4]["scripts"], [])
+    check("fallback reads a boolean", crude[0]["triggers"], [{"always": True}])
+    if yaml is not None:
+        lib = yaml.safe_load(SAMPLE_REGISTRY)["skills"]
+        check("both readers agree", crude, lib)
+
+    plan = build(surface, crude)
+    names = [s["name"] for s in plan["selected"]]
+    check("always-on skill is selected", "recon" in names, True)
+    check("path trigger selects", "auth-session" in names, True)
+    check("param trigger selects", "tenant-isolation" in names, True)
+    check("unmatched header does not select", "desync" in names, False)
+    check("a header trigger as a mapping selects", "cached" in names, True)
+    check(
+        "the mapping trigger names the header it matched",
+        plan["selected"][names.index("cached")]["evidence"],
+        ["header x-powered-by: Next.js"],
+    )
+    check(
+        "needs orders the prerequisite first",
+        names.index("auth-session") < names.index("api-protocols"),
+        True,
+    )
+    check("the evidence names what matched", plan["selected"][names.index("auth-session")]["evidence"],
+          ["path /login"])
+    check("what was not selected is recorded", [r["name"] for r in plan["not_selected"]], ["desync"])
+
+    # The sample above is not the file that ships. Read the real registry with
+    # both readers and require them to agree, because the one bug this guards
+    # against is a disagreement that only shows up on the machine that lacks a
+    # library: a header trigger read as a string matches nothing, and the skill
+    # it selects simply never runs.
+    if REGISTRY.exists():
+        shipped = load_registry(REGISTRY)
+        check("the shipped registry is not empty", len(shipped) > 0, True)
+        for entry in shipped:
+            skill = REPO / str(entry.get("skill", ""))
+            if not skill.exists():
+                fails.append(f"FAIL registry names a skill that does not exist: {entry.get('skill')!r}")
+            for t in entry.get("triggers") or []:
+                try:
+                    matches(t, surface)
+                except SystemExit as e:
+                    fails.append(f"FAIL registry trigger {t!r} is unreadable: {e}")
+        if yaml is not None:
+            check(
+                "both readers agree on the shipped registry",
+                _crude_registry(REGISTRY.read_text(encoding="utf-8"))["skills"],
+                yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))["skills"],
+            )
+
+    # A regex trigger that matches nothing must not select, and an unknown
+    # trigger form must fail loudly rather than be treated as no match.
+    check("no match returns None", matches({"path": "/nowhere"}, surface), None)
+    try:
+        matches({"nonsense": 1}, surface)
+        fails.append("FAIL an unknown trigger form should raise")
+    except SystemExit:
+        pass
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "surface.json").write_text(json.dumps(SAMPLE_SURFACE))
+        (d / "registry.yaml").write_text(SAMPLE_REGISTRY)
+        rc = main([str(d), "--registry", str(d / "registry.yaml"), "--write"])
+        check("writing exits zero", rc, 0)
+        check("plan.json is written", (d / "plan.json").exists(), True)
+        check("plan.md is written", (d / "plan.md").exists(), True)
+        written = json.loads((d / "plan.json").read_text())
+        check("the written plan carries the target", written["target"], "http://app.test")
+        check("plan.md names the skill file", "skills/auth-session/SKILL.md" in (d / "plan.md").read_text(), True)
+
+        empty = d / "empty"
+        empty.mkdir()
+        check("a missing surface map is refused", main([str(empty)]), 2)
+
+    for f in fails:
+        print(f)
+    print(f"triage selftest: {'FAILED' if fails else 'ok'}")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
