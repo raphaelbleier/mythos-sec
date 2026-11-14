@@ -29,7 +29,8 @@ RUN set -eu; \
         github.com/projectdiscovery/interactsh/cmd/interactsh-client@v1.4.1 \
         github.com/lc/gau/v2/cmd/gau@v2.2.4 \
         github.com/tomnomnom/qsreplace@v0.0.3 \
-        github.com/tomnomnom/gf@v0.0.0-20200618134122-dcd4c361f9f5 ; do \
+        github.com/tomnomnom/gf@v0.0.0-20200618134122-dcd4c361f9f5 \
+        github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.4 ; do \
       GOBIN=/out go install "$pkg"; \
     done; \
     # wcvs: upstream tag 2.0.0 has no "v" prefix (invalid for go), so pin the commit.
@@ -97,6 +98,8 @@ RUN set -eu; \
     wrap phpggc "php /opt/phpggc/phpggc"; \
     pin graphw00f https://github.com/dolevf/graphw00f 1fc956a956eeaeea74fd8038780fd118f4876ae9; \
     wrap graphw00f "python3 /opt/graphw00f/main.py"; \
+    pin graphql-cop https://github.com/dolevf/graphql-cop 17560b0827373797ffd7ada19be7d447b7d67662; \
+    wrap graphql-cop "python3 /opt/graphql-cop/graphql-cop.py"; \
     mkdir -p /opt/ysoserial; \
     curl -fsSL -o /opt/ysoserial/ysoserial-all.jar https://github.com/frohoff/ysoserial/releases/download/v0.0.6/ysoserial-all.jar; \
     echo "2c9bddd6a1a4ec66c1078ea97dacb61eb66d1c41aec7b6d21e3c72214ce170f1  /opt/ysoserial/ysoserial-all.jar" | sha256sum -c -; \

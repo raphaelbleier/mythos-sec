@@ -10,6 +10,7 @@ interactsh-client v1.4.1
 gau             v2.2.4
 qsreplace       v0.0.3
 gf              v0.0.0-20200618134122-dcd4c361f9f5
+grpcurl         v1.9.4
 # wcvs = Hackmanit/Web-Cache-Vulnerability-Scanner, built with go install at a commit (upstream tag 2.0.0 lacks the "v" go needs)
 wcvs            75159ea557772447a7760184e1f08e3cc3395090
 # apt (Kali rolling, version = snapshot at build): nmap sqlmap nikto commix whatweb
@@ -24,6 +25,11 @@ jwt_tool        3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b   (ticarpi/jwt_tool, /o
 smuggler.py     2be871e6151ce85167a277fab21c74c851d8b20b   (defparam/smuggler, /opt/smuggler, no release tags)
 phpggc          f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c   (ambionics/phpggc, /opt/phpggc, no release tags)
 graphw00f       1fc956a956eeaeea74fd8038780fd118f4876ae9   (dolevf/graphw00f 1.2.1, /opt/graphw00f; NOT pip: the PyPI name is an inert placeholder)
+graphql-cop     17560b0827373797ffd7ada19be7d447b7d67662   (dolevf/graphql-cop 1.9, /opt/graphql-cop; also not on PyPI.
+#                 Not run by default: 1.9 has no flag to select or deselect tests and runs all
+#                 thirteen unconditionally, five of them denial of service. scripts/apiproto
+#                 implements its eight information-level checks natively and invokes cop only
+#                 under --allow-dos-checks.)
 # jar:
 ysoserial       v0.0.6   (frohoff/ysoserial ysoserial-all.jar, /opt/ysoserial; run via `ysoserial` wrapper), sha256 checked at build
 # nuclei-templates  v10.5.2   (git clone at the tag into ~/nuclei-templates)

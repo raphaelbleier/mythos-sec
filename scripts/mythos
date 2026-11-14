@@ -40,7 +40,8 @@ AUDIT = REPO / "engagements" / "audit.jsonl"
 ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}  # Git Bash must not rewrite /repo
 
 TOOLS = ("nuclei sqlmap dalfox ffuf katana subfinder httpx nikto whatweb arjun "
-         "wafw00f interactsh-client commix gf qsreplace jwt_tool").split()
+         "wafw00f interactsh-client commix gf qsreplace jwt_tool "
+         "smuggler.py wcvs graphw00f graphql-cop grpcurl ysoserial phpggc").split()
 TOOLS_SH = ('for t in %s; do printf "%%-18s " "$t"; if command -v "$t" >/dev/null 2>&1; then '
             '("$t" -version || "$t" --version || echo OK) 2>&1 | head -1; '
             'else echo MISSING; fi; done' % " ".join(TOOLS))
