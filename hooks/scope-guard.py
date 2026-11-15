@@ -182,10 +182,23 @@ def _newest_scope():
 
 
 def _crude_list(text: str, key: str):
+    """The values under `key`, for a machine with no PyYAML installed.
+
+    An inline list has to be split into its items. Appending `[80, 443]` whole
+    made `_ports` give up and return None, which is not a parse error anyone
+    sees: it is a scope file whose port restriction is silently not enforced,
+    so a request to port 8443 on an in-scope host passes without a warning.
+    Found by the traffic selftest on a runner without PyYAML, having passed for
+    months on machines that had it.
+    """
     out, grab = [], False
     for line in text.splitlines():
         if line.strip().startswith(key + ":"):
             inline = line.split(":", 1)[1].strip()
+            if inline.startswith("["):
+                inline = inline.split("]", 1)[0]
+                out += [v.strip().strip("'\"") for v in inline[1:].split(",") if v.strip()]
+                continue
             if inline and not inline.startswith("#"):
                 out.append(inline.strip("'\""))
                 continue
@@ -399,13 +412,17 @@ def check(command: str) -> dict:
     result.update(scope=str(scope_file), in_scope=list(in_list))
     pairs = _from_text(str(command))
     lab = _lab_mode(in_list)
-    exempt = set(PLUMBING) | (LOOPBACK if lab else set())
-    pairs = {(h, p) for h, p in pairs if h not in exempt}
+    # Plumbing is never a target. Loopback in lab mode is an authorized host,
+    # but its port still has to be in the list: a lab scope pinned to one port
+    # is the only thing between this run and the next lab container on the same
+    # machine, and dropping the pair here skipped the port check entirely.
+    pairs = {(h, p) for h, p in pairs if h not in PLUMBING}
+    lab_hosts = LOOPBACK if lab else set()
 
     if not in_list:
         # An empty in_scope authorizes nothing. Reading it as "allow all" is
         # how a half-written scope file becomes a blank cheque.
-        offenders = sorted({h for h, _ in pairs})
+        offenders = sorted({h for h, _ in pairs if h not in lab_hosts})
         if offenders:
             result["offenders"] = offenders
             result["message"] = (
@@ -416,11 +433,12 @@ def check(command: str) -> dict:
                 "    Fill in in_scope before testing anything.")
         return result
 
-    offenders = sorted({h for h, _ in pairs if not in_scope(h, in_list, out_list)})
+    offenders = sorted({h for h, _ in pairs
+                        if h not in lab_hosts and not in_scope(h, in_list, out_list)})
     bad_ports = sorted({f"{h}:{p}" for h, p in pairs
                         if p is not None and ports and p not in ports
                         and h not in offenders
-                        and in_scope(h, in_list, out_list)})
+                        and (h in lab_hosts or in_scope(h, in_list, out_list))})
     if offenders or bad_ports:
         result["offenders"] = offenders + bad_ports
         lines = ["⚠️  MYTHOS SCOPE GUARD: this command targets host(s) that are "
@@ -441,6 +459,23 @@ def _selftest() -> int:
     def eq(got, want, label):
         if got != want:
             failures.append(f"{label}: got {got!r}, want {want!r}")
+
+    # The no-PyYAML path. Every assertion below this one runs through whichever
+    # parser the machine happens to have, so the fallback needs its own, or a
+    # scope file parses differently on a runner than on a laptop and nobody
+    # notices until a port restriction quietly stops being enforced.
+    fixture = ("target: https://app.test\n"
+               "in_scope:\n  - app.test\n  - '*.app.test'\n"
+               "out_of_scope: []\n"
+               "rules:\n  rate_limit_rps: 5\n  ports: [80, 443]\n")
+    eq(_crude_list(fixture, "in_scope"), ["app.test", "*.app.test"], "fallback: block list")
+    eq(_crude_list(fixture, "out_of_scope"), [], "fallback: an empty inline list is empty")
+    eq(_crude_list(fixture, "ports"), ["80", "443"], "fallback: an inline list is split")
+    eq(_ports(_crude_list(fixture, "ports")), {80, 443}, "fallback: ports reach the check")
+    eq(_crude_list("ports: [8443]  # only this one\n", "ports"), ["8443"],
+       "fallback: a trailing comment is not a port")
+    eq(_ports(_crude_list("in_scope:\n  - a.test\n", "ports")), None,
+       "fallback: a scope with no ports restricts none")
 
     # normalization
     eq(norm_host("3232235777"), "192.168.1.1", "decimal IPv4")
@@ -501,6 +536,21 @@ def _selftest() -> int:
         eq(check("curl http://127.0.0.1:5001/")["offenders"], [], "lab loopback")
         eq(check("curl https://evil.test/")["offenders"], ["evil.test"],
            "lab still guards elsewhere")
+
+        # A lab scope that pins a port must still enforce it. Exempting
+        # loopback wholesale dropped the pair before the port check, so the
+        # next lab container on the same machine was reachable from a run
+        # authorized for only one of them.
+        labp = Path(td) / "lab-ports.yaml"
+        labp.write_text("in_scope:\n  - 127.0.0.1\nrules:\n  ports: [5001]\n")
+        os.environ["MYTHOS_SCOPE"] = str(labp)
+        eq(check("curl http://127.0.0.1:5001/")["offenders"], [],
+           "lab: the pinned port passes")
+        eq(check("curl http://127.0.0.1:5024/")["offenders"], ["127.0.0.1:5024"],
+           "lab: an unlisted port is still out of scope")
+        eq(check("curl http://127.0.0.1/")["offenders"], [],
+           "lab: no port in the command is not a port violation")
+        os.environ["MYTHOS_SCOPE"] = str(lab)
 
         # The pin file is what a hook can actually read: an export inside the
         # agent's shell never reaches this process.

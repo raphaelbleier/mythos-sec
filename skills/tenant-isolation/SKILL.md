@@ -11,6 +11,14 @@ filter at one layer exposes a whole customer. Method notes and vectors live in
 BOLA mechanics (owner/other/anon diff, two transports) are in
 **business-logic**; this skill adds the tenant dimension and the layer map.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows an
+organization, workspace, tenant, team, account, company or project identifier
+in a path or a parameter, or one of those names in a session cookie. It drives
+`bola-diff` and `session-check`, and needs **auth-session** first. A tenant
+claim inside a token is not visible to triage: once **auth-session** holds a
+token, read its claims yourself and add the claim to the override vectors in
+step 3.
+
 ## Hard rules
 
 - **Only tenants and identities you created.** Two self-created tenants, A and
@@ -28,7 +36,7 @@ Create tenants A and B by the normal signup flow, then log each owner in with
 **auth-session** (`S=engagements/<dir>/sessions`, roles `userA` = owner of A,
 `userB` = owner of B; add `userA2` if the app has an in-tenant role to test).
 Record tenant id, org slug, subdomain and the user ids of both tenants in
-`scope.yaml` `identities`. Run `session_check.py` before every batch.
+`scope.yaml` `identities`. Run `session-check` before every batch.
 
 ## 2. Seed canaries at every layer
 
@@ -68,7 +76,7 @@ Also: edit the tenant claim in a token or cookie you hold (only on a token
 whose signature the app verifies badly, see **exploit** JWT notes), and a
 cache probe: A and B request the same URL; if A is served B's body, note
 `Age`/`X-Cache`. For bulk triage run
-`bola_diff.py --a $S/userA.headers --b $S/userB.headers --marker <A canary>`
+`bola-diff --a $S/userA.headers --b $S/userB.headers --marker <A canary>`
 against B's object URLs with the roles read as "attacker = A".
 
 ## 4. Cross-tenant write and enumeration

