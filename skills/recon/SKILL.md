@@ -1,6 +1,6 @@
 ---
 name: recon
-description: Reconnaissance playbook for a Mythos web engagement — map the in-scope attack surface with real tools (whatweb, subfinder, httpx, katana, ffuf, gau, arjun) run in the Kali toolbox. Use at the start of an engagement, after scope is set, to enumerate hosts, endpoints, parameters, forms, technologies and exposed files before any active scanning.
+description: Reconnaissance playbook for a Mythos web engagement — map the in-scope attack surface with real tools (whatweb, subfinder, httpx, katana, ffuf, gau, arjun) run in the Kali toolbox, the capped and scope-checked ones through `scripts/tools`. Use at the start of an engagement, after scope is set, to enumerate hosts, endpoints, parameters, forms, technologies and exposed files before any active scanning.
 ---
 
 # Recon — map the attack surface
@@ -155,18 +155,32 @@ to the `cve-deep-dive` skill.
 ## 2. Subdomains + liveness (domain targets only; skip for a single host/IP)
 
 ```
-scripts/mythos subfinder -d <domain> -silent          > engagements/<dir>/recon/subs.txt
-scripts/mythos sh 'cat engagements/<dir>/recon/subs.txt | httpx -silent -title -tech-detect -status-code' \
+scripts/tools hosts <domain> --json   > engagements/<dir>/recon/subs.json
+```
+
+Every name this returns comes back `in_scope: false`. That is not a formality:
+subfinder's answer is "these names exist", not "these names are authorized",
+and `scope.yaml` is the authorization boundary. So **do not send traffic to a
+discovered name.** Report the list to the operator; if they add a name to
+`in_scope` by hand, it becomes a target on the next run. There is no flag that
+widens scope and `scripts/tools` never pipes a discovered name into a tool that
+sends.
+
+For the names scope.yaml *already* authorizes, liveness is:
+
+```
+scripts/mythos sh 'cat engagements/<dir>/recon/live-candidates.txt | httpx -silent -title -tech-detect -status-code' \
     > engagements/<dir>/recon/live.txt
 ```
 
-Keep only in-scope subdomains (check each against `scope.yaml`).
+where `live-candidates.txt` holds only names with `"in_scope": true`.
 
 ## 3. Crawl — links, forms, parameters, JS endpoints
 
 ```
 scripts/mythos katana -u <URL> -jc -kf all -d 3 -silent  > engagements/<dir>/recon/urls.txt
-scripts/mythos sh 'gau --threads 4 <host> 2>/dev/null | anew engagements/<dir>/recon/urls.txt' || true
+scripts/mythos sh 'gau --threads 4 <host> 2>/dev/null >> engagements/<dir>/recon/urls.txt; \
+  sort -u -o engagements/<dir>/recon/urls.txt engagements/<dir>/recon/urls.txt' || true
 ```
 
 `katana -jc` parses JavaScript for endpoints, which is what an SPA needs. Where
@@ -176,18 +190,29 @@ rendered DOM and request log show the `fetch`/XHR endpoints curl never sees.
 ## 4. Parameter discovery on interesting endpoints
 
 ```
-scripts/mythos arjun -u '<URL-with-endpoint>' -m GET          # and -m POST
+scripts/tools params '<URL-with-endpoint>' -n 300 --json
 ```
 
 Use on endpoints with no obvious params but dynamic behaviour. Capture any
-hidden parameters.
+hidden parameters. The wrapper caps the name list at `-n`, passes arjun's
+`--rate-limit` from `rules.rate_limit_rps`, and checks the URL against
+`scope.yaml` before arjun starts. A hidden parameter is a reachable input, not
+a finding — test it like any other.
 
 ## 5. Content / sensitive-path discovery
 
 ```
-scripts/mythos ffuf -u '<URL>/FUZZ' -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
-    -mc 200,204,301,302,307,401,403,405 -fs 0 -t 40 -ac -s
+scripts/tools fuzz '<URL>/FUZZ' -n 300 --json
 ```
+
+`scripts/tools fuzz` is the wrapper form and the one to use: it checks the
+destination against `scope.yaml` before ffuf starts, derives `-rate` and the
+thread count from `rules.rate_limit_rps`, cuts the wordlist to `-n` entries, and
+turns the report into rows where only a *sensitive* path name is a candidate and
+an ordinary 200 is surface. Raise `-n` or pass `-w` for a bigger list when the
+surface earns it; the default is small so this can never sweep. Bare
+`scripts/mythos ffuf ...` still works and is unpaced and uncapped — that form
+used `raft-medium` (30k requests) with `-t 40` and no `-rate` at all.
 
 Then probe the classic exposures directly (don't fuzz what you can just GET):
 `/.git/HEAD`, `/.env`, `/.git/config`, `/backup.zip`, `/.DS_Store`,

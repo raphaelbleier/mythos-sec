@@ -65,6 +65,23 @@ scripts/sourcemap <source path> --json > engagements/<dir>/source/map.json
 scripts/sourcemap <source path>                      # the readable version
 ```
 
+`scripts/sourcemap`'s `config` section finds a credential written as
+`name = "value"`. That misses the shape that leaks most often: a high-entropy
+provider token assigned to an innocuous name, or one that is gone from the
+working tree and still in the history. So run the dedicated pass too — it is
+offline, it sends nothing, and the tree has to be inside the repository because
+that is all the toolbox can see:
+
+```
+scripts/tools secrets <source path under the repo> --json
+scripts/tools secrets <source path under the repo> --history   # git history too
+```
+
+Every hit is a `candidate` and a **finding about the repository**, never a
+credential to use: `rules.allow_secret_verification` stays false and the
+wrapper prints only the first four characters of the match. Do not
+authenticate with it; whether it is still live is the program's question.
+
 Then correlate with the live surface, which is the pass that pays:
 
 ```

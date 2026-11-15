@@ -98,7 +98,7 @@ C=$(sed -n 's/^Cookie: //p' $S/userA.headers)              # raw cookie string
 | ffuf | `-H "Cookie: $C"` / `-H "Authorization: ..."` | repeat `-H` per header |
 | sqlmap | `--cookie "$C"` and/or `-H "Authorization: ..."` | or a saved raw request with `-r req.txt` |
 | dalfox | `--cookie "$C"` and `-H "Authorization: ..."` | the image pins v2 (`dalfox url ...`); v3 (Rust) uses `dalfox scan ...`. Run `scripts/mythos dalfox --help` and use the flags it lists |
-| jwt_tool | `-t <URL> -rc "$C"` (cookie) or `-rh "Authorization: Bearer <JWT>"` | then `-M pb` / `-X a` etc. on the authed request |
+| jwt_tool | `-t <URL> -rc "$C"` (cookie) or `-rh "Authorization: Bearer <JWT>"` | then `-M pb` / `-X a` etc. on the authed request. For the token itself prefer `scripts/tools jwt <token>` (offline) or `scripts/tools jwt <token> --target <URL> --canary "<string only an authed response contains>"`: scope-checked, paced from `rules.rate_limit_rps`, and its verdicts stay candidates. `--canary` is not optional there -- without `-cv` jwt_tool prompts on stdin and the exec dies |
 | curl | `eval curl -s $H <URL>` | ad-hoc checks |
 | the `browser` tool | load `$S/userA.state.json` into the page before navigating; it drives one context, so switch roles in sequence | a second role needs its own navigation, not a second context |
 | bola-diff, race, xss-verify | `--a/--b/--headers $S/<role>.headers`, `--state $S/<role>.state.json` | see business-logic and stored-xss-oast |
