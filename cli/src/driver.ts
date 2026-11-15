@@ -713,6 +713,9 @@ export function verdictState(raw: string, writtenBy: "exploit" | "validate" = "v
   const w = raw.trim().toLowerCase();
   if (w === "confirmed") return writtenBy === "exploit" ? "candidate" : "confirmed";
   if (w === "candidate" || w === "rejected" || w === "tested" || w === "skipped") return w;
+  if (w === "inconclusive") return "inconclusive";
+  // Anything else is a word the prompt did not offer. `tested` is the cautious
+  // reading for a worker that sent requests; it must never be `confirmed`.
   return "tested";
 }
 

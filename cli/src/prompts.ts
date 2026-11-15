@@ -23,6 +23,19 @@ it. Prove an access-control flaw by reading, or by creating your own object and
 acting on that one. Where a class cannot be proven safely, report it as
 unconfirmed and say what you would have needed.
 
+Three classes end before the last step, and the tools enforce it rather than
+trusting you to remember. A dangling name or a free package name is proven by
+the reference plus the provider's own unclaimed response — you never claim or
+publish it, because on a real engagement that decision is the operator's.
+A cache is poisoned only on a key you isolated with a cache buster, with an
+inert marker, and the entry is busted and the bust verified before the finding
+is written; if \`scripts/cache\` exits 5 the cleanup failed and the key has to
+be disclosed to the programme, because that cache serves the target's real
+users. A race is run only against an object you created in this run, never
+against a destructive action, and one success is not a finding: the verdict is
+a hit rate with its interval against a sequential control that must come out
+clean.
+
 Exploitation is the work. This is a bug-bounty suite: proving a finding is the
 job, not an exception to it. There is no request ceiling. Honour
 \`rules.rate_limit_rps\`.
@@ -240,12 +253,12 @@ has a wall clock, and an endpoint you investigated without recording the outcome
 is indistinguishable from one nobody looked at: the driver will hand it to
 another worker and the budget pays for the work twice.
 
-A verdict is one of three things, and you record it by writing
+A verdict is one of four things, and you record it by writing
 \`verdicts/<slug>.md\` with the \`files\` tool, where <slug> is the endpoint with
 non-alphanumeric characters replaced by dashes:
 
     endpoint: <the endpoint exactly as listed above>
-    state: candidate | tested | skipped
+    state: candidate | tested | skipped | inconclusive
     note: <one or two sentences>
 
 You cannot write \`confirmed\`. That word belongs to the validate phase, which
@@ -286,6 +299,12 @@ confirming its own work measures its own optimism.
   skipped — you deliberately did not test it. Say why: out of scope, needs an
     identity you could not get, only provable destructively, no budget left.
     "Did not get to it" is a legitimate reason and far better than silence.
+  inconclusive — you sent the requests and no oracle could decide it. An empty
+    200 for another user's object with no owner view to compare against, a
+    refusal that may be a policy or may be a missing route, a stochastic result
+    whose interval straddles the control. Name the oracle you lacked. This is a
+    reportable verdict, not a failure, and it is the honest answer where
+    \`tested\` would claim more than you know.
 
 Do not invent endpoints and do not write a verdict for one you were not given.
 

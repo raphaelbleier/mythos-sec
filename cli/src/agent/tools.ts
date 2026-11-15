@@ -236,14 +236,66 @@ export function buildTools(ctx: ToolContext) {
     },
     authflows: {
       what:
-        "exercise the authentication flows per role: OAuth and OIDC, SAML, reset, MFA, session " +
-        "fixation.",
+        "exercise the authentication flows an app runs on its own: password reset, MFA, session " +
+        "fixation, email change, WebAuthn. Federation lives in `federation`, not here.",
       reaches: true,
     },
     ssrfprobe: {
       what:
         "send SSRF candidates at in-scope destinations and the lab metadata emulator, and judge " +
         "each callback.",
+      reaches: true,
+    },
+    supplychain: {
+      what:
+        "dependency confusion: package names and registry hosts from bundles, source maps, " +
+        "reachable lockfiles and leaked .npmrc, then read-only claimability lookups. Never " +
+        "publishes a name.",
+      reaches: true,
+    },
+    takeover: {
+      what:
+        "dangling references: CNAME/NS to an unclaimed service, lame delegation, buckets and " +
+        "PaaS hosts in HTML/CSS/JS/CSP/source maps, dead script hosts with their SRI coverage, " +
+        "dead CSP report-uri, SPF include: and OAuth redirect entries. Never claims a name.",
+      reaches: true,
+    },
+    sbom: {
+      what:
+        "component inventory from bundle markers, source maps and headers; CycloneDX 1.6 " +
+        "with per-row evidence; the cvefeed hand-off; SRI coverage; SBOM diff.",
+      reaches: true,
+    },
+    cloudexp: {
+      what:
+        "the cloud surface the page shows: bucket and container permissions, presigned " +
+        "URL hygiene, serverless front doors and authorizer gaps, unauthenticated " +
+        "kubelet/etcd/Docker API, and which client-side cloud key is public by design. " +
+        "Read-only: GET/HEAD/OPTIONS only, and every destination is scope-checked.",
+      reaches: true,
+    },
+    cache: {
+      what:
+        "web cache poisoning, deception, fat GET and edge/origin normalization: discover " +
+        "the cache key, poison only an isolated buster key with an inert marker, prove a " +
+        "second client was served it, then bust the entry and verify it is gone.",
+      reaches: true,
+    },
+    federation: {
+      what:
+        "SSO federation: SAML assertion mutations (unsigned, XSW1-XSW8, NameID comment " +
+        "truncation, audience and time bindings, replay, DTD/XXE), OIDC redirect_uri and " +
+        "flow binding, code redemption, id_token confusion, and account linking. Own " +
+        "identities only; --own is required.",
+      reaches: true,
+    },
+    tools: {
+      what:
+        "run a toolbox binary with the scope check, the rate limit and a cap applied, and " +
+        "get rows back instead of tool text: 'fuzz' ffuf content discovery, 'params' arjun, " +
+        "'crlf' crlfuzz header injection, 'jwt' jwt_tool (offline unless --target), " +
+        "'secrets' gitleaks over a tree, 'gadget' ysoserial/phpggc payloads (offline), " +
+        "'hosts' subfinder with every name marked out of scope. Nothing it reports is confirmed.",
       reaches: true,
     },
     aiplatform: {
@@ -282,9 +334,9 @@ export function buildTools(ctx: ToolContext) {
     },
     race: {
       what:
-        "race a one-shot resource you created yourself: a sequential wave against a parallel " +
-        "wave, judged by the authoritative state.",
-      path: "skills/business-logic/scripts/race.py",
+        "race a once-only action on an object you own: a sequential control against a " +
+        "parallel wave or an HTTP/2 single-packet burst, judged by the authoritative state " +
+        "read back as the owner, reported as a hit rate with a Wilson interval.",
       reaches: true,
     },
     "xss-verify": {
@@ -323,9 +375,11 @@ export function buildTools(ctx: ToolContext) {
       // A script that reaches the target is vetted like any request. Every URL
       // in the arguments is checked, not only the first: these scripts take a
       // base, a check URL and a state URL, and a slip in the second one is
-      // still a slip.
+      // still a slip. A URL also need not start the argument — `--map
+      // host=https://...` and `--registry-base npm=https://...` carry one in
+      // the middle, and matching only the start skipped those destinations.
       if (entry.reaches) {
-        const urls = args.filter((a) => a.startsWith("http"));
+        const urls = argUrls(args);
         if (urls.length) {
           try {
             await ctx.guards.vet(`${name} ${urls.join(" ")}`);
@@ -616,6 +670,16 @@ export function buildTools(ctx: ToolContext) {
 }
 
 /** Top-level keys and how much is under each, so the agent can see the map's size. */
+/**
+ * Every URL anywhere in a script's arguments, so the guard can vet each
+ * destination. A URL need not start its argument: `--map host=https://...`
+ * and `--registry-base npm=https://...` carry one in the middle, and matching
+ * only the start skipped those hosts entirely.
+ */
+export function argUrls(args: string[]): string[] {
+  return args.flatMap((a) => a.match(/https?:\/\/[^\s'"]+/g) ?? []);
+}
+
 export function summariseJson(text: string): string {
   try {
     const v = JSON.parse(text) as unknown;

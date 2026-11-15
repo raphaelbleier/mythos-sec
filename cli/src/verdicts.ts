@@ -16,6 +16,7 @@
  *   rejected   a validator could not reproduce it
  *   tested     tested against the classes the surface suggests, nothing proven
  *   skipped    deliberately not tested, with a reason a reader can check
+ *   inconclusive  tested, but no oracle could decide it either way
  *
  * The split between `candidate` and `confirmed` is deliberate and it is the one
  * thing here that is not about coverage. An agent that confirms its own finding
@@ -38,7 +39,13 @@ import { REPO, script } from "./paths.js";
 
 const run = promisify(execFile);
 
-export type VerdictState = "candidate" | "confirmed" | "rejected" | "tested" | "skipped";
+export type VerdictState =
+  | "candidate"
+  | "confirmed"
+  | "rejected"
+  | "tested"
+  | "skipped"
+  | "inconclusive";
 
 export const VERDICT_STATES: VerdictState[] = [
   "candidate",
@@ -46,6 +53,7 @@ export const VERDICT_STATES: VerdictState[] = [
   "rejected",
   "tested",
   "skipped",
+  "inconclusive",
 ];
 
 /** A candidate is an open question, not an outcome: validate still owes it one. */
@@ -167,6 +175,7 @@ export class Ledger {
       rejected: 0,
       tested: 0,
       skipped: 0,
+      inconclusive: 0,
     };
     for (const r of this.rows.values()) s[r.state] += 1;
     return s;
