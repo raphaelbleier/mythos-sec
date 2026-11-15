@@ -120,21 +120,26 @@ Only on a **one-shot resource the agent created** (own coupon, own gift card,
 own small balance, own invite), N <= 20, 2 repeats:
 
 ```
-scripts/mythos python3 /repo/skills/business-logic/scripts/race.py --headers $S/userA.headers \
-  --method POST --url <redeem URL> --data '{"code":"{{R}}"}' \
-  --setup '<shell cmd that creates a fresh code and prints it>' \
-  --success-regex '<what a success looks like>' --state-url <balance/usage URL> \
-  --n 10 --repeats 2 --out engagements/<dir>/scan/race.jsonl
+scripts/race limit --url <redeem URL> --method POST --data '{"code":"{{R}}"}' \
+  --setup-url <coupon-create URL> --setup-field code \
+  --owner-url <the endpoint that lists what you own> \
+  --state-url <balance/usage URL> --count-regex '"redemptions":\s*(\d+)' \
+  --header 'Authorization: Bearer <own token>' --n 8 --repeats 6 --json
 ```
 
-Each repeat runs a sequential wave (a correct app allows exactly 1) and a
-parallel wave on a fresh resource. Engine: HTTP/2 single-packet via h2spacex if
-installed and the target is https (Kettle 2023: 4-10x more effective than
-last-byte sync), else the stdlib last-byte-sync threads. `reproduced` =
-sequential 1 success, parallel > 1, in both repeats, **and** the authoritative
-state (`state_before`/`state_after` in the JSONL) moved by more than one unit.
-Simple cases can also use a nuclei template with `race: true` + `race_count`.
-Never race a real user's resource or a payment that leaves the lab.
+Each repeat runs a parallel wave and a sequential control of the same N on a
+fresh resource, and reads the authoritative state back **as the owner** after
+each one. A race is stochastic, so one success is not a finding: the verdict
+rests on the hit rate over the repeats with its confidence interval, and it
+comes back `inconclusive` when that interval straddles the control's. The
+control overrunning at all means the test is broken, not that the app is.
+`--engine h2` is the single-packet attack (Kettle 2023: 4-10x more effective
+than last-byte sync); `scripts/race single-packet` is the same thing with the
+h2 defaults, and `toctou` races a two-step gap instead of one action. The
+script refuses an object that is not in your `--owner-url` listing and refuses
+to race a destructive action on anything it did not create in this run.
+`skills/race-conditions` is the full playbook. Never race a real user's
+resource or a payment that leaves the lab.
 
 ## 5. Workflow and price manipulation
 
