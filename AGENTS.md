@@ -205,6 +205,14 @@ models without them did not. So reach for these before writing a paragraph.
 | `authflows` | reset poisoning, MFA bypass, session fixation and rotation, email change, passkeys through the CDP virtual authenticator. The agent's own accounts only |
 | `ssrfprobe` | what an SSRF actually controls, the cloud metadata surfaces with their real header and method requirements, blind SSRF through OAST, DNS rebinding |
 | `aiplatform` | AI platform version fingerprints, MCP `tools/list` diffing and descriptor scanning, a prompt-injection runner with per-variant controls and interval reporting, denial-of-wallet capability checks |
+| `supplychain` | internal package names and registry hosts from bundles, source maps, reachable lockfiles and a leaked `.npmrc`; read-only claimability. It never publishes or reserves a name |
+| `takeover` | dangling CNAME and NS, lame delegation, buckets and PaaS hosts in HTML/CSS/JS/CSP/source maps, dead script hosts with their SRI coverage, dead `report-uri` and SPF `include:`. It never claims a name |
+| `sbom` | component inventory from bundle markers, source maps and headers, CycloneDX 1.6 with per-row evidence and a confidence per marker, the `cvefeed` hand-off, SRI coverage, SBOM diff |
+| `cloudexp` | bucket and container permissions read from policy rather than by writing, presigned-URL hygiene, serverless front doors and authorizer gaps, unauthenticated kubelet, etcd and Docker API, which client-side cloud key is public by design |
+| `cache` | cache-key discovery, poisoning on an isolated buster key with an inert marker and a verified cleanup, cache deception, fat GET, edge-versus-origin normalization |
+| `race` | limit overrun and TOCTOU on an object the agent owns, HTTP/2 single-packet bursts with hand-built frames, every hit rate as an interval against a sequential control |
+| `federation` | SAML signature wrapping XSW1-XSW8, NameID comment truncation, audience and time bindings, replay; OIDC `redirect_uri`, `state`, PKCE, `id_token` confusion; account linking. The agent's own identities only |
+| `tools` | a toolbox binary behind the scope check, the rate limit and a cap, returning rows instead of tool text: ffuf, arjun, crlfuzz, jwt_tool, gitleaks, ysoserial and phpggc payloads offline, subfinder with every name marked out of scope |
 
 Every one has a `--selftest` that needs no network. Run it after changing one.
 
@@ -212,6 +220,13 @@ Four of them emit rather than act: `clientside protopollute` and `postmessage`,
 and `authflows webauthn`, produce the init script or the CDP call for the
 `browser` tool to run and then grade what comes back through `--judge`. Python
 drives no browser in this repository.
+
+Three refuse the step that would turn their candidate into a claim, and the
+refusal is in code rather than in prose: `takeover` never claims a name,
+`supplychain` never publishes one, and `cache` refuses to poison a key it
+cannot isolate. Claiming a dangling resource or a free package name is the
+operator's decision on a real engagement, and poisoning a shared cache reaches
+that target's real users.
 
 ## Proof standard
 

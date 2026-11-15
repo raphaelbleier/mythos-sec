@@ -67,6 +67,9 @@ jobs:
       - name: CLI selftest
         run: node cli/dist/selftest.js
 
+      - name: Web interface selftest
+        run: node cli/dist/web/selftest.js
+
       # Listed here as well as inside scripts/selftest.sh, so a failure names the
       # script in the job log instead of only the wrapper.
       - name: Script and guard selftests
@@ -75,7 +78,9 @@ jobs:
                    scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
                    scripts/lessons-record scripts/models scripts/triage scripts/evidence \
                    scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
-                   scripts/aiplatform \
+                   scripts/aiplatform scripts/supplychain scripts/takeover scripts/sbom \
+                   scripts/race scripts/cache scripts/federation scripts/cloudexp \
+                   scripts/tools \
                    hooks/scope-guard.py hooks/budget-guard.py; do
             echo "== $s"
             python3 "$s" --selftest
@@ -91,7 +96,9 @@ jobs:
           mkdir -p /tmp/noyaml
           printf 'raise ImportError("blocked for this check")\n' > /tmp/noyaml/yaml.py
           for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
-                   scripts/triage scripts/apiproto; do
+                   scripts/triage scripts/apiproto scripts/supplychain scripts/takeover \
+                   scripts/sbom scripts/race scripts/cache scripts/federation \
+                   scripts/cloudexp scripts/tools; do
             echo "== $s (no PyYAML)"
             PYTHONPATH=/tmp/noyaml python3 "$s" --selftest
           done

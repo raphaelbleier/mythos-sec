@@ -30,3 +30,4 @@ nuclei-output/
 # cli build output and dependencies
 cli/node_modules/
 cli/dist/
+.scratch/

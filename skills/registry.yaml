@@ -68,7 +68,7 @@ skills:
     skill: skills/toolbox/SKILL.md
     phase: setup
     triggers: []
-    scripts: []
+    scripts: [tools]
     needs: []
     why: How to run a tool in the Kali container; read on demand, in every phase.
 
@@ -102,7 +102,7 @@ skills:
     phase: recon
     triggers:
       - always: true
-    scripts: [probe, cvefeed, lessons, triage]
+    scripts: [probe, cvefeed, lessons, triage, tools]
     needs: []
     why: Every run starts by mapping the surface every later phase counts from.
 
@@ -112,7 +112,7 @@ skills:
     triggers:
       - path: '(?i)/\.git/config$'
       - path: '(?i)\.js\.map$'
-    scripts: [sourcemap, probe, verify]
+    scripts: [sourcemap, probe, verify, tools]
     needs: []
     why: A reachable .git or a published source map hands over the code the routes and sinks come from.
 
@@ -122,7 +122,7 @@ skills:
     phase: scan
     triggers:
       - always: true
-    scripts: [verify]
+    scripts: [verify, tools]
     needs: []
     why: The per-parameter canary pass over the whole surface map; every target gets one.
 
@@ -135,7 +135,7 @@ skills:
       - header: {Set-Cookie: '(?i)\b(session|sess|sid|jsessionid|phpsessid|asp\.net_sessionid|connect\.sid|_session|csrftoken|remember_?token)\b'}
       - header: {Set-Cookie: '(?i)=ey[A-Za-z0-9_-]{8,}\.'}
       - header: {WWW-Authenticate: '.'}
-    scripts: [auth-login, session-check]
+    scripts: [auth-login, session-check, tools]
     needs: []
     why: A login means the unauthenticated map is the lobby; two accounts of the same role are what an authorization test needs.
 
@@ -185,6 +185,65 @@ skills:
     scripts: [clientside, sourcemap]
     needs: []
     why: A bundle carries the routes, the parameter names and sometimes the secrets that no response body shows.
+
+  - name: supply-chain
+    skill: skills/supply-chain/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)/(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock)$'
+      - path: '(?i)/(composer\.(json|lock)|requirements\.txt|Pipfile(\.lock)?|pom\.xml|Gemfile(\.lock)?|Cargo\.toml)$'
+      - path: '(?i)/(\.npmrc|\.yarnrc(\.yml)?|pip\.conf|nuget\.config|packages\.config)$'
+      - path: '(?i)\.js\.map$'
+      - path: '(?i)/(_next/static|static/js|assets)/.*\.m?js$'
+    scripts: [supplychain]
+    needs: []
+    why: A reachable lockfile, a published source map or a leaked .npmrc hands over the internal package names a public registry may still be free to serve.
+
+  - name: takeover
+    skill: skills/takeover/SKILL.md
+    phase: scan
+    triggers:
+      - header: {Content-Security-Policy: '.'}
+      - header: {Set-Cookie: '(?i);\s*domain='}
+      - header: {Access-Control-Allow-Origin: '(?i)^https?://'}
+      - path: '(?i)\.js\.map$'
+      - path: '(?i)(/_next/static/|/static/js/|/assets/.*\.js|[.-]chunk\.js|bundle\.js)$'
+    scripts: [takeover, probe]
+    needs: []
+    why: A reference the target still serves to a name nobody owns hands a third party script execution, mail, reports or authorization codes under the target's own name.
+
+  - name: supply-chain-inventory
+    skill: skills/supply-chain-inventory/SKILL.md
+    phase: scan
+    triggers:
+      - tech: '(?i)^[a-z][\w.\-]*/\d+\.\d+'
+      - header: {Server: '(?i)[a-z][\w.\-]+/\d+\.\d+'}
+      - header: {X-Powered-By: '.'}
+      - header: {X-Aspnet-Version: '.'}
+      - header: {X-Generator: '.'}
+      - path: '(?i)\.js\.map$'
+    scripts: [sbom, cvefeed, probe]
+    needs: []
+    why: A target that serves third-party code or names a product version publishes its own dependency list, and a version match is the aim point the CVE feed ranks.
+
+  - name: cloud-exposure
+    skill: skills/cloud-exposure/SKILL.md
+    phase: scan
+    triggers:
+      - path: '(?i)\.s3[.-][a-z0-9-]+\.amazonaws\.com|\.s3\.amazonaws\.com'
+      - path: '(?i)(storage\.googleapis\.com|storage\.cloud\.google\.com|\.blob\.core\.windows\.net|\.r2\.cloudflarestorage\.com|\.digitaloceanspaces\.com)'
+      - path: '(?i)\.(lambda-url\.[a-z0-9-]+\.on\.aws|execute-api\.[a-z0-9-]+\.amazonaws\.com|cloudfunctions\.net|run\.app|workers\.dev)'
+      - path: '(?i)\.azurewebsites\.net/api/'
+      - path: '(?i)(firebaseio\.com|firebasestorage\.googleapis\.com|\.supabase\.co)'
+      - path: '(?i)X-Amz-Signature=|X-Goog-Signature=|[?&]sv=20\d\d-\d\d-\d\d'
+      - header: {Server: '(?i)(AmazonS3|Windows-Azure-Blob|UploadServer|cloudflare-r2)'}
+      - header: {X-Amz-Request-Id: '.'}
+      - header: {X-Amzn-Requestid: '.'}
+      - header: {X-Ms-Request-Id: '.'}
+      - tech: '(?i)(firebase|supabase|amplify|amazon s3|azure|cloudflare)'
+    scripts: [cloudexp, clientside, ssrfprobe]
+    needs: []
+    why: A page that names a bucket, a function URL or a presigned URL has already told you where the cloud account is; what it permits is a read-only question with a provider-specific answer.
 
   - name: cve-deep-dive
     skill: skills/cve-deep-dive/SKILL.md
@@ -285,7 +344,7 @@ skills:
       - path: '(?i)\.(xml|xsd|wsdl|svg|docx|xlsx|pptx)$'
       - param: '(?i)^(xml|soap|wsdl|__viewstate|viewstate|serialized|payload|template|redirect_?url|next|return_?to)$'
       - tech: '(?i)(tomcat|jboss|wildfly|jetty|weblogic|websphere|coldfusion|iis|asp\.net)'
-    scripts: [ssrfprobe, verify]
+    scripts: [ssrfprobe, verify, tools]
     needs: []
     why: A proxy chain, a cache or an XML parser is where a single malformed message reaches a tier that was never meant to see it.
 
@@ -298,6 +357,51 @@ skills:
     scripts: [evidence]
     needs: []
     why: Desync needs two tiers that disagree about where a request ends, so a proxy chain is the entire precondition.
+
+  - name: cache-poisoning
+    skill: skills/cache-poisoning/SKILL.md
+    phase: exploit
+    triggers:
+      - header: {X-Cache: '.'}
+      - header: {Age: '.'}
+      - header: {Via: '.'}
+      - header: {Server: '(?i)(cloudflare|akamai|akamaighost|varnish|fastly|cloudfront|awselb|elb|squid|apache[- ]traffic[- ]server|ats/|nginx|openresty|tengine)'}
+      - path: '(?i)/(account|profile|settings|dashboard|me|billing|orders?)(/|$)'
+    scripts: [cache, verify, evidence]
+    needs: []
+    why: A cache in front of the origin is the one class where the proof itself reaches real users, so it gets its own skill with the isolation and cleanup rules in code.
+
+  - name: race-conditions
+    skill: skills/race-conditions/SKILL.md
+    phase: exploit
+    triggers:
+      - path: '(?i)/(redeem|redemptions?|coupons?|vouchers?|promo(tions?|codes?)?|discounts?|gift-?cards?)(/|$)'
+      - path: '(?i)/(invites?|invitations?|referrals?|signup-?bonus|claims?|votes?|likes?|follow)(/|$)'
+      - path: '(?i)/(withdraw(als?)?|transfers?|payouts?|topup|top-up|purchase|checkout|apply-?coupon)(/|$)'
+      - path: '(?i)/(confirm|approve|finali[sz]e|commit|reserve|book(ing)?|cancel)(/|$)'
+      - path: '(?i)/(2fa|mfa|otp|verify(-?code)?|resend)(/|$)'
+      - param: '(?i)^(coupon|voucher|promo|promo_?code|discount_?code|gift_?card|invite_?code|referral_?code|otp|code)$'
+      - param: '(?i)^(quantity|qty|amount|balance|credits?)$'
+    scripts: [race, session-check, traffic, evidence]
+    needs: [auth-session]
+    why: A once-only action and a two-step confirm are the whole precondition for a limit overrun and a TOCTOU; both need an identity first.
+
+  - name: sso-federation
+    skill: skills/sso-federation/SKILL.md
+    phase: exploit
+    triggers:
+      - path: '(?i)/(saml2?|sso)/(acs|assertion|consume|callback|login|metadata|sls|slo)(/|$)'
+      - path: '(?i)/(Shibboleth\.sso|adfs/ls|saml/SSO|simplesaml|FederationMetadata)(/|$)'
+      - path: '(?i)/FederationMetadata/\d{4}-\d{2}/FederationMetadata\.xml$'
+      - path: '(?i)/(auth|users?|account|login)/(saml|oidc|openid|oauth2?)(/|$)'
+      - path: '(?i)/(oidc|openid|oauth2?)/(callback|cb|redirect|signin|complete)(/|$)'
+      - path: '(?i)/(signin-oidc|signin-google|signin-microsoft|auth/[a-z0-9_-]+/callback)(/|$)'
+      - path: '(?i)/(connections?|identit(y|ies)|linked[-_]?accounts?|social|providers?)(/|$)'
+      - param: '(?i)^(SAMLResponse|SAMLRequest|RelayState|id_token|id_token_hint|provider|idp|connection)$'
+      - header: {Location: '(?i)[?&](SAMLRequest|id_token|nonce)='}
+    scripts: [federation]
+    needs: [auth-session]
+    why: A federated login moves the identity decision to a second party, and the only question that matters is which element of its document the relying party actually reads.
 
   # ---------------------------------------------------------------- report
   - name: report

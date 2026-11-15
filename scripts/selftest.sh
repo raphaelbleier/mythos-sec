@@ -52,7 +52,8 @@ for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/
          scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
          scripts/lessons-record scripts/models scripts/triage scripts/evidence \
          scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
-         scripts/aiplatform \
+         scripts/aiplatform scripts/supplychain scripts/takeover scripts/sbom \
+         scripts/race scripts/cache scripts/federation scripts/cloudexp scripts/tools \
          hooks/scope-guard.py hooks/budget-guard.py; do
   run "$s --selftest" python3 "$s" --selftest
 done
@@ -63,7 +64,9 @@ done
 NOYAML=$(mktemp -d)
 printf 'raise ImportError("blocked for this check")\n' > "$NOYAML/yaml.py"
 for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
-         scripts/triage scripts/apiproto; do
+         scripts/triage scripts/apiproto scripts/supplychain scripts/takeover \
+         scripts/sbom scripts/race scripts/cache scripts/federation scripts/cloudexp \
+         scripts/tools; do
   run "$s --selftest (no PyYAML)" env PYTHONPATH="$NOYAML" python3 "$s" --selftest
 done
 rm -rf "$NOYAML"
@@ -82,6 +85,14 @@ if [ -f cli/dist/selftest.js ]; then
   run "cli/dist/selftest.js" node cli/dist/selftest.js
 else
   skip "cli selftest: no cli/dist (npm run build --prefix cli)"
+fi
+# The web interface serves engagement data and renders bytes a target chose, so
+# its checks are the token, the loopback bind, path traversal, the CSP and a
+# captured payload staying inert.
+if [ -f cli/dist/web/selftest.js ]; then
+  run "cli/dist/web/selftest.js" node cli/dist/web/selftest.js
+else
+  skip "web selftest: no cli/dist (npm run build --prefix cli)"
 fi
 
 echo
