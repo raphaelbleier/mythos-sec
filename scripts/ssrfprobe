@@ -435,6 +435,21 @@ METADATA = {
         "headers": {}, "lab": None,
         "requires": "nothing, where the hardened mode is off",
         "defeated_by": "hardened mode (token required, like IMDSv2)"},
+    # Added for scripts/cloudexp, which reads this table rather than keeping a
+    # second copy of it. Both are link-local like AWS and Azure.
+    "oracle": {
+        "host": "169.254.169.254", "method": "GET", "path": "/opc/v2/instance/",
+        "headers": {"Authorization": "Bearer Oracle"}, "lab": None,
+        "requires": "header control: the v2 endpoint rejects every request "
+                    "without Authorization: Bearer Oracle. The v1 endpoint "
+                    "(/opc/v1/instance/) needs no header and is the one to try "
+                    "when the instance still allows it.",
+        "defeated_by": "no header control, on an instance where v1 is disabled"},
+    "digitalocean": {
+        "host": "169.254.169.254", "method": "GET", "path": "/metadata/v1/",
+        "headers": {}, "lab": None,
+        "requires": "nothing: a plain GET, no token and no header",
+        "defeated_by": "nothing in the service itself; only egress filtering"},
 }
 
 
@@ -513,6 +528,11 @@ def looks_like_metadata(name, body):
         return any(k in low for k in ("instance/", "project/", "numeric-project-id"))
     if name == "azure":
         return any(k in low for k in ('"compute"', '"vmid"', "subscriptionid"))
+    if name == "oracle":
+        return any(k in low for k in ("availabilitydomain", "compartmentid",
+                                      "displayname"))
+    if name == "digitalocean":
+        return any(k in low for k in ("droplet_id", "interfaces", "region"))
     return False
 
 
