@@ -37,6 +37,7 @@ fact per file; keep them short, dated and sourced.
 - [DOM sinks, postMessage, clobbering, prototype pollution, CSP, mXSS](web/client-side-dom.md) - read before any browser-side test; used by the `client-side` skill.
 - [Service workers, the Cache API and server-sent events](web/service-workers-sse.md) - read when a worker script, a `workbox` bundle or an event stream is in the map; cleanup is mandatory.
 - [Client-side supply chain](web/client-side-supply-chain.md) - read for third-party scripts, SRI and lapsed dependency domains.
+- [Outside-in SBOM and known-CVE matching](web/sbom-known-cves.md) - read before turning a library version read off a bundle, a source map or a header into a CVE claim.
 
 ## API and identity
 - [gRPC, Connect, tRPC, JSON-RPC and batch authorization](web/grpc-rpc-batch.md) - read for any non-REST API: the batch where one id belongs to the caller, streaming authz, metadata trust. Used by the `api-protocols` skill.
