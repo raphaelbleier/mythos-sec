@@ -1,42 +1,110 @@
 version: 2
+
+# One maintainer reviews these, so every ecosystem is grouped down to a small
+# number of pull requests per week. The 7-day cooldown on every entry keeps a
+# freshly compromised release (tj-actions style) from being proposed at once.
+#
+# The lab is deliberately absent. `lab/docker-compose.yml` pins Juice Shop,
+# DVWA, VAmPI, DVGA and an old Postgres by digest because the known
+# vulnerabilities in those exact versions are the ground truth the checks
+# assert against. Bumping them would quietly change the answers. They are
+# updated by hand, together with whatever in `lab/README.md` describes the
+# findings they carry.
+
 updates:
-  # Digest and tag bumps for everything pinned by SHA or digest. The 7-day cooldown
-  # keeps a freshly compromised release (tj-actions style) from being proposed at once.
+  # Digest and tag bumps for every action pinned by SHA. All of them in one
+  # pull request: they are read together when reviewing what the runner now
+  # executes.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore(actions)
     cooldown:
       default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - '*'
 
   - package-ecosystem: docker
-    directories:
-      - /toolbox
-      - /lab/*
+    directory: /toolbox
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore(toolbox)
     cooldown:
       default-days: 7
+    groups:
+      toolbox-base:
+        patterns:
+          - '*'
 
-  - package-ecosystem: docker-compose
-    directory: /lab
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-
+  # `toolbox/requirements.txt` and `.github/ci-requirements.txt` are both
+  # hash-pinned and compiled from a `.in` file, so a bump here needs the
+  # `uv pip compile` line in the file's header re-run before it merges.
   - package-ecosystem: pip
     directories:
       - /toolbox
       - /.github
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: chore(deps)
     cooldown:
       default-days: 7
+    groups:
+      python:
+        patterns:
+          - '*'
 
   - package-ecosystem: npm
     directory: /cli
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: chore(cli)
     cooldown:
       default-days: 7
+    groups:
+      # `ai` and its provider packages share a protocol version. A provider one
+      # major behind `ai` fails at the first model call, so they move together
+      # in a single pull request, majors included.
+      ai-sdk:
+        applies-to: version-updates
+        patterns:
+          - ai
+          - '@ai-sdk/*'
+
+      # Typescript, tsx and the type packages never reach a target. One pull
+      # request, majors included; the typecheck in `check` is the review.
+      dev:
+        applies-to: version-updates
+        dependency-type: development
+        patterns:
+          - '*'
+
+      # Everything else that ships: ink, react, playwright-core, zod. Minor and
+      # patch grouped. A major is left on its own, because ink and react carry
+      # the TUI and playwright-core carries the browser capture, and each of
+      # those needs the CLI run against a lab target before it merges.
+      runtime:
+        applies-to: version-updates
+        dependency-type: production
+        patterns:
+          - '*'
+        exclude-patterns:
+          - ai
+          - '@ai-sdk/*'
+        update-types:
+          - minor
+          - patch

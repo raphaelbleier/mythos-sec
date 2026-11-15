@@ -1,0 +1,30 @@
+# One maintainer owns everything. The paths below are listed again so a
+# reviewer sees them named in the pull request: a change to any of them decides
+# what the agent is allowed to send, or what runs in CI.
+
+*                           @raphaelbleier
+
+# The scope boundary, the pacing rules and the destructive denylist.
+/hooks/                     @raphaelbleier
+/hooks/scope-guard.py       @raphaelbleier
+/hooks/budget-guard.py      @raphaelbleier
+
+# Where the guards are called from, and the text that tells the model what it
+# may do.
+/cli/src/agent/guards.ts    @raphaelbleier
+/cli/src/prompts.ts         @raphaelbleier
+
+# Methodology, and which skill a target selects.
+/skills/                    @raphaelbleier
+/skills/registry.yaml       @raphaelbleier
+
+# CI, release and dependency policy.
+/.github/                   @raphaelbleier
+/.github/workflows/         @raphaelbleier
+/scripts/selftest.sh        @raphaelbleier
+
+# Deliberately vulnerable targets and the container they are tested from.
+/lab/                       @raphaelbleier
+/toolbox/                   @raphaelbleier
+
+SECURITY.md                 @raphaelbleier

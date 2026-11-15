@@ -13,6 +13,13 @@ the smallest way to reproduce it. A patch is welcome but not required.
 Expect a first reply within a week. This is a research project maintained by
 one person, so there is no formal response-time commitment beyond that.
 
+On the repository itself: secret scanning with push protection and Dependabot
+alerts are on, `main` is protected and merges through a pull request with the
+`check` and `zizmor` jobs passing, and every action in `.github/workflows/` is
+pinned to a full commit SHA with the version in a trailing comment. Dependabot
+proposes those bumps after a seven-day cooldown, so a compromised release is
+not offered the day it lands.
+
 ## What counts as a vulnerability here
 
 Mythos is a CLI that drives security tools against hosts the operator declared

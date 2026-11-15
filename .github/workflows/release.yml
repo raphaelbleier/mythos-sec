@@ -1,0 +1,134 @@
+name: release
+
+# Cutting a release is one command: push an annotated `vX.Y.Z` tag. That tag
+# also triggers `toolbox.yml`, which builds, signs and pushes the matching
+# `ghcr.io/raphaelbleier/mythos-toolbox` tags. This workflow does the other
+# half: it checks the tag against `cli/package.json`, runs the same selftests
+# `check` runs, packs the CLI, and opens the GitHub release with notes built
+# from the Conventional Commit subjects since the previous tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0   # the notes read the commits since the previous tag
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'   # cli/package.json: engines.node >= 22
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      # A tag that disagrees with the version in the package is worse than no
+      # release: whatever is installed from it reports a version that never
+      # existed. Fail before anything is published.
+      - name: Tag matches cli/package.json
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          case "$REF_NAME" in
+            v*) ;;
+            *) echo "not a version tag: $REF_NAME" >&2; exit 1 ;;
+          esac
+          pkg=$(node -p 'require("./cli/package.json").version')
+          if [ "v$pkg" != "$REF_NAME" ]; then
+            echo "tag $REF_NAME does not match cli/package.json version $pkg" >&2
+            exit 1
+          fi
+
+      - name: Install the CLI's dependencies
+        run: npm ci --prefix cli
+
+      - name: CLI typecheck
+        run: npm run check --prefix cli
+
+      - name: CLI build
+        run: npm run build --prefix cli
+
+      # The same offline check a contributor runs, so a release can never be
+      # cut from a tree that fails it.
+      - name: Repository selftest
+        run: scripts/selftest.sh
+
+      - name: Pack the CLI
+        id: pack
+        run: |
+          mkdir -p /tmp/release
+          tarball=$(cd cli && npm pack --pack-destination /tmp/release | tail -1)
+          echo "tarball=/tmp/release/$tarball" >> "$GITHUB_OUTPUT"
+          (cd /tmp/release && sha256sum "$tarball" > "$tarball.sha256")
+
+      # Grouped by Conventional Commit type, which is why the repository insists
+      # on them. Anything that does not parse as `type: subject` lands under
+      # "Other", which is the signal that a subject was written loosely.
+      - name: Release notes
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          prev=$(git describe --tags --abbrev=0 "$REF_NAME^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            range="$prev..$REF_NAME"
+            echo "Changes since \`$prev\`." > /tmp/notes.md
+          else
+            range="$REF_NAME"
+            echo 'First tagged release.' > /tmp/notes.md
+          fi
+          git log --no-merges --pretty=format:'%s' "$range" > /tmp/subjects
+          emit() {
+            matched=$(grep -E "^$2(\([^)]*\))?!?: " /tmp/subjects || true)
+            [ -z "$matched" ] && return 0
+            printf '\n## %s\n\n' "$1" >> /tmp/notes.md
+            printf '%s\n' "$matched" | sed 's/^/- /' >> /tmp/notes.md
+          }
+          emit 'Features' 'feat'
+          emit 'Fixes' 'fix'
+          emit 'Documentation' 'docs'
+          emit 'Maintenance' 'chore'
+          other=$(grep -vE '^(feat|fix|docs|chore)(\([^)]*\))?!?: ' /tmp/subjects || true)
+          if [ -n "$other" ]; then
+            printf '\n## Other\n\n' >> /tmp/notes.md
+            printf '%s\n' "$other" | sed 's/^/- /' >> /tmp/notes.md
+          fi
+          breaking=$(git log --no-merges --pretty=format:'%s%n%b' "$range" \
+            | grep -E '^(BREAKING CHANGE|BREAKING-CHANGE):' || true)
+          if [ -n "$breaking" ]; then
+            printf '\n## Breaking\n\n' >> /tmp/notes.md
+            printf '%s\n' "$breaking" | sed 's/^/- /' >> /tmp/notes.md
+          fi
+          printf '\n## Install\n\n' >> /tmp/notes.md
+          printf 'The container image for this tag is built, signed and pushed by the\n' >> /tmp/notes.md
+          printf '`toolbox` workflow. `README.md` has the install steps; `mythos doctor`\n' >> /tmp/notes.md
+          printf 'checks the machine afterwards.\n' >> /tmp/notes.md
+          cat /tmp/notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          gh release create "$REF_NAME" \
+            --title "$REF_NAME" \
+            --notes-file /tmp/notes.md \
+            --verify-tag \
+            "$TARBALL" "$TARBALL.sha256"

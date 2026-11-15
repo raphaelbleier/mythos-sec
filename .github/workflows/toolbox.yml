@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# A pull request's build is superseded by the next push to it. A tag, the
+# weekly rebuild and a dispatch are never cancelled: they push and sign.
+concurrency:
+  group: toolbox-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   IMAGE: ghcr.io/raphaelbleier/mythos-toolbox
 

@@ -1,0 +1,13 @@
+# Blank issues stay off: a report without the doctor output and the failing
+# command cannot be acted on, and this is a one-person project.
+blank_issues_enabled: false
+contact_links:
+  - name: Vulnerability in Mythos itself
+    url: https://github.com/raphaelbleier/mythos-sec/security/advisories/new
+    about: Report it privately. Scope-guard bypasses, destructive-denylist bypasses, code execution through engagement input and credential leaks go here, not in a public issue. SECURITY.md says what counts.
+  - name: Vulnerability you found with Mythos
+    url: https://github.com/raphaelbleier/mythos-sec/blob/main/SECURITY.md
+    about: Report it to the affected program or vendor. If Mythos produced a wrong or unverifiable finding, that is a bug report instead.
+  - name: Question about using it
+    url: https://github.com/raphaelbleier/mythos-sec#install
+    about: Setup, model providers, what a phase does. The README and docs/ cover most of it. Open a bug report if they do not.

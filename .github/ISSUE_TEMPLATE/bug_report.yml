@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in Mythos does not work, or reports the wrong thing.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste anything from an engagement against a real target: no
+        hostnames, no scope file, no findings, no tokens. Reproduce it against a
+        target in `lab/` if you can, and redact what you cannot.
+
+        A vulnerability **in Mythos itself** does not belong here. Use private
+        reporting, see [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what it did instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The failing command and its output
+      description: The exact command, and the error or the wrong output. Redact hostnames.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: mythos doctor
+      description: Output of `mythos doctor`, or `node cli/dist/index.js doctor` from a clone.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: selftest
+    attributes:
+      label: scripts/selftest.sh
+      description: Output of `bash scripts/selftest.sh`, if it also fails. Leave empty if it passes.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The tag you installed, or `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: input
+    id: target
+    attributes:
+      label: Lab target
+      description: Which target in `lab/` reproduces it, if any.
+    validations:
+      required: false

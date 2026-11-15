@@ -1,0 +1,72 @@
+name: Skill, script or feature proposal
+description: Propose a new bug-class skill, a deterministic script, or a change to the agent.
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read "What does not belong here" in
+        [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) first. Denial of
+        service, brute force, detection evasion and anything that widens the
+        scope guard are out, and that is not negotiable.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of change
+      options:
+        - A skill (methodology for a bug class)
+        - A knowledge playbook (how to confirm a bug class)
+        - A deterministic script in scripts/
+        - A lab target
+        - The agent itself (cli/)
+        - A tool in the toolbox image
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What a run misses today
+      description: The bug class, surface or step that currently goes unchecked, or gets checked wrongly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: What it would do, and which files it would touch.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How it would be proved
+      description: |
+        A finding is only worth reporting if it can be confirmed. Say how this
+        produces evidence, and which lab target would seed the vulnerability it
+        looks for. A new target is fine; say what it would serve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: trigger
+    attributes:
+      label: The trigger, for a skill
+      description: |
+        `skills/registry.yaml` decides membership in code, from `surface.json`.
+        Which signal in the recon output should select this skill? A wrong
+        trigger spends a phase on a surface that is not there.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Boundary
+      options:
+        - label: This does not add destruction, brute force, denial of service or detection evasion, and does not widen the scope guard.
+          required: true
