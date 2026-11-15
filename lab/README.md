@@ -34,12 +34,18 @@ To work inside the lab's own network instead, attach the bridged toolbox with
 | apilab | 5022 | GraphQL + JSON-RPC |
 | authlab | 5023 | login, password reset, 2FA, session, email change, OAuth 2.0 |
 | ailab | 5024 | chat with RAG, tool calls and an MCP endpoint |
+| takeoverlab | 5030 | dangling references + three provider unclaimed-host stand-ins |
+| sbomlab | 5026 | stale front end: bundle markers, published source map, SRI gaps |
+| supplylab | 5025 | internal package names in a bundle, a leaked `.npmrc`, a lockfile mixing registries, and a stand-in public registry at `/__registry/<eco>/` |
+| cachelab | 5027, 5028 | an edge cache whose key excludes every header, in front of an origin on 5028 |
+| cloudexplab | 5029 | S3/GCS/Azure-style storage endpoints, a Lambda function URL, two API Gateway stages, kubelet `/pods` and `/metrics`, and a page with a Firebase config and a presigned URL |
+| racelab | 5035, 5036 | limit overrun, TOCTOU, and HTTP/2 over TLS on 5036 for the single-packet attack |
 
 The oast DNS listener answers every A query with `OAST_IP` (default 127.0.0.1); it is a logger, not a resolver.
 
-## The four capability targets
+## The five capability packages
 
-These six services sit on `mythos-lab-targets` instead of `mythos-lab`. That
+These seven services sit on `mythos-lab-targets` instead of `mythos-lab`. That
 network is a bridge with IP masquerading turned off, so nothing on it has a
 route to the internet while the published ports still answer on the host's
 loopback. The two metadata emulators sit on `mythos-lab-metadata`, which is
@@ -48,7 +54,7 @@ server-side fetch from `cloud-app`, which is the only way to a real instance
 metadata service too. (`internal: true` cannot be used for the others, because
 Docker silently drops published ports for a container on an internal network.)
 
-Every fake credential in all four is the single canary string
+Every fake credential in all of them is the single canary string
 `MYTHOS_LAB_CANARY`, so a run can grep for exactly one token and nothing in
 here resembles a real key.
 
@@ -172,6 +178,37 @@ Reproduce:
     curl -s -XPOST http://127.0.0.1:5023/oauth/token -H "$J" \
       -d '{"grant_type":"authorization_code","code":"<code>"}'     # works twice, no PKCE check
 
+### sbomlab — for the supply-chain-inventory package
+
+Deliberately *stale*, not exploitable: the bug class here is what a target tells
+you about its dependencies. `GET /__inventory` serves the ground truth, so a
+check never has to restate what the fixture ships.
+
+* `/static/app.bundle.js` carries banner comments (jQuery 1.12.4, AngularJS
+  1.5.8, Lodash 3.10.1), the matching runtime version assignments, and webpack
+  `./node_modules/<pkg>/` module paths.
+* `/static/app.bundle.js.map` is published, and its `sourcesContent` holds two
+  `package.json` files (moment 2.18.1, dompurify 2.0.7) — the strongest non-hash
+  component marker there is.
+* `/static/vendor.css` has a Bootstrap 3.3.7 banner, `/static/img-decode.wasm`
+  has a `producers` section naming emscripten 3.1.45.
+* The page loads one external script **with** `integrity`+`crossorigin`
+  (cdn.jsdelivr.net) and one **without** (cdn.sbom-analytics.test), plus a CDN
+  stylesheet and a Google font, under a CSP that also trusts
+  `*.s3.amazonaws.com`.
+* Response headers name `nginx/1.18.0` and `Express/4.16.0`.
+
+Every fake credential is `MYTHOS_LAB_CANARY`. stdlib only, so it also runs
+without docker: `PORT=5029 python3 lab/sbomlab/app.py`.
+
+Reproduce:
+
+    scripts/sbom inventory http://127.0.0.1:5026/ --from-probe surface.json
+    scripts/sbom cyclonedx inventory.json --out sbom.json
+    scripts/sbom cves inventory.json          # offline: cache + committed snapshot
+    scripts/sbom sri http://127.0.0.1:5026/
+    curl -s http://127.0.0.1:5026/__inventory  # the right answers
+
 ### ailab — for the ai-attack package
 
 Deliberately vulnerable to: indirect prompt injection from an uploaded
@@ -209,3 +246,61 @@ Reproduce:
     curl -s -XPOST http://127.0.0.1:5024/mcp -H "$J" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
     # honest-interval check
     AI_COMPLIANCE=0.5 docker compose -f lab/docker-compose.yml up -d ailab
+
+### takeoverlab — for the supply-chain / takeover package
+
+Deliberately vulnerable to: dangling third-party references. It is two things in
+one small standard-library server, because `scripts/takeover` needs both ends of
+the check.
+
+The victim side, every hostname on it unresolvable on purpose (`.invalid`, which
+RFC 2606 reserves, or a nonsense label under a real provider suffix so it matches
+the fingerprint table's CNAME suffixes without pointing at anything real):
+
+* `GET /` — HTML with a real `Content-Security-Policy` header: a third-party
+  `<script src>` with **no** `integrity=`, a second one pinned with SRI (so the
+  coverage fraction has a denominator), a `<link rel=preconnect>` to a dangling
+  S3 bucket, an `<img>` on a dangling GCS bucket, a `form-action` and a
+  `report-uri` on dead domains.
+* `GET /static/app.js` — a bundle that builds a bucket URL by concatenation, so
+  the bucket name never appears as a URL, plus a `sourceMappingURL`.
+* `GET /static/app.js.map` — a source map whose `sourceRoot` and `sources` name a
+  second, regional bucket.
+* `GET /api/config` — an app config disclosing the OAuth `redirect_uri`
+  allowlist, one entry of which no longer resolves.
+
+The provider side, so a fingerprint can be pointed at this server with
+`--map <host>=http://127.0.0.1:5030/fp/<service>` instead of at the real
+provider:
+
+* `GET /fp/s3` — 404 with S3's `<Code>NoSuchBucket</Code>`
+* `GET /fp/github-pages` — 404 with "There isn't a GitHub Pages site here."
+* `GET /fp/heroku` — 404 with "No such app"
+* `GET /fp/live` — 200, a normal page: the negative control
+
+Every fake credential is the single canary string `MYTHOS_LAB_CANARY`. It needs
+no dependencies, so it also runs on the host directly:
+`python3 lab/takeoverlab/app.py`.
+
+Reproduce:
+
+    # the dangling bucket in a preconnect, fingerprinted against the S3 stand-in
+    scripts/takeover dangling --url http://127.0.0.1:5030/ \
+      --map takeoverlab-legacy-assets.s3.amazonaws.com=http://127.0.0.1:5030/fp/s3
+    # the SRI-less third-party script, and the SRI-pinned one next to it
+    scripts/takeover scripts --url http://127.0.0.1:5030/
+    # the dead report-uri, form-action and OAuth redirect entry
+    scripts/takeover records --url http://127.0.0.1:5030/ \
+      --redirect-uri https://legacy-app.takeoverlab-partner.invalid/oauth/callback
+    # the same clean fingerprint, two honest verdicts: candidate for S3,
+    # inconclusive for GitHub Pages, because that claim may be blocked
+    scripts/takeover cname assets.takeoverlab.test docs.takeoverlab.test \
+      --cname assets.takeoverlab.test=takeoverlab-legacy-assets.s3.amazonaws.com \
+      --cname docs.takeoverlab.test=takeoverlab-gone.github.io \
+      --map takeoverlab-legacy-assets.s3.amazonaws.com=http://127.0.0.1:5030/fp/s3 \
+      --map takeoverlab-gone.github.io=http://127.0.0.1:5030/fp/github-pages
+    # the second bucket, only in the source map
+    scripts/takeover dangling --url http://127.0.0.1:5030/static/app.js.map --no-http
+
+`takeover` never claims a resource and refuses the verb in code: `takeover claim`
+and every other spelling exit 3. Nothing in this fixture is claimable anyway.

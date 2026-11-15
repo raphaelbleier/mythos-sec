@@ -19,6 +19,13 @@
 #   apilab            http://localhost:5022  GraphQL + JSON-RPC
 #   authlab           http://localhost:5023  login, reset, 2FA, OAuth
 #   ailab             http://localhost:5024  chat, RAG, tools, MCP
+#   supplylab         http://localhost:5025  leaked package names + stand-in registry
+#   sbomlab           http://localhost:5026  stale front end, source map, SRI gaps
+#   cachelab          http://localhost:5027  cache poisoning/deception/normalization
+#                     (origin on 5028, for the edge-vs-origin diff)
+#   cloudexplab       http://localhost:5029  misconfigured cloud/K8s exposure
+#   takeoverlab       http://localhost:5030  dangling refs + provider 404 stand-ins
+#   racelab           http://localhost:5035  limit overrun, TOCTOU, real h2 on 5036
 # Network `mythos-lab` has a fixed name: scripts/mythos net mythos-lab
 name: mythos-lab
 
@@ -212,6 +219,80 @@ services:
       - MCP_RUGPULL_AFTER=${MCP_RUGPULL_AFTER:-2}
     ports:
       - "${MYTHOS_LAB_BIND:-127.0.0.1}:5024:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- supply-chain package: leaked package names + a stand-in registry ----
+  # The registry it serves at /__registry/<eco>/ is why `supplychain claimable`
+  # can be exercised without a packet to npmjs.com.
+  supplylab:
+    build: ./supplylab
+    container_name: mythos-supplylab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5025:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- supply-chain package: stale front end with a published source map ----
+  sbomlab:
+    build: ./sbomlab
+    container_name: mythos-sbomlab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5026:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- cache package: a cache that keys on too little ----------------
+  # Two tiers in one container: an origin that normalizes like a framework and
+  # an edge cache in front of it whose key is (method, raw target, first value
+  # of each parameter) and no header at all. See lab/cachelab/README.md.
+  cachelab:
+    build: ./cachelab
+    container_name: mythos-cachelab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5027:5000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5028:5001"
+    networks: [mythos-lab-targets]
+
+  # ---- cloud package: deliberately misconfigured cloud and Kubernetes ----
+  # An S3-style endpoint with a public list, a private object and a policy
+  # granting anonymous write, an Azure container error body, a Lambda function
+  # URL with no authorizer, two API Gateway stages that differ, kubelet-style
+  # /pods and /metrics, and a page embedding a Firebase config and a
+  # short-expiry presigned URL.
+  cloudexplab:
+    build: ./cloudexplab
+    container_name: mythos-cloudexplab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5029:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- takeover package: dangling references -------------------------
+  # Two halves in one server: a victim page whose references all point at names
+  # that cannot resolve, and stand-ins for three providers' own unclaimed-host
+  # responses, so a fingerprint can be aimed here with
+  # `takeover ... --map <host>=http://127.0.0.1:5030/fp/<service>` instead of at
+  # the real provider.
+  takeoverlab:
+    build: ./takeoverlab
+    container_name: mythos-takeoverlab
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5030:5000"
+    networks: [mythos-lab-targets]
+
+  # ---- race-conditions package: non-atomic check-and-write ------------
+  # Two ports on purpose: 5035 is plaintext HTTP/1.1 (the last-byte-sync
+  # fallback) and 5036 is HTTP/2 over TLS with ALPN, which is the only way the
+  # single-packet attack runs for real instead of falling back. The certificate
+  # is self-signed and generated at build time, so clients pass --insecure.
+  racelab:
+    build: ./racelab
+    container_name: mythos-racelab
+    environment:
+      # The width of the race window, in milliseconds. 0 closes it, which is
+      # the control for the measurement itself: a tool that still reports an
+      # overrun against a closed window is reporting noise.
+      - RACE_WINDOW_MS=${RACE_WINDOW_MS:-25}
+    ports:
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5035:5000"
+      - "${MYTHOS_LAB_BIND:-127.0.0.1}:5036:5443"
     networks: [mythos-lab-targets]
 
 volumes:
