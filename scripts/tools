@@ -1,0 +1,1492 @@
+#!/usr/bin/env python3
+"""Mythos tools — one normalizing wrapper around the toolbox's offensive binaries.
+
+A binary existing in `toolbox/` is not a wired tool. A wired tool is one the
+framework can call with the scope check applied to every destination, paced to
+`rules.rate_limit_rps`, capped so it cannot sweep, whose output has become rows
+with a verdict and an oracle instead of a wall of text, and whose exact command
+line is on disk so a human can replay it. That is what this file does, with one
+subcommand per tool rather than one script per tool.
+
+  scripts/tools fuzz    <URL with FUZZ>   ffuf      content / path discovery
+  scripts/tools params  <URL>             arjun     hidden parameter discovery
+  scripts/tools crlf    <URL>             crlfuzz   CRLF / response-header injection
+  scripts/tools jwt     <TOKEN>           jwt_tool  token analysis (offline by default)
+  scripts/tools secrets <PATH>            gitleaks  secrets in a tree, OFFLINE
+  scripts/tools gadget  {list|java|php}   ysoserial / phpggc, OFFLINE
+  scripts/tools hosts   <DOMAIN>          subfinder names, all marked out of scope
+  scripts/tools selftest
+
+`--json` works on every subcommand. `--help` on a subcommand names exactly what
+that tool contacts.
+
+## No verdict here is ever `confirmed`
+
+A tool's own "VULNERABLE" line is the tool's opinion about one response. crlfuzz
+says vulnerable when a header it injected came back; jwt_tool's playbook says
+vulnerable when a forged token got a 200. Neither has checked that the response
+means what it looks like, and both are wrong on a target that returns 200 for
+everything. So the strongest verdict this file writes is `candidate`, with the
+live check that would settle it named in `why`. `confirmed` belongs to the
+validate phase (AGENTS.md). `knowledge/web/*.md` says the same thing per class.
+
+## Scope
+
+`engagements/<dir>/scope.yaml` (via `$MYTHOS_SCOPE`) is the authorization
+boundary and nothing here widens it. Every destination a tool would contact is
+checked through `hooks/scope-guard.py` BEFORE the tool starts, not after, and a
+refusal exits 3 naming the host — the tool is never launched. `secrets` and
+`gadget` contact nothing at all and are not gated.
+
+`hosts` is the special case the hard rule is about. subfinder turns one domain
+into many names, and a name is NOT in scope because subfinder found it. Every
+row it returns is marked `in_scope: false` unless scope.yaml already authorizes
+that exact name, there is no flag that adds one, and this file never passes a
+discovered name to a subcommand that sends traffic.
+
+## Brute force, flooding and destruction are not reachable from here
+
+Not by policy text: by construction. No subcommand takes passthrough argv, so
+`jwt_tool -C -d rockyou.txt` (secret cracking), ffuf against a credential form
+and phpggc's `File delete` chains cannot be expressed. `gadget` refuses a
+destructive chain type and a destructive `--cmd` outright, and the one
+wordlist-driven pair (`fuzz`, `params`) takes an explicit `-n` with a small
+default and paces to `rules.rate_limit_rps`. `hooks/scope-guard.py` refuses
+brute force, flooding and data destruction in every mode and no scope rule
+overrides it; this file does not try to.
+
+## How a tool is run
+
+Through `scripts/mythos`, exactly as the skills do, so the exec is audited to
+`engagements/audit.jsonl` and the recording proxy's variables are injected and
+the wire bytes land in the traffic store. Inside the container
+(`MYTHOS_IN_TOOLBOX=1`) the tool is executed directly instead.
+
+Exit codes: 0 ran, nothing reached `candidate`; 1 at least one candidate;
+2 usage; 3 refused (out of scope, or a destructive request); 4 a required tool
+is not in the image.
+
+Python 3 standard library only.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.parse
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MYTHOS = ROOT / "scripts" / "mythos"
+
+# The default rate when the engagement names none. Deliberately low: a sweep
+# nobody asked for is the failure mode of every tool in this file.
+DEFAULT_RPS = 5.0
+# Small on purpose. A wordlist run is opt-in in size, never by default.
+DEFAULT_N = 300
+FUZZ_WORDLIST = "/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"
+VERDICTS = ("candidate", "surface", "inconclusive", "none")
+
+# A path whose mere existence is worth a look, as opposed to one that is just
+# surface. This is the oracle for `fuzz`: without it every 200 is a "finding".
+SENSITIVE = re.compile(
+    r"(?i)(^|/)(\.git|\.env|\.svn|\.hg|\.DS_Store|\.aws|\.ssh|\.npmrc|"
+    r"backup|backups|dump|dumps|db|database|admin|administrator|actuator|"
+    r"debug|console|phpinfo|server-status|server-info|metrics|trace|heapdump|"
+    r"swagger|swagger-ui|openapi|graphql|graphiql|wp-config|config|configs|"
+    r"settings|secret|secrets|credentials|id_rsa|private|internal|phpmyadmin|"
+    r"\.sql|\.bak|\.old|\.zip|\.tar|\.tgz|\.gz|\.log|\.pem|\.key|\.p12)(\.|/|$)")
+
+# phpggc chain types that destroy data. hooks/scope-guard.py refuses data
+# destruction in every mode, so these are refused here before they are built.
+DESTRUCTIVE_CHAIN = re.compile(r"(?i)\b(file\s*delete|delete|truncate|wipe)\b")
+# A command nobody should be embedding in a gadget chain on an engagement.
+DESTRUCTIVE_CMD = re.compile(
+    r"(?i)(\brm\s+-|\bshred\b|\bmkfs|\bdd\s+if=|\b(shutdown|reboot|halt|poweroff)\b|"
+    r"\bdrop\s+(table|database)\b|\btruncate\s+table\b|:\(\)\{|\bchmod\s+-R\s+000\b|"
+    r">\s*/dev/sd|\bunlink\b|\bdel\s+/[fsq])")
+
+_mods = {}
+
+
+def mod(name):
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def scope_offenders(url):
+    """Which hosts in `url` the active scope file does not authorize.
+
+    Returns a list, never raises. Unlike `scripts/takeover`, nothing in this
+    file is DNS-only: every gated subcommand makes the tool send HTTP, so a
+    non-empty list means the tool does not start.
+    """
+    sg = mod("scope-guard")
+    probe = url if "//" in str(url) else f"https://{url}/"
+    try:
+        return sg.check(probe)["offenders"]
+    except Exception:
+        return []
+
+
+def scope_rate(default=DEFAULT_RPS):
+    """rules.rate_limit_rps from $MYTHOS_SCOPE, else `default`.
+
+    Same reader as scripts/takeover: PyYAML when the host has it, a regex when
+    it does not, because the toolbox image and the host disagree about PyYAML
+    and a missing module must not silently become "unlimited".
+    """
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+def threads_for(rps):
+    """Concurrency that cannot outrun the rate limit.
+
+    Every tool here paces per-request, not per-thread, so more threads than
+    requests-per-second only adds burstiness. ffuf's own default is 40.
+    """
+    return max(1, min(10, int(rps) or 1))
+
+
+# -------------------------------------------------------------- running tools
+
+class ToolMissing(Exception):
+    pass
+
+
+def in_toolbox():
+    return bool(os.environ.get("MYTHOS_IN_TOOLBOX"))
+
+
+def run_sh(cmd, timeout=600):
+    """Run one shell pipeline where the tools live, and return (rc, out, err).
+
+    Outside the container that is `scripts/mythos sh`, which audits the exec and
+    injects the recording proxy. Inside it, it is bash.
+    """
+    if in_toolbox():
+        argv = ["bash", "-lc", cmd]
+    else:
+        argv = [sys.executable, str(MYTHOS), "--timeout", str(int(timeout)), "sh", cmd]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def have(tool):
+    rc, out, _ = run_sh(f"command -v {shlex.quote(tool)} >/dev/null 2>&1 && echo yes || echo no")
+    return out.strip().endswith("yes")
+
+
+def require(tool):
+    if not have(tool):
+        raise ToolMissing(tool)
+
+
+# ------------------------------------------------------------------- evidence
+
+def evidence_dir(a):
+    """Where the raw command and raw tool output are written.
+
+    `--evidence DIR` wins; otherwise the engagement directory that owns
+    $MYTHOS_SCOPE, under `tools/`. Nothing is written when neither exists: a
+    selftest must not scatter files.
+    """
+    if getattr(a, "evidence", None):
+        return pathlib.Path(a.evidence)
+    scope = os.environ.get("MYTHOS_SCOPE")
+    if scope:
+        return pathlib.Path(scope).resolve().parent / "tools"
+    return None
+
+
+def write_evidence(a, sub, cmd, out, err=""):
+    """Save the exact command and the tool's own bytes, so a human can replay.
+
+    The wire bytes themselves are in the traffic store already (scripts/mythos
+    injects the recording proxy into every exec); this is the tool's own view,
+    which is what its verdict was derived from.
+    """
+    d = evidence_dir(a)
+    if d is None:
+        return None
+    d.mkdir(parents=True, exist_ok=True)
+    stem = d / f"{sub}-{time.strftime('%Y%m%d-%H%M%S')}"
+    stem.with_suffix(".cmd").write_text(cmd + "\n")
+    stem.with_suffix(".out").write_text(out + (("\n--- stderr ---\n" + err) if err else ""))
+    return str(stem.with_suffix(".out"))
+
+
+# --------------------------------------------------------------------- output
+
+def result(sub, tool, rows, **extra):
+    return {"subcommand": sub, "tool": tool, "results": rows,
+            "candidates": sum(1 for r in rows if r.get("verdict") == "candidate"),
+            "never_confirmed": "a tool's own verdict is a candidate; the validate "
+                               "phase decides confirmed",
+            **extra}
+
+
+def render(res):
+    out = [f"# {res['subcommand']} ({res['tool']})"]
+    for k in ("wordlist", "capped_to", "rate_limit_rps", "command", "evidence",
+              "scanned", "refused"):
+        if res.get(k) not in (None, "", []):
+            out.append(f"{k}: {res[k]}")
+    if not res["results"]:
+        out.append("\n(nothing)")
+    for r in res["results"]:
+        head = f"\n[{r.get('verdict')}] " + (r.get("what") or r.get("name") or "")
+        out.append(head)
+        for k, v in r.items():
+            if k in ("verdict", "what", "name") or v in (None, "", []):
+                continue
+            out.append(f"  {k}: {v}")
+    if res["candidates"]:
+        out.append(f"\n{res['candidates']} candidate(s). None is confirmed: "
+                   f"{res['never_confirmed']}.")
+    return "\n".join(out)
+
+
+def emit(a, res):
+    print(json.dumps(res, indent=2) if a.json else render(res))
+    return 1 if res["candidates"] else 0
+
+
+def refuse(a, sub, tool, why, **extra):
+    res = result(sub, tool, [], refused=why, **extra)
+    print(json.dumps(res, indent=2) if a.json else f"REFUSED: {why}", file=sys.stderr
+          if not a.json else sys.stdout)
+    return 3
+
+
+def gate(a, sub, tool, url):
+    """Scope check before the tool starts. Returns a refusal code or None."""
+    bad = scope_offenders(url)
+    if bad:
+        host = urllib.parse.urlsplit(url if "//" in url else f"https://{url}").hostname or url
+        return refuse(a, sub, tool,
+                      f"scope.yaml does not authorize {host} ({', '.join(bad)}), so "
+                      f"{tool} was not started. Add the host to in_scope in an editor "
+                      f"if the engagement authorizes it; this file never does.")
+    return None
+
+
+# ----------------------------------------------------------------- ffuf: fuzz
+
+def parse_ffuf(text):
+    """ffuf's `-of json` document into rows.
+
+    The oracle: a wordlist hit proves a path exists, which is surface, not a
+    finding. Only a path whose *name* means something ("/.git/", "/actuator")
+    is a candidate, and even then the finding is whatever it serves.
+    """
+    rows = []
+    try:
+        doc = json.loads(text or "{}")
+    except ValueError:
+        return rows
+    for r in doc.get("results") or []:
+        word = (r.get("input") or {}).get("FUZZ") or ""
+        url = r.get("url") or ""
+        sens = bool(SENSITIVE.search("/" + word.lstrip("/")))
+        rows.append({
+            "what": url or word,
+            "verdict": "candidate" if sens else "surface",
+            "status": r.get("status"), "length": r.get("length"),
+            "words": r.get("words"), "lines": r.get("lines"),
+            "redirect": r.get("redirectlocation") or None,
+            "why": ("the name matches a sensitive path pattern: GET it and read what it "
+                    "actually serves — a 200 on /.git/ with no object data is nothing"
+                    if sens else
+                    "a path that exists. Surface, not a finding; it earns a verdict only "
+                    "once something on it does"),
+        })
+    return rows
+
+
+def cmd_fuzz(a):
+    sub, tool = "fuzz", "ffuf"
+    if "FUZZ" not in a.url:
+        print("fuzz: the URL must contain the FUZZ keyword, e.g. "
+              "'https://host/FUZZ'", file=sys.stderr)
+        return 2
+    r = gate(a, sub, tool, a.url.replace("FUZZ", ""))
+    if r is not None:
+        return r
+    require(tool)
+    rps = scope_rate()
+    n, wl = max(1, a.max), a.wordlist
+    out_json, wcut = "/tmp/mythos-ffuf-$$.json", "/tmp/mythos-ffuf-$$.words"
+    # head -n is the cap: ffuf has no max-requests flag, so the wordlist itself
+    # is cut. Without this an "-w raft-medium" default is a 30k-request sweep.
+    pipeline = (
+        f"head -n {n} {shlex.quote(wl)} > {wcut} && "
+        f"ffuf -u {shlex.quote(a.url)} -w {wcut} -mc {shlex.quote(a.match_codes)} "
+        f"-fs 0 -ac -s -t {threads_for(rps)} -rate {int(rps) or 1} "
+        f"-maxtime {int(a.maxtime)} -of json -o {out_json} >/dev/null 2>&1; "
+        f"cat {out_json} 2>/dev/null; rm -f {out_json} {wcut}")
+    rc, out, err = run_sh(pipeline, timeout=a.maxtime + 60)
+    rows = parse_ffuf(out)
+    return emit(a, result(sub, tool, rows, wordlist=wl, capped_to=n,
+                          rate_limit_rps=rps, command=pipeline,
+                          evidence=write_evidence(a, sub, pipeline, out, err)))
+
+
+# --------------------------------------------------------------- arjun: params
+
+def parse_arjun(text):
+    """arjun's `-oJ` document into rows.
+
+    arjun's output is `{url: [param, ...]}`. A parameter arjun found is a
+    parameter the application reacts to; which is an input, not a bug.
+    """
+    rows = []
+    try:
+        doc = json.loads(text or "{}")
+    except ValueError:
+        return rows
+    for url, found in (doc.items() if isinstance(doc, dict) else []):
+        params = found.get("params") if isinstance(found, dict) else found
+        for p in params or []:
+            rows.append({
+                "what": p, "verdict": "candidate", "url": url,
+                "why": "an unlinked parameter the application reacts to: a reachable "
+                       "input no crawler would have found. Test it like any other "
+                       "input (reflection, SQLi, SSRF, IDOR) — its existence is not "
+                       "itself a finding",
+            })
+    return rows
+
+
+def cmd_params(a):
+    sub, tool = "params", "arjun"
+    r = gate(a, sub, tool, a.url)
+    if r is not None:
+        return r
+    require(tool)
+    rps = scope_rate()
+    n = max(1, a.max)
+    out_json, wcut = "/tmp/mythos-arjun-$$.json", "/tmp/mythos-arjun-$$.words"
+    # arjun's own db lives next to the installed package, and the path carries
+    # the python version, so it is resolved in the container rather than guessed.
+    src = (shlex.quote(a.wordlist) if a.wordlist else
+           '"$(python3 -c \'import arjun,os;print(os.path.dirname(arjun.__file__))\')/db/small.txt"')
+    pipeline = (
+        f"head -n {n} {src} > {wcut} && "
+        f"rm -f {out_json}; arjun -u {shlex.quote(a.url)} -w {wcut} -oJ {out_json} "
+        f"-t {threads_for(rps)} --rate-limit {int(rps) or 1} -T 15 -q "
+        f">/dev/null 2>&1; cat {out_json} 2>/dev/null; rm -f {out_json} {wcut}")
+    rc, out, err = run_sh(pipeline, timeout=a.maxtime + 60)
+    rows = parse_arjun(out)
+    return emit(a, result(sub, tool, rows,
+                          wordlist=a.wordlist or "arjun db/small.txt", capped_to=n,
+                          rate_limit_rps=rps, command=pipeline,
+                          evidence=write_evidence(a, sub, pipeline, out, err)))
+
+
+# --------------------------------------------------------------- crlfuzz: crlf
+
+CRLF_HIT = re.compile(r"(?i)\[(?:vuln|vulnerable)\]\s*(?:-\s*)?(\S+)")
+
+
+# crlfuzz injects `...%0d%0aSet-Cookie:param=crlfuzz;` and tries ~611 variants of
+# the encoding and of where the payload is appended -- including variants that
+# first append a literal `crlfuzz` or `?crlfuzz=` to the path. One vulnerable
+# endpoint therefore comes back as twenty near-identical lines in three shapes.
+# The endpoint ends at the first of those markers.
+CRLF_SPLIT = re.compile(r"(?i)crlfuzz|%0[da]|%23%0|%3f%0")
+
+
+def parse_crlfuzz(text):
+    """crlfuzz's `-s`ilent lines into one row per endpoint.
+
+    crlfuzz prints one URL per successful payload. The hit means a CRLF
+    sequence in the request came back as a real header boundary in the
+    response, which is the right oracle for the class — but crlfuzz has not
+    checked whether the header it injected does anything, and that is the
+    finding. Variants of the same endpoint are collapsed, because twenty rows
+    for one bug is how a report gets inflated.
+    """
+    by_endpoint = {}
+    for line in ANSI.sub("", text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = CRLF_HIT.search(line)
+        url = m.group(1) if m else (line if line.startswith(("http://", "https://")) else None)
+        if not url:
+            continue
+        key = CRLF_SPLIT.split(url)[0].rstrip("/?&=")
+        row = by_endpoint.setdefault(key, {
+            "what": key, "verdict": "candidate", "variants": 0, "first_payload": url,
+            "why": "crlfuzz saw an injected CRLF become a header boundary in the "
+                   "response. Replay `first_payload` by hand and read the raw "
+                   "response: the finding is what the injected header achieves "
+                   "(a Set-Cookie the victim keeps, a poisoned cache key, a split "
+                   "response), not the split itself. "
+                   "knowledge/web/cache-poisoning.md on why a reflected header alone "
+                   "is not impact",
+            "oracle": "a header the request injected appears as a header in the response",
+        })
+        row["variants"] += 1
+    return list(by_endpoint.values())
+
+
+def cmd_crlf(a):
+    sub, tool = "crlf", "crlfuzz"
+    r = gate(a, sub, tool, a.url)
+    if r is not None:
+        return r
+    require(tool)
+    rps = scope_rate()
+    # crlfuzz has no rate flag at all, only -c concurrency, so the pacing it can
+    # honour is "one request in flight at a time" when the engagement is slow.
+    conc = threads_for(rps)
+    # `< /dev/null` is load-bearing. crlfuzz's usage is `[buffers] | crlfuzz`:
+    # when stdin is a pipe it reads its URL list from stdin and IGNORES -u. Every
+    # exec through scripts/mythos is `docker exec -i`, which always hands it a
+    # pipe, so without this redirect `crlfuzz -u <URL>` silently sends nothing
+    # and reports no hits on a target that is plainly vulnerable.
+    cmd = (f"crlfuzz -u {shlex.quote(a.url)} -c {conc} -s < /dev/null 2>&1")
+    rc, out, err = run_sh(cmd, timeout=a.maxtime + 60)
+    rows = parse_crlfuzz(out)
+    return emit(a, result(sub, tool, rows, rate_limit_rps=rps, command=cmd,
+                          capped_to=f"nothing to cap: crlfuzz sends its fixed "
+                                    f"~611-payload matrix. Concurrency {conc}, no "
+                                    f"requests-per-second flag exists, --maxtime "
+                                    f"{a.maxtime}s is the hard stop",
+                          evidence=write_evidence(a, sub, cmd, out, err)))
+
+
+# ------------------------------------------------------------- jwt_tool: jwt
+
+def b64pad(s):
+    return s + "=" * (-len(s) % 4)
+
+
+def parse_jwt_offline(token):
+    """Rows from the token itself. No request is sent to produce these.
+
+    Everything here is a path to test, not a flaw: a HS256 token is not weak,
+    it is a token whose secret might be guessable; a `jku` is not an injection,
+    it is a fetch the server might perform.
+    """
+    import base64
+    rows = []
+    parts = (token or "").split(".")
+    if len(parts) < 2:
+        return [{"what": token[:24], "verdict": "inconclusive",
+                 "why": "not three dot-separated segments, so not a JWS/JWT"}]
+    try:
+        hdr = json.loads(base64.urlsafe_b64decode(b64pad(parts[0])))
+        pay = json.loads(base64.urlsafe_b64decode(b64pad(parts[1])))
+    except Exception as e:
+        return [{"what": "header/payload", "verdict": "inconclusive",
+                 "why": f"segments are not base64url JSON: {type(e).__name__}: {e}"}]
+    alg = str(hdr.get("alg") or "")
+    if alg.lower() in ("none", ""):
+        rows.append({"what": "alg", "verdict": "candidate", "value": alg,
+                     "why": "the token already declares no signature. Send it as-is to an "
+                            "authenticated endpoint: if it is accepted the finding is "
+                            "complete, and if it is rejected there is nothing here"})
+    elif alg.upper().startswith("HS"):
+        rows.append({"what": "alg", "verdict": "candidate", "value": alg,
+                     "why": "a symmetric algorithm. Two live checks: strip the signature "
+                            "(alg:none) and, if the server also serves an RSA public key, "
+                            "key confusion (RS->HS). Guessing the secret is brute force "
+                            "and hooks/scope-guard.py refuses it in every mode"})
+    for claim, note in (("kid", "a key identifier the server resolves: path traversal, SQL "
+                                "injection or a pointer to a key you control"),
+                        ("jku", "a URL the server fetches to get the verification key: "
+                                "point it at a key you control, and at an internal address "
+                                "for SSRF. The host you point it at must be in scope"),
+                        ("x5u", "same as jku with a certificate chain"),
+                        ("cty", "a content type that can switch the parser")):
+        if claim in hdr:
+            rows.append({"what": f"header.{claim}", "verdict": "candidate",
+                         "value": str(hdr[claim])[:200], "why": note})
+    if "exp" not in pay:
+        rows.append({"what": "exp", "verdict": "candidate",
+                     "why": "no expiry claim. Replay a token after logout or after a "
+                            "password change: the finding is that it still works, which "
+                            "the token alone does not prove"})
+    rows.append({"what": "claims", "verdict": "surface", "header": json.dumps(hdr),
+                 "payload_keys": sorted(pay.keys()),
+                 "why": "the decoded token. Look for an identity or a role claim the "
+                        "server trusts, then test it as an authorization problem"})
+    return rows
+
+
+# jwt_tool colours its output unconditionally, with no --no-color flag, so the
+# parser has to strip SGR sequences before matching anything.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+# One result line of jwt_tool's playbook:
+#   jwttool_<md5> <test name> Response Code: 200, 14 bytes
+PB_RESULT = re.compile(
+    r"^jwttool_([0-9a-f]{32})\s+(.*?)\s+Response Code:\s*(\d+),\s*(\d+)\s*bytes")
+PB_FOUND = re.compile(r'^\[\+\]\s+FOUND\s+"(.*)"\s+in response')
+# The two lines jwt_tool itself labels as controls, plus the anonymous baseline.
+PB_CONTROL = re.compile(r"(?i)^(persistence check|prescan: (original token|repeat original token))")
+PB_ANON = re.compile(r"(?i)^prescan: no token")
+PB_ATTACK = re.compile(r"(?i)^(exploit:|injected |claim processing|prescan: broken signature)")
+
+
+def parse_jwt_playbook(text):
+    """jwt_tool's `-M pb` output into rows, with its verdicts demoted.
+
+    jwt_tool's oracle is the `-cv` canary: a `[+] FOUND "<canary>" in response`
+    line immediately above a result line means that request reached
+    authenticated content. So the parser pairs the marker with the result line
+    rather than keyword-matching the text — keyword-matching scores
+    "Exploit: Blank password accepted in signature ... Response Code: 401" as a
+    hit, which is the opposite of what happened.
+
+    The first thing it checks is the anonymous control. If jwt_tool's
+    `Prescan: no token` request ALSO matched the canary, the canary does not
+    distinguish authentication state and every row below it is worthless: that
+    comes back as one `inconclusive` row and nothing reaches `candidate`.
+    """
+    results, found_next = [], None
+    for line in ANSI.sub("", text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = PB_FOUND.match(s)
+        if m:
+            found_next = m.group(1)
+            continue
+        m = PB_RESULT.match(s)
+        if m:
+            results.append({"name": m.group(2).strip(), "status": int(m.group(3)),
+                            "bytes": int(m.group(4)), "canary": found_next})
+            found_next = None
+            continue
+        found_next = None
+
+    anon = [r for r in results if PB_ANON.match(r["name"])]
+    if anon and anon[0]["canary"]:
+        return [{
+            "what": "canary", "verdict": "inconclusive",
+            "why": f"jwt_tool's anonymous control ({anon[0]['name']}, "
+                   f"{anon[0]['status']}) also matched the canary "
+                   f"{anon[0]['canary']!r}, so the canary does not distinguish an "
+                   f"authenticated response from an anonymous one and nothing the "
+                   f"playbook reported means anything. Pick a string that only an "
+                   f"authenticated response contains and run it again.",
+            "results_discarded": len(results),
+        }]
+
+    rows = []
+    for r in results:
+        attack, control = PB_ATTACK.match(r["name"]), PB_CONTROL.match(r["name"])
+        if attack and r["canary"]:
+            rows.append({
+                "what": r["name"], "verdict": "candidate",
+                "status": r["status"], "bytes": r["bytes"], "canary_matched": True,
+                "why": "jwt_tool's forged token reached content carrying the canary. "
+                       "That is one response, judged by one substring: replay it and "
+                       "read the body before calling it a bypass, and check that the "
+                       "identity in the response is the one the forged claim asked "
+                       "for and not the original user's",
+                "oracle": "the forged token reaches authenticated content that the "
+                          "anonymous request does not",
+            })
+        elif attack:
+            rows.append({"what": r["name"], "verdict": "none",
+                         "status": r["status"], "bytes": r["bytes"],
+                         "why": "the forged token did not reach the canary"})
+        elif control:
+            rows.append({"what": r["name"], "verdict": "surface",
+                         "status": r["status"], "bytes": r["bytes"],
+                         "canary_matched": bool(r["canary"]),
+                         "why": "jwt_tool's own control. It has to match the canary "
+                                "for the run to mean anything"})
+    return rows
+
+
+def cmd_jwt(a):
+    sub, tool = "jwt", "jwt_tool"
+    rows = parse_jwt_offline(a.token)
+    extra = {}
+    if a.target:
+        if not a.canary:
+            print("jwt: --target also needs --canary, a string that appears in the "
+                  "response only when the request is authenticated (jwt_tool -cv).\n"
+                  "Without it jwt_tool's prescan cannot tell an authenticated "
+                  "response from an anonymous one, stops and asks on stdin — and "
+                  "every exec here is non-interactive, so it dies with EOFError "
+                  "instead of scanning. Get the string from an authenticated "
+                  "response you already have.", file=sys.stderr)
+            return 2
+        r = gate(a, sub, tool, a.target)
+        if r is not None:
+            return r
+        require(tool)
+        rps = scope_rate()
+        # -rh puts the token where the server reads it: without it jwt_tool
+        # reports "No substitution occurred" and scans nothing.
+        # -rt is requests per MINUTE, not per second.
+        # < /dev/null is a safety net, not a fix: -cv is what stops the prompt.
+        cmd = (f"jwt_tool -t {shlex.quote(a.target)} "
+               f"-rh {shlex.quote(a.header + ': ' + a.prefix + a.token)} "
+               f"-cv {shlex.quote(a.canary)} -rt {max(1, int(rps * 60))} "
+               f"-M pb {shlex.quote(a.token)} < /dev/null 2>&1")
+        rc, out, err = run_sh(cmd, timeout=a.maxtime + 60)
+        rows += parse_jwt_playbook(out)
+        extra = {"rate_limit_rps": rps, "command": cmd,
+                 "evidence": write_evidence(a, sub, cmd, out, err)}
+    else:
+        extra = {"command": "(offline: the token was decoded locally, nothing was sent)"}
+    return emit(a, result(sub, tool, rows, **extra))
+
+
+# ---------------------------------------------------------- gitleaks: secrets
+
+def parse_gitleaks(text):
+    """gitleaks' JSON report into rows.
+
+    A gitleaks hit is a string that looks like a credential. Whether it is live
+    is a separate question and NOT one to answer by using it:
+    `rules.allow_secret_verification` stays false (skills/source-review).
+    """
+    rows = []
+    try:
+        doc = json.loads(text or "[]")
+    except ValueError:
+        return rows
+    for f in doc or []:
+        rows.append({
+            "what": f.get("RuleID") or f.get("Description") or "secret",
+            "verdict": "candidate",
+            "file": f.get("File"), "line": f.get("StartLine"),
+            "commit": (f.get("Commit") or "")[:12] or None,
+            "author": f.get("Author") or None,
+            "entropy": round(f.get("Entropy") or 0, 2) or None,
+            "redacted": (f.get("Secret") or "")[:4] + "..." if f.get("Secret") else None,
+            "why": "a string matching a provider's credential format in a tree you were "
+                   "given. It is a finding about the repository, not a key to use: do not "
+                   "authenticate with it. rules.allow_secret_verification stays false "
+                   "(skills/source-review). The live question is whether the credential "
+                   "is still valid, and the program answers that, not you",
+        })
+    return rows
+
+
+def cmd_secrets(a):
+    sub, tool = "secrets", "gitleaks"
+    p = pathlib.Path(a.path).resolve()
+    if not p.exists():
+        print(f"secrets: {p} does not exist", file=sys.stderr)
+        return 2
+    # The container sees the repo read-only at /repo and nothing else of the
+    # host, so a tree outside the repo is unreachable rather than silently empty.
+    try:
+        rel = p.relative_to(ROOT)
+    except ValueError:
+        print(f"secrets: {p} is outside the repository. The toolbox only sees the "
+              f"repo (read-only at /repo), so fetch the tree under the engagement "
+              f"directory first.", file=sys.stderr)
+        return 2
+    require(tool)
+    inside = f"/repo/{rel.as_posix()}" if not in_toolbox() else str(p)
+    rep = "/tmp/mythos-gitleaks-$$.json"
+    # `dir` scans the working tree; `git` would scan history. Both are offline:
+    # gitleaks sends nothing, which is why this subcommand is not scope-gated.
+    mode = "git" if a.history else "dir"
+    cmd = (f"rm -f {rep}; gitleaks {mode} {shlex.quote(inside)} --no-banner "
+           f"--report-format json --report-path {rep} --exit-code 0 >/dev/null 2>&1; "
+           f"cat {rep} 2>/dev/null; rm -f {rep}")
+    rc, out, err = run_sh(cmd, timeout=a.maxtime + 60)
+    rows = parse_gitleaks(out)
+    return emit(a, result(sub, tool, rows, scanned=str(p), command=cmd,
+                          contacts="nothing: gitleaks reads files only",
+                          evidence=write_evidence(a, sub, cmd, out, err)))
+
+
+# ------------------------------------------------- ysoserial / phpggc: gadget
+
+def parse_phpggc_list(text):
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^(\S+/\S+)\s{2,}(.*?)\s{2,}([A-Za-z].*?)\s{2,}(\S+)", line)
+        if not m:
+            continue
+        name, version, kind, vector = (x.strip() for x in m.groups())
+        destructive = bool(DESTRUCTIVE_CHAIN.search(kind))
+        rows.append({"name": name, "verdict": "surface", "version": version,
+                     "kind": kind, "vector": vector,
+                     "refused": "destructive chain type: data destruction is refused "
+                                "in every mode" if destructive else None,
+                     "why": "a gadget chain this image can generate offline. Generating "
+                            "it sends nothing; whether the target deserializes it is the "
+                            "live question"})
+    return rows
+
+
+def parse_ysoserial_list(text):
+    rows = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s{4,}(\w[\w.]*)\s+(@\S.*?)\s{2,}(\S.*)$", line)
+        if not m or m.group(1) in ("Payload",):
+            continue
+        rows.append({"name": m.group(1), "verdict": "surface",
+                     "authors": m.group(2).strip(), "requires": m.group(3).strip(),
+                     "why": "a Java gadget chain this image can generate offline. It only "
+                            "fires if the named library version is on the target's "
+                            "classpath, which is what the inventory (scripts/sbom) is for"})
+    return rows
+
+
+def chain_kind(action, chain):
+    """The chain's declared type, from the tool, not from its name.
+
+    A phpggc chain name says nothing: `CodeIgniter4/FD1` is a File delete and
+    `CodeIgniter4/FR1` is a File read. Only `phpggc -i` knows which, so the
+    refusal has to ask it rather than pattern-match the name.
+    """
+    if action != "php" or not chain:
+        return None
+    _, out, _ = run_sh(f"phpggc -i {shlex.quote(chain)} 2>&1 | head -8")
+    m = re.search(r"^Type\s*:\s*(.+?)\s*$", out or "", re.M)
+    return m.group(1) if m else None
+
+
+def cmd_gadget(a):
+    sub = "gadget"
+    if a.action == "list":
+        rows, tools = [], []
+        if a.lang in ("php", "both"):
+            require("phpggc")
+            tools.append("phpggc")
+            _, out, _ = run_sh("phpggc -l 2>&1")
+            rows += parse_phpggc_list(out)
+        if a.lang in ("java", "both"):
+            require("ysoserial")
+            tools.append("ysoserial")
+            _, out, _ = run_sh("ysoserial 2>&1")
+            rows += parse_ysoserial_list(out)
+        return emit(a, result(sub, "/".join(tools), rows,
+                              contacts="nothing: listing chains is offline"))
+
+    if a.chain is None:
+        print(f"gadget {a.action}: name a chain (see `scripts/tools gadget list`)",
+              file=sys.stderr)
+        return 2
+    named = "phpggc" if a.action == "php" else "ysoserial"
+    kind = chain_kind(a.action, a.chain)
+    if DESTRUCTIVE_CHAIN.search(a.chain) or DESTRUCTIVE_CHAIN.search(kind or ""):
+        return refuse(a, sub, named,
+                      f"{a.chain} is a data-destruction chain (type: "
+                      f"{kind or 'from its name'}). hooks/scope-guard.py refuses data "
+                      f"destruction in every mode and no scope rule overrides it, so "
+                      f"this wrapper will not build one. Pick a chain whose type is "
+                      f"file read, SSRF or an RCE you point at a harmless out-of-band "
+                      f"signal: `scripts/tools gadget list --lang "
+                      f"{'php' if a.action == 'php' else 'java'}`.")
+    cmdstr = a.cmd or ""
+    if cmdstr and DESTRUCTIVE_CMD.search(cmdstr):
+        return refuse(a, sub, named,
+                      f"the command to embed ({cmdstr!r}) destroys data or state. "
+                      f"Prove deserialization with a harmless out-of-band signal "
+                      f"(an interactsh callback) instead; that is the oracle a report "
+                      f"needs anyway.")
+    if a.action == "java":
+        require("ysoserial")
+        tool = "ysoserial"
+        if not cmdstr:
+            print("gadget java: --cmd is required. Use a harmless out-of-band signal, "
+                  "e.g. --cmd 'curl http://<id>.oast.fun/yso'", file=sys.stderr)
+            return 2
+        cmd = f"ysoserial {shlex.quote(a.chain)} {shlex.quote(cmdstr)} | base64 -w0"
+    else:
+        require("phpggc")
+        tool = "phpggc"
+        args = " ".join(shlex.quote(x) for x in (a.args or []))
+        cmd = f"phpggc -b {shlex.quote(a.chain)} {args}".strip()
+    rc, out, err = run_sh(cmd, timeout=a.maxtime + 60)
+    blob = (out or "").strip()
+    # phpggc prints the chain's info page (not a payload) when the argument count
+    # is wrong, on stdout, with exit 0. Without this check that page would be
+    # reported as a generated payload.
+    if blob and not re.fullmatch(r"[A-Za-z0-9+/=\s]+", blob):
+        return emit(a, result(sub, tool, [
+            {"what": a.chain, "verdict": "inconclusive",
+             "why": f"{tool} printed something that is not a payload, which usually "
+                    f"means the chain takes a different number of arguments. Run "
+                    f"`scripts/tools gadget list` and `phpggc -i {a.chain}` for its "
+                    f"signature.",
+             "tool_said": blob[:400]}], command=cmd))
+    if not blob:
+        return emit(a, result(sub, tool, [
+            {"what": a.chain, "verdict": "inconclusive",
+             "why": f"{tool} produced nothing (exit {rc}): {(err or '').strip()[:300]}"}],
+            command=cmd))
+    row = {"what": a.chain, "verdict": "surface",
+           "payload_b64_len": len(blob),
+           "payload_sha256": hashlib.sha256(blob.encode()).hexdigest(),
+           "why": "a gadget chain, base64-encoded. Nothing has been sent: generating a "
+                  "payload is offline. Sending it is a separate, scope-gated decision, "
+                  "and the oracle is the out-of-band callback, not the response"}
+    if a.out:
+        pathlib.Path(a.out).write_text(blob + "\n")
+        row["written_to"] = a.out
+    else:
+        row["payload_b64"] = blob if a.json else blob[:120] + ("..." if len(blob) > 120 else "")
+    return emit(a, result(sub, tool, [row], command=cmd,
+                          contacts="nothing: generation is offline",
+                          evidence=write_evidence(a, sub, cmd, blob[:4000], err)))
+
+
+# ------------------------------------------------------------ subfinder: hosts
+
+def parse_hosts(text, authorized):
+    """subfinder names into rows, every one of them out of scope by default.
+
+    This is the hard rule, not a nicety. subfinder's answer is "these names
+    exist", which is not "these names are authorized". A name becomes in-scope
+    only when a human adds it to scope.yaml.
+    """
+    rows, seen = [], set()
+    for line in (text or "").splitlines():
+        h = line.strip().lower().rstrip(".")
+        if not h or " " in h or h in seen or "." not in h:
+            continue
+        seen.add(h)
+        ok = h in authorized
+        rows.append({
+            "what": h,
+            "verdict": "surface" if ok else "candidate",
+            "in_scope": ok,
+            "why": ("already named in scope.yaml, so traffic to it is authorized"
+                    if ok else
+                    "discovered, NOT authorized. A name is not in scope because a tool "
+                    "found it. Nothing here sends traffic to it, and no flag adds it: "
+                    "an operator edits scope.yaml or it stays out"),
+        })
+    return rows
+
+
+def scope_authorized_names():
+    """The names scope.yaml already lists, read as text, never widened."""
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return set()
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    names = set()
+    for m in re.finditer(r"^\s*-\s*([A-Za-z0-9*._:-]+)\s*$", text, re.M):
+        names.add(m.group(1).split(":")[0].lower())
+    for m in re.finditer(r"^\s*target\s*:\s*(\S+)", text, re.M):
+        h = urllib.parse.urlsplit(m.group(1)).hostname or m.group(1)
+        names.add(h.lower())
+    return names
+
+
+def cmd_hosts(a):
+    sub, tool = "hosts", "subfinder"
+    if a.from_file:
+        out = pathlib.Path(a.from_file).read_text(encoding="utf-8", errors="replace")
+        cmd = f"(parsed recorded output: {a.from_file})"
+        err = ""
+    else:
+        if not a.domain:
+            print("hosts: give a DOMAIN or --from FILE", file=sys.stderr)
+            return 2
+        require(tool)
+        # subfinder queries third-party datasets about a name; it does not touch
+        # the target, which is why there is no scope gate on the domain. What it
+        # returns is still unauthorized, and parse_hosts marks it so.
+        cmd = (f"subfinder -d {shlex.quote(a.domain)} -silent -timeout 10 "
+               f"-max-time {int(a.maxtime // 60) or 1} 2>/dev/null")
+        _, out, err = run_sh(cmd, timeout=a.maxtime + 60)
+    rows = parse_hosts(out, scope_authorized_names())
+    res = result(sub, tool, rows, command=cmd,
+                 contacts="third-party passive datasets about the domain, never the "
+                          "discovered hosts",
+                 evidence=write_evidence(a, sub, cmd, out, err))
+    res["never_confirmed"] = ("a discovered name is out of scope until an operator adds "
+                              "it to scope.yaml by hand")
+    return emit(a, res)
+
+
+# ------------------------------------------------------------------- selftest
+
+FIX = ROOT / "tests" / "fixtures" / "tools"
+
+
+def _fixture_server():
+    """The loopback target the live asserts run against. Started by the selftest.
+
+    One handler covering every tool's oracle, so there is one server and no lab
+    container: a path list for ffuf, a reflected parameter for arjun, an
+    unsanitised Location for crlfuzz, and a token check for jwt_tool.
+    """
+    import http.server
+    import socket
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def reply(self, code, body=b"", extra=()):
+            self.send_response(code)
+            for k, v in extra:
+                # crlfuzz sends 611 variants, some with bytes no header can
+                # carry. A handler that raises on those looks like a dead server.
+                k = k.encode("latin-1", "replace").decode("latin-1")
+                v = v.encode("latin-1", "replace").decode("latin-1")
+                if k.strip() and "\r" not in k and "\n" not in k:
+                    self.send_header(k, v)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            path = u.path.rstrip("/") or "/"
+            if path == "/reflect":
+                # arjun's oracle: the response changes when a real parameter is
+                # present. Anything else gets a fixed body.
+                hits = [k for k in ("debug", "redirect") if k in q]
+                body = ("reflected: " + ",".join(hits)).encode() if hits else b"x" * 64
+                return self.reply(200, body)
+            if path == "/go":
+                # crlfuzz's oracle: the `url` value lands in a header unfiltered.
+                raw = urllib.parse.unquote(q.get("url", [""])[0])
+                head, _, rest = raw.partition("\r\n")
+                extra = [("X-Echo", head.replace("\r", "").replace("\n", ""))]
+                for line in rest.split("\r\n"):
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        extra.append((k.strip(), v.strip()))
+                # 200, not a redirect: crlfuzz follows redirects, and the
+                # response it would then read no longer carries the injected
+                # header, so a 302 here makes the fixture look not-vulnerable.
+                return self.reply(200, b"", extra)
+            if path in ("/.git", "/admin", "/", "/jwt"):
+                if path == "/jwt":
+                    auth = self.headers.get("Authorization", "")
+                    tok = auth.split(" ")[-1]
+                    hdr = tok.split(".")[0] if tok else ""
+                    alg = None
+                    if tok and tok.count(".") >= 2:
+                        try:
+                            import base64
+                            alg = json.loads(
+                                base64.urlsafe_b64decode(b64pad(hdr))).get("alg")
+                        except Exception:
+                            alg = None
+                    # An absent or malformed token is anonymous, not "alg: none".
+                    # Getting this wrong made jwt_tool's own prescan report that
+                    # the no-token control ALSO looked authenticated, which is
+                    # exactly the case the parser has to flag as inconclusive.
+                    if alg is not None and str(alg).lower() == "none":
+                        return self.reply(200, b"Welcome, admin")
+                    return self.reply(401, b"denied")
+                return self.reply(200, b"hello")
+            return self.reply(404, b"nope")
+
+        def log_message(self, *a_):
+            pass
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, port
+
+
+def _selftest(a):
+    """Asserts against recorded real output of each tool, plus live runs.
+
+    Every fixture under tests/fixtures/tools/ is the bytes the tool actually
+    printed in the toolbox image; docs/toolbox-inventory.md names the command
+    that produced each one. A fixture assert fails if the parser is broken,
+    which is the point of asserting on specific values rather than on counts.
+
+    `--live` additionally runs every wired tool through this wrapper against a
+    loopback server this function starts. It needs the toolbox image and is off
+    by default so CI's offline run stays offline; scripts/selftest.sh
+    --with-docker passes it.
+    """
+    import tempfile
+
+    fails, skipped = [], []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+        else:
+            print(f"  ok   {label}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+        else:
+            print(f"  ok   {label}")
+
+    def skip(label, why):
+        skipped.append(label)
+        print(f"  skip {label} ({why})")
+
+    def fixture(name):
+        p = FIX / name
+        if not p.exists():
+            fails.append(f"missing fixture {p}")
+            return ""
+        return p.read_text()
+
+    print("scripts/tools selftest")
+    print("\n-- parsers against recorded real tool output --")
+
+    rows = parse_ffuf(fixture("ffuf.json"))
+    eq(sorted(r["what"].rsplit("/", 1)[-1] for r in rows), [".git", "admin", "reflect"],
+       "ffuf: all three recorded hits parse, the 404 does not")
+    eq([r["status"] for r in rows if r["what"].endswith(".git")], [200],
+       "ffuf: /.git keeps its real status code")
+    eq({r["what"].rsplit("/", 1)[-1]: r["verdict"] for r in rows},
+       {".git": "candidate", "admin": "candidate", "reflect": "surface"},
+       "ffuf: a sensitive name is a candidate, an ordinary 200 is surface")
+    ok(all(r["verdict"] in VERDICTS for r in rows), "ffuf: every verdict is a known one")
+
+    rows = parse_arjun(fixture("arjun.json"))
+    eq(sorted(r["what"] for r in rows), ["debug", "redirect"],
+       "arjun: both recorded parameters parse out")
+    ok(rows and all(r["verdict"] == "candidate" for r in rows),
+       "arjun: a hidden parameter is a candidate")
+    ok(rows and all(r["url"].startswith("http") for r in rows),
+       "arjun: the row names the URL it was found on")
+
+    rows = parse_crlfuzz(fixture("crlfuzz.txt"))
+    eq(len(rows), 1, "crlfuzz: many payload variants collapse to one endpoint row")
+    ok(rows and rows[0]["variants"] > 1,
+       "crlfuzz: and the row counts the variants instead of repeating them")
+    ok(rows and rows[0]["what"].startswith("http") and "%0" not in rows[0]["what"],
+       "crlfuzz: the row is the endpoint, with the payload stripped")
+    ok(rows and "%0" in rows[0]["first_payload"],
+       "crlfuzz: one replayable payload is kept verbatim")
+    ok(rows and rows[0]["verdict"] == "candidate",
+       "crlfuzz: its own VULN line is demoted to candidate")
+    ok(rows and "not the split itself" in rows[0]["why"],
+       "crlfuzz: the row says what is still missing")
+
+    rows = parse_gitleaks(fixture("gitleaks.json"))
+    ok(len(rows) >= 2, "gitleaks: the recorded report parses into rows")
+    ok(any(r["what"] == "generic-api-key" for r in rows),
+       "gitleaks: the rule id is carried through")
+    ok(all(r["verdict"] == "candidate" for r in rows), "gitleaks: a hit is a candidate")
+    ok(all(r.get("redacted", "").endswith("...") and len(r["redacted"]) <= 8
+           for r in rows), "gitleaks: the secret itself is never echoed in full")
+    ok(all(r["file"] and r["line"] for r in rows),
+       "gitleaks: every row names its file and line")
+
+    rows = parse_phpggc_list(fixture("phpggc-l.txt"))
+    ok(len(rows) >= 5, "phpggc: the chain table parses")
+    ok(any(r["name"] == "CakePHP/RCE1" for r in rows),
+       "phpggc: a known chain name parses with its slash")
+    dels = [r for r in rows if DESTRUCTIVE_CHAIN.search(r["kind"])]
+    ok(dels and all(r["refused"] for r in dels),
+       "phpggc: every File delete chain is marked refused")
+    ok(all(r["verdict"] != "candidate" for r in rows),
+       "phpggc: an available chain is surface, never a candidate")
+
+    rows = parse_ysoserial_list(fixture("ysoserial.txt"))
+    ok(any(r["name"] == "CommonsCollections6" for r in rows),
+       "ysoserial: the payload table parses")
+    ok(any("commons-collections" in r["requires"] for r in rows),
+       "ysoserial: the dependency column is carried through")
+
+    rows = parse_jwt_offline(
+        "eyJhbGciOiJub25lIiwia2lkIjoiLi4vLi4vZXRjL3Bhc3N3ZCJ9."
+        "eyJzdWIiOiIxIiwicm9sZSI6InVzZXIifQ.")
+    kinds = {r["what"] for r in rows}
+    ok({"alg", "header.kid", "exp"} <= kinds,
+       "jwt: alg:none, the kid and the missing exp all become rows")
+    ok(all(r["verdict"] in VERDICTS for r in rows), "jwt: every verdict is a known one")
+    eq([r["verdict"] for r in parse_jwt_offline("not-a-token")], ["inconclusive"],
+       "jwt: a non-token is inconclusive, not a candidate")
+    rows = parse_jwt_playbook(fixture("jwt_tool-pb.txt"))
+    ok(len(rows) > 10, "jwt: the recorded playbook output parses into its result lines")
+    ok(any(r["what"].startswith('Exploit: "alg":"none"') and r["verdict"] == "candidate"
+           for r in rows), "jwt: the alg:none exploit that got the canary is a candidate")
+    ok(all(r["verdict"] == "none" for r in rows if r.get("status") == 401),
+       "jwt: a 401 is 'none' — a line reading 'accepted ... 401' is not a hit")
+    ok(any(r["verdict"] == "surface" and r["canary_matched"] for r in rows),
+       "jwt: jwt_tool's own controls are kept as surface, so the run can be judged")
+    ok(all(r["verdict"] != "confirmed" for r in rows), "jwt: nothing is ever confirmed")
+    # The case that invalidates a whole run: the anonymous control also matched.
+    bad = parse_jwt_playbook(
+        '[+] FOUND "Welcome" in response:\n'
+        "jwttool_" + "0" * 32 + " Prescan: no token Response Code: 200, 14 bytes\n"
+        '[+] FOUND "Welcome" in response:\n'
+        "jwttool_" + "1" * 32 + ' Exploit: "alg":"none" (-X a) Response Code: 200, 14 bytes\n')
+    eq([r["verdict"] for r in bad], ["inconclusive"],
+       "jwt: a canary the anonymous request also matches voids the whole run")
+
+    raw = fixture("subfinder.txt")
+    first = [x for x in raw.splitlines() if x.strip()][:1]
+    rows = parse_hosts(raw, set(first))
+    ok(len(rows) >= 10, "hosts: the recorded subfinder output parses")
+    eq([r["what"] for r in rows if r["in_scope"]], [first[0].lower()] if first else [],
+       "hosts: only a name scope.yaml already lists is in scope")
+    ok(all(r["verdict"] == "candidate" for r in rows if not r["in_scope"]),
+       "hosts: a discovered name is never authorized by discovery")
+    ok(all("NOT authorized" in r["why"] for r in rows if not r["in_scope"]),
+       "hosts: and every such row says so")
+    eq(parse_hosts(raw, set()), parse_hosts(raw, set()),
+       "hosts: the parse is deterministic")
+    ok(not any(r["in_scope"] for r in parse_hosts(raw, set())),
+       "hosts: with an empty scope file nothing is in scope")
+
+    print("\n-- scope, pacing and refusals --")
+    with tempfile.TemporaryDirectory() as td:
+        sc = pathlib.Path(td) / "scope.yaml"
+        sc.write_text("target: http://127.0.0.1:5041\nin_scope:\n  - 127.0.0.1\n"
+                      "  - api.example.com\nports: [5041]\nrules:\n"
+                      "  rate_limit_rps: 7\n")
+        old = os.environ.get("MYTHOS_SCOPE")
+        os.environ["MYTHOS_SCOPE"] = str(sc)
+        try:
+            eq(scope_rate(), 7.0, "scope: rate_limit_rps is read from scope.yaml")
+            ok("api.example.com" in scope_authorized_names(),
+               "scope: in_scope names are read")
+            ok("evil.example.com" not in scope_authorized_names(),
+               "scope: a name not in the file is not authorized")
+        finally:
+            if old is None:
+                os.environ.pop("MYTHOS_SCOPE", None)
+            else:
+                os.environ["MYTHOS_SCOPE"] = old
+    eq(scope_rate(), DEFAULT_RPS, "scope: no scope file means the low default, not unlimited")
+    eq(threads_for(1.0), 1, "pacing: concurrency never exceeds the rate limit")
+    eq(threads_for(100.0), 10, "pacing: concurrency is capped at 10 however fast the engagement")
+
+    ok(DESTRUCTIVE_CHAIN.search("File delete"), "refusal: a File delete chain is destructive")
+    ok(not DESTRUCTIVE_CHAIN.search("RCE: Function Call"), "refusal: an RCE chain is not")
+    for bad in ("rm -rf /", "DROP TABLE users", "dd if=/dev/zero of=/dev/sda",
+                "shutdown -h now", "shred -u /etc/passwd"):
+        ok(DESTRUCTIVE_CMD.search(bad), f"refusal: {bad}")
+    for good in ("curl http://x.oast.fun/y", "id", "nslookup x.oast.fun"):
+        ok(not DESTRUCTIVE_CMD.search(good), f"allowed: {good}")
+
+    # --- live ---------------------------------------------------------------
+    print("\n-- live, against a loopback server this selftest starts --")
+    srv, port = _fixture_server()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sc = pathlib.Path(td) / "scope.yaml"
+            sc.write_text(f"target: http://127.0.0.1:{port}\nin_scope:\n  - 127.0.0.1\n"
+                          f"ports: [{port}]\nrules:\n  rate_limit_rps: 20\n")
+            env = dict(os.environ, MYTHOS_SCOPE=str(sc), MYTHOS_NET="host")
+
+            def tools(*argv, timeout=420):
+                r = subprocess.run([sys.executable, __file__, *argv, "--json",
+                                    "--evidence", td],
+                                   env=env, capture_output=True, text=True,
+                                   timeout=timeout)
+                try:
+                    return r.returncode, json.loads(r.stdout or "{}")
+                except ValueError:
+                    return r.returncode, {"stdout": r.stdout, "stderr": r.stderr}
+
+            # Needs no tool at all: the gate fires before anything is launched.
+            rc, doc = tools("fuzz", "http://127.0.0.1:9/FUZZ", timeout=120)
+            eq(rc, 3, "live: an unauthorized destination exits 3")
+            ok("not authorize" in json.dumps(doc), "live: and the refusal names the host")
+            rc, doc = tools("jwt", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.", timeout=120)
+            eq(rc, 1, "live: the offline jwt decode runs with no container and finds alg:none")
+
+            if not a.live:
+                skip("the tool runs", "pass --live (needs the toolbox image)")
+            else:
+                wl = ROOT / "engagements" / f".selftest-tools-{port}.txt"
+                wl.write_text(".git\nreflect\nnope-not-there\n")
+                pl = ROOT / "engagements" / f".selftest-params-{port}.txt"
+                pl.write_text("debug\nredirect\nnot-a-param\n")
+                tree = ROOT / "engagements" / f".selftest-tree-{port}"
+                tree.mkdir(exist_ok=True)
+                # Fabricated strings in two documented provider formats. Not
+                # credentials. AWS's own AKIA…EXAMPLE is deliberately
+                # not used: gitleaks allowlists it, so it would assert nothing.
+                (tree / "config.py").write_text(
+                    'GITHUB_TOKEN = "ghp_0123456789abcdefghijklmnopqrstuvwx"\n'
+                    # Assembled, not written out: the value is fabricated, but a
+                    # scanner reading this file cannot tell, and a push of this
+                    # repository has already been blocked over exactly that.
+                    'SLACK = "' + "xoxb-" + "000000000000-000000000000-"
+                    + "aBcDeFgHiJkLmNoPqRsTuVwX" + '"\n')
+                try:
+                    rc, doc = tools("fuzz", f"http://127.0.0.1:{port}/FUZZ",
+                                    "-w", f"/repo/engagements/{wl.name}", "-n", "10")
+                    eq(sorted(x["what"].rsplit("/", 1)[-1] for x in doc.get("results") or []),
+                       [".git", "reflect"], "live ffuf: found both real paths, not the 404")
+                    eq({x["what"].rsplit("/", 1)[-1]: x["verdict"]
+                        for x in doc["results"]},
+                       {".git": "candidate", "reflect": "surface"},
+                       "live ffuf: the sensitive name is the only candidate")
+                    eq(doc.get("rate_limit_rps"), 20.0,
+                       "live ffuf: the run honoured rate_limit_rps 20")
+                    eq(doc.get("capped_to"), 10, "live ffuf: the wordlist cap is reported")
+                    ok(doc.get("evidence") and pathlib.Path(doc["evidence"]).exists(),
+                       "live ffuf: the raw tool output was written as evidence")
+
+                    rc, doc = tools("params", f"http://127.0.0.1:{port}/reflect",
+                                    "-w", f"/repo/engagements/{pl.name}", "-n", "10")
+                    ok("redirect" in [x["what"] for x in doc.get("results") or []] or
+                       "debug" in [x["what"] for x in doc.get("results") or []],
+                       "live arjun: found a parameter the server reacts to")
+
+                    rc, doc = tools("crlf", f"http://127.0.0.1:{port}/go?url=x")
+                    ok(rc in (0, 1) and "results" in doc, "live crlfuzz: ran and parsed")
+                    ok(all(x["verdict"] == "candidate" for x in doc.get("results") or []),
+                       "live crlfuzz: any hit is a candidate, never confirmed")
+
+                    rc, doc = tools("secrets", str(tree))
+                    found = {x["what"] for x in doc.get("results") or []}
+                    ok(found, "live gitleaks: the planted keys were found")
+                    ok(all(x["verdict"] == "candidate" for x in doc.get("results") or []),
+                       "live gitleaks: a hit is a candidate")
+
+                    rc, doc = tools("gadget", "list", "--lang", "both")
+                    names = {x["name"] for x in doc.get("results") or []}
+                    ok("CommonsCollections6" in names and
+                       any("/" in n for n in names),
+                       "live gadget: both chain tables listed")
+                    rc, doc = tools("gadget", "java", "URLDNS",
+                                    "--cmd", "http://127.0.0.1:1/selftest")
+                    ok((doc.get("results") or [{}])[0].get("payload_sha256"),
+                       "live gadget: a Java chain was generated offline")
+                    rc, doc = tools("gadget", "php", "CodeIgniter4/FD1", "/tmp/x")
+                    eq(rc, 3, "live gadget: a File delete chain is refused (exit 3)")
+                    rc, doc = tools("gadget", "java", "CommonsCollections6",
+                                    "--cmd", "rm -rf /tmp/x")
+                    eq(rc, 3, "live gadget: a destructive --cmd is refused (exit 3)")
+
+                    rc, doc = tools("jwt", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.",
+                                    "--target", f"http://127.0.0.1:{port}/jwt",
+                                    "--canary", "Welcome, admin")
+                    names = [x["what"] for x in doc.get("results") or []]
+                    ok(any(n.startswith("Exploit:") for n in names),
+                       "live jwt_tool: the playbook ran against the loopback target")
+                    ok(any(x["verdict"] == "candidate" for x in doc.get("results") or []),
+                       "live jwt_tool: and the alg:none forgery reached the canary")
+                    rc2, _ = tools("jwt", "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.",
+                                   "--target", f"http://127.0.0.1:{port}/jwt")
+                    eq(rc2, 2, "live jwt_tool: --target without --canary is refused, "
+                               "because jwt_tool would prompt on stdin and die")
+                    ok(all(x["verdict"] != "confirmed" for x in doc.get("results") or []),
+                       "live jwt_tool: nothing it said became confirmed")
+                finally:
+                    wl.unlink(missing_ok=True)
+                    pl.unlink(missing_ok=True)
+                    for f in tree.glob("*"):
+                        f.unlink()
+                    tree.rmdir()
+    finally:
+        srv.shutdown()
+
+    print()
+    if fails:
+        for f in fails:
+            print(f"FAIL {f}")
+        print(f"{len(fails)} failure(s)")
+        return 1
+    print(f"all asserts passed ({len(skipped)} skipped)" if skipped else "all asserts passed")
+    return 0
+
+
+# ------------------------------------------------------------------- argparse
+
+def main(argv):
+    p = argparse.ArgumentParser(
+        prog="scripts/tools", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__.split("\n\n", 1)[0],
+        epilog="Every destination is checked against scope.yaml before the tool "
+               "starts. No verdict here is ever `confirmed`.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        """The flags every subcommand takes, after the subcommand name."""
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+        sp.add_argument("--evidence", metavar="DIR",
+                        help="where to write the exact command and the tool's raw "
+                             "output (default: the engagement directory that owns "
+                             "$MYTHOS_SCOPE)")
+        sp.add_argument("--maxtime", type=int, default=300, metavar="S",
+                        help="wall-clock cap for the tool itself (default 300)")
+        return sp
+
+    f = sub.add_parser("fuzz", help="ffuf: content / path discovery",
+                       description="CONTACTS: the URL you give it, once per wordlist "
+                                   "entry, and nothing else. Capped by -n and paced to "
+                                   "rules.rate_limit_rps. The default wordlist is small "
+                                   "on purpose: this must never sweep.")
+    f.add_argument("url", help="target URL containing the FUZZ keyword")
+    f.add_argument("-w", "--wordlist", default=FUZZ_WORDLIST,
+                   help=f"wordlist inside the toolbox (default: {FUZZ_WORDLIST})")
+    f.add_argument("-n", "--max", type=int, default=DEFAULT_N,
+                   help=f"use at most N entries of the wordlist (default {DEFAULT_N})")
+    f.add_argument("--match-codes", default="200,204,301,302,307,401,403,405")
+    common(f)
+    f.set_defaults(fn=cmd_fuzz)
+
+    a_ = sub.add_parser("params", help="arjun: hidden parameter discovery",
+                        description="CONTACTS: the URL you give it, in chunked batches "
+                                    "of parameter names, and nothing else. Capped by -n, "
+                                    "paced with arjun's --rate-limit from "
+                                    "rules.rate_limit_rps.")
+    a_.add_argument("url")
+    a_.add_argument("-w", "--wordlist", help="default: arjun's own db/small.txt (835 names)")
+    a_.add_argument("-n", "--max", type=int, default=DEFAULT_N,
+                    help=f"use at most N parameter names (default {DEFAULT_N})")
+    common(a_)
+    a_.set_defaults(fn=cmd_params)
+
+    c = sub.add_parser("crlf", help="crlfuzz: CRLF / response-header injection",
+                       description="CONTACTS: the URL you give it, with CRLF sequences "
+                                   "in the path and query, and nothing else. It sends a "
+                                   "FIXED ~611 requests per URL (its payload matrix) and "
+                                   "has no flag that shortens that list, so there is "
+                                   "nothing here to cap: budget for 611. It also has no "
+                                   "requests-per-second flag, so the only pacing "
+                                   "available is its concurrency, derived from "
+                                   "rules.rate_limit_rps, plus --maxtime as a hard stop. "
+                                   "If 611 requests is too many for the engagement, do "
+                                   "not run it; test the one reflected header by hand "
+                                   "(skills/web-scan step 4).")
+    c.add_argument("url")
+    common(c)
+    c.set_defaults(fn=cmd_crlf)
+
+    j = sub.add_parser("jwt", help="jwt_tool: token analysis",
+                       description="CONTACTS: nothing by default — the token is decoded "
+                                   "locally. With --target it contacts that URL only, "
+                                   "and only after the scope check. Secret cracking "
+                                   "(jwt_tool -C) is not reachable from here: it is "
+                                   "brute force, which hooks/scope-guard.py refuses in "
+                                   "every mode.")
+    j.add_argument("token")
+    j.add_argument("--target", help="URL to replay forged tokens against (scope-gated)")
+    j.add_argument("--canary", help="a string that appears in the response ONLY when "
+                                    "the request is authenticated (jwt_tool -cv). "
+                                    "Required with --target: without it jwt_tool's "
+                                    "prescan prompts on stdin and the exec dies")
+    j.add_argument("--header", default="Authorization",
+                   help="request header carrying the token (default Authorization)")
+    j.add_argument("--prefix", default="Bearer ",
+                   help="what precedes the token in that header (default 'Bearer ')")
+    common(j)
+    j.set_defaults(fn=cmd_jwt)
+
+    s = sub.add_parser("secrets", help="gitleaks: secrets in a tree (offline)",
+                       description="CONTACTS: nothing. gitleaks reads files. The path "
+                                   "must be inside the repository, because that is all "
+                                   "the toolbox can see (read-only at /repo). A hit is "
+                                   "a finding about the repository and never a "
+                                   "credential to use.")
+    s.add_argument("path")
+    s.add_argument("--history", action="store_true",
+                   help="scan git history (gitleaks git) instead of the working tree")
+    common(s)
+    s.set_defaults(fn=cmd_secrets)
+
+    g = sub.add_parser("gadget", help="ysoserial / phpggc: offline payload generation",
+                       description="CONTACTS: nothing, on the network. Generating a "
+                                   "gadget chain is offline, and so is listing the "
+                                   "chains. A php chain's declared type is read with "
+                                   "`phpggc -i` in the toolbox (also offline) because a "
+                                   "chain NAME does not say what it does: "
+                                   "CodeIgniter4/FD1 is a File delete and "
+                                   "CodeIgniter4/FR1 is a File read. Data-destruction "
+                                   "chains and destructive --cmd values are refused "
+                                   "with exit 3.")
+    g.add_argument("action", choices=["list", "java", "php"])
+    g.add_argument("chain", nargs="?", help="chain name, e.g. CommonsCollections6 or Laravel/RCE1")
+    g.add_argument("args", nargs="*", help="phpggc chain arguments")
+    g.add_argument("--lang", choices=["java", "php", "both"], default="both",
+                   help="which chain tables `list` prints")
+    g.add_argument("--cmd", help="command to embed (ysoserial). Use a harmless "
+                                 "out-of-band signal, not a destructive command")
+    g.add_argument("--out", help="write the base64 payload to this file")
+    common(g)
+    g.set_defaults(fn=cmd_gadget)
+
+    h = sub.add_parser("hosts", help="subfinder: names, all marked out of scope",
+                       description="CONTACTS: subfinder's passive third-party datasets "
+                                   "about the domain. It never contacts the hosts it "
+                                   "discovers, and neither does anything else here: "
+                                   "every name comes back in_scope=false until an "
+                                   "operator adds it to scope.yaml by hand. There is no "
+                                   "flag that widens scope.")
+    h.add_argument("domain", nargs="?")
+    h.add_argument("--from", dest="from_file", metavar="FILE",
+                   help="parse recorded subfinder output instead of running it")
+    common(h)
+    h.set_defaults(fn=cmd_hosts)
+
+    t = sub.add_parser("selftest", help="asserts: recorded fixtures + live loopback runs",
+                       description="Parser asserts against recorded real tool output, the "
+                                   "scope reader, the refusals, and two live asserts that "
+                                   "need no container. --live additionally runs every "
+                                   "wired tool through this wrapper against a loopback "
+                                   "server it starts itself, which needs the toolbox "
+                                   "image.")
+    t.add_argument("--live", action="store_true",
+                   help="also run the tools in the toolbox against the loopback fixture")
+    common(t)
+    t.set_defaults(fn=_selftest)
+
+    if argv[:1] == ["--selftest"]:  # the spelling scripts/selftest.sh uses
+        argv = ["selftest"] + argv[1:]
+    a = p.parse_args(argv)
+    try:
+        return a.fn(a)
+    except ToolMissing as e:
+        print(f"scripts/tools: {e} is not in the toolbox image. See toolbox/tools.txt "
+              f"and docs/toolbox-inventory.md.", file=sys.stderr)
+        return 4
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

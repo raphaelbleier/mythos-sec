@@ -3,20 +3,23 @@
 </p>
 
 <p align="center">
-  <b>Mythos</b> — a skill-driven web red-team framework for OpenCode and Claude Code, for authorized pentesting and bug bounty.
+  <b>Mythos</b> — an autonomous web red-team agent for authorized pentesting and bug bounty.
 </p>
 
 <p align="center">
-  <i>Point <code>/cybersecurity</code> at a target you're allowed to test. Your agent host <b>is</b> the agent: it reasons like a pentester and drives real security tools in a Kali toolbox to find — and prove — web vulnerabilities. No API key of its own.</i>
+  <i>Point it at a target you are allowed to test. It maps the surface, reasons about the
+  stack, drives real security tools in a Kali container, proves what it finds, and writes
+  the report. Four phases enforced in code, every endpoint accounted for, your model behind it.</i>
 </p>
 
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="#what-it-can-do">What it can do</a> ·
   <a href="#how-it-works">How it works</a> ·
-  <a href="#benchmarks">Benchmarks</a> ·
-  <a href="#scope--safety">Scope &amp; safety</a> ·
-  <a href="#responsible-use">Responsible use</a>
+  <a href="#models-and-providers">Models</a> ·
+  <a href="#scope-and-safety">Safety</a> ·
+  <a href="#what-this-does-not-claim">Limits</a>
 </p>
 
 <p align="center">
@@ -27,618 +30,471 @@
 
 ---
 
-> **For authorized testing only.** Bug-bounty programs in scope, systems you own,
-> or lab targets. "Permitted" means written authorization or a program whose scope
-> covers the host, not your own judgement that nobody will mind.
+> ### Authorized testing only
 >
-> `scope.yaml` is the authorization boundary and a hook watches it, but in the
-> default `warn` mode the request is already out when the warning arrives. Set
-> `MYTHOS_SCOPE_ENFORCE=ask` for anything that is not a lab. With `--scope <file>`
-> the engagement then runs unattended, with shell access, until it writes a report.
+> Bug-bounty programs whose scope covers the host, systems you own, or lab targets.
+> "Allowed" means written authorization or a published program scope, not your own
+> judgement that nobody will mind.
+>
+> `engagements/<dir>/scope.yaml` is the authorization boundary and nothing in a run widens
+> it. The scope guard **warns** by default, which means the request is already out when you
+> read the warning. Set `MYTHOS_SCOPE_ENFORCE=ask` for anything that is not a lab and the
+> call is refused instead.
 
-## Results at a glance
+```bash
+mythos -t https://target.example.com --scope engagements/acme/scope.yaml
+```
 
-**The benchmark is being re-measured.** An audit on 13 November 2026 found faults
-in the harness that make part of the published numbers indefensible. The harness
-is fixed; the affected claims are withdrawn until the sweep has been run again.
-What each fault was and how it is now prevented:
-[`bench/METHODOLOGY.md`](bench/METHODOLOGY.md).
+<p align="center">
+  <img src="docs/assets/cli.png" alt="Mythos running an engagement: the phase rail, two parallel exploit workers and the guard output" width="880">
+</p>
 
-**The one measurement made since the fix points the other way.** On 14 November
-2026 the coverage gate was re-measured on DVGA with the repaired harness: four
-cells, paired on each of the 21 documented vulnerabilities rather than on the
-target, rated blind by two independent raters on different models. Both put the
-gate-off arm ahead. Rater A saw recall 0.48 against 0.19 with six discordant
-pairs all one way (McNemar exact p = 0.0312); rater B saw 0.57 against 0.29
-(p = 0.0703). It is one target, 21 entries, one cluster, a minimum detectable
-difference of 0.30, and two raters who disagree across the 0.05 line, so it does
-not establish that the gate hurts either. The run, both ratings and the honest
-limits are in
-[`bench/data/runs/gate-dvga-20261114/`](bench/data/runs/gate-dvga-20261114/).
+---
 
-That run also produced the project's first precision figures, 0.80 to 1.00
-depending on the rater, with six false positives found between them. Every
-earlier precision of 1.00 came from a triage schema in which no row could be a
-false positive.
+## Contents
 
-**The scaffolding does not find more, it finds different.** A head-to-head on
-Vuln Bank the same day put Mythos, a bare control agent and Strix on the same
-model, key, budget and endpoint, scored against the same 76 documented
-vulnerabilities and rated blind by two raters (Cohen's kappa 0.80 to 1.00, the
-best agreement here so far). Recall was 0.34 and 0.39 for the scaffolding
-against 0.33 and 0.39 for the bare agent, McNemar p = 1.0000 both times. But
-each arm found six or seven entries the other missed, so their union is 31 and
-37 of 76 against 25 to 30 individually. The scaffolding uniquely reached the
-bill-payment, merchant and AI-configuration surfaces that this project's own
-limitations file had recorded as never reached. Details, and the five things
-this does not establish, in
-[`bench/data/runs/h2h-vulnbank-20261114/`](bench/data/runs/h2h-vulnbank-20261114/).
+- [What it can do](#what-it-can-do)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [How it works](#how-it-works)
+- [What a run produces](#what-a-run-produces)
+- [Models and providers](#models-and-providers)
+- [Scope and safety](#scope-and-safety)
+- [Continuous testing](#continuous-testing)
+- [What this does not claim](#what-this-does-not-claim)
+- [Layout](#layout)
+- [Contributing and license](#contributing-and-license)
 
-Strix scored 0.00 recall, and that number should be read there rather than
-quoted: it was cut off before writing a report and labels its own findings
-"requires further review". Getting it to run took four attempts and all four
-failures were this project's own, one of which very likely accounts for the
-whole of the "Strix kept only 2 of 12 valid cells" recorded here previously.
-Every Strix comparison from this repository before 14 November 2026 is
-withdrawn.
+---
 
-Withdrawn:
+## What it can do
 
-- **The Vuln Bank coverage-gate separation** (Mythos with the gate 34 and 33
-  entries, the control 30 and 29). The Mythos arm ran with `--add-dir <repo>` and
-  `--plugin-dir <repo>`, so the scoring key for that measurement,
-  `bench/data/ground_truth/vulnbank.json`, sat inside a directory the arm was
-  invited to read, and its toolbox mounted the same repository at `/repo`. The
-  control arm got an empty working directory and no such grant. No check in the
-  harness tested for that, and the transcript detector would not have matched a
-  ground-truth path, so the transcripts neither show that the key was read nor
-  show that it was not. The gate's coverage score came from `scripts/coverage`,
-  which counted a substring match in the report as a mapped path having been
-  covered. Two runs per condition, no interval and no test.
-- **Precision 1.00**, everywhere it appears. No triage row could carry the status
-  `fp`: the schema listed the documented vulnerabilities and asked the rater to
-  mark each one found or missed, so a false positive the arm reported had nowhere
-  to go. The number is a property of the schema, not a measurement.
-- **"All 42 mapped paths accounted for."** The hook handed the agent the path
-  list and the scorer counted a mention of a path as coverage of it, so the claim
-  restates its own input.
-- **Every solve rate on the Claude Code host.** A cell was dropped from the
-  denominator only if it had also failed, so an exclusion could only raise the
-  rate. The 40-challenge control arm reads 0.69 with no exclusions at all, 0.90
-  under the published rule, and 0.96 under a rule that decides infrastructure
-  failure from the host's own `safety_stops` counter without looking at whether
-  the cell solved.
+### Run a whole assessment without you
 
-What survives, with its limits:
+One command maps the surface, decides what is worth attacking, attacks it, proves what
+holds, and writes a report a triager can read. Nothing is asked mid-run: there is one human
+gate and it is the scope file, settled before the run starts. On a lab target with 36
+mapped endpoints, a run took 50 minutes and closed every phase.
 
-- On single-flag CTF challenges the paired comparison shows no detectable
-  difference under any of those three exclusion rules, because it was never able
-  to show one. With 26 paired challenges and a discordance rate of 0.3, the
-  smallest difference the exact test detects with 80% power is 0.29, and the
-  sweep saw 1 discordant pair. Published work on the same XBOW benchmark
-  ("Baselines Before Architecture", arXiv 2607.13085) puts the scaffold
-  advantage at 5 to 10 percentage points at a matched model, so this design was
-  underpowered against the plausible effect by roughly a factor of three. The
-  honest statement is: underpowered, no detectable difference, minimum
-  detectable difference about 0.29. Not a null result. `bench/stats.py --selftest`
-  recomputes those power figures.
-- On GLM 5.3 both arms solved all 10 scored cells of 12 (two per arm were rate
-  limited). Ten cells per arm, a ceiling at 1.00, no test.
-- Every solved cell's flag came back from the target. Re-scoring all four stored
-  sweeps, 79 of 79 solved cells had the flag first appear in tool output after a
-  request to the target, and none had it first appear in the agent's own text.
-  Audits of other CTF harnesses find 17 to 23 points of inflation from flags
-  that were never exploited for; that does not reproduce here. The check is a
-  necessary condition, not proof that the intended vulnerability was the path.
-- The flagless recall figures (VAmPI 8/9 against 8/9, DVGA 12/21 against 11/21,
-  Vuln Bank without the gate 28 and 29 against 30 and 29) carry the same
-  ground-truth access problem and are withdrawn as measurements of the
-  scaffolding. Their direction is "no separation", which a leak toward the Mythos
-  arm would not have produced.
+### Find and prove these classes
 
-Two things no number here controls for. The targets are public: XBEN and all four
-real apps are public repositories with public write-ups, and for the flagless
-targets the ground truth is each app's own README, so a model may have read it.
-XBOW's own repository now describes the validation benchmarks as trained into
-current models and kept for historical purposes, which makes XBEN a regression
-check rather than evidence of capability. And "scaffolding" is one undifferentiated
-condition: skills, sub-agents, toolbox, prompt and tool access all change at once
-between the arms.
+The skills and the per-class playbooks in `knowledge/` cover:
 
-The scope guard is a safety net, not a sandbox. In its default `warn` mode it reports
-an out-of-scope request after the request has already gone out, and it has let one
-through: a `169.254.169.254` SSRF payload that the target then connected to. Set
-`MYTHOS_SCOPE_ENFORCE=ask` when a single such request is unacceptable.
+| Area | Classes |
+|---|---|
+| Injection | SQL (error, boolean, blind, UNION, and via sqlmap), NoSQL, OS command (reflected and blind over OOB), SSTI through to RCE, XXE, CRLF and response splitting, deserialization |
+| Access control | IDOR and BOLA with two identities, privilege escalation, multi-tenant isolation, mass assignment, broken function-level authorization |
+| Client side | Reflected, stored and DOM XSS proven by execution in a real Chromium, CSRF, clickjacking, WebSocket abuse, client-side supply chain, client-side path traversal |
+| Authentication | JWT forgery, weak signing keys and `alg` confusion, OAuth 2.0 and OIDC flow abuse (`redirect_uri`, `state`, PKCE, `id_token` audience confusion), SAML signature wrapping and NameID comment truncation, SCIM, federated account linking, session fixation, account-takeover chains |
+| Server side | SSRF with out-of-band confirmation, path traversal and LFI with filter evasion, file upload, request smuggling, web cache poisoning and deception with a verified cleanup, race conditions including the HTTP/2 single-packet attack, edge-versus-origin parser differentials, gateway bypass |
+| APIs | GraphQL introspection, resolver injection and batching abuse, OpenAPI-driven parameter coverage, excessive data exposure, webhooks, BaaS and cloud-storage exposure |
+| AI applications | Prompt injection, unsafe tool invocation, output handling, MCP server exposure |
+| Configuration | Exposed secrets and `.env`, verbose debug endpoints, CORS, security headers and cookie flags |
+| Cloud | Bucket and container permissions read from policy rather than by writing, presigned-URL and SAS hygiene, serverless front doors and authorizer gaps, unauthenticated kubelet, etcd and Docker API, provider metadata through an SSRF |
+| Supply chain | Dependency confusion and typosquatting from internal names left in bundles, maps, lockfiles and a leaked `.npmrc`; subdomain and dangling-resource takeover; component inventory as CycloneDX with a confidence per marker |
+| Known CVEs | Live triage of the fingerprinted stack against KEV, EPSS, NVD, GHSA, OSV and nuclei templates |
 
-Full tables, parameters and what the numbers do not cover: [Benchmarks](#benchmarks),
-[`bench/METHODOLOGY.md`](bench/METHODOLOGY.md),
-[`docs/poster/poster.md`](docs/poster/poster.md) (German),
-[`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
+This is what the methodology aims at, not a measured success rate. Each class has a
+confirmation playbook that says what counts as proof and what does not.
 
-## What it is
+### Prove findings instead of listing suspicions
 
-Mythos is in the spirit of CAI / Strix / HexStrike / PentestGPT, but
-**skill-driven, with no separate engine and no LLM runtime of its own.** The
-agent host (OpenCode first, Claude Code second) is the agent loop. Mythos
-supplies the methodology (skills), the orchestration (one orchestrator, six
-sub-agents), a Kali tool belt (Docker), a per-bug-class knowledge base, and a
-scope guard.
+Every finding carries the exact request, the response that proves it, a negative control,
+the CVSS vector and the score computed from that vector rather than typed next to it. A
+canary that merely appears in a response is a reflection and is reported as one. Before the
+report is written a second model reviews the findings: a model approves its own errors 11.9
+percentage points more often when it wrote them, so the validator tier has to be a
+different model, and a profile that cannot provide one makes the report say so.
 
-- **`/cybersecurity` command**: the orchestrator. Sets up a scoped engagement,
-  then runs recon, scan, exploit, report.
-- **Phase skills**: `engagement-setup`, `recon`, `web-scan`, `exploit`,
-  `report`, `toolbox`, plus capability skills `auth-session`,
-  `business-logic`, `stored-xss-oast`, `deep-server` and the maintenance skills
-  `research-ingest` and `cve-deep-dive`. Findings carry a closure state
-  (candidate / confirmed / ruled_out / open_proof_gap).
-- **Sub-agents**: planner, recon, scanner, browser, exploiter, reporter, using
-  the session model.
-- **Kali toolbox** (Docker): nuclei, sqlmap, dalfox, ffuf, katana, subfinder,
-  httpx, nikto, commix, interactsh, jwt_tool and more, run through
-  `scripts/mythos`; headless Chromium for the browser agent.
-- **Knowledge base** (`knowledge/`): per-class confirmation playbooks read at
-  runtime to cut false positives.
-- **One canonical source**: `AGENTS.md`, `.opencode/` and `skills/` are
-  hand-edited; `python3 scripts/build-hosts.py` generates the Claude Code files
-  (`CLAUDE.md`, `agents/`, `commands/`).
+### Account for every endpoint, not just the hits
 
-## Architecture
+Exploitation closes on coverage. Each endpoint in the surface map needs an explicit
+verdict: **confirmed** with evidence, **tested** against the classes its shape suggests, or
+**skipped** with a reason a reader can check. Endpoints without one are work still owed and
+the driver keeps assigning workers until there are none. "Tested, not vulnerable" and
+"never looked at" are different sentences, and only one of them is honest about a gap.
 
-![Mythos architecture](docs/assets/architecture.svg)
+### Drive real tools, not only a model
 
-The host is the agent; skills are the playbooks; the shim runs real tools in
-the Kali container against the target; the scope guard watches bash/webfetch
-calls. (Source: `docs/assets/architecture.dot` — `dot -Tsvg` renders it.)
-Full write-up: [`docs/architecture.md`](docs/architecture.md). Status and open work:
-[`docs/plan/ROADMAP.md`](docs/plan/ROADMAP.md).
+nuclei, sqlmap, ffuf, httpx, katana, dalfox, nikto, whatweb, arjun, wafw00f, commix,
+jwt_tool, interactsh and subfinder, all inside a signed Kali container, plus a real
+Chromium for anything client-rendered. Nine deterministic Python tools do the mechanical
+work in one call each, instead of dozens of model round trips:
+
+| Tool | What it does |
+|---|---|
+| `probe` | maps the surface, GET only except the GraphQL introspection POST |
+| `verify` | sends benign canaries at every parameter and judges each against an oracle |
+| `cvefeed` | ranks CVE candidates for the fingerprinted stack from six live feeds |
+| `coverage` | lists the mapped paths the report does not account for |
+| `findings` | builds `findings.json` and SARIF, computes CVSS from the vector, dedups, redacts |
+| `sourcemap` | routes, missing guards and sinks from a source tree, for grey-box work |
+| `traffic` | what was sent, byte-exact replay, HAR export for Burp or Caido |
+| `watch` | what changed on a tested target since last time |
+| `lessons` | class priors from past engagements |
+
+### Record everything it sends
+
+A recording proxy captures every request and response of a run, byte for byte. Any one of
+them can be replayed and the response diffed, or the lot exported as HAR into Burp. The
+report references findings by traffic id, so a triager can re-send the proof.
+
+### Fit a pipeline
+
+`findings.sarif` drops into a CI annotation. `findings --diff` compares against a previous
+run for a retest: fixed, still present, new. `scripts/watch` keeps a tested target under
+observation between engagements.
+
+### Refuse to break the target
+
+Data destruction, brute force and denial of service are refused in code, in every mode, and
+no scope rule overrides it. One exception is deliberate: deleting an object you created
+yourself is how an access-control finding gets proven without touching anyone else's data,
+so that is warned about and allowed.
+
+---
 
 ## Install
 
-**Prerequisites**
-
-- [OpenCode](https://opencode.ai) (1.x >= 1.18.29 or 2.x), primary, or
-  [Claude Code](https://docs.claude.com/en/docs/claude-code), secondary.
-- A model for the host: any provider the host supports. On OpenCode the default
-  is GLM 5.3 on the Z.AI Coding Plan, which needs `ZHIPU_API_KEY` or
-  `opencode auth login`; `models.json` assigns a tier per agent and
-  [`docs/models.md`](docs/models.md) covers every provider, including Anthropic,
-  OpenAI and a local one. To run the whole suite on another provider:
-  `OPENCODE_CONFIG_CONTENT="$(scripts/models anthropic)" opencode`. Plain
-  `--model` moves only the orchestrator, because the sub-agents carry their own
-  model. On Claude Code the host's own model is used.
-- **Docker**, with your user able to run `docker`. `git`, and Python 3 (stdlib
-  only) for the shim.
-
-**1. Get the repo**
+Node 20 or newer, Python 3.11 or newer, Docker.
 
 ```bash
 git clone https://github.com/raphaelbleier/mythos-sec
-cd mythos-sec
+cd mythos-sec/cli
+npm ci && npm run build
+npm link                      # puts `mythos` on your PATH
+cd .. && mythos doctor        # checks the machine before a run
 ```
 
-**2a. OpenCode (primary)**: nothing to install. Run `opencode` in the repo; it
-reads `opencode.json` (default agent `mythos`, `AGENTS.md`, the `skills/` path)
-and `.opencode/` (agents, `/cybersecurity` command, scope-guard plugin).
-Non-interactive:
+`mythos doctor` pulls and starts the signed Kali toolbox image on first run, which takes a
+few minutes, and reports whether your model profile has an independent validator.
+
+For the browser tool:
 
 ```bash
-opencode run --agent mythos --auto "https://target.example --scope scope.yaml"
+npx playwright install chromium
 ```
 
-**2b. Claude Code (secondary)**: install the plugin straight from GitHub (Claude
-Code 2.1.275 or later)
+<details>
+<summary>If the toolbox image will not pull</summary>
 
-```text
-/plugin install mythos-sec --marketplace raphaelbleier/mythos-sec
-```
-
-From a clone, or on an older build:
-
-```text
-/plugin marketplace add /path/to/mythos-sec
-/plugin install mythos-sec
-```
-
-**3. Toolbox**: `scripts/mythos up` pulls the prebuilt image from GHCR and starts
-it (no local build):
+`scripts/mythos` pulls the digest pinned in `toolbox/IMAGE_DIGEST` and verifies its cosign
+signature. If the registry refuses the pull, build the image locally instead:
 
 ```bash
-docker pull ghcr.io/raphaelbleier/mythos-toolbox:latest   # optional, `up` does this
-scripts/mythos up          # pull (or build) the image, start the container
-scripts/mythos tools       # sanity-check the tool belt
+MYTHOS_BUILD=1 scripts/mythos up
 ```
 
-Pin a tag for reproducibility (`MYTHOS_IMAGE=ghcr.io/raphaelbleier/mythos-toolbox:<tag>`;
-tags are `vX.Y.Z`, `X.Y`, `YYYYMMDD`, `sha-...`; the workflow publishes amd64 and
-arm64). `latest` and `v0.2.0` are published and pullable today. To build locally
-instead: `MYTHOS_BUILD=1 scripts/mythos up` (first build takes minutes).
+A locally built image is named `mythos-toolbox` and skips the signature check, because
+there is no signature to check. To use an image you already have, set
+`MYTHOS_IMAGE=<name-or-digest>`.
+</details>
 
-**4. (optional) practice lab**: see [`lab/README.md`](lab/README.md)
-
-```bash
-docker compose -f lab/docker-compose.yml up -d
-scripts/mythos net mythos-lab     # let the toolbox reach lab targets by service name
-```
-
-**5. Verify** end to end:
-
-```bash
-scripts/selftest.sh                   # probe, verify, 7 vuln classes, 2 no-FP controls, scope-guard, coverage gate
-scripts/selftest.sh --host opencode   # same checks, scored from the mythos agent's report
-```
-
-**Platform notes**
-
-- **Linux**: Docker engine; add your user to the `docker` group.
-- **macOS**: Docker Desktop. Local lab targets are reached from the toolbox as
-  `http://host.docker.internal:<port>`. Untested by the maintainer.
-- **Windows**: Docker Desktop with WSL integration; run the repo and the host
-  inside WSL, or use Git Bash (the shim sets `MSYS_NO_PATHCONV` so `/repo` is not
-  rewritten). Only the WSL path has been exercised; native Windows is untested.
-
-You need a model for the agent host; Mythos itself needs no extra API key.
+---
 
 ## Quick start
 
-```text
-/cybersecurity https://target.example
+Against a lab target, with a scope file generated for that host and port alone:
+
+```bash
+docker compose -f lab/docker-compose.yml up -d vulnapp
+mythos -t http://127.0.0.1:5001
 ```
 
-Mythos sets up `engagements/<target>-<date>/`, writes a `scope.yaml` you confirm
-(or takes yours via `--scope`),
-then runs recon → scan → exploit → report, driving the toolbox throughout, and
-writes a bug-bounty-format `report.md`.
+Against a real program, with your own scope file:
 
-The model comes from the host. On Claude Code that is `/model` and every agent
-uses it. On OpenCode `models.json` gives each agent a tier, so recon and
-scanning run on a cheap model and the orchestrator, exploiter and validator on
-the strongest one available. That split is a cost heuristic, not a measured
-allocation: no model has been tested against the exploit skill's proof standard
-except Claude Sonnet, and those runs are under re-measurement. See
-[`docs/models.md`](docs/models.md).
-
-The single human gate is the scope confirmation. With `--scope <file>` (also
-with `opencode run --auto`) the file is the confirmation and nothing is asked;
-after that the engagement runs unattended. The rules it follows (non-destructive,
-no DoS or brute force, minimal PoC, no data dumping) are instructions to the model,
-not limits enforced in code: on DVGA the control arm deleted another user's paste.
-See [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md).
-
-A scope file you bring yourself looks like this. Put it anywhere and pass it with
-`--scope`; Mythos copies it to `engagements/<target>-<date>/scope.yaml`, which is the
-boundary for the whole run:
-
-```yaml
-target: https://target.example
-in_scope:
-  - target.example      # only the hosts or CIDRs the program lists; *.example.com for wildcards
-out_of_scope: []        # every excluded host the program names
-rules:
-  rate_limit_rps: 5
-  max_requests: 20000
-  allow_active: false   # true only if active scanning is permitted
-  allow_exploit: false  # true only if PoC exploitation is permitted
-identities: []          # optional: two accounts, for BOLA and IDOR testing
-notes: ""               # paste the program's testing rules verbatim
+```bash
+mythos -t https://target.example.com \
+  --scope engagements/acme/scope.yaml \
+  --budget 7200 --workers 4
 ```
 
-Useful sub-commands:
+Without a scope file, a target that is not loopback is confirmed once before anything is
+written — type the hostname, or pass `--yes`. That is the only prompt in the tool, and
+`--no-input` turns it into an error that names the flag instead.
 
-```text
-/cybersecurity research CVE-2026-1234     # CVE deep-dive -> knowledge-base note
-/cybersecurity research <topic>           # ingest a technique into knowledge/
+Quietly, for cron or CI:
+
+```bash
+mythos -t https://target.example.com -s engagements/acme/scope.yaml -n -q | tee run.log
+mythos -t https://target.example.com -s engagements/acme/scope.yaml --json > run.json
 ```
+
+`--json` writes one JSON document to stdout and moves every human line to stderr, so the
+pipe stays clean. It works on `run`, `doctor`, `providers`, `verdicts`, `login` and
+`logout`.
+
+While a run is up: `p` pauses, `h` sends the agents a hint ("the admin panel is on 8443"),
+`?` shows the keys, `q` aborts (twice to exit immediately). Nothing ever waits for you.
+
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `mythos -t <url>` | run an engagement |
+| `mythos login <provider>` | OAuth for OpenRouter, `--api-key` for the rest |
+| `mythos providers` | what is reachable, and how |
+| `mythos doctor` | check the machine before a run |
+| `mythos verdicts [dir]` | the endpoint ledger of an engagement |
+| `mythos web` | a local, read-only view of every engagement in a browser |
+| `mythos demo` | replay a scripted run through the view |
+| `mythos help [command]` | the full help, or one command's page with its examples and environment |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-t, --target <url>` | | the target; a scope file is generated for this host and port alone |
+| `-s, --scope <file>` | | an existing `scope.yaml`, the authorization boundary |
+| `-b, --budget <s>` | 3600 | whole-run wall clock |
+| `-w, --workers <n>` | 3 | parallel exploit workers |
+| `--retries <n>` | 2 | attempts per phase before it is recorded incomplete |
+| `-m, --model <spec>` | | pin every tier, e.g. `openrouter/z-ai/glm-5.3` |
+| `--profile <name>` | | a profile from `models.json` |
+| `--skip <list>` | | phases to skip |
+| `--rps <n>` | 5 | rate limit for a generated scope file |
+| `--headed` | | show the browser instead of running it headless |
+| `-n, --no-tui` | | one line per event instead of the full-screen view |
+| `-v, --verbose` | | with `-n`, also log tool results and agent prose |
+| `-q, --quiet` | | only what a later reader must act on: findings, refusals, the verdict |
+| `--json` | | one JSON document on stdout, every human line on stderr |
+| `-y, --yes` | | answer the scope-file confirmation in advance |
+| `--no-input` | | never prompt; fail naming the flag that would have answered it |
+| `--no-color` | | never colour the output (so does `NO_COLOR=1`) |
+| `-h, --help` | | the full help; `mythos <command> --help` for one command |
+| `-V, --version` | | the version, then the licence and the node it runs on |
+
+Every command's own page lists the environment variables it reads: `mythos help run`.
+Colour is off when the stream is not a terminal, when `NO_COLOR` is set to anything
+non-empty, or with `--no-color`; `FORCE_COLOR=1` puts it back into a pipe.
+`MYTHOS_GLYPHS=ascii` drops to an ASCII glyph set.
+
+Exit codes: `0` finished and clean, `1` ran and did not (a phase `incomplete` or `failed`,
+a `doctor` check that failed), `2` usage or configuration and nothing ran, `130`
+interrupted. A CI step may retry a `1` and must never retry a `2`. Findings do not change
+the code — ask `mythos verdicts --json` for those.
+
+The conventions behind all of this, and the ones deliberately not adopted, are in
+[docs/cli-design.md](docs/cli-design.md).
+
+---
 
 ## How it works
 
-Everything runs in the `mythos-toolbox` Kali container via `scripts/mythos`:
-
-```bash
-scripts/probe <url> --depth 2          # surface map in one call, on the host, no container
-scripts/probe <url> --depth 2 --json | scripts/verify --from-probe   # prove the aim points
-scripts/mythos up                      # build (first run) + start the container
-scripts/mythos <tool> [args]           # run one tool,  e.g. scripts/mythos nuclei -u URL
-scripts/mythos sh '<pipeline>'         # run a shell pipeline in the toolbox
-scripts/mythos tools                   # list the belt + versions
-scripts/mythos net <network>           # attach the toolbox to a lab docker network
-scripts/mythos down                    # stop + remove the container
+```
+scope.yaml ──► recon ──► scan ──► exploit ──► report
+                 │         │       │ │ │         │
+                 │         │       └─┴─┴─ parallel workers,
+                 │         │              one verdict per endpoint
+                 ▼         ▼                     ▼
+          surface.json   candidates.md     report.md + findings.json
+          cve-candidates.json              + an independent validator pass
 ```
 
-The repo is mounted at `/repo`, so output lands under `engagements/`. A local
-lab target on `localhost:PORT` is reached as `http://host.docker.internal:PORT`.
-`toolbox/Dockerfile` (two-stage) builds the belt; a tool missing from a given
-Kali snapshot is skipped, never fatal. Every exec is logged to
-`engagements/audit.jsonl`.
+Three things make this different from pointing a coding agent at a target.
 
-## Classes the skills target
+**The phases are in code, not in a prompt.** Each runs as a separate agent with fresh
+context and closes on a file it has to produce, not on its own opinion that it is finished.
+A phase that does not produce its artifact runs again, then is recorded `incomplete` and
+the run carries on, because a half-finished engagement that says so beats one that hangs.
 
-Reflected & DOM XSS, SQLi (error + blind + UNION, via sqlmap), GraphQL-resolver
-SQLi, SSTI → RCE, OS command injection (reflected + blind/OOB), SSRF (out-of-
-band via interactsh), path traversal / LFI + filter-evasion, open redirect,
-CRLF, IDOR + two-account BOLA, CORS, JWT forgery / privilege escalation,
-GraphQL introspection + code execution, API excessive-data-exposure,
-sensitive-file exposure, verbose-debug disclosure, security headers/cookies;
-authenticated flows (cookie/bearer, Playwright for SPAs); OpenAPI/GraphQL
-import; CVE triage (KEV/EPSS, patch-diff); nuclei templated scanning.
+| Phase | Closes when |
+|---|---|
+| recon | `surface.json` maps at least one endpoint, and `recon.md` exists |
+| scan | `candidates.md` exists |
+| exploit | every endpoint in the surface has a verdict |
+| report | `report.md` and `findings.json` exist |
 
-This is what the skills aim at, not a measured success rate. Only the classes named
-under [Benchmarks](#benchmarks) and in the self-test have numbers behind them.
+**Exploitation closes on coverage, not on satisfaction.** This exists because of a
+measurement: on a target with 76 documented vulnerabilities, agents stopped after a quarter
+of their budget having found a third, with whole surfaces never receiving a single request.
+A gate that merely nudged changed nothing, so a ledger decides instead.
 
-## Benchmarks
+**The guards cannot be absent.** Scope checking, rate limiting and the destructive denylist
+run inside the tool layer, so every path to the network goes through them. They used to be
+host plugin hooks, and a configuration that loaded no plugin silently measured the framework
+with all of them inert.
 
-**Controlled evaluation.** `bench/` runs Mythos and a bare-model control on the
-XBOW validation-benchmarks with the same model, prompt, budget and sandbox, a
-random flag per run, scoring on the harness side, Wilson intervals and paired
-McNemar tests. Design, scoring rules, exclusions, blinding and reproduction
-steps: [`bench/METHODOLOGY.md`](bench/METHODOLOGY.md); usage and isolation:
-[`bench/README.md`](bench/README.md).
+The agent has six tools: `shell` (a pipeline in the Kali container), `request` (one HTTP
+request), `script` (the deterministic tools above), `browser` (a real Chromium with its
+console and network log), `files` (the engagement directory) and `reference` (the skills
+and the knowledge base). The set is small on purpose: the published evidence is that the
+tool layer decides the outcome, so the work went into making a few tools carry a lot.
 
-**The published figures below are under re-measurement.** The audit of
-13 November 2026 found that the Mythos arm could read the flagless targets'
-scoring key, that infrastructure exclusions were applied only to failed cells,
-that no triage row could record a false positive, and that the coverage gate was
-scored by substring match. The harness fixes are described in
-`bench/METHODOLOGY.md`; the tables are kept here so the record is visible, each
-with what the audit leaves of it.
+[`docs/architecture.md`](docs/architecture.md) has the detail.
 
-Vuln Bank, the only measurement in which the scaffolding separated from the
-control:
+---
 
-| Vuln Bank, 76 documented vulnerabilities (Claude Code, Sonnet, 3600 s budget) | found | recall | precision | tool calls | USD |
-|---|---|---|---|---|---|
-| Mythos + coverage gate | 34, 33 | 0.45, 0.43 | not measured | 32, 31 | 0.61, 0.67 |
-| Mythos without the gate | 28, 29 | 0.37, 0.38 | not measured | 18, 20 | 0.42, 0.39 |
-| control (bare model with a shell) | 30, 29 | 0.39, 0.38 | not measured | 15, 14 | 0.29, 0.25 |
+## What a run produces
 
-**Not currently defensible.** The Mythos arm's readable roots included
-`bench/data/ground_truth/vulnbank.json`, which is the key these recall numbers
-are scored against, and the control arm's did not; the coverage score that the
-gate acts on counted a substring match in the report as a covered path. Two runs
-per condition, no interval and no test. The gate was also written in response to
-the ungated runs and scored on the same target, so even with a clean harness it
-is a fit to that measurement rather than a prediction confirmed by it. It will be
-re-measured with the ground truth outside every root the arms are given, and with
-the corrected coverage scorer.
+```
+engagements/<host>-<date>/
+  scope.yaml            the authorization boundary
+  surface.json          the surface map
+  cve-candidates.json   ranked CVE candidates for the fingerprinted stack
+  recon.md              stack, identities, promising surfaces
+  candidates.md         what is worth an exploitation attempt
+  findings/<id>.md      one file per finding, with its evidence pair
+  verdicts/             one verdict per endpoint, with its reasoning
+  verdicts.json         the ledger
+  validation.md         the independent review pass
+  report.md             the deliverable
+  findings.json         machine-readable, CVSS computed from each vector
+  findings.sarif        SARIF 2.1.0, for a CI annotation
+  traffic/              every request and response, replayable, HAR-exportable
+  evidence/<id>/        the bundle a human replays: request, response, control,
+                        oracle, screenshots, and a sha256 manifest
+  run-events.jsonl      the whole run as an event stream
+```
 
-**The same gate inverted the result on DVGA: 6 of 21 against 12 without it and 11 for
-the control, at $0.77 instead of $0.27.** DVGA is a GraphQL app whose surface map held
-eleven HTML pages while all 21 documented vulnerabilities sit behind `/graphql`, so the
-agent closed out the pages and never reached the fields. Vuln Bank worked because it
-publishes an OpenAPI document. The probe now introspects GraphQL schemas, but the
-measurement with that map is still outstanding. The gate helps where the map captures
-the real surface and hurts where it does not. These two numbers come from the same
-harness as the Vuln Bank runs and are withdrawn on the same grounds.
+### Reading it in a browser
 
-The flag-capture sweeps. The Mythos column is the scaffolded arm, the control
-column the bare model with a shell; `p` is the exact paired McNemar two-sided p
-over the challenges both arms completed:
+```bash
+mythos web
+```
 
-| sweep | model | Mythos | control | pairs, discordant | paired p |
-|---|---|---|---|---|---|
-| 40 challenges, scaffolding verified loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 26, 1 | 1.0 |
-| the same 40 challenges, plugin silently not loaded | Claude Sonnet | 28/33 = 0.85 | 27/30 = 0.90 | 25, 0 | 1.0 |
-| 12 challenges | GLM 5.3 | 10/10 = 1.00 | 10/10 = 1.00 | 10, 0 | 1.0 |
-| the seven challenges both arms had failed | Claude Sonnet | 2/5 = 0.40 | 2/5 = 0.40 | 3, 0 | 1.0 |
+A local server on `127.0.0.1`, read-only: every engagement with its phases,
+findings, verdict ledger, recorded traffic, and the scope panel that answers
+"what did this thing touch". The URL it prints carries a per-run bearer token
+and that token is the only credential, so anyone with the URL has every
+engagement on the machine. Nothing in the view can start a run, send a request
+or edit a scope file, and a response body a target chose is rendered as text
+behind a strict Content-Security-Policy — a stored-XSS payload the framework
+captured must not execute in the tool that displays it. `docs/web-ui.md` has
+the security model.
 
-The two 40-challenge rows share one control measurement: the control arm was run
-once, and the second sweep re-ran only the Mythos arm after the plugin manifest
-was fixed. The control row is therefore the same 39 cells printed twice, not two
-measurements.
+---
 
-A p of 1.0 on one discordant pair out of 26 is not a null result, it is an
-absence of power. At 26 pairs and a discordance rate of 0.3, the smallest true
-difference the exact test detects with 80% power is 0.29; at 30 pairs it is
-0.27 and at 40 it is 0.24, and a true difference of 0.2 would be caught two
-times in five at 30 pairs. The exact test cannot reject at all below six
-discordant pairs. Against the 5 to 10 points that arXiv 2607.13085 reports for
-scaffold advantage on this benchmark at a matched model, this design was short
-by about a factor of three. Both arms also sit at 0.85 to 0.90 with three to
-five unsolved cells each, so there is little room left for a difference to
-appear in. `bench/stats.py` prints the minimum detectable difference with every
-comparison, and `--selftest` pins these figures.
+## Models and providers
 
-The denominators depend on an exclusion rule that the audit found invalid: cells
-were dropped only when they had also failed, so an exclusion could only raise a
-rate. Recomputed from the stored artifacts under the corrected, outcome-blind
-rule, the 40-challenge arms read 0.87 [0.71, 0.95] for the control and 0.88
-[0.72, 0.95] for Mythos, against the published 0.90 and 0.85. **The gap changes
-sign**, which is the clearest evidence available that it was an artifact of the
-rule and not a measurement. Over all cells with no exclusion at all the arms read
-0.69 and 0.70. The harness now classifies infrastructure failure from signals the
-agent cannot author, treats intention-to-treat as the primary analysis, and
-prints both rates in the same row.
+```bash
+mythos login openrouter                  # OAuth, mints a real key
+mythos login anthropic --api-key sk-ant-...
+mythos providers                         # what is reachable, and how
+mythos -t <url> --model openrouter/z-ai/glm-5.3
+mythos -t <url> --profile anthropic
+```
 
-The same correction removes the Strix number entirely. Ten of its twelve cells
-hit the stall deadline and two ended in a runner error, including both cells
-previously reported as valid, which were kept only because they had solved.
-Under the corrected rule Strix has **no scored cells**, not 2 of 2 at 1.00.
-Wherever a Strix figure appeared, it was an artifact of the exclusion rule.
+Sixteen providers by API key: OpenAI, Anthropic, Gemini, OpenRouter, Z.ai, Moonshot,
+DeepSeek, xAI, Mistral, Groq, Cerebras, Together, Nebius, Ollama and LM Studio locally, and
+any OpenAI-compatible endpoint.
 
-The flagless recall measurements:
+`models.json` assigns a tier to each agent and maps tiers to models per profile, so recon
+can run on a cheap model while exploitation and validation do not. `--model` pins every
+tier except the validator, because pinning that one would turn the independent check into a
+self-check without saying so.
 
-| target | Mythos | control |
+**On subscription logins.** OpenRouter's OAuth flow is implemented, because OpenRouter
+publishes it for third-party clients and it hands back a real API key. Consumer plan logins
+for ChatGPT, Claude and Copilot are not, and will not be: those flows work by presenting
+another client's OAuth credentials, the providers either forbid them outright or merely
+tolerate them, and the account that gets suspended belongs to the user. One OpenRouter
+login reaches most of the models above.
+
+[`docs/models.md`](docs/models.md) has the per-tier table and the data-handling notes.
+
+---
+
+## Scope and safety
+
+`engagements/<dir>/scope.yaml` names the hosts, the ports and the rate limit. The run never
+widens it.
+
+| Rule | Mode | Why |
 |---|---|---|
-| VAmPI, 9 documented vulnerabilities | 8/9 = 0.89 | 8/9 = 0.89 |
-| DVGA, 21 documented vulnerabilities | 12/21 = 0.57 | 11/21 = 0.52 |
-| Vuln Bank, 76 documented vulnerabilities, no gate | 28 and 29 of 76 | 30 and 29 of 76 |
+| out-of-scope host | warns, or refuses with `MYTHOS_SCOPE_ENFORCE=ask`/`block` | scope is a judgement about authorization, and it is yours |
+| rate limit | warns, and paces single calls | a program's limit is a courtesy you may have negotiated |
+| data destruction, brute force, denial of service | refused, in every mode | the one hard line |
 
-All three carry the ground-truth access problem and are withdrawn as
-measurements of the scaffolding. Their direction is "no separation", which a leak
-toward the Mythos arm would not produce, so a re-run is more likely to confirm
-than to overturn them. On DVGA the arms also tie at 10 of 16 once the five
-denial-of-service classes the engagement's safety rules forbid proving are
-removed from the denominator. The precision of 1.00 previously reported for all
-of these is withdrawn outright: the triage schema had no way to record a false
-positive.
+The hard line is not a setting because a prompt rule did not hold. During benchmarking a run
+sent `{deleteAllPastes}` in a GraphQL body, received `{"data":{"deleteAllPastes":true}}` and
+emptied the target's table. The guard at the time read the shell and never saw a destructive
+operation named inside a request body. It does now.
 
-Cost direction is not stable. On the 40-challenge sweep the scaffolded arm spent
-$20.88 against the control's $8.63 and 928 tool calls against 390, a factor of
-2.4 either way; those are totals over all 40 and 39 cells, while the solve rates
-above count only the scored ones, so the two sets of numbers do not describe the
-same cells. Over the scored cells alone it is $19.97 against $7.82 and 901 calls
-against 345. On DVGA the direction inverts: the scaffolded arm came in at $0.27
-and 18 tool calls against the control's $0.81 and 43. On GLM 5.3 the scaffolded
-arm was faster, median 135 s against 177 s, with ten cells per arm and no test.
+There is no request ceiling and no exploitation gate. This is a bug-bounty suite: proving a
+finding is the work, not an exception to it.
 
-An invalid plugin manifest kept the Claude Code Mythos arm unscaffolded until
-5 November 2026, which is why the two 40-challenge sweeps exist. Full parameters
-and the diagnosis from the transcripts:
-[`docs/poster/poster.md`](docs/poster/poster.md) (German). What the numbers do not
-cover: [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md). Example
-engagement reports from the earlier manual runs, including the full triage of two
-of them: [`docs/poster/evidence/`](docs/poster/evidence/).
+**A request the target makes on your behalf counts as yours.** During benchmarking a run
+placed `169.254.169.254` in an SSRF payload and the target made the connection to the cloud
+metadata service. The destination of an SSRF probe has to be in scope too.
 
-Nothing in the design controls for contamination. XBEN and all four real apps are
-public repositories with public write-ups, and for the flagless targets the
-ground truth is each app's own public README, so the model may have read it
-already. The per-cell random flag only defeats precomputing the upstream
-`sha256(UPPERCASE_DIRNAME)` flag. XBOW's own repository states that the set is
-saturated, that the underlying vulnerabilities have been trained into the models
-and that it is kept for historical purposes only, in a warning dated 7 July 2026,
-so XBEN is a regression check here and not evidence of capability. The harness
-records whether any of XBOW's canary strings appear in a transcript, as a leak
-signal, and never copies them into a result file. That check cannot establish
-non-contamination and is not claimed to: no published work estimates how much of
-these apps sits in frontier training data, no study validates canary strings for
-security data, and membership inference runs near chance even on open models of
-known composition.
+Testing an application you are not authorized to test is a crime in most jurisdictions,
+whatever tool sent the request. The scope file exists so that decision is explicit, written
+down and dated. To report a vulnerability in Mythos itself, see [`SECURITY.md`](SECURITY.md).
 
-Construct validity is unestablished as well. No study correlates any security
-benchmark score with a real-world outcome such as a bounty payout or a field CVE,
-so every figure above describes performance on these targets under this harness
-and nothing beyond that.
+---
 
-One more thing weakened the scanner side in every sweep. A supply-chain review of
-the toolbox image found that the image as published during the sweeps shipped
-`nuclei` with no templates, because pip's cache created `/home/pentester` as root
-before `useradd` ran and the template update then failed silently at build time,
-and that it carried the PyPI `graphw00f`, which is an inert placeholder rather
-than the real tool. The second one bears on the DVGA figures in particular. Both
-are fixed in the current `toolbox/Dockerfile`. Which sweep ran which image cannot
-be established, because no sweep recorded an image digest; that is now recorded
-per cell.
+## Continuous testing
 
-"Scaffolding" is also one undifferentiated condition. The control arm is denied
-`edit`, `webfetch`, `websearch`, `task` and `skill` as well as the skills,
-sub-agents and toolbox, so a difference cannot be attributed to any one of them;
-on the flagless targets the control cannot write a file at all, so the two arms'
-reports are produced through different media. The run record now carries each
-treatment as its own field so an ablation is possible later.
+Between engagements, `scripts/watch` keeps a tested target under observation: it diffs the
+surface, matches new CVEs against the known stack and lists stored proofs worth replaying.
+The `continuous` skill works that list. It is pinned to the engagement's scope file and
+holds all traffic when that file changes or the authorization confirmation is older than 30
+days, because a scheduled job testing a program whose scope moved is how a tester ends up
+unauthorized. See [`docs/continuous.md`](docs/continuous.md).
 
-```bash
-python3 bench/xben.py check --out <build_results.tsv>
-python3 bench/run.py --frameworks mythos,control --model <id> --sample 30 --seed 1 --runs 3 --dry-run
-python3 bench/stats.py <results>/results.jsonl --compare mythos,control
-python3 bench/labs.py list                       # flagless targets + ground truth
-```
+---
 
-The four flagless real apps (crAPI, Vuln Bank, DVGA, VAmPI) are scored by recall
-against their upstream documented vulnerability lists in
-`bench/data/ground_truth/`, driven by `bench/labs.py`; VAmPI's secure instance
-serves as a false-positive control. Build lists for the 104 XBOW challenges are
-in `bench/data/`: 43 of 104 build from a clean clone, 102 of 104 once the harness
-repoints the dead Debian apt mirrors (`--no-apt-fix` disables that).
+## What this does not claim
 
-The self-test is a regression test on this repo's own seeded lab app, not a target
-result. `scripts/selftest.sh` prints its own `== result: N passed, M failed ==`
-line; that line is the number, and the count is not quoted here because it depends
-on the host and on which lab targets are reachable. The file holds 45 `assert`
-calls plus two inline checks. The counts published earlier, 31 in the poster and
-35 here, match neither the file nor each other and were wrong.
+The project measured itself against a bare agent with the same model on three deliberately
+vulnerable applications, 106 paired vulnerabilities, two blinded raters. It found **no
+detectable difference in recall** (p = 1.0000 and p = 0.1435), with the minimum detectable
+difference at that sample size being 15 percentage points. It did find that the two arms
+covered *different* vulnerabilities at equal totals, which is a smaller and more honest
+claim.
 
-**Earlier manual engagements** (single runs, no control arm, from the earlier
-skill-driven flow; evidence, not a measured advantage). Details:
-[`docs/poster/benchmark-skill-driven.md`](docs/poster/benchmark-skill-driven.md),
-[`docs/poster/benchmark-hard-targets.md`](docs/poster/benchmark-hard-targets.md).
+That benchmark harness is no longer in the repository, and none of those numbers describe
+the current code: the agent was rebuilt from a host plugin into this CLI, and the phase
+driver and the verdict ledger are new. Treat the published figures as what motivated the
+rebuild, not as its result. They are in the git history.
 
-| Target                  | Stack                        | Headline confirmed findings                                                                                                             |
-| ----------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **OWASP Juice Shop**    | Node SPA + REST              | UNION SQLi (Users dump), `/ftp` disclosure, poison-null-byte filter bypass, open redirect, config leak, **DOM XSS** (browser-confirmed) |
-| **DVGA**                | Python GraphQL               | **unauth RCE** (introspection → SSRF → command injection), broken access control, introspection                                         |
-| **VAmPI**               | Python REST                  | `_debug` plaintext-password dump; a BOLA **tested and disproven** (not over-claimed)                                                    |
-| **Vuln Bank** (2026)    | Flask + PostgreSQL + GraphQL | `.env` leak → **JWT forge → admin takeover**, GraphQL-resolver SQLi, verbose-debug disclosure                                           |
+What the current code has been shown to do is narrower and unblinded: one run against the
+local lab target, 50 minutes on GLM 5.3, all four phases closing on their artifacts, 21
+findings with evidence, a verdict for all 36 mapped endpoints, and 534 recorded request and
+response pairs. That is a working pipeline, not a measurement: one target, one run, no
+control arm, no blinded rater.
 
-Honest limits: full crAPI does not fit a ~3.7 GB host. "Works on any web app"
-is not provable without authorized access to each target.
+Other limits worth knowing before you trust it:
 
-## Scope & safety
+- The coverage check is a text check over the report. It cannot tell a real test from a
+  mention, so it is a floor on coverage, never evidence of it.
+- `scripts/lessons` reports precision among reported findings, not yield, because nothing
+  records "I tested this class and found nothing". It is a tie-breaker.
+- All three benchmark targets are public repositories with public write-ups, and nothing
+  measures how much of them is in a model's training data.
+- `scripts/sourcemap` produces a hypothesis list, not findings.
+- A target bound to `127.0.0.1` forces the toolbox onto the host's network namespace, which
+  removes the isolation between the container and your machine. That is for a local lab and
+  nothing else.
 
-- Scope is stated up front and watched by a warn-only scope guard
-  (`hooks/scope-guard.py` as a Claude Code `PreToolUse` hook,
-  `.opencode/plugin/scope-guard.ts` for OpenCode; set
-  `MYTHOS_SCOPE_ENFORCE=ask` to decide per call, `=block` to hard-block
-  out-of-scope hosts). It is a safety
-  net, not a sandbox; coverage inside OpenCode sub-agents is not yet verified.
-  The agent honors `scope.yaml` in every tool call.
-- Non-destructive by default; exploitation only when `scope.rules.allow_exploit`
-  is set; proofs are minimal (no data dumps, no DoS, no brute-force).
-- Engagement data lives under `engagements/` and is git-ignored.
-
-## Responsible use
-
-Mythos is offensive security tooling. Use it only against systems you own,
-bug-bounty programs within their stated scope, or lab targets, and only with
-authorization in writing or in the program's published scope.
-
-Unauthorized access is a criminal offence in most jurisdictions: the Computer
-Fraud and Abuse Act in the United States, the Computer Misuse Act in the United
-Kingdom, § 118a StGB in Austria, § 202a StGB in Germany, and equivalents
-elsewhere. A bug-bounty program's safe-harbour terms protect you only inside the
-scope they state.
-
-Practical points a first run should know:
-
-- Requests the toolbox sends come from your own IP and are attributable to you.
-  `scripts/traffic` records them locally and forwards from your own address; it
-  is a recorder, not an anonymizing proxy, and nothing here hides where a
-  request came from.
-- `engagements/audit.jsonl` logs every toolbox command's argv and exit code,
-  before and after. It is not a record of the requests: host `curl`,
-  `scripts/probe`, `scripts/verify` and the agent host's own fetches never
-  appear in it. `scripts/traffic` records the requests themselves, as HAR, and
-  `scripts/traffic replay <id>` re-sends one byte for byte and diffs the
-  response. Keep both.
-- A request the target makes on your behalf, such as an SSRF probe, counts as
-  yours. The destination has to be in scope too.
-- The scope guard and rate limits reduce risk but do not grant permission, and in
-  the default `warn` mode the guard cannot stop a request. What has gone wrong in
-  practice is written down in
-  [`docs/poster/LIMITATIONS.md`](docs/poster/LIMITATIONS.md): one out-of-scope
-  SSRF payload that the target connected to, and seed-data changes on DVGA.
-
-The software is provided as is, without warranty (MIT). Mythos is an independent
-project and is not affiliated with Anthropic or with the OpenCode project.
+---
 
 ## Layout
 
 ```
-AGENTS.md          canonical project instructions (CLAUDE.md imports it)
-opencode.json      OpenCode config (default agent, skills path)
-.opencode/         canonical agents, /cybersecurity command, scope-guard plugin
-commands/ agents/  generated for Claude Code by scripts/build-hosts.py
-skills/            engagement-setup · recon · web-scan · exploit · report · toolbox
-                   · auth-session · business-logic · stored-xss-oast · deep-server
-                   · research-ingest · cve-deep-dive
-hooks/             scope-guard (PreToolUse hook + shared --check logic)
-                   coverage-gate (Stop hook: every mapped path must be accounted for)
-toolbox/           two-stage Kali toolbox Dockerfile
-.github/           toolbox image CI (GHCR, amd64 + arm64)
-lab/               vulnerable targets, OAST catcher, admin bot
-bench/             XBOW harness, flagless-lab runner, ground truth, build lists
-scripts/           mythos (toolbox shim) · probe (surface map) · verify (canary proofs)
-                   · selftest.sh · build-hosts.py
-knowledge/         per-class confirmation playbooks + CVE technique notes
-docs/              architecture, research, plan, poster/benchmark evidence
-CONTRIBUTING.md    how to change the canonical files and run the self-test
-SECURITY.md        how to report a vulnerability in Mythos itself
+cli/               the agent: phase driver, tool layer, providers, full-screen view
+  src/driver.ts      phase order, artifact gates, exploit fan-out
+  src/agent/         the loop, the six tools, the guard call site
+  src/providers/     sixteen providers, OpenRouter OAuth, credential store
+skills/            the methodology, one directory per phase and per class
+knowledge/         per-class confirmation playbooks and CVE technique notes
+hooks/             scope-guard and budget-guard, called by the tool layer
+scripts/           the deterministic tools, each with a --selftest
+toolbox/           the two-stage Kali toolbox Dockerfile
+lab/               vulnerable targets, an OAST catcher and an admin bot
+docs/              architecture, model policy, continuous mode, research notes
+AGENTS.md          the rules every agent in a run is given
 ```
 
-## License
+---
 
-MIT. See `LICENSE`. Built by raphaelbleier for Security Engineering research
-into AI pentest agents.
+## Contributing and license
 
-Pull requests are welcome; read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, since
-the files in `agents/` and `commands/` are generated and must not be hand-edited.
-To report a vulnerability in Mythos itself, follow
-[`SECURITY.md`](SECURITY.md).
+Pull requests are welcome; read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. Every
+deterministic tool has a `--selftest`, every guard rule has a selftest case, and
+`scripts/selftest.sh` runs the lot offline in about ten seconds.
+
+MIT, see [`LICENSE`](LICENSE). Built for security engineering research into AI pentest
+agents.

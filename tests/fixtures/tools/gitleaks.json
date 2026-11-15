@@ -1,0 +1,42 @@
+[
+ {
+  "RuleID": "slack-bot-token",
+  "Description": "Identified a Slack Bot token, which may compromise bot integrations and communication channel security.",
+  "StartLine": 2,
+  "EndLine": 2,
+  "StartColumn": 11,
+  "EndColumn": 65,
+  "Match": "xoxb-REDACTED-see-PROVENANCE.md",
+  "Secret": "xoxb-REDACTED-see-PROVENANCE.md",
+  "File": "/repo/engagements/.fixgen-tree/config.py",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.621469,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "/repo/engagements/.fixgen-tree/config.py:slack-bot-token:2"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 1,
+  "EndColumn": 55,
+  "Match": "GITHUB_TOKEN = \"ghp_0123456789abcdefghijklmnopqrstuvwx\"",
+  "Secret": "ghp_0123456789abcdefghijklmnopqrstuvwx",
+  "File": "/repo/engagements/.fixgen-tree/config.py",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 5.0900326,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "/repo/engagements/.fixgen-tree/config.py:generic-api-key:1"
+ }
+]

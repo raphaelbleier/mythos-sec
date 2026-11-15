@@ -5,37 +5,42 @@ description: Web vulnerability scanning playbook for a Mythos engagement — run
 
 # Web scan — find the vulnerabilities
 
-Find real issues on the surface recon mapped. Run active tools only when
-`scope.rules.allow_active` is true. Everything runs in the toolbox via
-`scripts/mythos`. Save raw output under `engagements/<dir>/scan/`.
+Find real issues on the surface recon mapped. Read `recon.md`, `surface.json`
+and `cve-candidates.json` from the engagement directory first. Run active tools
+only when `scope.rules.allow_active` is true. Everything runs in the toolbox
+through the `shell` tool, which drops the `scripts/mythos` prefix the command
+lines below carry (see the **toolbox** skill). Save raw output under
+`engagements/<dir>/scan/`.
 
 Work one injection point at a time where it matters; the WSL host is RAM-limited,
 so do not run nuclei + sqlmap + a browser at once.
 
 If the target has a login, run **auth-session** first and repeat steps 1 to 5
 with the session (`nuclei -sf`, `dalfox --cookie/-H`, `sqlmap --cookie`, see the
-table there). Run `session_check.py` before each step.
+table there). Run `session-check` before each step.
 
 ## 0. Probe your hypotheses first
 
 The ranked parameter list from `scripts/probe` is your work queue: each entry
 names the parameter, where it was seen, and the class to try.
 
-Work the whole queue in one call:
+Work the whole queue in one call: the `script` tool, name `verify`, args
+`["--from-probe"]` with the probe map on stdin, which means a `shell` pipeline:
 
 ```
-scripts/probe <target> --depth 2 --json | scripts/verify --from-probe
+python3 /repo/scripts/probe <target> --depth 2 --json | python3 /repo/scripts/verify --from-probe
 ```
 
 `scripts/verify` sends one benign canary per aim point (GET only, rate-limited,
 nothing destructive) and prints the request/response pair for every class that
 answered, plus the aim points that stayed quiet. Use its output as evidence,
 then work the quiet ones and anything behind a POST or a login by hand.
-`scripts/verify <url> --param <name> --classes xss,sqli` targets one point.
+`verify <url> --param <name> --classes xss,sqli` targets one point and needs no
+pipeline, so it runs through the `script` tool directly.
 
 Start with what recon actually saw. For each promising parameter, id or form,
-name the bug class it suggests and send one aimed `curl` request for it. The
-host's own `curl` is enough; no container needed.
+name the bug class it suggests and send one aimed request with the `request`
+tool. That is cheaper than a scanner and it lands in the record as one request.
 
 Keep probing while the evidence moves. One well-aimed request beats a template
 scan on a small app, and it tells you which class to escalate.
@@ -94,7 +99,22 @@ toolbox. Pick payloads by the stack recon found.
   `%2e%2e%2f`, null-byte/`?` truncation, `php://filter` for source read.
 - **Open redirect**: `?next=//evil.example`, `?url=https://evil.example`,
   `?redirect=/\evil.example`; follow with `-I` and read `Location`.
-- **CRLF**: `%0d%0aSet-Cookie:mythos=1` in a header-reflected param.
+- **CRLF**: `%0d%0aSet-Cookie:mythos=1` in a header-reflected param. For the
+  whole surface rather than one param, `crlfuzz` is wired:
+
+```
+scripts/tools crlf '<URL>' --json
+```
+
+  It checks the destination against `scope.yaml` before crlfuzz starts and
+  derives its concurrency from `rules.rate_limit_rps` (crlfuzz has no
+  requests-per-second flag). A hit is a `candidate`, never confirmed: crlfuzz
+  saw an injected CRLF become a header boundary, which is the right oracle for
+  the class but is not impact. Replay it by hand and read the raw response —
+  the finding is what the injected header achieves (a `Set-Cookie` the victim
+  keeps, a poisoned cache key, a split response), and
+  `knowledge/web/cache-poisoning.md` is why a reflected header alone is not a
+  report.
 
 ```
 scripts/mythos sh "curl -s -G '<URL>' --data-urlencode 'q={{7*7}}' | grep -o '49' && echo SSTI-LIKELY"
@@ -102,15 +122,32 @@ scripts/mythos sh "curl -s -G '<URL>' --data-urlencode 'q={{7*7}}' | grep -o '49
 
 ## 5. Auth / API / access-control
 
-- **JWT**: `scripts/mythos jwt_tool <token> -M at` (alg confusion, `alg:none`,
-  weak secret: `jwt_tool <token> -C -d /usr/share/wordlists/rockyou.txt`).
+- **JWT**: `scripts/tools jwt <token>` decodes it with no request at all and
+  names the live check per row (`alg:none`, a symmetric `alg`, a `kid`/`jku`
+  the server resolves, a missing `exp`). Add
+  `--target <URL> --canary '<string only an authenticated response contains>'`
+  to run jwt_tool's playbook against a scope-checked URL, paced from
+  `rules.rate_limit_rps`. The canary is required, and it is also the oracle:
+  if jwt_tool's anonymous control matches it too, the whole run comes back as
+  one `inconclusive` row instead of thirty false candidates. jwt_tool's own
+  "vulnerable" lines come back as candidates, because it compared one substring
+  in one response and not an authorization outcome.
+  The bare form is `scripts/mythos jwt_tool <token> -M at`, which is the same
+  playbook plus the claim fuzzers, unpaced and with the same `-cv`/`-rh`
+  requirement.
+  **Do not guess the signing secret.** `jwt_tool -C -d <wordlist>` is offline
+  credential brute force, `hooks/scope-guard.py` refuses brute force in every
+  mode and no scope rule overrides it, and this skill used to name it with
+  rockyou by path. A symmetric `alg` is a candidate because of `alg:none` and
+  RS→HS key confusion, both of which are single requests; it is not an
+  invitation to crack.
 - **CORS**: send `Origin: https://evil.example`; a reflected
   `Access-Control-Allow-Origin` + `-Allow-Credentials: true` is a finding.
 - **API excessive data exposure**: diff what the UI needs vs what the endpoint
   returns (extra PII, internal fields).
 - **BOLA / IDOR, BFLA, mass assignment, races, workflow abuse**: run the
-  **business-logic** skill (Subject x Object x Action matrix, `bola_diff.py`,
-  `mass_assign.py`, `race.py`) with the userA/userB sessions from
+  **business-logic** skill (Subject x Object x Action matrix, `bola-diff`,
+  `mass-assign`, `race`) with the userA/userB sessions from
   **auth-session**. Guard against token/auth params that just break the session
   (not a real finding).
 
@@ -158,10 +195,10 @@ and `n/a` (class does not apply to this endpoint):
 | class | endpoint (method path param) | role(s) | tool / check | state | evidence / reason |
 |---|---|---|---|---|---|
 | sqli | GET /search q | anon | sqlmap BT | rejected(no boolean diff) | scan/sqlmap-search.log |
-| xss-stored | POST /api/comments text | userA->userB | xss_verify | reproduced | scan/xss-mx1a2b3c4d.png |
-| bola | GET /api/orders/{id} | userA,userB,anon | bola_diff | candidate | scan/bola.jsonl line 4 |
-| mass-assign | PUT /api/users/{id} role | userA | mass_assign probe | untested | |
-| race | POST /api/redeem code | userA | race.py threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
+| xss-stored | POST /api/comments text | userA->userB | xss-verify | reproduced | scan/xss-mx1a2b3c4d.png |
+| bola | GET /api/orders/{id} | userA,userB,anon | bola-diff | candidate | scan/bola.jsonl line 4 |
+| mass-assign | PUT /api/users/{id} role | userA | mass-assign probe | untested | |
+| race | POST /api/redeem code | userA | race threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
 | smuggling | * front proxy | anon | smuggler | n/a(single server, no proxy) | |
 ```
 
@@ -173,9 +210,15 @@ smuggling, jwt).
 
 ## Output: candidate findings
 
-Write `engagements/<dir>/scan/candidates.md`: each candidate with class,
-severity, affected URL+param, one evidence snippet (the request + the proving
-response), and its closure state (`candidate` / `reproduced` /
-`rejected(reason)`; nothing is `validated` before the exploit validator pass).
-Rank by severity x exploitability. Hand the top candidates to the
-**exploit** skill for a minimal PoC; never weaponize here.
+Write `candidates.md` at the root of the engagement directory, not under
+`scan/`: the phase does not close without that file, and the exploit phase reads
+it there. One entry per thing worth an exploitation attempt, ordered by what you
+would try first, each with class, severity, affected URL and parameter, one
+evidence snippet (the request + the proving response), and its closure state
+(`candidate` / `reproduced` / `rejected(reason)`; nothing is `validated` before
+the exploit validator pass). Everything here is unproven by definition, so do
+not write it as if it were a finding, and never weaponize in this phase.
+
+Write down the classes you looked for and found nothing on. The exploit phase
+starts with an empty context and needs to know what has already been
+eliminated.

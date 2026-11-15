@@ -1,0 +1,2414 @@
+#!/usr/bin/env python3
+"""Mythos API-protocol prober — the surfaces that have no routes.
+
+`probe` maps what a crawler can see. The five protocols here are invisible to
+it: a GraphQL schema hides a hundred operations behind one path, a tRPC or
+JSON-RPC batch hides a per-element authorization check behind one status code,
+gRPC does not speak HTTP/1 at all, and a Next.js Server Action is an RPC
+endpoint with no URL of its own. Each one is also where the authorization bugs
+live, because the per-request controls that a reverse proxy, a WAF and a route
+guard apply all see a single request while the server runs many operations.
+
+  scripts/apiproto graphql       <url>  [...]   schema, per-field role matrix, APQ, subscriptions
+  scripts/apiproto rpcbatch      <url>  [...]   one foreign id in a batch of your own
+  scripts/apiproto grpc          <target> [...] reflection or bundle recovery, per-method matrix
+  scripts/apiproto serveractions <url>  [...]   harvest Next-Action ids, replay per role
+  scripts/apiproto specfuzz      <spec> [...]   spec vs traffic, version sweep, method swap
+  scripts/apiproto --selftest
+
+What it refuses, in every mode, because `AGENTS.md` refuses it in every mode:
+denial of service, brute force and destruction. The GraphQL depth, alias,
+batch-size and complexity checks are denial of service by construction, so they
+sit behind `--allow-dos-checks`, whose help text says what the flag costs. The
+role matrix is read-only unless `--include-mutations` is passed, and Server
+Actions are probed with a deliberately malformed argument body unless
+`--replay-args` is given.
+
+Authorization comes from the engagement scope file and nowhere else. Every
+request this script makes passes `hooks/scope-guard.py` first and a host it does
+not authorize is a refusal, not a warning. HTTP goes out through urllib with the
+recorder's proxy variables in the environment, exactly as `scripts/probe` does,
+so everything it sends can be replayed with `scripts/traffic replay`. A finding
+that cannot be replayed is not a finding.
+
+**False positives are the enemy.** No verdict here is ever derived from a
+response diff, a length or a status code. An authorization verdict needs: an
+owner-only canary in the response (or a state read-back by the owner), an
+owner baseline proving the canary is reachable at all, a public-by-design
+control, and the same result on two objects and two repeats. Anything short of
+that prints as `inconclusive` with the reason. The published accuracy numbers in
+this space are poor — BACFuzz (arXiv 2507.15984) found 16 of 17 known issues
+and 26 new ones across 20 PHP apps, but its own table implies roughly 30% false
+positives, and no vendor's claim has a published method — so the controls are
+the design, not a filter bolted on afterwards.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import http.client as httpclient    # `http` below is this script's request helper
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-apiproto/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# The canary prefix the knowledge notes use. An authorization proof is this
+# string coming back to the wrong principal, never a response that merely
+# differs from the owner's.
+CANARY_PREFIX = "MYTHOS-"
+
+
+# --------------------------------------------------------------- scope and rate
+
+_mods: dict = {}
+
+
+def mod(name):
+    """Load a hook by path, so its logic is called and not copied.
+
+    Host matching, wildcards, CIDRs, lab mode and the port list are already
+    solved in `hooks/scope-guard.py` and that is the single implementation for
+    every agent host. A second copy here would drift, and the copy that drifts
+    is the one that lets a request out.
+    """
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py", "budget-guard": "hooks/budget-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(f"mythos_{name}".replace("-", "_"),
+                                                      str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def authorize(target: str) -> None:
+    """Refuse a target the scope file does not name. Not a warning: a refusal.
+
+    The hook is warn-only as a PreToolUse tripwire, which is right there — the
+    request has already left by the time the agent reads it. Inside this process
+    the check runs *before* the socket, so it can actually stop the request, and
+    it is the only place that decides. Widening the scope to silence this is a
+    human action taken in an editor, outside a run.
+    """
+    try:
+        result = mod("scope-guard").check(target)
+    except Exception as e:                            # a broken hook must not mean "allowed"
+        raise SystemExit(f"apiproto: cannot evaluate scope for {target!r}: {type(e).__name__}: {e}")
+    if result.get("offenders"):
+        raise SystemExit(
+            f"apiproto: refusing {target!r}: {', '.join(result['offenders'])} is not in the "
+            f"active scope ({result.get('scope') or 'no scope file pinned'}).\n"
+            "Pin the right engagement with MYTHOS_SCOPE, or stop. Never widen a scope file "
+            "to make a tool proceed.")
+
+
+def scope_rate(default=5.0) -> float:
+    """rules.rate_limit_rps from the scope file, through the budget guard.
+
+    This process makes hundreds of requests inside one tool call, so the
+    PreToolUse budget guard never sees them: it paces the agent's calls, not the
+    loop inside one of them. The rate has to be honoured here or not at all.
+    The guard already reads the file with PyYAML when it is installed and with a
+    line scanner when it is not, so there is one parser and no second fallback.
+    """
+    try:
+        rules = mod("budget-guard").load_rules()[1]
+        value = mod("budget-guard")._num(rules, "rate_limit_rps")
+    except Exception:
+        value = None
+    try:
+        return float(value) if value else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST = [0.0]
+_MIN_GAP = [0.0]
+
+
+def pace() -> None:
+    """Hold the configured rate across every request this process makes."""
+    gap = _MIN_GAP[0]
+    if gap <= 0:
+        return
+    wait = _LAST[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+class Resp:
+    __slots__ = ("status", "headers", "body", "url", "error")
+
+    def __init__(self, status, headers, body, url, error=None):
+        self.status, self.headers, self.body, self.url, self.error = status, headers, body, url, error
+
+    def json(self):
+        try:
+            return json.loads(self.body)
+        except ValueError:
+            return None
+
+    def row(self):
+        return {"status": self.status, "bytes": len(self.body or ""),
+                **({"error": self.error} if self.error else {})}
+
+
+CFG = {"timeout": 10.0, "insecure": False}
+
+
+def http(method, url, headers=None, body=None):
+    """One request, scope-checked, paced, through the recorder's proxy variables.
+
+    urllib's default opener reads http_proxy/https_proxy and ssl reads
+    SSL_CERT_FILE, which is what `scripts/traffic env` exports, so nothing extra
+    is needed to be recorded — and nothing here may construct an opener that
+    bypasses them.
+    """
+    authorize(url)
+    pace()
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"User-Agent": UA, **(headers or {})})
+    ctx = ssl._create_unverified_context() if CFG["insecure"] else None
+    try:
+        with urllib.request.urlopen(req, timeout=CFG["timeout"], context=ctx) as r:
+            return Resp(r.status, {k.lower(): v for k, v in r.headers.items()},
+                        r.read(400_000).decode("utf-8", "replace"), r.geturl())
+    except urllib.error.HTTPError as e:
+        raw = e.read(200_000) if e.fp else b""
+        return Resp(e.code, {k.lower(): v for k, v in (e.headers or {}).items()},
+                    raw.decode("utf-8", "replace"), url)
+    except Exception as e:
+        return Resp(None, {}, "", url, error=f"{type(e).__name__}: {e}")
+
+
+# ------------------------------------------------------------------ principals
+
+def load_principals(sessions_dir, extra_headers, roles=None):
+    """{role: {header: value}} from the sessions directory, plus anon.
+
+    `skills/auth-session` already writes `<role>.headers` with one `Name: value`
+    per line and keeps them alive with `session_check.py`. Reading that is the
+    whole identity story; this script does not log anything in.
+    """
+    out = {}
+    if sessions_dir:
+        d = pathlib.Path(sessions_dir)
+        if not d.is_dir():
+            raise SystemExit(f"apiproto: --sessions {sessions_dir}: not a directory. "
+                             "skills/auth-session writes <role>.headers there.")
+        for f in sorted(d.glob("*.headers")):
+            role = f.name[:-len(".headers")]
+            if roles and role not in roles:
+                continue
+            hdrs = {}
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                name, sep, value = line.partition(":")
+                if sep and name.strip():
+                    hdrs[name.strip()] = value.strip()
+            if hdrs:
+                out[role] = hdrs
+    for role, hdrs in list(out.items()):
+        out[role] = {**hdrs, **extra_headers}
+    # anon last so a matrix row order reads owner -> other -> anon
+    out["anon"] = dict(extra_headers)
+    return out
+
+
+def parse_objects(specs):
+    """--object 'ID:CANARY' pairs into [{"id":..., "canary":...}].
+
+    Two objects are required for a verdict, and both must be the agent's own:
+    an id belonging to anyone else is never requested, so "foreign" in this
+    script always means the second account the agent created.
+    """
+    out = []
+    for s in specs:
+        oid, sep, canary = s.partition(":")
+        if not sep or not oid.strip() or not canary.strip():
+            raise SystemExit(f"apiproto: bad --object {s!r}: expected 'OBJECT_ID:CANARY'")
+        out.append({"id": oid.strip(), "canary": canary.strip()})
+    return out
+
+
+# ------------------------------------------------------- the authorization judge
+
+def judge_cell(observations, owner_baseline, public_control=None,
+               min_objects=2, min_repeats=2):
+    """One cell of a role matrix: did this principal reach the owner's object?
+
+    `observations`  [{object, repeat, proof: bool, status: int|None}]
+                    `proof` is the canary in the response, or a state read-back
+                    by the owner for a write. It is never a diff.
+    `owner_baseline` {object_id: bool} — did the owner's own request return the
+                    canary. Without it there is no oracle and no verdict, which
+                    is the single most common way these tools lie.
+    `public_control` True when an object the operator declared public-by-design
+                    is also readable anonymously. Then a leak here is the
+                    product working, not a finding. This is Autorize's
+                    "Is Enforced???" bucket, named instead of guessed.
+
+    Returns {"state", "reason", ...}. States: confirmed, enforced,
+    public-by-design, inconclusive. Nothing else is ever emitted.
+    """
+    valid = {o for o, ok in owner_baseline.items() if ok}
+    usable = [x for x in observations if x["object"] in valid]
+    detail = {"objects_tested": sorted({x["object"] for x in observations}),
+              "objects_with_oracle": sorted(valid)}
+    if not valid:
+        return {"state": "inconclusive",
+                "reason": "no oracle: the owner's own request did not return the canary, so "
+                          "nothing about another principal's response can be read",
+                **detail}
+    if public_control:
+        return {"state": "public-by-design",
+                "reason": "the control object the operator declared public is readable "
+                          "anonymously too, so reaching this one proves nothing",
+                **detail}
+
+    leaking, flapping, repeats_short = [], [], []
+    for obj in sorted(valid):
+        rows = [x for x in usable if x["object"] == obj]
+        proofs = {bool(x["proof"]) for x in rows}
+        if len(rows) < min_repeats:
+            repeats_short.append(f"{obj} ({len(rows)} repeat(s))")
+        elif proofs == {True}:
+            leaking.append(obj)
+        elif True in proofs:
+            flapping.append(obj)
+    detail["leaking_objects"] = leaking
+
+    if flapping:
+        return {"state": "inconclusive",
+                "reason": f"not reproducible: {', '.join(flapping)} answered differently across "
+                          "repeats. A result that does not repeat is noise, not a finding",
+                **detail}
+    if repeats_short:
+        return {"state": "inconclusive",
+                "reason": f"too few repeats to decide: {', '.join(repeats_short)}, "
+                          f"{min_repeats} needed",
+                **detail}
+    if len(leaking) >= min_objects:
+        return {"state": "confirmed",
+                "reason": f"the owner's canary reached this principal on "
+                          f"{len(leaking)} object(s), "
+                          f"every repeat: {', '.join(leaking)}",
+                **detail}
+    if leaking:
+        return {"state": "inconclusive",
+                "reason": f"held on one object only ({leaking[0]}); {min_objects} needed, because "
+                          "one object can be shared by design",
+                **detail}
+    if len(valid) < min_objects:
+        return {"state": "inconclusive",
+                "reason": f"only {len(valid)} object(s) had a working oracle; {min_objects} needed "
+                          "before 'enforced' means anything",
+                **detail}
+    return {"state": "enforced",
+            "reason": "the owner's canary never reached this principal on any object or repeat",
+            **detail}
+
+
+def compare_transports(verdicts):
+    """{transport: verdict} -> the two-transport note from access-control.md.
+
+    A candidate that holds on GraphQL and on its REST twin is systemic: the
+    check is missing in the service, not in one router. One that holds on only
+    one of them is a gap in that transport's guard, which is a different fix and
+    a different report line.
+    """
+    confirmed = sorted(t for t, v in verdicts.items() if v.get("state") == "confirmed")
+    if len(confirmed) >= 2:
+        return {"systemic": True, "transports": confirmed,
+                "note": "the same object is reachable on two transports: the authorization check "
+                        "is missing below the routing layer, not in one route"}
+    if confirmed:
+        other = sorted(t for t in verdicts if t not in confirmed)
+        return {"systemic": False, "transports": confirmed,
+                "note": f"reachable on {confirmed[0]} but not on {', '.join(other) or 'any twin'}: "
+                        "one transport's guard is missing"}
+    return {"systemic": False, "transports": [], "note": "no transport confirmed"}
+
+
+def proof_in(text, canary, owner_canaries=()):
+    """Is the owner's canary in this response, and nobody else's by accident."""
+    if not text or not canary:
+        return False
+    if canary not in text:
+        return False
+    # A response that carries *every* canary is a list endpoint the caller is
+    # allowed to see, or an error page echoing the request. Both are noise.
+    others = [c for c in owner_canaries if c != canary]
+    return not (others and all(c in text for c in others))
+
+
+# ------------------------------------------------------------------- graphql
+
+# Enough of the schema to build a real query: fields, their arguments and the
+# shape of what they return, so a selection set can be generated instead of
+# guessed. Two levels of ofType covers [Type!]! which is the common case.
+INTROSPECTION = (
+    "{__schema{queryType{name}mutationType{name}subscriptionType{name}"
+    "types{name kind fields{name "
+    "args{name type{kind name ofType{kind name ofType{kind name}}}} "
+    "type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}}}}}")
+
+SCALARS = {"SCALAR", "ENUM"}
+# The message arrives inside a JSON string, so the quotes around a suggested
+# name are usually escaped (`Did you mean \"user\"?`). Matching only the bare
+# form found nothing on any real server, which is the quiet kind of bug: the
+# recovery channel looked closed everywhere.
+SUGGEST_RE = re.compile(
+    r'Did you mean\s+((?:\\?"[^"\\]+\\?"(?:\s*(?:,|or|and)\s*)?)+)', re.I)
+NAME_RE = re.compile(r'\\?"([^"\\]+)\\?"')
+
+
+def unwrap(type_ref):
+    """(base name, base kind) through NON_NULL and LIST wrappers."""
+    cur = type_ref or {}
+    while cur.get("name") is None and cur.get("ofType"):
+        cur = cur["ofType"]
+    return cur.get("name"), cur.get("kind")
+
+
+def parse_introspection(doc):
+    """An introspection response into operations and a type table.
+
+    The whole surface of a GraphQL application is this document, so a parser
+    that silently drops a field drops an endpoint the verdict ledger will never
+    account for. Errors-with-partial-data is the normal shape when introspection
+    is half disabled, so partial data is kept rather than discarded.
+    """
+    schema = ((doc or {}).get("data") or {}).get("__schema") or {}
+    types = {}
+    for t in schema.get("types") or []:
+        name = t.get("name")
+        if not name or name.startswith("__"):
+            continue
+        fields = {}
+        for f in t.get("fields") or []:
+            fname = f.get("name")
+            if not fname:
+                continue
+            base, kind = unwrap(f.get("type"))
+            fields[fname] = {
+                "name": fname, "type": base, "kind": kind,
+                "args": [{"name": a.get("name"), "type": unwrap(a.get("type"))[0],
+                          "kind": unwrap(a.get("type"))[1]}
+                         for a in (f.get("args") or []) if a.get("name")],
+            }
+        types[name] = {"name": name, "kind": t.get("kind"), "fields": fields}
+
+    roots = {}
+    ops = []
+    for op, key in (("query", "queryType"), ("mutation", "mutationType"),
+                    ("subscription", "subscriptionType")):
+        root = (schema.get(key) or {}).get("name")
+        if not root:
+            continue
+        roots[op] = root
+        for fname, f in (types.get(root) or {}).get("fields", {}).items():
+            ops.append({"op": op, "field": fname, "returns": f["type"],
+                        "args": f["args"], "root": root})
+    return {"roots": roots, "types": types, "operations": ops,
+            "errors": [e.get("message") for e in (doc or {}).get("errors") or []]}
+
+
+def selection_for(type_name, types, depth=2):
+    """A selection set of scalars, descending `depth` levels into objects.
+
+    Depth 2 is deliberate: `order{customer{email}}` is where per-field
+    authorization is usually missing, and a scalars-only selection would never
+    ask for it. Deeper is a cost attack, which this script does not do.
+    """
+    t = types.get(type_name) or {}
+    if not t.get("fields"):
+        return ""
+    picks = []
+    for fname, f in t["fields"].items():
+        if f["args"]:
+            continue                      # an argument we would have to invent
+        if f["kind"] in SCALARS:
+            picks.append(fname)
+        elif depth > 1 and f["kind"] in ("OBJECT", "INTERFACE"):
+            sub = selection_for(f["type"], types, depth - 1)
+            if sub:
+                picks.append(f"{fname}{sub}")
+        if len(picks) >= 12:
+            break
+    return "{" + " ".join(picks) + "}" if picks else ""
+
+
+def literal(value):
+    """A GraphQL argument literal. Ids arrive as strings and stay quoted."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    text = str(value)
+    return text if re.fullmatch(r"-?\d+(\.\d+)?", text) else json.dumps(text)
+
+
+ID_ARG_RE = re.compile(r"(?i)^(id|ids|_?id|.*_id|.*Id|uid|uuid|guid|slug|key|pk|node|nodeId)$")
+
+
+def build_query(op, types, object_id=None):
+    """One operation as a document, with the agent's own object id in the id arg."""
+    args = []
+    for a in op["args"]:
+        if object_id is not None and ID_ARG_RE.match(a["name"] or ""):
+            args.append(f"{a['name']}: {literal(object_id)}")
+    arglist = f"({', '.join(args)})" if args else ""
+    sel = selection_for(op["returns"], types) if op["returns"] in types else ""
+    return f"{op['op']} {{ {op['field']}{arglist}{sel} }}"
+
+
+def field_suggestions(body):
+    """Field names recovered from a 'Did you mean' error.
+
+    With introspection off this is the whole schema-recovery channel, and it is
+    the same one Clairvoyance walks with a wordlist. Report it as its own low
+    finding: a server that corrects your spelling has not disabled introspection,
+    it has made it slower.
+    """
+    names = []
+    for m in SUGGEST_RE.finditer(body or ""):
+        for n in NAME_RE.findall(m.group(1)):
+            if n not in names:
+                names.append(n)
+    return names
+
+
+SUGGEST_WORDS = ("usr", "usrs", "accnt", "ordr", "admn", "nod", "mee", "fil", "paymnt", "tokn")
+
+
+def gql_post(url, headers, query, variables=None, extensions=None):
+    payload = {"query": query}
+    if variables is not None:
+        payload["variables"] = variables
+    if extensions is not None:
+        payload["extensions"] = extensions
+    return http("POST", url, {**headers, "Content-Type": "application/json"},
+                json.dumps(payload))
+
+
+def persisted_query_state(url, headers):
+    """Which of the two persisted-query paths is open.
+
+    An allowlist that still answers an arbitrary query is not an allowlist, and
+    an APQ server that accepts a client-registered document has the same hole
+    with extra steps. Both are reported, separately, because they are different
+    fixes.
+    """
+    probe_query = "{__typename}"
+    digest = __import__("hashlib").sha256(probe_query.encode()).hexdigest()
+    out = {}
+    hash_only = gql_post(url, headers, None, extensions={
+        "persistedQuery": {"version": 1, "sha256Hash": digest}})
+    out["hash_only"] = {**hash_only.row(),
+                        "not_found": "PersistedQueryNotFound" in (hash_only.body or "")
+                        or "PERSISTED_QUERY_NOT_FOUND" in (hash_only.body or "")}
+    out["apq_in_use"] = bool(out["hash_only"]["not_found"])
+
+    register = gql_post(url, headers, probe_query, extensions={
+        "persistedQuery": {"version": 1, "sha256Hash": digest}})
+    body = register.body or ""
+    # Only meaningful where APQ is actually configured: a server that ignores
+    # the extension and runs every document has not "accepted a registration",
+    # it has no allowlist at all, which is the line below.
+    out["client_registration_accepted"] = (
+        out["apq_in_use"] and '"__typename"' in body and '"errors"' not in body)
+    out["register"] = register.row()
+
+    plain = gql_post(url, headers, probe_query)
+    out["arbitrary_query_accepted"] = '"__typename"' in (plain.body or "")
+    out["plain"] = plain.row()
+    if out["apq_in_use"] and out["arbitrary_query_accepted"]:
+        out["note"] = ("persisted queries are configured but an arbitrary document is still "
+                       "executed: the allowlist is advisory")
+    elif out["client_registration_accepted"]:
+        out["note"] = ("the client may register its own document and have it executed: "
+                       "automatic persisted queries without a server-side allowlist")
+    else:
+        out["note"] = "no persisted-query bypass observed"
+    return out
+
+
+# --- WebSocket, for subscription auth. Frame codec first so it can be asserted.
+
+def ws_frame(payload: bytes, opcode=0x1) -> bytes:
+    """A masked client frame. Clients must mask; servers must not."""
+    mask = os.urandom(4)
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 1 << 16:
+        head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def ws_parse(buf: bytes):
+    """(opcode, payload, consumed) or None while the frame is incomplete."""
+    if len(buf) < 2:
+        return None
+    opcode = buf[0] & 0x0F
+    masked = bool(buf[1] & 0x80)
+    n = buf[1] & 0x7F
+    at = 2
+    if n == 126:
+        if len(buf) < 4:
+            return None
+        n, at = int.from_bytes(buf[2:4], "big"), 4
+    elif n == 127:
+        if len(buf) < 10:
+            return None
+        n, at = int.from_bytes(buf[2:10], "big"), 10
+    mask = b""
+    if masked:
+        if len(buf) < at + 4:
+            return None
+        mask, at = buf[at:at + 4], at + 4
+    if len(buf) < at + n:
+        return None
+    body = buf[at:at + n]
+    if mask:
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(body))
+    return opcode, body, at + n
+
+
+def _ws_connect(url):
+    """A socket to the WebSocket endpoint, through the recorder's CONNECT.
+
+    http.client does the proxy CONNECT itself when a tunnel is set, which keeps
+    the hop in the recorder's log. The frames inside it are opaque to the
+    recorder, so a subscription finding carries the handshake as its replayable
+    request and the frames as transcript, and the report has to say so.
+    """
+    u = urllib.parse.urlsplit(url)
+    secure = u.scheme in ("https", "wss")
+    host, port = u.hostname, u.port or (443 if secure else 80)
+    proxy = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")) if secure else \
+            (os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY"))
+    ctx = ssl._create_unverified_context() if CFG["insecure"] else None
+    if proxy:
+        p = urllib.parse.urlsplit(proxy)
+        cls = httpclient.HTTPSConnection if secure else httpclient.HTTPConnection
+        kw = {"timeout": CFG["timeout"]}
+        if secure:
+            kw["context"] = ctx
+        conn = cls(p.hostname, p.port or 80, **kw)
+        conn.set_tunnel(host, port)
+    elif secure:
+        conn = httpclient.HTTPSConnection(host, port, timeout=CFG["timeout"], context=ctx)
+    else:
+        conn = httpclient.HTTPConnection(host, port, timeout=CFG["timeout"])
+    return conn, (u.path or "/") + (f"?{u.query}" if u.query else "")
+
+
+def subscription_probe(url, headers, origin=None, protocol="graphql-transport-ws"):
+    """Does the server authenticate the connection, and does it check Origin?
+
+    The documented failure is auth checked once at `connection_init` and never
+    again per event. Proving the event leak needs a second principal to mutate
+    while this one is subscribed, which is orchestration this script does not
+    own — so it establishes whether an unauthenticated or cross-origin
+    connection is accepted at all, and says what the leak test still needs.
+    """
+    out = {"url": url, "protocol": protocol, "origin_sent": origin}
+    authorize(url)
+    pace()
+    try:
+        conn, path = _ws_connect(url)
+        key = base64.b64encode(os.urandom(16)).decode()
+        conn.putrequest("GET", path, skip_accept_encoding=True)
+        for name, value in {"Upgrade": "websocket", "Connection": "Upgrade",
+                            "Sec-WebSocket-Key": key, "Sec-WebSocket-Version": "13",
+                            "Sec-WebSocket-Protocol": protocol, "User-Agent": UA,
+                            **({"Origin": origin} if origin else {}), **headers}.items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        r = conn.getresponse()
+        out["handshake_status"] = r.status
+        if r.status != 101:
+            out["upgraded"] = False
+            out["note"] = f"no upgrade ({r.status}): this endpoint does not take subscriptions here"
+            conn.close()
+            return out
+        out["upgraded"] = True
+        sock = conn.sock
+        sock.settimeout(CFG["timeout"])
+        sock.sendall(ws_frame(json.dumps({"type": "connection_init", "payload": {}}).encode()))
+        buf, frames = b"", []
+        deadline = time.monotonic() + min(CFG["timeout"], 8)
+        while time.monotonic() < deadline and len(frames) < 3:
+            try:
+                chunk = sock.recv(8192)
+            except (socket.timeout, TimeoutError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                parsed = ws_parse(buf)
+                if not parsed:
+                    break
+                op, body, used = parsed
+                buf = buf[used:]
+                if op in (0x1, 0x2):
+                    frames.append(body.decode("utf-8", "replace")[:400])
+                elif op == 0x8:
+                    frames.append("<close>")
+                    deadline = 0
+        conn.close()
+        out["frames"] = frames
+        acked = any('"connection_ack"' in f for f in frames)
+        out["connection_ack"] = acked
+        out["note"] = (
+            "connection accepted with these credentials" if acked else
+            "connection not acknowledged: either authenticated or it wants a payload token")
+        if acked and not headers:
+            out["candidate"] = ("unauthenticated connection_init acknowledged; subscribe as this "
+                                "connection and have a second principal mutate its own object to "
+                                "prove whether events cross principals")
+        if acked and origin:
+            out["candidate"] = (f"connection accepted with Origin {origin}: missing Origin check "
+                                "is cross-site WebSocket hijacking")
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+# --- the information-level checks, native. Thirteen of graphql-cop's tests are
+# worth having and five of them are denial of service; version 1.9 has no flag
+# to select or deselect any of them (its options are -t, -H, -o, -x and -v, and
+# graphql-cop.py imports every test module at the top and runs them all), so the
+# only way to get the first eight without the last five is to send them here.
+# Each is one cheap request with one narrow assertion, and the assertion is a
+# pure function of the response so it can be asserted offline.
+
+STACK_RE = re.compile(
+    r"(?m)(^\s*at [A-Za-z_$][\w$.<>]* \(|Traceback \(most recent call last\)|"
+    r"^\s*File \"[^\"]+\", line \d+|\bjava\.[a-z]+\.[A-Za-z]+Exception\b|"
+    r"\bgoroutine \d+ \[|\bRuntimeError\b|\bNullPointerException\b)")
+GRAPHIQL_RE = re.compile(r"(?i)graphiql|graphql playground|__APOLLO_DEVTOOLS|altair|"
+                         r"graphql-playground")
+GQL_DATA_RE = re.compile(r'"data"\s*:\s*\{')
+
+
+def _executed(r):
+    """Did this response actually run the document, as opposed to refusing it.
+
+    A 200 carrying only `errors` is a refusal, which is the whole point of the
+    GET and form-body checks: the question is whether the server executed the
+    document on this transport, not whether it answered with something.
+    """
+    body = r.body or ""
+    return bool(GQL_DATA_RE.search(body)) and "__typename" in body
+
+
+def info_suggestions(r):
+    return bool(field_suggestions(r.body))
+
+
+def info_introspection(r):
+    return '"queryType"' in (r.body or "") or '"__schema"' in (r.body or "")
+
+
+def info_graphiql(r):
+    ctype = (r.headers or {}).get("content-type", "")
+    return bool(r.status == 200 and "html" in ctype and GRAPHIQL_RE.search(r.body or ""))
+
+
+def info_trace(r):
+    """Tracing or debug timings returned in `extensions`.
+
+    Apollo's tracing extension and the Hasura and Yoga debug payloads all land
+    under `extensions`, and they hand over the resolver tree, the backend
+    latencies and sometimes the queries behind them. Checked structurally rather
+    than by substring, so a field whose *value* contains the word does not trip.
+    """
+    doc = r.json()
+    ext = (doc or {}).get("extensions") if isinstance(doc, dict) else None
+    if not isinstance(ext, dict):
+        return False
+    return any(k in ext for k in ("tracing", "traceTimings", "trace", "metrics", "timing"))
+
+
+def info_stacktrace(r):
+    return bool(STACK_RE.search(r.body or ""))
+
+
+# (name, which request, the assertion, severity, what it means). Declarative so
+# the selftest can exercise every assertion without a socket.
+INFO_CHECKS = [
+    ("field_suggestions", "suggest", info_suggestions, "low",
+     "the server corrects field names, so the schema can be rebuilt with a wordlist "
+     "(Clairvoyance) even with introspection off. Report it as its own low finding"),
+    ("introspection", "introspect", info_introspection, "info",
+     "introspection answers: a finding only with sensitive types or mutations in it, "
+     "otherwise a hardening note"),
+    ("graphiql", "graphiql", info_graphiql, "low",
+     "an in-browser IDE is served at the endpoint: it hands any visitor the schema and a "
+     "request builder"),
+    ("get_query_accepted", "get_query", _executed, "low",
+     "a query runs over GET, so it is reachable from a third-party page and lands in logs, "
+     "proxies and browser history"),
+    ("get_mutation_accepted", "get_mutation", _executed, "high",
+     "a MUTATION runs over GET: cross-site request forgery with a plain link. Confirm with one "
+     "harmless mutation on your own object and no CSRF token"),
+    ("urlencoded_accepted", "form_post", _executed, "high",
+     "the endpoint executes a form-encoded body, which a cross-origin form can send without a "
+     "preflight: cross-site request forgery unless a token is enforced"),
+    ("trace_mode", "trace", info_trace, "low",
+     "tracing or debug timings are returned in `extensions`: resolver tree and backend "
+     "latencies, and sometimes the queries behind them"),
+    ("unhandled_error", "malformed", info_stacktrace, "low",
+     "a malformed request body produces a stack trace: framework, file paths and versions, "
+     "which is what cvefeed needs and what an attacker gets for free"),
+]
+
+
+def native_info_checks(url, headers, introspection_resp=None):
+    """The eight information-level checks. One request each, none of them DoS."""
+    sep = "&" if "?" in url else "?"
+    plain = {**headers, "Content-Type": "application/json"}
+    sent = {
+        "suggest": lambda: gql_post(url, headers, "{qwertyuiop}"),
+        "introspect": lambda: (introspection_resp if introspection_resp is not None
+                               else gql_post(url, headers, INTROSPECTION)),
+        "graphiql": lambda: http("GET", url, {**headers, "Accept": "text/html"}),
+        "get_query": lambda: http("GET", url + sep + urllib.parse.urlencode(
+            {"query": "{__typename}"}), headers),
+        "get_mutation": lambda: http("GET", url + sep + urllib.parse.urlencode(
+            {"query": "mutation{__typename}"}), headers),
+        "form_post": lambda: http("POST", url,
+                                  {**headers,
+                                   "Content-Type": "application/x-www-form-urlencoded"},
+                                  urllib.parse.urlencode({"query": "{__typename}"})),
+        "trace": lambda: gql_post(url, headers, "{__typename}"),
+        # A truncated JSON body: the request dies in the body parser, before any
+        # document exists, so nothing is executed and nothing costs the server
+        # anything. A well-built server answers 400; one with debug left on
+        # answers with the stack that got it there. An unbalanced GraphQL
+        # document instead would hit the clean syntax-error path and never
+        # reach the unhandled one, which is the whole point of this check.
+        "malformed": lambda: http("POST", url, plain, '{"query":'),
+    }
+    cache, rows = {}, []
+    for name, key, assertion, severity, why in INFO_CHECKS:
+        if key not in cache:
+            cache[key] = sent[key]()
+        r = cache[key]
+        rows.append({"check": name, "result": bool(assertion(r)), "severity": severity,
+                     "status": r.status, "why": why,
+                     **({"error": r.error} if r.error else {})})
+    return rows
+
+
+# graphql-cop's five denial-of-service tests, named so the output can say what
+# the default path does not cover. A silent hole is worse than a named one.
+COP_DOS_TESTS = ("dos_alias_overloading", "dos_batch", "dos_field_duplication",
+                 "dos_directive_overloading", "dos_circular_introspection")
+
+
+def run_graphql_cop(url, headers, allow_dos):
+    """graphql-cop, only ever with --allow-dos-checks. It cannot be run partially.
+
+    Version 1.9 takes `-t`, `-H`, `-o`, `-x` and `-v` and nothing else: there is
+    no test selection, and it imports all thirteen test modules and runs them
+    unconditionally. Five make the server do N times the work for one request.
+    So the options are all of it or none of it, and none of it is the default —
+    which also means the default path depends on nothing outside the image.
+    """
+    if not allow_dos:
+        return {"ran": False,
+                "skipped": "graphql-cop was not run. Version 1.9 has no flag to select or "
+                           "deselect tests, it runs all thirteen unconditionally, and five of "
+                           "them are denial of service (" + ", ".join(COP_DOS_TESTS) + "), which "
+                           "AGENTS.md refuses in every mode and no scope rule overrides. Its "
+                           "other eight checks ran natively (see info_checks), so those five are "
+                           "the whole of what is not covered here. --allow-dos-checks runs cop in "
+                           "full; throwaway lab only."}
+    exe = shutil.which("graphql-cop")
+    if not exe:
+        return {"ran": False, "skipped": "graphql-cop is not installed, so its denial-of-service "
+                                         "tests did not run even though --allow-dos-checks was "
+                                         "passed. The native checks are unaffected."}
+    cmd = [exe, "-t", url, "-o", "json"]
+    for h in (f"{k}: {v}" for k, v in headers.items()):
+        cmd += ["-H", h]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        return {"ran": False, "skipped": f"graphql-cop failed to run: {type(e).__name__}: {e}"}
+    try:
+        findings = json.loads(p.stdout)
+    except ValueError:
+        findings = None
+    return {"ran": True, "dos_checks_enabled": True, "dos_tests_included": list(COP_DOS_TESTS),
+            "findings": findings, "stdout": None if findings else p.stdout[-4000:],
+            "stderr": p.stderr[-2000:] or None,
+            "note": "this run included the denial-of-service tests, so it is only valid against "
+                    "a throwaway lab target."}
+
+
+def run_graphw00f(url):
+    exe = shutil.which("graphw00f")
+    if not exe:
+        return {"ran": False, "skipped": "graphw00f is not installed: the engine was not "
+                                         "fingerprinted, so engine-specific checks (Hasura role "
+                                         "headers, Apollo APQ) have no starting point"}
+    try:
+        p = subprocess.run([exe, "-f", "-d", "-t", url], capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return {"ran": False, "skipped": f"graphw00f failed to run: {type(e).__name__}: {e}"}
+    m = re.search(r"(?i)discovered GraphQL engine:?\s*\(?([^)\n]+)\)?", p.stdout)
+    return {"ran": True, "engine": (m.group(1).strip() if m else None), "stdout": p.stdout[-2000:]}
+
+
+def cmd_graphql(a):
+    headers_extra = parse_headers(a.header)
+    principals = load_principals(a.sessions, headers_extra, a.roles)
+    objects = parse_objects(a.object)
+    owner = a.owner if a.owner in principals else None
+    result = {"subcommand": "graphql", "url": a.url, "principals": list(principals),
+              "owner": owner, "skipped": [], "dos_checks_enabled": bool(a.allow_dos_checks)}
+
+    owner_headers = principals.get(owner, {}) if owner else {}
+    detect = gql_post(a.url, owner_headers, "{__typename}")
+    result["detect"] = {**detect.row(), "is_graphql": '"__typename"' in (detect.body or "")
+                        or "__typename" in (detect.body or "")}
+
+    intro_raw = gql_post(a.url, owner_headers, INTROSPECTION)
+    schema = parse_introspection(intro_raw.json() or {})
+    result["introspection"] = {**intro_raw.row(), "open": bool(schema["operations"]),
+                               "operations": len(schema["operations"]),
+                               "errors": schema["errors"][:3]}
+    if not schema["operations"]:
+        recovered = []
+        for word in SUGGEST_WORDS:
+            r = gql_post(a.url, owner_headers, "{%s}" % word)
+            recovered += [n for n in field_suggestions(r.body) if n not in recovered]
+        result["field_suggestions"] = {
+            "enabled": bool(recovered), "recovered": recovered,
+            "note": "introspection is off but the server corrects field names: recover the schema "
+                    "with Clairvoyance and a wordlist, and report the suggestions as their own "
+                    "low finding" if recovered else
+                    "introspection off and no field suggestions: supply a schema with --schema"}
+        if a.schema:
+            schema = parse_introspection(json.loads(pathlib.Path(a.schema).read_text()))
+            result["introspection"]["from_file"] = a.schema
+            result["introspection"]["operations"] = len(schema["operations"])
+
+    result["persisted_queries"] = persisted_query_state(a.url, owner_headers)
+
+    # The eight information-level checks, sent from here rather than shelled out
+    # to graphql-cop, because cop 1.9 cannot run them without its five
+    # denial-of-service tests. The introspection response is reused, not resent.
+    result["info_checks"] = native_info_checks(a.url, owner_headers, intro_raw)
+
+    sub_url = re.sub(r"^http", "ws", a.url)
+    result["subscriptions"] = [subscription_probe(sub_url, {}, protocol=p)
+                               for p in ("graphql-transport-ws", "graphql-ws")]
+    if a.origin:
+        result["subscriptions"].append(
+            subscription_probe(sub_url, principals.get(owner, {}), origin=a.origin))
+
+    result["graphw00f"] = run_graphw00f(a.url)
+    result["graphql_cop"] = run_graphql_cop(a.url, owner_headers, a.allow_dos_checks)
+    for block in ("graphw00f", "graphql_cop"):
+        if result[block].get("skipped"):
+            result["skipped"].append(result[block]["skipped"])
+
+    # --- the part no tool does: the same field as every principal, on the
+    # agent's own objects, with the controls that make the answer mean something.
+    matrix = []
+    if objects and owner:
+        canaries = [o["canary"] for o in objects]
+        ops = [o for o in schema["operations"]
+               if o["op"] == "query" or (a.include_mutations and o["op"] == "mutation")]
+        if a.field:
+            ops = [o for o in ops if o["field"] in a.field]
+            if not ops:
+                # `--field` names a top-level operation, not a nested selection:
+                # on this schema that is `user`, not `apiToken`. Filtering to
+                # nothing used to leave the matrix empty with no reason printed,
+                # which reads as "the tool declined" rather than "you asked for
+                # a field that is not an operation".
+                result["skipped"].append(
+                    "no per-field role matrix: --field "
+                    + ", ".join(sorted(a.field))
+                    + " matched no operation. --field names a top-level query or mutation; "
+                    "the operations this schema exposes are "
+                    + ", ".join(sorted({o["field"] for o in schema["operations"]})[:20])
+                    + ". Nested selections are always included in their operation's query.")
+        for op in ops[:a.max_fields]:
+            baseline, obs_by_role = {}, {r: [] for r in principals if r != owner}
+            for obj in objects:
+                q = build_query(op, schema["types"], obj["id"])
+                r = gql_post(a.url, principals[owner], q)
+                baseline[obj["id"]] = proof_in(r.body, obj["canary"], canaries)
+                for role, hdrs in principals.items():
+                    if role == owner:
+                        continue
+                    for rep in range(a.repeats):
+                        rr = gql_post(a.url, hdrs, q)
+                        obs_by_role[role].append(
+                            {"object": obj["id"], "repeat": rep, "status": rr.status,
+                             "proof": proof_in(rr.body, obj["canary"], canaries)})
+            row = {"op": op["op"], "field": op["field"], "args": [x["name"] for x in op["args"]],
+                   "query": build_query(op, schema["types"], objects[0]["id"]),
+                   "owner_baseline": baseline, "cells": {}}
+            for role, obs in obs_by_role.items():
+                row["cells"][role] = judge_cell(
+                    obs, baseline, public_control=(a.public_field == op["field"]),
+                    min_objects=a.min_objects, min_repeats=a.repeats)
+            twin = (a.rest_twin or {}).get(op["field"])
+            if twin:
+                row["rest_twin"] = rest_twin_matrix(twin, principals, owner, objects, a)
+                row["two_transport"] = compare_transports({
+                    "graphql": max(row["cells"].values(),
+                                   key=lambda v: v["state"] == "confirmed"),
+                    "rest": max(row["rest_twin"]["cells"].values(),
+                                key=lambda v: v["state"] == "confirmed")})
+            matrix.append(row)
+    elif not objects or not owner:
+        result["skipped"].append(
+            "no per-field role matrix: pass --owner ROLE and two --object 'ID:CANARY' pairs for "
+            "objects that role created. Without an owner-only canary there is no oracle, and a "
+            "response diff is not one.")
+    result["role_matrix"] = matrix
+    return result
+
+
+def rest_twin_matrix(template, principals, owner, objects, a):
+    """The same object over its REST route, so the two-transport rule can apply."""
+    canaries = [o["canary"] for o in objects]
+    baseline, obs_by_role = {}, {r: [] for r in principals if r != owner}
+    for obj in objects:
+        url = template.replace("{id}", urllib.parse.quote(str(obj["id"]), safe=""))
+        r = http("GET", url, principals[owner])
+        baseline[obj["id"]] = proof_in(r.body, obj["canary"], canaries)
+        for role, hdrs in principals.items():
+            if role == owner:
+                continue
+            for rep in range(a.repeats):
+                rr = http("GET", url, hdrs)
+                obs_by_role[role].append({"object": obj["id"], "repeat": rep,
+                                          "status": rr.status,
+                                          "proof": proof_in(rr.body, obj["canary"], canaries)})
+    return {"template": template, "owner_baseline": baseline,
+            "cells": {role: judge_cell(obs, baseline, min_objects=a.min_objects,
+                                       min_repeats=a.repeats)
+                      for role, obs in obs_by_role.items()}}
+
+
+# ------------------------------------------------------------------- rpcbatch
+
+def build_jsonrpc_batch(method, own_ids, foreign_id, param_name="id"):
+    """A JSON-RPC batch whose elements are addressed by id, one of them foreign.
+
+    The bug this finds is a server that authorizes the batch and not its
+    elements: any one element belonging to the caller is enough, so the foreign
+    element rides along. Element ids are strings so the mapping back is exact
+    even when the server reorders or omits.
+    """
+    calls = []
+    for i, oid in enumerate(list(own_ids) + [foreign_id]):
+        calls.append({"jsonrpc": "2.0", "id": f"e{i}", "method": method,
+                      "params": {param_name: oid}})
+    return calls
+
+
+def build_trpc_batch(procedures, inputs):
+    """(path, body) for an httpBatchLink call: comma-joined procedures, indexed inputs."""
+    path = ",".join(procedures)
+    body = {str(i): {"json": inp} for i, inp in enumerate(inputs)}
+    return path, body
+
+
+def map_batch_results(sent, response):
+    """Per element, what came back. One verdict for the batch would hide the bug.
+
+    JSON-RPC answers are matched on their `id`, which is authoritative and
+    survives reordering. tRPC answers are a positional array, so index is the
+    only key there — and a server that drops an element shifts every later one,
+    which is why a missing element is reported as `missing` rather than
+    silently aligned.
+    """
+    rows = []
+    by_id = {}
+    if isinstance(response, dict) and response and all(k.isdigit() for k in response):
+        # tRPC's index-keyed object: the key *is* the element's position, which
+        # is a better key than our own enumeration.
+        by_id = {k: v for k, v in response.items()}
+        response = [response[k] for k in sorted(response, key=int)]
+    elif isinstance(response, list):
+        for item in response:
+            if isinstance(item, dict) and item.get("id") is not None:
+                by_id[str(item["id"])] = item
+    for i, element in enumerate(sent):
+        eid = str(element.get("id")) if isinstance(element, dict) else None
+        if eid and eid in by_id:
+            answer = by_id[eid]
+            matched = "id"
+        elif by_id:
+            # The protocol answered with ids, so this element simply was not
+            # answered. Aligning it with a positional neighbour would attribute
+            # one element's data to another, which is how a batch finding becomes
+            # a wrong finding.
+            rows.append({"index": i, "id": eid, "matched": "missing", "answer": None})
+            continue
+        elif isinstance(response, list) and i < len(response):
+            answer = response[i]
+            matched = "index"
+        else:
+            rows.append({"index": i, "id": eid, "matched": "missing", "answer": None})
+            continue
+        rows.append({"index": i, "id": eid, "matched": matched, "answer": answer,
+                     "has_result": isinstance(answer, dict)
+                     and ("result" in answer or "data" in answer),
+                     "has_error": isinstance(answer, dict) and bool(answer.get("error"))})
+    return rows
+
+
+def cmd_rpcbatch(a):
+    headers_extra = parse_headers(a.header)
+    principals = load_principals(a.sessions, headers_extra, a.roles)
+    caller = a.owner if a.owner in principals else None
+    if not caller:
+        raise SystemExit("apiproto rpcbatch: --owner ROLE must name a role with a "
+                         "<role>.headers file in --sessions. The caller's identity is the "
+                         "whole point of the test.")
+    own = parse_objects(a.object)
+    foreign = parse_objects([a.foreign])[0] if a.foreign else None
+    if not own or not foreign:
+        raise SystemExit("apiproto rpcbatch: needs at least two --object 'ID:CANARY' pairs the "
+                         "caller owns and one --foreign 'ID:CANARY' belonging to the agent's "
+                         "second account. Never a real user's id.")
+    kind = a.kind
+    if kind == "auto":
+        kind = "trpc" if "/trpc" in a.url else "jsonrpc"
+    result = {"subcommand": "rpcbatch", "url": a.url, "kind": kind, "caller": caller,
+              "foreign_id": foreign["id"], "rounds": [], "skipped": []}
+    all_canaries = [o["canary"] for o in own] + [foreign["canary"]]
+
+    for rep in range(a.repeats):
+        if kind == "jsonrpc":
+            sent = build_jsonrpc_batch(a.method, [o["id"] for o in own], foreign["id"],
+                                       a.param)
+            r = http("POST", a.url, {**principals[caller], "Content-Type": "application/json"},
+                     json.dumps(sent))
+        else:
+            procs = a.method.split(",")
+            inputs = [{a.param: o["id"]} for o in own] + [{a.param: foreign["id"]}]
+            if len(procs) == 1:
+                procs = procs * len(inputs)
+            path, body = build_trpc_batch(procs, inputs)
+            base = a.url.rstrip("/")
+            url = f"{base}/{path}?batch=1"
+            sent = [{"id": str(i), "method": procs[i], "params": inputs[i]}
+                    for i in range(len(inputs))]
+            r = http("POST", url, {**principals[caller], "Content-Type": "application/json"},
+                     json.dumps(body))
+        rows = map_batch_results(sent, r.json())
+        for i, row in enumerate(rows):
+            text = json.dumps(row.get("answer"))
+            canary = (own[i]["canary"] if i < len(own) else foreign["canary"])
+            row["own"] = i < len(own)
+            row["proof"] = proof_in(text, canary, all_canaries)
+        result["rounds"].append({"repeat": rep, "http": r.row(), "elements": rows})
+
+    # The verdict is per element: the foreign element, on two repeats, with the
+    # caller's own elements as the positive control that the batch ran at all.
+    foreign_obs, own_ok = [], []
+    for rnd in result["rounds"]:
+        for row in rnd["elements"]:
+            if row["own"]:
+                own_ok.append(bool(row["proof"]))
+            else:
+                foreign_obs.append({"object": foreign["id"], "repeat": rnd["repeat"],
+                                    "status": rnd["http"]["status"], "proof": row["proof"]})
+    # Two objects for this class means the same batch shape on two of the
+    # caller's own ids: the oracle is the foreign canary, the control is that
+    # the owned elements did come back.
+    baseline = {foreign["id"]: any(own_ok)}
+    # min_objects=1 here on purpose: the two objects of the general rule are the
+    # caller's own elements in the same batch, which are the control that the
+    # batch executed at all. The oracle is still the foreign element's canary.
+    result["verdict"] = judge_cell(foreign_obs, baseline, min_objects=1, min_repeats=a.repeats)
+    result["verdict"]["element"] = f"the foreign element, index {len(own)}"
+    if not any(own_ok):
+        result["verdict"] = {
+            "state": "inconclusive",
+            "reason": "the caller's own elements did not come back either, so the batch was "
+                      "rejected as a whole and nothing was tested. Fix --method/--param first."}
+    result["note"] = ("CVE-2025-68130 in the tRPC Next.js App Router caller is this shape. "
+                      "Report per element; a single verdict for the batch is what hides it.")
+    return result
+
+
+# ----------------------------------------------------------------------- grpc
+
+# /pkg.Service/Method as it appears in generated gRPC-web and Connect clients.
+GRPC_PATH_RE = re.compile(r"[\"'`]/((?:[A-Za-z_]\w*\.)+[A-Z]\w*)/([A-Za-z_]\w*)[\"'`]")
+CONNECT_TYPE_RE = re.compile(r"typeName\s*:\s*[\"']((?:[A-Za-z_]\w*\.)+[A-Z]\w*)[\"']")
+METHOD_NAME_RE = re.compile(r"(?:methodName|name)\s*:\s*[\"']([A-Za-z_]\w*)[\"']")
+
+
+def methods_from_bundle(text):
+    """Service and method names recovered from a JS bundle or a source map.
+
+    With reflection off this is the enumeration channel: generated gRPC-web and
+    Connect clients carry the full path as a literal, and a source map carries
+    the unminified client as well. Returns sorted "pkg.Service/Method" strings.
+    """
+    found = set()
+    for m in GRPC_PATH_RE.finditer(text or ""):
+        found.add(f"{m.group(1)}/{m.group(2)}")
+    # Connect's generated service objects name the service once and its methods
+    # beside it, so pair every method literal after a typeName with that service.
+    for m in CONNECT_TYPE_RE.finditer(text or ""):
+        window = (text or "")[m.end():m.end() + 4000]
+        for mm in METHOD_NAME_RE.finditer(window):
+            if mm.group(1)[0].isupper():
+                found.add(f"{m.group(1)}/{mm.group(1)}")
+    return sorted(found)
+
+
+def methods_from_sourcemap(text):
+    """Same recovery, run over every sourcesContent entry of a .map file."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return []
+    out = set()
+    for src in doc.get("sourcesContent") or []:
+        if isinstance(src, str):
+            out.update(methods_from_bundle(src))
+    for name in doc.get("sources") or []:
+        if isinstance(name, str) and name.endswith((".proto", "_pb.js", "_connect.js")):
+            out.update(methods_from_bundle(name))
+    return sorted(out)
+
+
+def grpcurl_list(target, headers, plaintext):
+    exe = shutil.which("grpcurl")
+    if not exe:
+        return {"ran": False,
+                "skipped": "grpcurl is not installed: server reflection was not queried, so "
+                           "service and method names had to come from --bundle. Install grpcurl "
+                           "in the toolbox image to enumerate a reflection-enabled server."}
+    authorize(f"https://{target}/")
+    base = [exe] + (["-plaintext"] if plaintext else [])
+    for k, v in headers.items():
+        base += ["-H", f"{k}: {v}"]
+    try:
+        pace()
+        services = subprocess.run(base + [target, "list"], capture_output=True, text=True,
+                                  timeout=120)
+    except Exception as e:
+        return {"ran": False, "skipped": f"grpcurl failed: {type(e).__name__}: {e}"}
+    if services.returncode != 0:
+        return {"ran": True, "reflection": False,
+                "note": "server reflection is off or refused: "
+                        + (services.stderr.strip()[:300] or "no detail"),
+                "methods": []}
+    methods = []
+    for svc in [s.strip() for s in services.stdout.splitlines() if s.strip()]:
+        if svc.startswith("grpc.reflection"):
+            continue
+        pace()
+        desc = subprocess.run(base + [target, "list", svc], capture_output=True, text=True,
+                              timeout=120)
+        for line in desc.stdout.splitlines():
+            if line.strip():
+                methods.append(line.strip())
+    return {"ran": True, "reflection": True, "methods": sorted(set(methods))}
+
+
+def cmd_grpc(a):
+    headers_extra = parse_headers(a.header)
+    principals = load_principals(a.sessions, headers_extra, a.roles)
+    owner = a.owner if a.owner in principals else None
+    objects = parse_objects(a.object)
+    result = {"subcommand": "grpc", "target": a.target, "principals": list(principals),
+              "skipped": []}
+
+    refl = grpcurl_list(a.target, principals.get(owner, {}) if owner else {}, a.plaintext)
+    if refl.get("skipped"):
+        result["skipped"].append(refl["skipped"])
+    result["reflection"] = refl
+    methods = list(refl.get("methods") or [])
+
+    recovered = []
+    for path in a.bundle:
+        p = pathlib.Path(path)
+        files = sorted(p.rglob("*")) if p.is_dir() else [p]
+        for f in files:
+            if not f.is_file() or f.suffix not in (".js", ".mjs", ".ts", ".map", ".json"):
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+            got = methods_from_sourcemap(text) if f.suffix == ".map" else methods_from_bundle(text)
+            for g in got:
+                if g not in recovered:
+                    recovered.append(g)
+    result["recovered_from_bundles"] = recovered
+    if not methods and not recovered:
+        result["skipped"].append(
+            "no methods to test: reflection is off and --bundle recovered nothing. Pull the JS "
+            "chunks and source maps (scripts/sourcemap) and pass them with --bundle.")
+    for m in recovered:
+        if m not in methods:
+            methods.append(m)
+    result["methods"] = methods
+
+    # gRPC-web and Connect ride on HTTP, so the role matrix is ordinary HTTP
+    # through the recorder. Native gRPC over HTTP/2 is not replayable from the
+    # recorder, which the report has to say.
+    matrix = []
+    if a.http_base and objects and owner:
+        canaries = [o["canary"] for o in objects]
+        for m in methods[:a.max_fields]:
+            baseline, obs_by_role = {}, {r: [] for r in principals if r != owner}
+            url = a.http_base.rstrip("/") + "/" + m
+            for obj in objects:
+                body = json.dumps({a.param: obj["id"]})
+                hdr = {"Content-Type": "application/json", "Connect-Protocol-Version": "1"}
+                r = http("POST", url, {**principals[owner], **hdr}, body)
+                baseline[obj["id"]] = proof_in(r.body, obj["canary"], canaries)
+                for role, hs in principals.items():
+                    if role == owner:
+                        continue
+                    for rep in range(a.repeats):
+                        rr = http("POST", url, {**hs, **hdr}, body)
+                        obs_by_role[role].append(
+                            {"object": obj["id"], "repeat": rep, "status": rr.status,
+                             "proof": proof_in(rr.body, obj["canary"], canaries)})
+            matrix.append({"method": m, "url": url, "owner_baseline": baseline,
+                           "cells": {role: judge_cell(obs, baseline, min_objects=a.min_objects,
+                                                      min_repeats=a.repeats)
+                                     for role, obs in obs_by_role.items()}})
+    elif not a.http_base:
+        result["skipped"].append(
+            "no per-method role matrix: pass --http-base https://host (the Connect or gRPC-web "
+            "origin) plus --owner and two --object pairs. Native gRPC over HTTP/2 is not "
+            "replayable through the recorder, so the matrix only runs over HTTP here.")
+    result["role_matrix"] = matrix
+    return result
+
+
+# ---------------------------------------------------------------- serveractions
+
+# Next.js binds a Server Action by its id, which the client bundle has to carry.
+ACTION_CTX_RE = re.compile(
+    r"createServerReference\s*\)?\s*\(\s*[\"']([0-9a-f]{40,64})[\"']|"
+    r"\$\$ACTION_ID_([0-9a-f]{40,64})|"
+    r"[\"']?[Nn]ext-[Aa]ction[\"']?\s*[:=,]\s*[\"']([0-9a-f]{40,64})[\"']")
+HEX_ID_RE = re.compile(r"[\"']([0-9a-f]{40}|[0-9a-f]{64})[\"']")
+CHUNK_SRC_RE = re.compile(r"""[\"'](/_next/static/[^\"'\s>]+\.js)[\"']""")
+NEXT_VERSION_RE = re.compile(r"(?:next[/@-]|\"next\"\s*:\s*\"\^?~?)(\d+\.\d+\.\d+)")
+
+
+def next_action_ids(text, loose=False):
+    """Action ids from a chunk. Context first; bare hex only when asked for.
+
+    An action id is a hex digest and so is every build hash, cache key and
+    subresource integrity value in the same file, so collecting bare literals
+    invents endpoints. The contexts below are the ones the client runtime
+    actually uses; `--loose` widens it and the output says it was loose.
+    """
+    out = []
+    for m in ACTION_CTX_RE.finditer(text or ""):
+        got = m.group(1) or m.group(2) or m.group(3)
+        if got and got not in out:
+            out.append(got)
+    if loose:
+        for m in HEX_ID_RE.finditer(text or ""):
+            if m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
+def next_version(texts):
+    for text in texts:
+        m = NEXT_VERSION_RE.search(text or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+# Reported against, not exploited: the version tells the agent whether the id
+# disclosure it just performed is the known advisory or a fresh finding.
+NEXT_ADVISORIES = [
+    {"id": "CVE-2026-64643", "ranges": [("12.0.0", "15.5.20"), ("16.0.0", "16.2.10")],
+     "fixed": "16.2.11",
+     "what": "Server Function ids disclosed from public build artifacts. Sources disagree on "
+             "whether the impact is information disclosure or authorization bypass; treat the "
+             "disclosure as proven and the bypass as a separate test."},
+]
+
+
+def match_next_advisories(version):
+    if not version:
+        return []
+    v = vtuple(version)
+    hits = []
+    for adv in NEXT_ADVISORIES:
+        if any(vtuple(lo) <= v <= vtuple(hi) for lo, hi in adv["ranges"]):
+            hits.append({**adv, "version": version})
+    return hits
+
+
+def cmd_serveractions(a):
+    headers_extra = parse_headers(a.header)
+    principals = load_principals(a.sessions, headers_extra, a.roles)
+    result = {"subcommand": "serveractions", "url": a.url, "principals": list(principals),
+              "loose": bool(a.loose), "skipped": []}
+
+    page = http("GET", a.url, headers_extra)
+    result["page"] = page.row()
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(a.url))
+    chunks = [urllib.parse.urljoin(origin, m.group(1))
+              for m in CHUNK_SRC_RE.finditer(page.body or "")]
+    for extra in a.chunk:
+        chunks.append(urllib.parse.urljoin(origin, extra))
+    seen, texts, ids = set(), [page.body or ""], next_action_ids(page.body, a.loose)
+    for url in chunks[:a.max_chunks]:
+        if url in seen:
+            continue
+        seen.add(url)
+        r = http("GET", url, headers_extra)
+        texts.append(r.body or "")
+        for i in next_action_ids(r.body, a.loose):
+            if i not in ids:
+                ids.append(i)
+        # The source map carries the unminified module, where the id sits next
+        # to the function it binds — which is the only way to name an action.
+        if a.sourcemaps:
+            mr = http("GET", url + ".map", headers_extra)
+            if mr.status == 200:
+                try:
+                    doc = json.loads(mr.body)
+                except ValueError:
+                    doc = {}
+                for src in doc.get("sourcesContent") or []:
+                    texts.append(src or "")
+                    for i in next_action_ids(src, a.loose):
+                        if i not in ids:
+                            ids.append(i)
+    result["chunks_read"] = len(seen)
+    result["action_ids"] = ids
+    version = a.next_version or next_version(texts)
+    result["next_version"] = version
+    result["advisories"] = match_next_advisories(version)
+    if not version:
+        result["skipped"].append("Next.js version not found in the page or chunks: the advisory "
+                                 "comparison was skipped. Pass --next-version X.Y.Z if recon "
+                                 "established it another way.")
+    if not ids:
+        result["skipped"].append(
+            "no Server Action ids found. Try --loose (bare hex literals, noisier), more "
+            "--max-chunks, or --sourcemaps if the build ships them.")
+        return result
+
+    # Default probe is non-mutating on purpose. An action is an arbitrary RPC
+    # with whatever side effect its body has, and `AGENTS.md` refuses
+    # destruction in every mode, so the default sends an argument body the
+    # action cannot deserialize. The authorization check still runs first in a
+    # correctly built app, so 401/403 versus 400 is the signal, and nothing is
+    # written. --replay-args opts into the real call.
+    body = a.replay_args if a.replay_args else '{"mythos":"probe-only, not valid action args"}'
+    result["replay_mode"] = "real-args" if a.replay_args else "malformed-args (non-mutating)"
+    replays = []
+    for action in ids[:a.max_fields]:
+        row = {"action_id": action, "per_role": {}}
+        for role, hdrs in principals.items():
+            r = http("POST", a.url, {**hdrs, "Next-Action": action,
+                                     "Content-Type": "text/plain;charset=UTF-8"}, body)
+            row["per_role"][role] = {**r.row(),
+                                     "denied": r.status in (401, 403),
+                                     # 404/405/501 means the request never
+                                     # reached an action handler, which is not
+                                     # the same as being allowed through.
+                                     "unsupported": r.status in (404, 405, 501),
+                                     "rejected_args": r.status in (400, 422, 500)}
+        reached = sorted(r for r, v in row["per_role"].items()
+                         if not v["denied"] and not v["unsupported"])
+        if not reached:
+            row["candidate"] = None
+            row["note"] = ("every principal was denied or the endpoint does not take this "
+                           "action: nothing to chase here")
+        else:
+            row["candidate"] = (
+                f"reached by {', '.join(reached)}: no route in the sitemap guards this, so prove "
+                "it with --replay-args and a canary, or with the owner reading the state back")
+        replays.append(row)
+    result["replays"] = replays
+    result["note"] = ("A reached action is a candidate, not a finding: the malformed-args probe "
+                      "shows the authorization check did not run first, and the proof still needs "
+                      "a canary in the response or a state read-back by the owner.")
+    return result
+
+
+# ------------------------------------------------------------------- specfuzz
+
+def load_spec(path_or_url):
+    """An OpenAPI document from a file or a URL. YAML needs PyYAML, and says so."""
+    if re.match(r"^https?://", path_or_url):
+        r = http("GET", path_or_url, {})
+        text = r.body
+    else:
+        text = pathlib.Path(path_or_url).read_text(encoding="utf-8", errors="replace")
+    try:
+        return json.loads(text), None
+    except ValueError:
+        pass
+    try:
+        import yaml                                   # optional, as everywhere else here
+    except Exception:
+        return None, ("the spec is not JSON and PyYAML is not installed, so it could not be "
+                      "parsed. `pip install pyyaml`, or convert the spec to JSON.")
+    try:
+        return yaml.safe_load(text) or {}, None
+    except Exception as e:
+        return None, f"the spec parsed as neither JSON nor YAML: {type(e).__name__}: {e}"
+
+
+def spec_operations(spec):
+    """[{method, path, params, body_fields, response_fields, read_only}] from a spec."""
+    out = []
+    for path, methods in ((spec or {}).get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in ("get", "post", "put", "patch", "delete", "head", "options") \
+                    or not isinstance(op, dict):
+                continue
+            body = (((op.get("requestBody") or {}).get("content") or {})
+                    .get("application/json") or {}).get("schema") or {}
+            props = body.get("properties") or {}
+            resp_fields, read_only = set(), set()
+            for code, resp in (op.get("responses") or {}).items():
+                schema = (((resp or {}).get("content") or {})
+                          .get("application/json") or {}).get("schema") or {}
+                inner = schema.get("items") if schema.get("type") == "array" else schema
+                for name, field in ((inner or {}).get("properties") or {}).items():
+                    resp_fields.add(name)
+                    if isinstance(field, dict) and field.get("readOnly"):
+                        read_only.add(name)
+            for name, field in props.items():
+                if isinstance(field, dict) and field.get("readOnly"):
+                    read_only.add(name)
+            out.append({"method": method.upper(), "path": path,
+                        "params": [(p or {}).get("name") for p in (op.get("parameters") or [])
+                                   if (p or {}).get("name")],
+                        "path_params": [(p or {}).get("name")
+                                        for p in (op.get("parameters") or [])
+                                        if (p or {}).get("in") == "path" and (p or {}).get("name")]
+                        or re.findall(r"\{([^}]+)\}", path),
+                        "body_fields": sorted(props), "response_fields": sorted(resp_fields),
+                        "read_only": sorted(read_only)})
+    return out
+
+
+def match_path(observed, templates):
+    """The spec template an observed concrete path belongs to, or None.
+
+    `/users/42` has to find `/users/{id}` or every observed request looks like a
+    shadow endpoint and the diff is noise. Longest literal prefix wins so
+    `/users/me` prefers its own route over `/users/{id}`.
+    """
+    best = None
+    obs = [s for s in observed.split("/") if s != ""]
+    for t in templates:
+        parts = [s for s in t.split("/") if s != ""]
+        if len(parts) != len(obs):
+            continue
+        literals = 0
+        for want, got in zip(parts, obs):
+            if want.startswith("{") and want.endswith("}"):
+                continue
+            if want != got:
+                break
+            literals += 1
+        else:
+            if best is None or literals > best[1]:
+                best = (t, literals)
+    return best[0] if best else None
+
+
+def spec_vs_traffic(spec, observed):
+    """What the server does that the spec does not declare.
+
+    `observed` is [{method, path, body_fields, response_fields}] — from a HAR,
+    from `scripts/traffic`, or from the recorder. Three different bugs come out
+    of this one diff and they are reported separately because they are three
+    different fixes: an endpoint nobody documented, a field the server accepts
+    that nobody documented, and a field the server returns but will not take as
+    input, which is the mass-assignment candidate set.
+    """
+    ops = spec_operations(spec)
+    templates = sorted({o["path"] for o in ops})
+    by_key = {(o["method"], o["path"]): o for o in ops}
+    out = {"shadow_endpoints": [], "undeclared_methods": [], "shadow_fields": [],
+           "mass_assignment_candidates": []}
+
+    for row in observed:
+        method, path = row.get("method", "GET").upper(), row.get("path", "")
+        template = match_path(path, templates)
+        if template is None:
+            out["shadow_endpoints"].append(
+                {"method": method, "path": path,
+                 "why": "seen in traffic, declared nowhere in the spec"})
+            continue
+        if (method, template) not in by_key:
+            declared = sorted(m for (m, p) in by_key if p == template)
+            out["undeclared_methods"].append(
+                {"method": method, "path": template, "declared": declared,
+                 "why": "this verb works on a documented route the spec does not declare it for"})
+            continue
+        op = by_key[(method, template)]
+        extra = [f for f in (row.get("body_fields") or []) if f not in op["body_fields"]]
+        if extra:
+            out["shadow_fields"].append(
+                {"method": method, "path": template, "fields": sorted(extra),
+                 "why": "the server accepted body fields the spec does not declare"})
+
+    for op in ops:
+        if op["method"] in ("GET", "HEAD", "OPTIONS"):
+            continue
+        candidates = sorted(set(op["read_only"])
+                            | {f for f in op["response_fields"] if f not in op["body_fields"]})
+        if candidates:
+            out["mass_assignment_candidates"].append(
+                {"method": op["method"], "path": op["path"], "fields": candidates,
+                 "why": "returned by the API but not accepted as input, or declared readOnly: "
+                        "send each one and read the object back as its owner"})
+    return out
+
+
+def id_dependencies(spec):
+    """Which operation produces the id another operation consumes.
+
+    A BOLA test with an invented id proves nothing: a 404 is indistinguishable
+    from an enforced check. BOLABuster's producer/consumer idea is the fix —
+    walk the spec for the operation that hands out a real id, call it as each of
+    the agent's own accounts, and test with the ids it returns.
+    """
+    ops = spec_operations(spec)
+    out = []
+    for op in ops:
+        for param in op["path_params"] or []:
+            parent = re.sub(r"/\{%s\}.*$" % re.escape(param), "", op["path"]) or "/"
+            producers = []
+            for cand in ops:
+                if cand is op or cand["path"] != parent:
+                    continue
+                if cand["method"] not in ("GET", "POST"):
+                    continue
+                base = re.sub(r"(?i)[_-]?id$", "", param).lower()
+                fields = {f.lower() for f in cand["response_fields"]}
+                if "id" in fields or param.lower() in fields or any(
+                        f == f"{base}id" or f == f"{base}_id" for f in fields):
+                    producers.append(f"{cand['method']} {cand['path']}")
+            out.append({"consumer": f"{op['method']} {op['path']}", "needs": param,
+                        "producers": sorted(producers),
+                        "note": "call a producer as each of your own accounts and use the ids it "
+                                "returns" if producers else
+                                "no producer in the spec: get this id from the UI or a list "
+                                "endpoint, never by guessing"})
+    return out
+
+
+VERSION_SEG_RE = re.compile(r"/v(\d+)(?=/|$)")
+
+
+def version_variants(path, extras=("internal", "v0", "beta")):
+    """Sibling versions of a route. An old version is where the guard is missing.
+
+    A deprecated `/v1` left routable beside the current `/v2` is the classic
+    shadow API: the new route got the authorization middleware and the old one
+    kept serving.
+    """
+    out = []
+    m = VERSION_SEG_RE.search(path)
+    if m:
+        n = int(m.group(1))
+        for other in sorted({0, 1, 2, 3, n - 1, n + 1} - {n}):
+            if other < 0:
+                continue
+            out.append(VERSION_SEG_RE.sub(f"/v{other}", path, count=1))
+        for word in extras:
+            if not word.startswith("v"):
+                out.append(VERSION_SEG_RE.sub(f"/{word}", path, count=1))
+    else:
+        for word in extras:
+            out.append("/" + word + path)
+    seen, uniq = set(), []
+    for p in out:
+        if p != path and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+SAFE_SWAP_METHODS = ("GET", "HEAD", "OPTIONS")
+WRITE_SWAP_METHODS = ("PUT", "PATCH", "DELETE")
+
+
+def run_schemathesis(spec, base_url, rate):
+    exe = shutil.which("schemathesis") or shutil.which("st")
+    if not exe:
+        return {"ran": False,
+                "skipped": "schemathesis is not installed: the property-based and stateful "
+                           "schema checks were not run. Add it to the toolbox image to get "
+                           "spec-driven coverage of the operations listed above."}
+    cmd = [exe, "run", spec, "--url", base_url,
+           # No fuzzing of availability: the ignored_auth and response-conformance
+           # checks are the authorization-relevant ones, and a rate cap keeps
+           # a property-based run inside the engagement's rate limit.
+           "--checks", "not_a_server_error,status_code_conformance,"
+                       "response_schema_conformance,ignored_auth",
+           "--max-response-time", "10000"]
+    if rate:
+        cmd += ["--rate-limit", f"{max(1, int(rate))}/s"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    except Exception as e:
+        return {"ran": False, "skipped": f"schemathesis failed to run: {type(e).__name__}: {e}"}
+    return {"ran": True, "exit": p.returncode, "stdout": p.stdout[-6000:],
+            "stderr": p.stderr[-2000:] or None,
+            "note": "schemathesis finds spec violations, not authorization bugs. Its findings are "
+                    "input to the role matrix, not verdicts."}
+
+
+def load_observed(path):
+    """Observed traffic as [{method, path, body_fields}] from a HAR or JSONL."""
+    if not path:
+        return []
+    text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    rows = []
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    entries = None
+    if isinstance(doc, dict) and "log" in doc:
+        entries = [{"method": e.get("request", {}).get("method"),
+                    "url": e.get("request", {}).get("url"),
+                    "body": (e.get("request", {}).get("postData") or {}).get("text")}
+                   for e in (doc["log"].get("entries") or [])]
+    elif isinstance(doc, list):
+        entries = doc
+    else:
+        entries = [json.loads(line) for line in text.splitlines() if line.strip().startswith("{")]
+    for e in entries or []:
+        url = e.get("url") or e.get("path") or ""
+        path_only = urllib.parse.urlsplit(url).path or url
+        fields = e.get("body_fields")
+        if fields is None:
+            try:
+                body = json.loads(e.get("body") or "null")
+                fields = sorted(body) if isinstance(body, dict) else []
+            except ValueError:
+                fields = []
+        rows.append({"method": (e.get("method") or "GET").upper(), "path": path_only,
+                     "body_fields": fields})
+    return rows
+
+
+def cmd_specfuzz(a):
+    headers_extra = parse_headers(a.header)
+    spec, error = load_spec(a.spec)
+    result = {"subcommand": "specfuzz", "spec": a.spec, "skipped": []}
+    if error or spec is None:
+        result["skipped"].append(error or "the spec could not be read")
+        return result
+    ops = spec_operations(spec)
+    result["operations"] = len(ops)
+    result["diff"] = spec_vs_traffic(spec, load_observed(a.observed))
+    if not a.observed:
+        result["skipped"].append(
+            "no --observed traffic: shadow endpoints and shadow fields need the recorder's view "
+            "of what the server actually accepted. Export it with "
+            "`scripts/traffic har` and pass the file.")
+    result["id_dependencies"] = id_dependencies(spec)
+
+    if a.base:
+        sweep, swaps = [], []
+        for op in ops[:a.max_fields]:
+            path = op["path"]
+            if "{" in path and not a.sample_id:
+                continue                       # no invented ids: see id_dependencies
+            concrete = re.sub(r"\{[^}]+\}", a.sample_id or "", path)
+            for variant in version_variants(concrete):
+                r = http("GET", a.base.rstrip("/") + variant, headers_extra)
+                if r.status and r.status not in (404, 405, 501):
+                    sweep.append({"path": variant, **r.row(),
+                                  "why": "a sibling version answers: check whether it carries the "
+                                         "same authorization middleware as the current one"})
+            if op["method"] != "GET":
+                continue
+            methods = list(SAFE_SWAP_METHODS)
+            if a.allow_write_verbs:
+                methods += list(WRITE_SWAP_METHODS)
+            declared = {o["method"] for o in ops if o["path"] == path}
+            for m in methods:
+                if m in declared:
+                    continue
+                r = http(m, a.base.rstrip("/") + concrete, headers_extra)
+                if r.status and r.status not in (404, 405, 501):
+                    swaps.append({"method": m, "path": path, **r.row(),
+                                  "why": "undeclared verb answered: gateway rules written per "
+                                         "method do not cover it"})
+        result["version_sweep"] = sweep
+        result["method_swap"] = swaps
+        if not a.allow_write_verbs:
+            result["skipped"].append(
+                "method swap covered GET/HEAD/OPTIONS only. PUT/PATCH/DELETE need "
+                "--allow-write-verbs and an object the agent created, because a write verb on "
+                "someone else's object is destruction, not a test.")
+    else:
+        result["skipped"].append("no --base URL: the version sweep and method swap need a live "
+                                 "origin; only the offline spec analysis ran.")
+
+    if a.schemathesis:
+        if not a.base:
+            result["schemathesis"] = {"ran": False, "skipped": "schemathesis needs --base"}
+        else:
+            result["schemathesis"] = run_schemathesis(a.spec, a.base, scope_rate())
+        if result["schemathesis"].get("skipped"):
+            result["skipped"].append(result["schemathesis"]["skipped"])
+    return result
+
+
+# -------------------------------------------------------------------- rendering
+
+def render(r):
+    out = [f"# apiproto {r['subcommand']}  {r.get('url') or r.get('target') or r.get('spec','')}",
+           ""]
+    sub = r["subcommand"]
+
+    if sub == "graphql":
+        out.append(f"detect: {r['detect']['status']} graphql={r['detect']['is_graphql']}")
+        i = r["introspection"]
+        out.append(f"introspection: {'OPEN' if i['open'] else 'closed'}, "
+                   f"{i['operations']} operations")
+        if r.get("field_suggestions"):
+            fs = r["field_suggestions"]
+            out.append(f"field suggestions: {'ON' if fs['enabled'] else 'off'} "
+                       f"{fs['recovered'][:12]}")
+            out.append(f"  {fs['note']}")
+        pq = r["persisted_queries"]
+        out.append(f"persisted queries: apq={pq['apq_in_use']} "
+                   f"arbitrary={pq['arbitrary_query_accepted']} "
+                   f"client_register={pq['client_registration_accepted']}")
+        out.append(f"  {pq['note']}")
+        out.append("info checks:")
+        for c in r.get("info_checks") or []:
+            flag = "YES" if c["result"] else "no "
+            out.append(f"  {flag} [{c['severity']:4s}] {c['check']}")
+            if c["result"]:
+                out.append(f"       {c['why']}")
+        for s in r["subscriptions"]:
+            out.append(f"subscription {s.get('protocol')}: handshake="
+                       f"{s.get('handshake_status')} ack={s.get('connection_ack')}"
+                       + (f"  {s['error']}" if s.get("error") else ""))
+            if s.get("candidate"):
+                out.append(f"  CANDIDATE: {s['candidate']}")
+        if r["graphw00f"].get("engine"):
+            out.append(f"engine: {r['graphw00f']['engine']}")
+        cop = r["graphql_cop"]
+        if cop.get("ran"):
+            out.append("graphql-cop: ran IN FULL, including "
+                       f"{len(cop['dos_tests_included'])} denial-of-service tests")
+
+    if sub == "rpcbatch":
+        out.append(f"kind={r['kind']} caller={r['caller']} foreign={r['foreign_id']}")
+        for rnd in r["rounds"]:
+            out.append(f"round {rnd['repeat']}: HTTP {rnd['http']['status']}")
+            for e in rnd["elements"]:
+                out.append(f"  [{e['index']}] {'own' if e['own'] else 'FOREIGN'} "
+                           f"matched-by={e['matched']} proof={e['proof']}")
+        out.append(f"verdict: {r['verdict']['state']} — {r['verdict']['reason']}")
+        out.append(r["note"])
+
+    if sub == "grpc":
+        refl = r["reflection"]
+        out.append(f"reflection: {refl.get('reflection')} "
+                   f"({len(refl.get('methods') or [])} methods)")
+        out.append(f"recovered from bundles: {len(r['recovered_from_bundles'])}")
+        for m in r["methods"][:40]:
+            out.append(f"  {m}")
+
+    if sub == "serveractions":
+        out.append(f"chunks read: {r['chunks_read']}  action ids: {len(r['action_ids'])}"
+                   + ("  (loose)" if r["loose"] else ""))
+        out.append(f"next version: {r.get('next_version') or 'unknown'}")
+        for adv in r.get("advisories") or []:
+            out.append(f"  ADVISORY {adv['id']} (fixed {adv['fixed']}): {adv['what']}")
+        out.append(f"replay mode: {r.get('replay_mode', '-')}")
+        for row in r.get("replays") or []:
+            states = "  ".join(f"{k}={v['status']}" for k, v in row["per_role"].items())
+            out.append(f"  {row['action_id'][:16]}…  {states}")
+            if row.get("candidate"):
+                out.append(f"    CANDIDATE: {row['candidate']}")
+        if r.get("note"):
+            out.append(r["note"])
+
+    if sub == "specfuzz" and "operations" not in r:
+        out.append("the spec could not be read, so nothing was analysed")
+    elif sub == "specfuzz":
+        out.append(f"operations in spec: {r['operations']}")
+        d = r.get("diff") or {}
+        for key in ("shadow_endpoints", "undeclared_methods", "shadow_fields",
+                    "mass_assignment_candidates"):
+            rows = d.get(key) or []
+            out.append(f"{key}: {len(rows)}")
+            for row in rows[:12]:
+                out.append(f"  {row.get('method','')} {row.get('path','')} "
+                           f"{row.get('fields', '')}")
+        for row in (r.get("version_sweep") or [])[:12]:
+            out.append(f"version sweep: {row['status']} {row['path']}")
+        for row in (r.get("method_swap") or [])[:12]:
+            out.append(f"method swap: {row['status']} {row['method']} {row['path']}")
+        dep = r.get("id_dependencies") or []
+        out.append(f"id dependencies: {len(dep)}")
+        for row in dep[:10]:
+            out.append(f"  {row['consumer']} needs {row['needs']} <- "
+                       f"{row['producers'] or 'nothing in the spec'}")
+
+    matrix = r.get("role_matrix")
+    if matrix:
+        out += ["", "## role matrix (a verdict needs a canary, two objects, two repeats)"]
+        for row in matrix:
+            label = row.get("field") or row.get("method")
+            out.append(f"{row.get('op','')} {label}")
+            for role, cell in row["cells"].items():
+                out.append(f"  {role:10s} {cell['state']:17s} {cell['reason']}")
+            if row.get("two_transport"):
+                out.append(f"  two-transport: {row['two_transport']['note']}")
+    elif "role_matrix" in r:
+        out += ["", "## role matrix: not run"]
+
+    if r.get("skipped"):
+        out += ["", "## degraded, honestly"]
+        out += [f"- {s}" for s in r["skipped"]]
+    out += ["", "Nothing here is a finding until it has the exact request, the response that "
+            "proves it, the negative control and the impact. A state you see labelled "
+            "`inconclusive` is the tool refusing to guess, not a gap to fill with a diff."]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------- selftest
+
+def _selftest() -> int:
+    """Asserts over the offline logic, with no network.
+
+    Every one of these is a place where a quiet parsing or counting mistake
+    would turn into a wrong verdict in a report: the schema reader decides which
+    operations exist at all, the judge decides what counts as proof, the batch
+    mapper decides which element answered, the action harvester decides whether
+    an endpoint is found, and the spec diff decides what is shadow surface.
+    """
+    failures = []
+
+    def want(got, expect, label):
+        if got != expect:
+            failures.append(f"{label}: got {got!r}, want {expect!r}")
+
+    # --- introspection parsing
+    doc = {"data": {"__schema": {
+        "queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
+        "subscriptionType": None,
+        "types": [
+            {"name": "Query", "kind": "OBJECT", "fields": [
+                {"name": "user", "args": [{"name": "id", "type": {"kind": "NON_NULL", "name": None,
+                                                                  "ofType": {"kind": "SCALAR", "name": "ID"}}}],
+                 "type": {"kind": "OBJECT", "name": "User", "ofType": None}},
+                {"name": "users", "args": [],
+                 "type": {"kind": "LIST", "name": None,
+                          "ofType": {"kind": "OBJECT", "name": "User", "ofType": None}}}]},
+            {"name": "Mutation", "kind": "OBJECT", "fields": [
+                {"name": "deleteUser", "args": [], "type": {"kind": "SCALAR", "name": "Boolean"}}]},
+            {"name": "User", "kind": "OBJECT", "fields": [
+                {"name": "email", "args": [], "type": {"kind": "SCALAR", "name": "String"}},
+                {"name": "id", "args": [], "type": {"kind": "SCALAR", "name": "ID"}},
+                {"name": "orders", "args": [], "type": {"kind": "LIST", "name": None,
+                                                        "ofType": {"kind": "OBJECT", "name": "Order",
+                                                                   "ofType": None}}}]},
+            {"name": "Order", "kind": "OBJECT", "fields": [
+                {"name": "total", "args": [], "type": {"kind": "SCALAR", "name": "Int"}}]},
+            {"name": "__Hidden", "kind": "OBJECT", "fields": []},
+        ]}}}
+    schema = parse_introspection(doc)
+    want(sorted(o["field"] for o in schema["operations"]), ["deleteUser", "user", "users"],
+         "every root field becomes an operation")
+    want([o["op"] for o in schema["operations"] if o["field"] == "deleteUser"], ["mutation"],
+         "a mutation is labelled a mutation, so the read-only default can exclude it")
+    want("__Hidden" in schema["types"], False, "introspection meta types are not surface")
+    want(unwrap({"kind": "NON_NULL", "name": None,
+                 "ofType": {"kind": "LIST", "name": None,
+                            "ofType": {"kind": "OBJECT", "name": "User"}}}),
+         ("User", "OBJECT"), "[User!]! unwraps to the object type")
+    want(parse_introspection({"errors": [{"message": "introspection disabled"}]})["operations"],
+         [], "an introspection refusal yields no operations rather than crashing")
+
+    sel = selection_for("User", schema["types"])
+    want("email" in sel and "id" in sel, True, "scalars are selected")
+    want("orders{total}" in sel, True,
+         "depth 2 reaches a nested object, which is where per-field authz is missing")
+    q = build_query([o for o in schema["operations"] if o["field"] == "user"][0],
+                    schema["types"], "42")
+    want(q.startswith("query { user(id: 42)"), True, "the owner's own id goes in the id argument")
+    want('"a-1"' in build_query([o for o in schema["operations"] if o["field"] == "user"][0],
+                                schema["types"], "a-1"), True, "a non-numeric id stays quoted")
+
+    want(field_suggestions('Cannot query field "usr" on type "Query". Did you mean "user" '
+                           'or "users"?'), ["user", "users"],
+         "both suggested names are recovered")
+    # A real server sends this inside a JSON string, so the quotes are escaped.
+    # Matching only the bare form reported every server as having suggestions off.
+    want(field_suggestions(r'{"errors":[{"message":"Did you mean \"user\" or \"users\"?"}]}'),
+         ["user", "users"], "the escaped form a JSON body actually carries is recovered too")
+    want(field_suggestions("no such field"), [], "no suggestion means no recovery")
+
+    # --- the judge: the controls are the point
+    two_objects = [{"object": o, "repeat": r, "status": 200, "proof": True}
+                   for o in ("o1", "o2") for r in (0, 1)]
+    base = {"o1": True, "o2": True}
+    want(judge_cell(two_objects, base)["state"], "confirmed",
+         "canary on two objects, two repeats, with an owner baseline: confirmed")
+    want(judge_cell(two_objects, {"o1": False, "o2": False})["state"], "inconclusive",
+         "no owner baseline means no oracle, whatever the other principal saw")
+    want(judge_cell(two_objects, base, public_control=True)["state"], "public-by-design",
+         "a public control that also leaks makes this the product working")
+    want(judge_cell([{"object": "o1", "repeat": 0, "status": 200, "proof": True},
+                     {"object": "o1", "repeat": 1, "status": 200, "proof": True}],
+                    {"o1": True, "o2": True})["state"], "inconclusive",
+         "one object is not enough: a single object can be shared by design")
+    want(judge_cell([{"object": o, "repeat": r, "status": 200, "proof": r == 0}
+                     for o in ("o1", "o2") for r in (0, 1)], base)["state"], "inconclusive",
+         "a result that does not repeat is noise")
+    want(judge_cell([{"object": o, "repeat": 0, "status": 200, "proof": True}
+                     for o in ("o1", "o2")], base)["state"], "inconclusive",
+         "one repeat each is below the bar even on two objects")
+    want(judge_cell([{"object": o, "repeat": r, "status": 403, "proof": False}
+                     for o in ("o1", "o2") for r in (0, 1)], base)["state"], "enforced",
+         "canary never reached the other principal: enforced")
+    want(judge_cell([{"object": "o1", "repeat": r, "status": 403, "proof": False} for r in (0, 1)],
+                    {"o1": True})["state"], "inconclusive",
+         "'enforced' on one object is not a result either")
+    # A different status and a different body with no canary is exactly the
+    # ambiguity that makes these tools untrusted. It must never be a verdict.
+    want(judge_cell([{"object": o, "repeat": r, "status": 200, "proof": False}
+                     for o in ("o1", "o2") for r in (0, 1)], base)["state"], "enforced",
+         "a 200 with a different body but no canary is not a leak")
+
+    want(proof_in("here is MYTHOS-A1", "MYTHOS-A1", ["MYTHOS-A1", "MYTHOS-B2"]), True,
+         "the owner's canary in the body is the proof")
+    want(proof_in("MYTHOS-A1 MYTHOS-B2", "MYTHOS-A1", ["MYTHOS-A1", "MYTHOS-B2"]), False,
+         "a response carrying every canary is a list view or an echo, not a leak")
+
+    want(compare_transports({"graphql": {"state": "confirmed"},
+                             "rest": {"state": "confirmed"}})["systemic"], True,
+         "holding on two transports is systemic")
+    want(compare_transports({"graphql": {"state": "confirmed"},
+                             "rest": {"state": "enforced"}})["systemic"], False,
+         "one transport only is one missing guard")
+
+    # --- batch element mapping
+    sent = build_jsonrpc_batch("getOrder", ["own1", "own2"], "foreign1")
+    want([c["params"]["id"] for c in sent], ["own1", "own2", "foreign1"],
+         "the foreign id is the last element and the caller's own ids are the control")
+    rows = map_batch_results(sent, [{"id": "e2", "result": {"canary": "MYTHOS-B"}},
+                                    {"id": "e0", "result": {"canary": "MYTHOS-A"}}])
+    want([r["matched"] for r in rows], ["id", "missing", "id"],
+         "a reordered JSON-RPC batch maps on id, and a dropped element says so")
+    want(rows[2]["answer"]["result"]["canary"], "MYTHOS-B",
+         "the foreign element's answer is the one that matters")
+    path, body = build_trpc_batch(["order.byId", "order.byId"], [{"id": 1}, {"id": 2}])
+    want(path, "order.byId,order.byId", "tRPC joins procedures with a comma")
+    want(body, {"0": {"json": {"id": 1}}, "1": {"json": {"id": 2}}},
+         "tRPC inputs are keyed by position")
+    want([r["matched"] for r in map_batch_results(
+        [{"id": "0"}, {"id": "1"}], {"0": {"result": 1}, "1": {"result": 2}})],
+        ["id", "id"], "an index-keyed object response is read in numeric order")
+    want([r["matched"] for r in map_batch_results(
+        [{"id": None}, {"id": None}], [{"result": 1}, {"result": 2}])],
+        ["index", "index"], "a positional tRPC array falls back to index")
+
+    # --- Next-Action ids
+    chunk = ('f=(0,r.createServerReference)("40e4b9f0c2a1d3e5f60718293a4b5c6d7e8f9012",a);'
+             'var h="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";'
+             '$$ACTION_ID_1111111111111111111111111111111111111111')
+    ids = next_action_ids(chunk)
+    want(ids, ["40e4b9f0c2a1d3e5f60718293a4b5c6d7e8f9012",
+               "1111111111111111111111111111111111111111"],
+         "ids come from createServerReference and $$ACTION_ID, in that order")
+    want("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" in ids, False,
+         "a bare hex literal is a build hash, not an endpoint: not harvested by default")
+    want("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" in next_action_ids(chunk, loose=True), True,
+         "--loose widens it, and the output says it was loose")
+    want([a["id"] for a in match_next_advisories("15.5.19")], ["CVE-2026-64643"],
+         "a version inside the advisory range is reported")
+    want(match_next_advisories("16.2.11"), [], "the fixed version is not reported")
+    want(match_next_advisories(None), [], "an unknown version reports nothing rather than guessing")
+
+    # --- gRPC method recovery
+    bundle = ('new grpc.web.MethodDescriptor("/billing.v1.InvoiceService/GetInvoice",'
+              '...);const x={typeName:"billing.v1.AdminService",methods:{'
+              'deleteAll:{name:"DeleteAll"}}};var p="/not.a.service/lower";')
+    want(methods_from_bundle(bundle),
+         ["billing.v1.AdminService/DeleteAll", "billing.v1.InvoiceService/GetInvoice"],
+         "gRPC-web descriptors and Connect service objects both yield pkg.Service/Method")
+    want(methods_from_sourcemap(json.dumps({"sourcesContent": [bundle]})),
+         ["billing.v1.AdminService/DeleteAll", "billing.v1.InvoiceService/GetInvoice"],
+         "a source map is searched through sourcesContent")
+    want(methods_from_sourcemap("not json"), [],
+         "an unparseable map yields nothing rather than raising")
+
+    # --- the native information-level checks: one assertion each, all pure
+    def resp(body="", status=200, headers=None):
+        return Resp(status, headers or {}, body, "http://t/graphql")
+
+    want(len(INFO_CHECKS), 8, "all eight non-DoS checks are implemented natively, so the "
+                              "default path needs nothing outside the image")
+    want(info_suggestions(resp('{"errors":[{"message":"Did you mean \\"user\\"?"}]}')), True,
+         "a suggestion error trips the field-suggestion check")
+    want(info_suggestions(resp('{"errors":[{"message":"Cannot query field"}]}')), False,
+         "an ordinary field error does not")
+    want(info_introspection(resp('{"data":{"__schema":{"queryType":{"name":"Query"}}}}')), True,
+         "an answered introspection query is detected")
+    want(info_introspection(resp('{"errors":[{"message":"introspection disabled"}]}')), False,
+         "a refusal is not introspection")
+    want(info_graphiql(resp("<html>GraphiQL</html>", headers={"content-type": "text/html"})),
+         True, "an IDE served at the endpoint is detected")
+    want(info_graphiql(resp('{"data":{"graphiql":"not here"}}',
+                            headers={"content-type": "application/json"})), False,
+         "the word in a JSON value is not an IDE: that is the substring false positive")
+    want(_executed(resp('{"data":{"__typename":"Query"}}')), True,
+         "data with __typename means the document ran on this transport")
+    want(_executed(resp('{"errors":[{"message":"GET not supported for __typename"}]}')), False,
+         "a 200 carrying only errors is a refusal, not acceptance — the whole point of the "
+         "GET and form-body checks")
+    want(_executed(resp("", status=400)), False, "an empty body is not acceptance")
+    want(info_trace(resp('{"data":{},"extensions":{"tracing":{"version":1}}}')), True,
+         "tracing under extensions is detected structurally")
+    want(info_trace(resp('{"data":{"name":"tracing"}}')), False,
+         "the word as a field value is not trace mode")
+    want(info_trace(resp("not json")), False, "an unparseable body is not trace mode")
+    want(info_stacktrace(resp("TypeError\n    at Object.resolve (/app/src/r.js:12:9)")), True,
+         "a JS stack frame is an unhandled error")
+    want(info_stacktrace(resp('{"errors":[{"message":"Syntax Error: Expected Name"}]}')), False,
+         "a clean GraphQL syntax error is correct behaviour, not a leak")
+    want([c[1] for c in INFO_CHECKS if c[0] == "get_mutation_accepted"], ["get_mutation"],
+         "a mutation over GET is its own check, not inferred from the query one")
+    want(sorted({c[3] for c in INFO_CHECKS}), ["high", "info", "low"],
+         "the two CSRF-able transports are high and the rest are not")
+    want(len(COP_DOS_TESTS), 5,
+         "the five cop tests the default path does not cover are named, so the output can say so")
+
+    # --- spec vs traffic
+    spec = {"paths": {
+        "/users": {"get": {"responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "array", "items": {"properties": {"id": {}, "email": {}}}}}}}}},
+                   "post": {"requestBody": {"content": {"application/json": {"schema": {
+                       "properties": {"email": {}, "name": {}}}}}},
+                            "responses": {"201": {"content": {"application/json": {"schema": {
+                                "properties": {"id": {}, "email": {},
+                                               "role": {"readOnly": True}}}}}}}}},
+        "/users/{id}": {"get": {"parameters": [{"name": "id", "in": "path"}],
+                                "responses": {}},
+                        "patch": {"requestBody": {"content": {"application/json": {"schema": {
+                            "properties": {"name": {}}}}}}, "responses": {}}},
+    }}
+    want(len(spec_operations(spec)), 4, "every declared method is an operation")
+    want(match_path("/users/42", ["/users", "/users/{id}"]), "/users/{id}",
+         "a concrete path finds its template, so the diff is not all noise")
+    want(match_path("/users/me", ["/users/me", "/users/{id}"]), "/users/me",
+         "a literal route wins over a templated one")
+    want(match_path("/orders/1", ["/users/{id}"]), None, "an unknown path matches nothing")
+    diff = spec_vs_traffic(spec, [
+        {"method": "GET", "path": "/internal/metrics"},
+        {"method": "DELETE", "path": "/users/7"},
+        {"method": "POST", "path": "/users", "body_fields": ["email", "name", "is_admin"]},
+    ])
+    want([x["path"] for x in diff["shadow_endpoints"]], ["/internal/metrics"],
+         "traffic to an undeclared path is a shadow endpoint")
+    want([(x["method"], x["path"]) for x in diff["undeclared_methods"]],
+         [("DELETE", "/users/{id}")],
+         "a verb that works on a documented route but is not declared for it is its own bug")
+    want(diff["shadow_fields"][0]["fields"], ["is_admin"],
+         "a body field the server took and the spec never declared is a shadow field")
+    mass = {(x["method"], x["path"]): x["fields"] for x in diff["mass_assignment_candidates"]}
+    want(mass[("POST", "/users")], ["id", "role"],
+         "fields returned but not accepted, and readOnly fields, are the mass-assignment set")
+    want(("GET", "/users") in mass, False, "a read has no mass-assignment candidates")
+
+    deps = {d["consumer"]: d for d in id_dependencies(spec)}
+    want(deps["GET /users/{id}"]["producers"], ["GET /users", "POST /users"],
+         "the id a BOLA test needs comes from the operations that hand one out")
+    want(deps["GET /users/{id}"]["needs"], "id", "the consumed parameter is named")
+
+    want(version_variants("/api/v2/orders"),
+         ["/api/v0/orders", "/api/v1/orders", "/api/v3/orders", "/api/internal/orders",
+          "/api/beta/orders"],
+         "a versioned route gets its siblings, where the old guard is missing")
+    want(version_variants("/orders")[0], "/internal/orders",
+         "an unversioned route gets a prefix instead")
+    want("/api/v2/orders" in version_variants("/api/v2/orders"), False,
+         "the route itself is not swept twice")
+
+    # --- WebSocket frame codec, used for the subscription handshake
+    parsed = ws_parse(ws_frame(b"hello"))
+    want((parsed[0], parsed[1]), (0x1, b"hello"), "a masked client frame round-trips")
+    want(ws_parse(b"\x81"), None, "an incomplete frame waits instead of guessing")
+    long = ws_parse(ws_frame(b"x" * 300))
+    want((long[1] == b"x" * 300, long[2]), (True, 308),
+         "the 16-bit length path is handled and the consumed count is exact")
+    want(ws_parse(bytes([0x81, 0x02]) + b"ok")[1], b"ok", "an unmasked server frame reads directly")
+
+    # --- principals and objects
+    want(parse_objects(["42:MYTHOS-A", "43:MYTHOS-B"]),
+         [{"id": "42", "canary": "MYTHOS-A"}, {"id": "43", "canary": "MYTHOS-B"}],
+         "object/canary pairs parse")
+    try:
+        parse_objects(["42"])
+        failures.append("an object without a canary must be refused: there is no oracle without it")
+    except SystemExit:
+        pass
+
+    for f in failures:
+        print(f"FAIL {f}")
+    print(f"apiproto selftest: {len(failures)} failure(s)")
+    return 1 if failures else 0
+
+
+# ------------------------------------------------------------------------- main
+
+def parse_headers(items):
+    headers = {}
+    for h in items or []:
+        name, sep, value = h.partition(":")
+        if not sep or not name.strip():
+            raise SystemExit(f"apiproto: bad --header {h!r}: expected 'Name: value'")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def parse_twins(items):
+    out = {}
+    for item in items or []:
+        field, sep, template = item.partition("=")
+        if not sep or "{id}" not in template:
+            raise SystemExit(f"apiproto: bad --rest-twin {item!r}: expected "
+                             "'field=https://host/api/users/{id}'")
+        out[field.strip()] = template.strip()
+    return out
+
+
+EPILOG = """\
+Pick a subcommand by what the target speaks:
+
+  graphql        one path, a schema behind it, `{"query": ...}` bodies, /graphql
+                 /graphiql /playground, or an Apollo/Hasura/Yoga error shape.
+  rpcbatch       /api/trpc/<router>.<proc> with ?batch=1, or bodies carrying
+                 "jsonrpc":"2.0", or any endpoint that takes an array of calls.
+  grpc           application/grpc, application/grpc-web-text, Connect's
+                 application/connect+json, or POST /<pkg.Service>/<Method>.
+  serveractions  a Next.js app: a `Next-Action` header, /_next/static chunks.
+                 These have no route in the sitemap, so nothing else finds them.
+  specfuzz       you have an OpenAPI/Swagger document, or found one in recon.
+
+Every subcommand that tests authorization needs the same three things, because
+without them the result is a guess: --sessions (where skills/auth-session wrote
+<role>.headers), --owner ROLE, and two --object 'ID:CANARY' pairs for objects
+that role created, each carrying a unique owner-only string.
+
+Denial of service, brute force and destruction are refused in every mode. The
+GraphQL amplification checks are denial of service by construction and need
+--allow-dos-checks; mutations and write verbs need their own flags.
+"""
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="scripts/apiproto", description=__doc__, epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true", help="offline asserts, no network")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p, needs_matrix=True):
+        p.add_argument("--header", action="append", default=[],
+                       help="'Name: value' added to every request, repeatable")
+        p.add_argument("--timeout", type=float, default=10)
+        p.add_argument("--insecure", action="store_true", help="skip TLS verification")
+        p.add_argument("--rate", type=float, default=None,
+                       help="requests per second, 0 = unlimited. Default: rules.rate_limit_rps "
+                            "from the scope file, else 5")
+        p.add_argument("--json", action="store_true")
+        if needs_matrix:
+            p.add_argument("--sessions", help="directory of <role>.headers from auth-session")
+            p.add_argument("--roles", action="append",
+                           help="only these roles from --sessions, repeatable")
+            p.add_argument("--owner", default="userA",
+                           help="the role that owns the --object ids (default userA)")
+            p.add_argument("--object", action="append", default=[], metavar="ID:CANARY",
+                           help="an object the owner created and a unique string only its owner "
+                                "should see. Two are needed for a verdict; repeatable")
+            p.add_argument("--repeats", type=int, default=2,
+                           help="requests per cell; a result that does not repeat is noise "
+                                "(default 2)")
+            p.add_argument("--min-objects", type=int, default=2,
+                           help="objects that must agree before a cell is confirmed (default 2)")
+            p.add_argument("--max-fields", type=int, default=40,
+                           help="cap on operations put through the matrix (default 40)")
+
+    g = sub.add_parser("graphql", help="schema, per-field role matrix, persisted queries, "
+                                       "subscription auth",
+                       description="Introspection or field-suggestion recovery, then the same "
+                                   "field as every principal on the agent's own objects, with "
+                                   "the REST twin compared where one exists.",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    g.add_argument("url", help="the GraphQL endpoint, e.g. https://app.test/graphql")
+    g.add_argument("--schema", help="an introspection response saved as JSON (from InQL or "
+                                    "Clairvoyance) to use when introspection is off")
+    g.add_argument("--field", action="append", help="only these root fields, repeatable")
+    g.add_argument("--rest-twin", action="append", default=[], metavar="FIELD=URL/{id}",
+                   help="the REST route for the same object, so the two-transport rule applies")
+    g.add_argument("--public-field", help="a root field the operator knows is public by design: "
+                                          "its cells are the public-by-design control")
+    g.add_argument("--origin", help="an off-site Origin for the subscription handshake, to test "
+                                    "cross-site WebSocket hijacking")
+    g.add_argument("--include-mutations", action="store_true",
+                   help="put mutation fields through the matrix too. Only on objects the agent "
+                        "created: a mutation writes")
+    g.add_argument("--allow-dos-checks", action="store_true",
+                   help="DENIAL OF SERVICE. Enables graphql-cop's alias overloading, array "
+                        "batching, field duplication, directive overloading and circular "
+                        "introspection checks. Each makes the server do N times the work for one "
+                        "request, which AGENTS.md refuses in every mode. Throwaway lab only")
+    common(g)
+
+    b = sub.add_parser("rpcbatch", help="a batch where only one id belongs to the caller",
+                       description="The authorization bug batch protocols hide: the server "
+                                   "authorizes the batch and not its elements, so one foreign "
+                                   "element rides along. Results are per element, never one "
+                                   "verdict for the batch.")
+    b.add_argument("url", help="the JSON-RPC endpoint, or the /api/trpc base")
+    b.add_argument("--kind", choices=("auto", "jsonrpc", "trpc"), default="auto")
+    b.add_argument("--method", required=True,
+                   help="the JSON-RPC method, or a tRPC procedure path "
+                        "(router.proc, or a comma-separated list, one per element)")
+    b.add_argument("--param", default="id", help="the parameter that carries the object id")
+    b.add_argument("--foreign", metavar="ID:CANARY", required=True,
+                   help="an id belonging to the agent's SECOND account, with its canary. Never a "
+                        "real user's id")
+    common(b)
+
+    r = sub.add_parser("grpc", help="reflection or bundle recovery, then a per-method role matrix",
+                       description="grpcurl when reflection is on; service and method names "
+                                   "recovered from JS bundles and source maps when it is off. "
+                                   "gRPC-web and Connect ride on HTTP, so their matrix goes "
+                                   "through the recorder.")
+    r.add_argument("target", help="host:port for reflection")
+    r.add_argument("--plaintext", action="store_true", help="grpcurl -plaintext (no TLS)")
+    r.add_argument("--bundle", action="append", default=[],
+                   help="a JS file, .map file or directory to recover names from, repeatable")
+    r.add_argument("--http-base", help="the Connect or gRPC-web origin, e.g. https://app.test, "
+                                       "for the role matrix over HTTP")
+    r.add_argument("--param", default="id", help="the JSON field carrying the object id")
+    common(r)
+
+    s = sub.add_parser("serveractions", help="harvest Next-Action ids and replay each per role",
+                       description="A Server Action is an RPC endpoint with no route in the "
+                                   "sitemap, so nothing else in this repo will find it. The "
+                                   "default replay sends an argument body the action cannot "
+                                   "deserialize, so nothing is written.")
+    s.add_argument("url", help="a page of the Next.js app")
+    s.add_argument("--chunk", action="append", default=[],
+                   help="an extra /_next/static chunk to read, repeatable")
+    s.add_argument("--sourcemaps", action="store_true",
+                   help="also fetch <chunk>.js.map, where the id sits next to the function name")
+    s.add_argument("--loose", action="store_true",
+                   help="also harvest bare 40/64-hex literals. Noisier: build hashes look the same")
+    s.add_argument("--max-chunks", type=int, default=40)
+    s.add_argument("--next-version", help="the Next.js version, when recon established it "
+                                           "elsewhere, for the advisory comparison")
+    s.add_argument("--replay-args",
+                   help="a real argument body for the action. MAY WRITE: only against objects the "
+                        "agent created, and never on a shared target")
+    common(s)
+
+    f = sub.add_parser("specfuzz", help="spec versus traffic, version sweep, method swap",
+                       description="Diff the declared schema against what the server actually "
+                                   "accepted, sweep sibling API versions, swap methods per route, "
+                                   "and walk the producer/consumer dependencies so a BOLA test "
+                                   "uses a real id instead of an invented one.")
+    f.add_argument("spec", help="an OpenAPI/Swagger file or URL")
+    f.add_argument("--base", help="the live origin, for the sweep and the swap")
+    f.add_argument("--observed", help="recorded traffic: a HAR from `scripts/traffic har`, or "
+                                       "JSONL of {method, path, body_fields}")
+    f.add_argument("--sample-id", help="an object id the agent created, for templated paths. "
+                                        "Without it templated routes are skipped rather than "
+                                        "swept with an invented id")
+    f.add_argument("--schemathesis", action="store_true",
+                   help="also run schemathesis, rate-capped, when it is installed")
+    f.add_argument("--allow-write-verbs", action="store_true",
+                   help="include PUT/PATCH/DELETE in the method swap. Only with --sample-id "
+                        "naming an object the agent created: a write verb on anyone else's "
+                        "object is destruction")
+    common(f)
+    return ap
+
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
+    ap = build_parser()
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    CFG["timeout"] = a.timeout
+    CFG["insecure"] = a.insecure
+    rate = scope_rate() if a.rate is None else a.rate
+    _MIN_GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    if hasattr(a, "rest_twin"):
+        a.rest_twin = parse_twins(a.rest_twin)
+    if not hasattr(a, "sessions"):
+        a.sessions = None
+    result = {"graphql": cmd_graphql, "rpcbatch": cmd_rpcbatch, "grpc": cmd_grpc,
+              "serveractions": cmd_serveractions, "specfuzz": cmd_specfuzz}[a.cmd](a)
+    result["rate_limit_rps"] = rate
+    print(json.dumps(result, indent=1, default=str) if a.json else render(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
