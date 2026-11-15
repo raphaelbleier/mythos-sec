@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en" data-token="__TOKEN__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
+<title>Mythos</title>
+<link rel="icon" href="mark.svg?t=__TOKEN__" type="image/svg+xml">
+<link rel="stylesheet" href="app.css?t=__TOKEN__">
+<script type="module" src="app.js?t=__TOKEN__"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <a class="brand" href="#/" aria-label="Mythos, all engagements">
+    <img class="mark" src="mark.svg?t=__TOKEN__" alt="" width="34" height="34">
+    <span class="wordmark">MYTHOS</span>
+    <span class="tagline">web red-team framework</span>
+  </a>
+  <p class="posture" id="posture">
+    <span class="chip chip-ro" title="No endpoint can start, stop or modify an engagement, send a request at a target, or edit scope.">read-only</span>
+    <span class="chip" id="bind">127.0.0.1</span>
+  </p>
+</header>
+
+<nav class="tabs" id="tabs" aria-label="Engagement sections" hidden></nav>
+
+<main id="main" tabindex="-1">
+  <p class="loading" id="boot">Reading the engagements directory…</p>
+</main>
+
+<footer class="colophon">
+  <p>Authorized testing only. This page is served from <span id="root-path">the repository</span> and makes no outbound request.</p>
+</footer>
+</body>
+</html>
