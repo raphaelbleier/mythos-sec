@@ -157,7 +157,7 @@ so that is warned about and allowed.
 
 ## Install
 
-Node 20 or newer, Python 3.11 or newer, Docker.
+Node 22 or newer, Python 3.11 or newer, Docker.
 
 ```bash
 git clone https://github.com/raphaelbleier/mythos-sec

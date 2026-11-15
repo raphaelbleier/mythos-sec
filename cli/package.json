@@ -13,7 +13,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/web/assets && cp src/web/assets/* dist/web/assets/",
@@ -22,15 +22,15 @@
     "test": "node --test dist/*.test.js"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^2.0.0",
-    "@ai-sdk/google": "^2.0.0",
-    "@ai-sdk/openai": "^2.0.0",
-    "@ai-sdk/openai-compatible": "^1.0.0",
-    "ai": "^5.0.0",
-    "ink": "^6.0.0",
+    "@ai-sdk/anthropic": "^4.0.105",
+    "@ai-sdk/google": "^4.0.113",
+    "@ai-sdk/openai": "^4.0.110",
+    "@ai-sdk/openai-compatible": "^3.0.86",
+    "ai": "^7.0.173",
+    "ink": "^8.0.0",
     "playwright-core": "^1.65.1",
     "react": "^19.0.0",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

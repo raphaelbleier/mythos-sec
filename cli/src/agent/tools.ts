@@ -550,7 +550,7 @@ export function buildTools(ctx: ToolContext) {
         .optional()
         .describe("for context: a Playwright storage state file, as auth_login.py writes it"),
       method: z.string().optional().describe("for cdp, e.g. DOMDebugger.getEventListeners"),
-      params: z.record(z.unknown()).optional().describe("for cdp: the method's parameters"),
+      params: z.record(z.string(), z.unknown()).optional().describe("for cdp: the method's parameters"),
       why: z.string(),
     }),
     execute: async ({ action, url, selector, value, name, storage_state, method, params, why }) => {

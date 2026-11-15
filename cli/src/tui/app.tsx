@@ -273,7 +273,9 @@ export function App({ bus }: { bus: Bus }) {
   const [keys, setKeys] = useState(false);
   const [startedAt] = useState(() => Date.now());
   const { exit } = useApp();
-  const { stdout } = useStdout();
+  // ink 8 types the hook's stream as a bare WritableStream, which carries no
+  // terminal size. It is still process.stdout at runtime.
+  const stdout = useStdout().stdout as NodeJS.WriteStream | undefined;
   const t = theme();
   const g = glyphs();
 
