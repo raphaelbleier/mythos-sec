@@ -1,6 +1,6 @@
 # OAuth 2.0 / OpenID Connect flows
 
-**Class:** authentication  **Updated:** 2026-11-13
+**Class:** authentication  **Updated:** 2026-11-15
 
 ## What it is
 The authorization server (AS) or the client (the app that offers "log in with
@@ -22,6 +22,15 @@ registration, device code, magic links). Token internals are in `jwt.md`.
   with curl.
 - If you may register your own client, use it for the AS checks. Otherwise test
   the app's own public client with your own login.
+
+`scripts/federation` runs the deterministic half of this note against your own
+accounts, with the unmodified flow as the control in every subcommand:
+`federation oidc <authorize>` for the `redirect_uri` table and the flow-binding
+rows, `federation token <token-url>` for redemption, `federation idtoken <rp>`
+for what the relying party does with an `id_token`, and
+`federation linking <link-url>` for the linking class below. The skill is
+`sso-federation`; **oauth-audit** stays the browser half, because a `Location`
+header is a lead and a code arriving at a host you control is the proof.
 
 ## Flow map (do this first)
 From one recorded login, note and write down: `response_type` (`code`, or
@@ -84,15 +93,39 @@ refused by the same AS. One accepted mutation is enough; stop there.
    client rejects a callback whose `iss` is another issuer. Full proof needs
    a second AS you run yourself; without it, report `candidate` with the
    metadata evidence and say what is missing.
-5. **Cross-client acceptance.** Mint an ID token or access token for a second
-   client you registered at the same IdP (your own account) and present it
-   to the app's login or API. Accepted = `aud`/`azp` not checked, so any
-   third-party client can replay a token it received. For ID tokens also
-   check `nonce` replay: reuse an old `nonce`/ID token.
-6. **Identity binding.** Log in with an IdP account whose email is `userB`'s
-   address but unverified (an IdP you can create accounts on). Accepted login
-   as `userB` = app trusts `email` without `email_verified`, or keys on email
-   instead of `sub` (nOAuth class, Descope 2023-06). Own accounts only.
+5. **Cross-client acceptance and token confusion.** Mint an ID token or access
+   token for a second client you registered at the same IdP (your own account)
+   and present it to the app's login or API. Accepted = `aud`/`azp` not
+   checked, so any third-party client can replay a token it received. Three
+   rows here need no new signature at all, which makes them the strongest ones
+   available without an RSA key: audience confusion (the token for client A at
+   client B), `nonce` replay (the same ID token into a second flow), and token
+   substitution (an access token in the field where the `id_token` belongs — a
+   relying party that parses it for an identity without checking `typ`,
+   `at_hash` or `aud`). The rows that do need a signature — `alg: none`,
+   HS/RS confusion, `kid` traversal, `jku`/`x5u` pointing at a host you
+   control — are in `jwt.md`; `scripts/federation idtoken` builds all of them
+   and marks the ones RSA would be needed for.
+6. **Identity binding and account linking.** One class, four rows, and they
+   differ only in which side already exists. Own accounts only, both of them.
+   (a) *Unverified email*: a fresh `(iss, sub)` asserting the address of an
+   existing local account with `email_verified: false`. A session for that
+   account means the app trusts `email` without `email_verified`, or keys on
+   email instead of `sub` (nOAuth, Descope 2023-06).
+   (b) *Two IdPs, one email*: a second issuer asserting the same verified
+   address. Accepted into the first issuer's account means the link is keyed on
+   email, so which IdP got there first does not matter — and any IdP that lets
+   a user set their address can take the account.
+   (c) *Pre-registration claim*: register a local account with an address, do
+   not confirm it, then sign in through the IdP with that address. Whoever
+   arrives second inherits the first one's account; test both directions.
+   (d) *Stale session after unlinking*: disconnect the identity in the
+   settings page, then reuse the session the link created, and any API token it
+   minted. Still authenticated = unlinking revoked nothing, which is the bug
+   that turns a removed contractor's SSO identity into standing access.
+   Oracle for all four: the read-back endpoint names the account, with the
+   legitimate link flow as the control. A `sub` that changes while the email
+   stays the same is the same bug seen from the IdP's side.
 7. **Scope and audience.** Request `scope` beyond the registered or consented
    set (`admin`, `offline_access`), and widen `scope` at refresh. Proof is the
    issued token's scope claim (or introspection) plus an API call that needs it.
