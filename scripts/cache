@@ -1,0 +1,1803 @@
+#!/usr/bin/env python3
+"""Mythos cache — web cache poisoning, cache deception, and edge/origin normalization.
+
+A shared cache is the one class where proving the bug *is* the harm: an entry
+you poison is served to every real user who asks for that key. So the first
+thing in this file is not a probe, it is a refusal.
+
+  scripts/cache keys      <url> ...  find the cache key: vary one input at a
+                                     time and classify it keyed / unkeyed-and-
+                                     reflected / ignored, naming the signal
+  scripts/cache poison    <url> ...  place an inert marker through an unkeyed
+                                     input, prove a second independent client
+                                     was served it, then bust the entry and
+                                     prove it is gone
+  scripts/cache deception <url> ...  cache a private page under a path the edge
+                                     treats as static, owner session as victim,
+                                     an anonymous context as the reader
+  scripts/cache fatget    <url> ...  a GET carrying a body, a method-override
+                                     header or a `_method` parameter where the
+                                     origin expects a POST
+  scripts/cache normdiff  <url> ...  where edge and origin disagree: path
+                                     encoding, dot segments, duplicate
+                                     parameters, header folding, TE/CL — all
+                                     written byte-exact on a fresh socket
+  scripts/cache selftest             loopback origin + a caching proxy of our
+                                     own; a real poisoning and a real cleanup
+
+THE FOUR RULES, IN CODE AND NOT ONLY HERE
+
+ 1. **Every stored entry must be on a key the operator can isolate.** Each
+    subcommand that can put something in the cache appends a unique
+    cache-buster parameter (`--buster-param`, default `cb`) whose value nobody
+    else will ever request, so the poisoned entry is one nobody is served.
+    Poisoning a bare, buster-free key — the key real users hit — is refused
+    unless `--i-own-this-cache` is passed, and that flag belongs on your own
+    lab and nowhere else. `--no-buster` without it exits 3.
+ 2. **The marker is inert.** `^[A-Za-z0-9._-]{4,64}$` and nothing else: no
+    angle brackets, no quotes, no scheme, no CR or LF, no payload. A
+    host-shaped marker is generated under `.invalid`, which resolves nowhere by
+    RFC 2606. A `--marker` that does not match is refused, whatever it is for.
+ 3. **After proving it, the entry is busted and the bust is verified.** Every
+    candidate carries a `cleanup` block: the request that evicted the entry and
+    the read that shows the marker is gone.
+ 4. **A cleanup that fails is collateral.** It is printed loudly, carried in
+    `--json` as `cleanup.state = "FAILED"` with the exact key, and the process
+    exits 5 — because the operator now has something to disclose to the
+    programme, and a quiet 0 would let them not know.
+
+Verdicts here are `candidate` or `inconclusive`, never `confirmed`: a separate
+validator on a different model replays the recorded byte-exact pairs
+(`--dir <engagement>` writes them to `traffic/log.jsonl` as `kind: "raw"`
+records, which `scripts/traffic show|replay` reads). `X-Cache: HIT` on its own
+is never the oracle — see `knowledge/web/cache-poisoning.md`. The oracle is
+always content: our marker in a response to a request that did not carry it,
+with a negative control on a fresh key that was never primed.
+
+EXIT CODES
+
+  0  ran, nothing held: every verdict is `no`, `ignored` or `inconclusive`
+  1  a `candidate` was recorded, with its negative control and its cleanup
+  2  usage error
+  3  refused by a safety rule: out of scope, a bare key without
+     --i-own-this-cache, a marker that is not inert, a destructive override
+  4  the request cap was reached; nothing is wrong, the pass was capped
+  5  a candidate was found AND the cleanup failed. Collateral. Disclose it.
+
+Non-destructive only. No DoS, no brute force, no flood: every subcommand is
+capped (`--max-requests`, default 150) with a small `--n`, and paced at
+`rules.rate_limit_rps` from `$MYTHOS_SCOPE`. A method override to PUT, PATCH or
+DELETE is refused in code. The scope file is the authorization boundary and
+this script never writes to it.
+"""
+import argparse
+import base64
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import random
+import re
+import shutil
+import socket
+import ssl
+import string
+import sys
+import tempfile
+import time
+import urllib.parse
+
+UA = "mythos-cache/1.0 (authorized security testing)"
+# The reader is a second, independent client: its own socket, its own
+# User-Agent, no cookies, and none of the inputs the prime carried.
+READER_UA = "mythos-cache-reader/1.0 (authorized security testing, second client)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# The cache's own signals, in the order a report should read them. `cache-status`
+# is RFC 9211 and is the only one with a specified meaning; the rest are vendor
+# conventions and an origin application can set any of them itself, which is
+# exactly why none of them is an oracle on its own.
+SIGNALS = ("cache-status", "x-cache", "x-cache-hits", "cf-cache-status", "age",
+           "via", "fastly-debug", "x-served-by", "x-varnish", "x-proxy-cache",
+           "x-drupal-cache", "x-nextjs-cache", "x-vercel-cache", "cdn-cache",
+           "x-iinfo", "akamai-cache-status", "x-akamai-request-id")
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py", "traffic": "scripts/traffic"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def require_in_scope(*items):
+    """Refuse, not warn. A poisoned entry on the wrong host cannot be recalled."""
+    sg = mod("scope-guard")
+    bad = []
+    for item in items:
+        if not item:
+            continue
+        probe = item if "//" in str(item) else f"https://{item}/"
+        bad += sg.check(probe)["offenders"]
+    if bad:
+        raise Refusal("out of scope: " + ", ".join(sorted(set(bad)))
+                      + "\n  A cache entry you poison is served to that host's real "
+                        "users. Add it to scope.yaml in an editor, or pick a target "
+                        "the engagement already authorizes.")
+
+
+def scope_rate(default=5.0):
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+class Refusal(Exception):
+    """A safety rule said no. Exit 3, and never a partially sent probe."""
+
+
+class Overspend(Exception):
+    """The request cap was reached. Exit 4. Not a finding, not a failure."""
+
+
+def token(n=8):
+    alpha = string.ascii_lowercase + string.digits
+    return "m" + "".join(random.choice(alpha) for _ in range(n))
+
+
+MARKER_OK = re.compile(r"^[A-Za-z0-9._-]{4,64}$")
+
+
+def inert(marker, what="marker"):
+    """Rule 2. Anything that could execute, redirect or fold is refused here.
+
+    The check is an allow-list on purpose: a deny-list of dangerous characters
+    is a list somebody will find a gap in, and this value ends up stored in a
+    cache that serves strangers."""
+    if not MARKER_OK.match(marker or ""):
+        raise Refusal(
+            f"{what} {marker!r} is not inert. A cache entry is served to real users, "
+            "so the value placed in one must be a harmless string and nothing else: "
+            "4-64 characters of [A-Za-z0-9._-]. No brackets, quotes, scheme, CR or LF, "
+            "and no payload of any kind.")
+    low = marker.lower()
+    for bad in ("javascript", "script", "data:", "onerror", "onload"):
+        if bad in low:
+            raise Refusal(f"{what} {marker!r} spells {bad!r}; pick a neutral token.")
+    return marker
+
+
+def host_marker(tok):
+    """A host-shaped inert marker. `.invalid` resolves nowhere (RFC 2606)."""
+    return inert(f"{tok}.invalid", "host marker")
+
+
+# ---------------------------------------------------------------- transport
+
+
+def split_url(url):
+    p = urllib.parse.urlsplit(url if "//" in url else f"http://{url}")
+    scheme = p.scheme or "http"
+    port = p.port or (443 if scheme == "https" else 80)
+    host = p.hostname or ""
+    target = p.path or "/"
+    if p.query:
+        target += "?" + p.query
+    hostheader = p.netloc.split("@")[-1]
+    return scheme, host, port, hostheader, target
+
+
+def with_param(target, name, value):
+    path, _, query = target.partition("?")
+    q = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    q = [(k, v) for k, v in q if k != name] + [(name, value)]
+    return path + "?" + urllib.parse.urlencode(q)
+
+
+def param_names(target):
+    return [k for k, _ in urllib.parse.parse_qsl(target.partition("?")[2],
+                                                 keep_blank_values=True)]
+
+
+def build(method, hostheader, target, headers=(), body=b"", auto_len=True,
+          version="HTTP/1.1", ua=UA):
+    """The request bytes, exactly. Header order is the caller's, duplicates kept.
+
+    Nothing here canonicalizes, re-orders or de-duplicates: `normdiff` exists
+    because a library that tidied the message would resolve the ambiguity that
+    is the experiment."""
+    names = {k.lower() for k, _ in headers}
+    lines = [f"{method} {target} {version}"]
+    if "host" not in names:
+        lines.append(f"Host: {hostheader}")
+    lines += [f"{k}: {v}" for k, v in headers]
+    if "user-agent" not in names:
+        lines.append(f"User-Agent: {ua}")
+    if "accept" not in names:
+        lines.append("Accept: */*")
+    if auto_len and "content-length" not in names and "transfer-encoding" not in names:
+        if body or method in ("POST", "PUT"):
+            lines.append(f"Content-Length: {len(body)}")
+    if "connection" not in names:
+        lines.append("Connection: close")
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+    return head + body
+
+
+CHUNK = re.compile(rb"^([0-9a-fA-F]+)")
+
+
+def dechunk(body):
+    out = bytearray()
+    rest = body
+    while rest:
+        line, _, rest = rest.partition(b"\r\n")
+        m = CHUNK.match(line.strip())
+        if not m:
+            break
+        n = int(m.group(1), 16)
+        if n == 0:
+            break
+        out += rest[:n]
+        rest = rest[n + 2:]
+    return bytes(out)
+
+
+def parse(raw):
+    """Minimal response read: status, headers (duplicates kept), decoded body."""
+    split = re.search(rb"\r?\n\r?\n", raw)
+    if not split:
+        return {"status": None, "headers": [], "h": {}, "body": "", "raw": raw}
+    text = raw[:split.start()].decode("latin-1")
+    body = raw[split.end():]
+    lines = text.replace("\r\n", "\n").split("\n")
+    m = re.match(r"HTTP/[\d.]+ (\d{3})", lines[0] or "")
+    headers, h = [], {}
+    for line in lines[1:]:
+        if line[:1] in (" ", "\t") and headers:
+            headers[-1] = (headers[-1][0], headers[-1][1] + " " + line.strip())
+        elif ":" in line:
+            k, _, v = line.partition(":")
+            headers.append((k.strip(), v.strip()))
+    for k, v in headers:
+        h[k.lower()] = f"{h[k.lower()]}, {v}" if k.lower() in h else v
+    if "chunked" in h.get("transfer-encoding", "").lower():
+        body = dechunk(body)
+    return {"status": int(m.group(1)) if m else None, "headers": headers, "h": h,
+            "body": body.decode("utf-8", "replace"), "raw": raw}
+
+
+class Ctx:
+    """One run: the target, the budget, the pacing and the traffic record."""
+
+    def __init__(self, a):
+        self.a = a
+        self.rate = a.rate if a.rate is not None else scope_rate()
+        self.gap = 1.0 / self.rate if self.rate and self.rate > 0 else 0.0
+        self.last = 0.0
+        self.sent = 0
+        self.cap = a.max_requests
+        self.records = []
+        self.dir = pathlib.Path(a.dir) if getattr(a, "dir", None) else None
+        self.buster_param = a.buster_param
+        self.isolated = not getattr(a, "no_buster", False)
+        self.owns = getattr(a, "i_own_this_cache", False)
+        # Every buster token this run issued. Two responses on two isolated keys
+        # differ by their buster value alone, so a body comparison that did not
+        # mask these would call every input "unkeyed".
+        self.busters = []
+
+    def drop(self):
+        return tuple(self.busters)
+
+    # -- rule 1 ----------------------------------------------------------
+    def key_for(self, target, tok):
+        """Rule 1. A key the operator can isolate, or an explicit refusal."""
+        if self.isolated:
+            self.busters.append(tok)
+            return with_param(target, self.buster_param, tok)
+        if not self.owns:
+            raise Refusal(
+                "--no-buster would store an entry on the bare key real users request. "
+                "That poisons the shared cache for every visitor of that URL, which is "
+                "the harm this class is about.\n"
+                "  Drop --no-buster (the default appends a unique "
+                f"`{self.buster_param}=<token>`, so only a key nobody asks for is "
+                "touched), or pass --i-own-this-cache if the cache is yours — your own "
+                "lab, not a bug-bounty target.")
+        return target
+
+    # A client revalidation. It is the least invasive eviction there is — it
+    # asks the cache for a fresh copy of one key — and it is what the cleanup
+    # step and normdiff's reference reads use.
+    FRESH = [("Cache-Control", "no-cache, no-store, max-age=0"),
+             ("Pragma", "no-cache")]
+
+    def pace(self):
+        if self.gap <= 0:
+            return
+        wait = self.last + self.gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.monotonic()
+
+    def send(self, method, target, headers=(), body=b"", label="", ua=UA,
+             auto_len=True, version="HTTP/1.1", hostheader=None):
+        """One request, one fresh socket, byte-exact, recorded.
+
+        A connection is never reused: a cache's behaviour on a keep-alive
+        connection can differ from a fresh one, and a second client has to be a
+        second connection for the proof to mean anything."""
+        if self.sent >= self.cap:
+            raise Overspend(f"request cap reached ({self.cap}). Raise --max-requests "
+                            "deliberately or narrow --n; this cap is what keeps the "
+                            "pass away from anything that looks like a flood.")
+        a = self.a
+        raw_req = build(method, hostheader or self.hostheader, target, headers, body,
+                        auto_len=auto_len, version=version, ua=ua)
+        self.pace()
+        self.sent += 1
+        got, ip, err = bytearray(), None, None
+        t0 = time.time()
+        try:
+            s = socket.create_connection((self.host, self.port), a.timeout)
+            s.settimeout(a.timeout)
+            if self.scheme == "https":
+                c = ssl.create_default_context()
+                c.set_alpn_protocols(["http/1.1"])
+                if a.insecure:
+                    c.check_hostname, c.verify_mode = False, ssl.CERT_NONE
+                s = c.wrap_socket(s, server_hostname=self.host)
+            ip = s.getpeername()[0]
+            s.sendall(raw_req)
+            while len(got) < (1 << 20):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                got += chunk
+            s.close()
+        except socket.timeout:
+            pass                      # whatever arrived is the answer
+        except (OSError, ssl.SSLError) as e:
+            err = f"{type(e).__name__}: {e}"
+        dur = time.time() - t0
+        r = parse(bytes(got))
+        r.update(label=label, error=err, dur=round(dur, 3), target=target,
+                 request=raw_req.decode("latin-1"), id=self.record(
+                     t0, dur, ip, raw_req, bytes(got), label, err))
+        r["cache"] = cache_view(r["h"])
+        return r
+
+    def record(self, t0, dur, ip, req, res, label, err):
+        """A `kind: "raw"` record, the shape `scripts/traffic` documents, so the
+        validator replays these bytes with `traffic replay <id>` and nothing in
+        the chain re-frames them."""
+        rec = {"kind": "raw", "t": round(t0, 3), "dur": round(dur, 3), "client": "raw",
+               "tool": "cache", "label": label or "cache probe",
+               "scheme": self.scheme, "host": self.host, "port": self.port, "ip": ip,
+               "req": base64.b64encode(req).decode(),
+               "res": base64.b64encode(res).decode()}
+        if err:
+            rec["error"] = err
+        self.records.append(rec)
+        if not self.dir:
+            return None
+        try:
+            t = mod("traffic")
+            path = self.dir / "traffic" / "log.jsonl"
+            t.append(path, rec)
+            return sum(1 for _ in path.open("rb"))
+        except Exception as e:                       # a lost line is not a lost probe
+            print(f"cache: could not record to {self.dir}: {e}", file=sys.stderr)
+            return None
+
+    def aim(self, url):
+        require_in_scope(url)
+        self.scheme, self.host, self.port, self.hostheader, self.target = split_url(url)
+        if not self.host:
+            raise Refusal(f"{url!r} has no host")
+        return self.target
+
+
+# ------------------------------------------------------------ cache signals
+
+
+def cache_view(h):
+    """What the cache said about itself, and how much that is worth.
+
+    `confidence` is the point of this function. "explicit" means a header whose
+    documented job is to report hit or miss said so; "weak" means only `Age`
+    did, which an origin can also set; "none" means the cache said nothing and
+    every verdict that would rest on it is `inconclusive`."""
+    signals = {k: h[k] for k in SIGNALS if k in h}
+    state, rests_on, confidence = "unknown", None, "none"
+
+    cs = h.get("cache-status", "").lower()
+    if cs:
+        if "hit" in cs:
+            state, rests_on, confidence = "hit", f"Cache-Status: {h['cache-status']}", "explicit"
+        elif "fwd=" in cs or "miss" in cs:
+            state, rests_on, confidence = "miss", f"Cache-Status: {h['cache-status']}", "explicit"
+    for name in ("x-cache", "cf-cache-status", "x-proxy-cache", "x-drupal-cache",
+                 "akamai-cache-status", "x-nextjs-cache", "x-vercel-cache", "cdn-cache"):
+        if state != "unknown" or name not in h:
+            continue
+        v = h[name].lower()
+        if "hit" in v:
+            state, rests_on, confidence = "hit", f"{name}: {h[name]}", "explicit"
+        elif "miss" in v or "expired" in v or "bypass" in v or "dynamic" in v:
+            state, rests_on, confidence = "miss", f"{name}: {h[name]}", "explicit"
+    hits = h.get("x-cache-hits", "")
+    if state == "unknown" and re.fullmatch(r"\s*\d+\s*", hits or ""):
+        state = "hit" if int(hits) > 0 else "miss"
+        rests_on, confidence = f"X-Cache-Hits: {hits.strip()}", "explicit"
+    if state == "unknown" and re.fullmatch(r"\s*\d+\s*", h.get("age", "") or ""):
+        if int(h["age"]) > 0:
+            state, rests_on, confidence = "hit", f"Age: {h['age'].strip()}", "weak"
+        else:
+            state, rests_on, confidence = "unknown", f"Age: 0 (ambiguous: a fresh store and a hit within the same second look the same)", "weak"
+    return {"signals": signals, "state": state, "rests_on": rests_on,
+            "confidence": confidence,
+            "note": ("no cache signal at all: nothing here can rest on hit/miss"
+                     if confidence == "none" else
+                     "Age only, which an origin can set itself" if confidence == "weak"
+                     else None)}
+
+
+NOISE = [
+    (re.compile(r"(?i)\b(?:mon|tue|wed|thu|fri|sat|sun),[^\n<\"]{0,40}GMT"), "<date>"),
+    (re.compile(r"\b[0-9a-f]{16,64}\b"), "<hex>"),
+    (re.compile(r"\b1[0-9]{9}(?:[0-9]{3})?\b"), "<epoch>"),
+    (re.compile(r"\s+"), " "),
+]
+
+
+def normalize(body, drop=()):
+    """Mask what changes between two identical requests, so a body comparison
+    measures the input and not the clock. The masks are deliberately few: a
+    similarity score is how a false positive gets manufactured."""
+    out = body
+    # Longest first: a token that is a substring of a request target would
+    # otherwise be masked inside it and leave the two sides incomparable.
+    for d in sorted({str(x) for x in drop if x}, key=len, reverse=True):
+        out = out.replace(d, "<drop>")
+    for pat, rep in NOISE:
+        out = pat.sub(rep, out)
+    return out.strip()
+
+
+def same(a, b, drop=()):
+    return normalize(a, drop) == normalize(b, drop)
+
+
+def digest(body, drop=()):
+    return hashlib.sha256(normalize(body, drop).encode()).hexdigest()[:12]
+
+
+def found(marker, r):
+    """Did the marker come back? Body or any header value; headers count,
+    because a poisoned `Location` or `Set-Cookie` is the same bug."""
+    if marker in r["body"]:
+        return "body"
+    for k, v in r["headers"]:
+        if marker in v:
+            return f"header {k}"
+    return None
+
+
+def carried(marker, r):
+    """Did the request we are reading the answer to carry the marker itself? If
+    it did, the response is a reflection and proves nothing about the cache."""
+    return marker in r["request"]
+
+
+# --------------------------------------------------- 1. keys: the cache key
+
+# The curated list. Every entry is a header a real edge or framework is known to
+# either forward unkeyed or rewrite into the response, and the value shape
+# matters: an IP header given a hostname is usually dropped before it reaches
+# anything, so the test would measure the validator and not the key.
+#   kind: how the value is shaped, so the marker is plausible
+HEADER_INPUTS = [
+    ("X-Forwarded-Host", "host"),
+    ("X-Forwarded-Scheme", "token"),
+    ("X-Forwarded-Proto", "token"),
+    ("X-Forwarded-Port", "port"),
+    ("X-Host", "host"),
+    ("X-Original-Host", "host"),
+    ("X-Forwarded-Server", "host"),
+    ("Forwarded", "forwarded"),
+    ("X-Original-URL", "url"),
+    ("X-Rewrite-URL", "url"),
+    ("X-HTTP-Method-Override", "token"),
+    ("X-Forwarded-For", "ip"),
+    ("X-Real-IP", "ip"),
+    ("True-Client-IP", "ip"),
+    ("X-Forwarded-Prefix", "path"),
+    ("X-Wap-Profile", "url"),
+]
+
+
+def header_value(kind, tok):
+    """An inert value of the right shape. Every one is checked by `inert`."""
+    if kind == "host":
+        return host_marker(tok)
+    if kind == "url":
+        return f"http://{host_marker(tok)}/{inert(tok)}"
+    if kind == "forwarded":
+        return f"host={host_marker(tok)}"
+    if kind == "port":
+        return "1337"
+    if kind == "ip":
+        return "127.0.0.1"
+    if kind == "path":
+        return f"/{inert(tok)}"
+    return inert(tok)
+
+
+def classify(prime, probe, ref, marker, drop):
+    """keyed / unkeyed-and-reflected / unkeyed / ignored / inconclusive.
+
+    The three facts this reads, in order of worth:
+      1. the marker in `probe`, whose request did not carry it  -> unkeyed and
+         reflected, and that is a poisoning primitive, not a guess
+      2. `prime` differs from a clean reference -> the input changes the
+         response; then whether `probe` (same key, input absent) shows the
+         changed or the clean body says whether the cache keyed it
+      3. nothing changed -> the input is ignored, and a cache cannot key on
+         something that makes no difference"""
+    if marker and found(marker, probe) and not carried(marker, probe):
+        return ("unkeyed-and-reflected",
+                f"the marker {marker} came back in a response to a request that did not "
+                f"carry it ({found(marker, probe)}); cache said "
+                f"{probe['cache']['rests_on'] or 'nothing'}")
+    changed = not same(prime["body"], ref["body"], drop) or prime["status"] != ref["status"]
+    if not changed:
+        return ("ignored", "the input changed neither status nor body, so there is "
+                           "nothing for the cache to key on and nothing to poison with")
+    if probe["cache"]["state"] != "hit":
+        return ("inconclusive",
+                "the input changes the response, but the follow-up read was "
+                f"{probe['cache']['state']} ({probe['cache']['rests_on'] or 'no signal'}), "
+                "so whether the cache keyed it cannot be told from this pair")
+    if same(probe["body"], prime["body"], drop):
+        return ("unkeyed",
+                "the changed response was served from cache to a request that did not "
+                f"carry the input ({probe['cache']['rests_on']}), so the input is not "
+                "part of the key")
+    return ("keyed",
+            "the same key served the clean response on a cache hit "
+            f"({probe['cache']['rests_on']}), so the input went to a key of its own")
+
+
+def cmd_keys(ctx, a):
+    target = ctx.aim(a.url)
+    out = {"command": "keys", "url": a.url, "buster_param": ctx.buster_param,
+           "isolated": ctx.isolated, "cacheable": None, "inputs": [], "key_shape": []}
+
+    # Does this key cache at all? Everything below rests on this, so it is
+    # measured rather than assumed: two reads of one fresh key.
+    k0, tok0 = None, token()
+    k0 = ctx.key_for(target, tok0)
+    first = ctx.send("GET", k0, label="keys: cacheability, first read")
+    second = ctx.send("GET", k0, label="keys: cacheability, second read", ua=READER_UA)
+    out["cacheable"] = {
+        "key": k0, "first": first["cache"], "second": second["cache"],
+        "verdict": ("caches" if second["cache"]["state"] == "hit" else
+                    "no cache hit observed" if second["cache"]["confidence"] != "none"
+                    else "no cache signal at all"),
+        "rests_on": second["cache"]["rests_on"],
+        "traffic": [first["id"], second["id"]]}
+    cached = second["cache"]["state"] == "hit"
+    if not cached:
+        out["warning"] = ("this key never reported a hit, so every verdict below that "
+                          "would rest on hit/miss is `inconclusive` by construction. "
+                          "Reflection is still measurable and still reported.")
+
+    ref = ctx.send("GET", ctx.key_for(target, token()), label="keys: clean reference")
+
+    inputs = HEADER_INPUTS[:a.n]
+    for name, kind in inputs:
+        if a.only and name.lower() not in [x.lower() for x in a.only]:
+            continue
+        tok = token()
+        val = header_value(kind, tok)
+        key = ctx.key_for(target, token())
+        prime = ctx.send("GET", key, [(name, val)], label=f"keys: prime with {name}")
+        probe = ctx.send("GET", key, label=f"keys: read {name} key without it", ua=READER_UA)
+        verdict, why = classify(prime, probe, ref, val if kind != "ip" else "",
+                                 ctx.drop() + (tok,))
+        out["inputs"].append({
+            "kind": "header", "input": name, "value": val, "key": key,
+            "verdict": verdict, "why": why,
+            "signal_the_verdict_rests_on": probe["cache"]["rests_on"],
+            "signal_confidence": probe["cache"]["confidence"],
+            "cache_signals": {"prime": prime["cache"]["signals"],
+                              "read": probe["cache"]["signals"]},
+            "bodies": {"reference": digest(ref["body"], ctx.drop() + (tok,)),
+                       "prime": digest(prime["body"], ctx.drop() + (tok,)),
+                       "read": digest(probe["body"], ctx.drop() + (tok,))},
+            "traffic": [prime["id"], probe["id"]]})
+
+    for name in (a.param or param_names(target))[:a.n]:
+        tok = token()
+        key = ctx.key_for(with_param(target, name, inert(tok)), token())
+        clean = with_param(key, name, inert(token()))
+        prime = ctx.send("GET", key, label=f"keys: prime with ?{name}")
+        probe = ctx.send("GET", clean, label=f"keys: same key, other ?{name}", ua=READER_UA)
+        verdict, why = classify(prime, probe, ref, inert(tok), ctx.drop() + (tok,))
+        if verdict == "unkeyed-and-reflected":
+            why += ("; for a query parameter this is parameter cloaking territory — "
+                    "check whether the edge keys the first occurrence and the origin "
+                    "reads the last (`normdiff`)")
+        out["inputs"].append({
+            "kind": "parameter", "input": name, "value": inert(tok), "key": key,
+            "verdict": verdict, "why": why,
+            "signal_the_verdict_rests_on": probe["cache"]["rests_on"],
+            "signal_confidence": probe["cache"]["confidence"],
+            "cache_signals": {"prime": prime["cache"]["signals"],
+                              "read": probe["cache"]["signals"]},
+            "traffic": [prime["id"], probe["id"]]})
+
+    # The key's shape, which is a different question from the key's inputs.
+    path = target.partition("?")[0]
+    shapes = [("host-port", None, f"{ctx.hostheader.split(':')[0]}:1337"),
+              ("path-case", path.upper() if path.upper() != path else path + "/X", None),
+              ("trailing-slash", path.rstrip("/") + "/", None),
+              ("path-parameter", path + ";mythos=1", None),
+              ("trailing-newline", path + "%0a", None),
+              ("static-suffix", path.rstrip("/") + "/mythos.css", None)]
+    for label, newpath, newhost in shapes[:a.n]:
+        tok = token()
+        base = ctx.key_for(target, tok)
+        prime = ctx.send("GET", base, label=f"keys: shape baseline for {label}")
+        if newhost:
+            alt = ctx.send("GET", base, [("Host", newhost)], ua=READER_UA,
+                           label=f"keys: shape {label}")
+        else:
+            q = base.partition("?")[2]
+            alt = ctx.send("GET", newpath + (f"?{q}" if q else ""), ua=READER_UA,
+                           label=f"keys: shape {label}")
+        drop = ctx.drop() + (tok,)
+        if alt["cache"]["state"] == "hit" and same(alt["body"], prime["body"], drop):
+            verdict = "not in the key"
+            why = ("this variation hit the entry the baseline stored, so the cache "
+                   "treats the two as one key while the origin may not")
+        elif alt["status"] == prime["status"] and same(alt["body"], prime["body"], drop):
+            verdict = "in the key, same response"
+            why = ("a separate entry with the same content: the origin normalizes the "
+                   "difference away and the cache does not, which is the seed of both "
+                   "deception and key confusion")
+        elif alt["cache"]["confidence"] == "none":
+            verdict, why = "inconclusive", "no cache signal, so keyedness is unknown"
+        else:
+            verdict = "in the key, different response"
+            why = f"status {prime['status']} -> {alt['status']}, different body"
+        out["key_shape"].append({
+            "kind": "key-shape", "input": label,
+            "variant": newhost or newpath, "verdict": verdict, "why": why,
+            "signal_the_verdict_rests_on": alt["cache"]["rests_on"],
+            "signal_confidence": alt["cache"]["confidence"],
+            "traffic": [prime["id"], alt["id"]]})
+
+    hot = [i for i in out["inputs"] if i["verdict"] in ("unkeyed-and-reflected", "unkeyed")]
+    out["next"] = ([f"scripts/cache poison {a.url} --header '{i['input']}: AUTO'"
+                    for i in hot if i["kind"] == "header"]
+                   or ["no unkeyed input found; try `deception` and `normdiff`"])
+    out["requests_sent"] = ctx.sent
+    return out, (1 if hot else 0)
+
+
+# ----------------------------------------------------- 2. poison: the proof
+
+
+def cmd_poison(ctx, a):
+    target = ctx.aim(a.url)
+    if not a.header and not a.param:
+        raise Refusal("poison needs the unkeyed input `keys` found: "
+                      "--header 'X-Forwarded-Host: AUTO' or --param utm_x")
+    tok = token()
+    if a.header:
+        name, _, val = a.header.partition(":")
+        name, val = name.strip(), val.strip()
+        marker = host_marker(tok) if val in ("", "AUTO") else inert(val)
+        if val in ("", "AUTO"):
+            val = marker
+        else:
+            inert(val)
+        injected, extra = f"header {name}", [(name, val)]
+    else:
+        marker = inert(a.marker or tok)
+        injected, extra = f"parameter {a.param}", []
+
+    key = ctx.key_for(target, token())
+    if a.param:
+        key = with_param(key, a.param, marker)
+
+    out = {"command": "poison", "url": a.url, "injected": injected, "marker": marker,
+           "key": key, "isolated": ctx.isolated,
+           "isolation": ("a unique cache-buster parameter, so the only key touched is "
+                         "one no real client will ever request"
+                         if ctx.isolated else
+                         "NONE: --no-buster with --i-own-this-cache, so the bare key "
+                         "real users request was stored. Only ever on your own cache."),
+           "verdict": "inconclusive", "oracle": None, "cleanup": None}
+
+    prime = ctx.send("GET", key, extra, label=f"poison: prime {key} via {injected}")
+    reader = ctx.send("GET", key, ua=READER_UA,
+                      label="poison: second independent client reads the key")
+    out["prime"] = brief(prime)
+    out["reader"] = brief(reader)
+    where = found(marker, reader)
+
+    # The control-after-every-hit rule: a fresh key that was never primed. If
+    # the marker shows up there too, the target echoes it unconditionally and
+    # this is not a cache finding at all.
+    control = ctx.send("GET", ctx.key_for(target, token()), ua=READER_UA,
+                       label="poison: negative control, a key never primed")
+    out["negative_control"] = {**brief(control), "marker_present": bool(found(marker, control)),
+                               "why": "a key this run never primed must not carry the marker"}
+
+    if where and not carried(marker, reader):
+        if out["negative_control"]["marker_present"]:
+            out["verdict"] = "inconclusive"
+            out["oracle"] = ("the marker came back, BUT it came back on a key that was "
+                             "never primed too: the target reflects it unconditionally, "
+                             "so this is not the cache serving it")
+        else:
+            out["verdict"] = "candidate"
+            out["oracle"] = (
+                f"the marker {marker} appeared in the {where} of a response to a request "
+                f"that did not carry it, on the key {key}; the cache reported "
+                f"{reader['cache']['rests_on'] or 'nothing'}"
+                f"{'' if reader['cache']['state'] == 'hit' else ' — the content oracle stands on its own, but the hit/miss signal does not support it'}"
+                "; a key never primed stayed clean")
+    elif where:
+        out["oracle"] = ("the marker came back, but the reading request carried it "
+                         f"itself ({where}): that is the key reflecting its own query, "
+                         "not the cache serving something a client never sent")
+    else:
+        out["oracle"] = ("the marker did not come back to a second client, so nothing "
+                         "was stored under this key through that input")
+    out["signal_the_verdict_rests_on"] = reader["cache"]["rests_on"]
+    out["signal_confidence"] = reader["cache"]["confidence"]
+    out["cleanup"] = cleanup(ctx, key, marker, a, stored=bool(where))
+    out["replay"] = replay_block([prime["id"], reader["id"]], reader["id"], marker, a,
+                                 f"scripts/cache poison {a.url} --header "
+                                 f"'{injected.split()[-1]}: AUTO'" if a.header else
+                                 f"scripts/cache poison {a.url} --param {a.param}")
+    out["requests_sent"] = ctx.sent
+    return out, exit_for(out)
+
+
+def replay_block(order, read_id, marker, a, reproduce):
+    """What the validator does with this, and the one thing it cannot do.
+
+    Rule 3 destroys the entry this finding was proven on, so replaying the
+    recorded prime against the same key will NOT re-poison it: the cleanup
+    revalidation left a fresh, clean entry there, and a cache that honours the
+    revalidation answers the replayed prime from it without ever reaching the
+    origin. That tension is real and safety wins it. So the record is for
+    inspection and byte-level diffing, and reproduction is the same subcommand
+    on a new buster key — which is also what a triager will run."""
+    recorded = all(i is not None for i in order)
+    return {"order": order, "read_id": read_id, "marker": marker,
+            "inspect": [f"scripts/traffic show --dir {a.dir} {i}" for i in order]
+                       if recorded else None,
+            "reproduce": reproduce,
+            "expect": (f"in record {read_id} the response carries {marker!r} while its "
+                       "own request bytes do not"),
+            "why_not_a_straight_replay": (
+                "the entry was busted on purpose (rule 3), so the recorded key now holds "
+                "a clean, fresh response. Re-running the subcommand picks a new buster "
+                "key and proves it again; replaying the stored bytes shows what was sent "
+                "and what came back, which is what the byte diff is for."),
+            "note": None if recorded else
+                    "no --dir was given, so nothing was recorded. Re-run with "
+                    "--dir <engagement> before citing this as evidence."}
+
+
+def brief(r):
+    return {"traffic": r["id"], "status": r["status"], "cache": r["cache"],
+            "body_sha256_12": digest(r["body"]), "bytes": len(r["raw"]),
+            "error": r["error"]}
+
+
+def cleanup(ctx, key, marker, a, stored=True):
+    """Rule 3 and rule 4. Bust the entry, then prove it is gone.
+
+    A revalidation request is the least invasive eviction there is: it asks the
+    cache for a fresh copy of one key. If the entry survives every try, the
+    operator is left with collateral, and this block is what they disclose."""
+    if not stored:
+        return {"state": "nothing to clean up", "tries": 0,
+                "why": "no marker was served from this key, so no poisoned entry exists",
+                "key": key}
+    tries, reads = [], []
+    for i in range(max(1, a.cleanup_tries)):
+        bust = ctx.send("GET", key, Ctx.FRESH,
+                        label=f"cleanup: revalidate {key} (try {i + 1})")
+        check = ctx.send("GET", key, ua=READER_UA,
+                         label=f"cleanup: verify the marker is gone (try {i + 1})")
+        tries.append(bust["id"])
+        reads.append(brief(check))
+        if not found(marker, check):
+            return {"state": "verified", "tries": i + 1, "key": key,
+                    "bust_requests": tries, "verify_reads": reads,
+                    "why": ("the key was revalidated and a second client no longer gets "
+                            "the marker: whatever the key now serves is clean "
+                            f"(the verifying read reported "
+                            f"{check['cache']['rests_on'] or 'no cache signal'})")}
+    self_keyed = marker in key
+    return {"state": "FAILED", "tries": len(tries), "key": key,
+            "bust_requests": tries, "verify_reads": reads,
+            "self_keyed": self_keyed,
+            "collateral": (
+                ("the marker is part of the key itself, so the only client who can be "
+                 "served it is one who asks for that exact key — but an entry this run "
+                 "created is still there and could not be scrubbed. " if self_keyed else "")
+                + f"the entry for `{key}` still serves the marker {marker} after "
+                f"{len(tries)} revalidation attempts. THIS IS COLLATERAL YOU MUST "
+                "DISCLOSE: tell the programme the exact key, the marker, and that it "
+                "needs a purge. Do not poison anything else on this host until it is "
+                "cleared."),
+            "why": "the marker survived every bust attempt"}
+
+
+def exit_for(out):
+    c = (out.get("cleanup") or {}).get("state")
+    if c == "FAILED":
+        return 5
+    return 1 if out.get("verdict") == "candidate" else 0
+
+
+# ------------------------------------------------ 3. deception: private page
+
+# Each variant is a path the edge is likely to read as a static asset and the
+# origin is likely to route to the private page anyway. The delimiter forms are
+# the ones published for ASP.NET (`;`), Nginx/Node (`%0a`, `%0d`), Akamai and
+# Cloudflare (`%3f`, `%23`) and the dot-segment form.
+def deception_variants(path):
+    base = path.rstrip("/")
+    return [
+        ("suffix-segment", f"{base}/profile.css"),
+        ("suffix-extension", f"{base}.css"),
+        ("delimiter-semicolon", f"{base};.js"),
+        ("delimiter-newline", f"{base}%0a.js"),
+        ("delimiter-cr", f"{base}%0d.css"),
+        ("delimiter-question", f"{base}%3f.css"),
+        ("delimiter-hash", f"{base}%23.css"),
+        ("dot-segment-encoded", f"{base}/..%2fprofile.css"),
+        ("dot-segment-plain", f"{base}/../{base.strip('/')}/x.js"),
+    ]
+
+
+def pick_marker(owner, anon):
+    """A string the authenticated page has and the anonymous one does not.
+
+    The operator can name it with --marker; derived is a fallback, and the one
+    that was used is reported either way, because a marker nobody can restate
+    is not an oracle."""
+    anon_words = set(re.findall(r"[A-Za-z0-9_@.-]{8,64}", anon))
+    for w in re.findall(r"[A-Za-z0-9_@.-]{8,64}", owner):
+        if w not in anon_words and not re.fullmatch(r"[\d.]+", w):
+            return w
+    return None
+
+
+def cmd_deception(ctx, a):
+    target = ctx.aim(a.url)
+    owner = [tuple(h.split(":", 1)) for h in (a.owner_header or [])]
+    owner = [(k.strip(), v.strip()) for k, v in owner]
+    if not owner:
+        raise Refusal("deception needs the victim role's own credential: "
+                      "--owner-header 'Cookie: session=...'. The owner is you; never "
+                      "another user's session.")
+    path = target.partition("?")[0]
+    out = {"command": "deception", "url": a.url, "variants": [],
+           "isolated": ctx.isolated, "marker": None, "verdict": "inconclusive"}
+
+    as_owner = ctx.send("GET", ctx.key_for(path, token()), owner,
+                        label="deception: the private page as its owner")
+    as_anon = ctx.send("GET", ctx.key_for(path, token()), ua=READER_UA,
+                       label="deception: the same page anonymously")
+    marker = inert(a.marker) if a.marker else pick_marker(as_owner["body"], as_anon["body"])
+    out["baseline"] = {"owner": brief(as_owner), "anonymous": brief(as_anon)}
+    if not marker:
+        out["note"] = ("no string distinguishes the owner's copy from the anonymous one, "
+                       "so there is no oracle here. Name one with --marker, or pick a "
+                       "page that actually shows private data.")
+        out["requests_sent"] = ctx.sent
+        return out, 0
+    out["marker"] = marker
+    out["marker_source"] = "operator" if a.marker else "derived: owner-only token"
+
+    hits = 0
+    for label, variant in deception_variants(path)[:a.n]:
+        key = ctx.key_for(variant, token())
+        prime = ctx.send("GET", key, owner, label=f"deception: owner primes {label}")
+        reader = ctx.send("GET", key, ua=READER_UA,
+                          label=f"deception: anonymous reader on {label}")
+        where = found(marker, reader)
+        control = ctx.send("GET", ctx.key_for(variant, token()), ua=READER_UA,
+                           label=f"deception: control on an unprimed {label} key")
+        row = {"variant": label, "path": variant, "key": key,
+               "owner_status": prime["status"], "reader_status": reader["status"],
+               "owner_cache": prime["cache"], "reader_cache": reader["cache"],
+               "signal_the_verdict_rests_on": reader["cache"]["rests_on"],
+               "signal_confidence": reader["cache"]["confidence"],
+               "negative_control": {**brief(control),
+                                    "marker_present": bool(found(marker, control))},
+               "traffic": [prime["id"], reader["id"], control["id"]],
+               "replay": replay_block([prime["id"], reader["id"]], reader["id"], marker, a,
+                                      f"scripts/cache deception {a.url} "
+                                      f"--owner-header '{(a.owner_header or [''])[0]}'")}
+        if where and not carried(marker, reader) and not row["negative_control"]["marker_present"]:
+            row["verdict"] = "candidate"
+            row["oracle"] = (f"an anonymous client with no session was served the owner-only "
+                             f"marker {marker} in the {where} of {variant}; cache reported "
+                             f"{reader['cache']['rests_on'] or 'nothing'}")
+            hits += 1
+        elif where:
+            row["verdict"] = "inconclusive"
+            row["oracle"] = ("the marker came back, but an unprimed key carries it too, or "
+                             "the reader's own request contained it")
+        elif prime["status"] == 200 and reader["status"] in (401, 403, 302):
+            row["verdict"] = "not cached"
+            row["oracle"] = ("the origin served the private page under this path, but the "
+                             "edge did not store it: the path trick works and the cache "
+                             "rule does not")
+        else:
+            row["verdict"] = "no"
+            row["oracle"] = "the origin did not serve the private page under this path"
+        row["cleanup"] = cleanup(ctx, key, marker, a, stored=bool(where))
+        row["requests_after_cleanup"] = ctx.sent
+        out["variants"].append(row)
+
+    out["verdict"] = "candidate" if hits else "inconclusive"
+    failed = [v for v in out["variants"] if v["cleanup"]["state"] == "FAILED"]
+    out["cleanup_failures"] = [v["key"] for v in failed]
+    out["requests_sent"] = ctx.sent
+    return out, (5 if failed else 1 if hits else 0)
+
+
+# ------------------------------------------------------- 4. fatget: fat GET
+
+SAFE_OVERRIDES = ("POST", "GET", "HEAD", "OPTIONS")
+
+
+def cmd_fatget(ctx, a):
+    m = a.override_method.upper()
+    if m not in SAFE_OVERRIDES:
+        raise Refusal(
+            f"--override-method {m} is refused. An override to {m} is a write against "
+            "an endpoint whose behaviour you do not know yet, and this suite is "
+            f"non-destructive in every mode. Allowed: {', '.join(SAFE_OVERRIDES)}.")
+    target = ctx.aim(a.url)
+    body = (a.body or "").encode()
+    if len(body) > 4096:
+        raise Refusal("--body over 4 KiB: a fat GET is a framing experiment, not a upload")
+    out = {"command": "fatget", "url": a.url, "override_method": m,
+           "isolated": ctx.isolated, "variants": [], "verdict": "inconclusive"}
+
+    base = ctx.send("GET", ctx.key_for(target, token()),
+                    label="fatget: plain GET baseline")
+    out["baseline"] = {**brief(base), "note": "what a GET on this key normally answers"}
+
+    variants = [
+        ("body-only", [], body or b"_=1", {}),
+        ("x-http-method-override", [("X-HTTP-Method-Override", m)], b"", {}),
+        ("x-method-override", [("X-Method-Override", m)], b"", {}),
+        ("x-http-method", [("X-HTTP-Method", m)], b"", {}),
+        ("method-param", [], b"", {"param": f"_method={m}"}),
+        ("form-body-method", [("Content-Type", "application/x-www-form-urlencoded")],
+         f"_method={m}".encode(), {}),
+    ]
+    hits, failed = 0, []
+    for label, extra, payload, opt in variants[:a.n]:
+        key = ctx.key_for(target, token())
+        # The override may live in the query, and then it is part of what the
+        # edge keys. The prime carries it; the read never does, because a read
+        # that carried the override would prove nothing about the cache.
+        prime_target = key
+        if opt.get("param"):
+            k, _, v = opt["param"].partition("=")
+            prime_target = with_param(key, k, v)
+        prime = ctx.send("GET", prime_target, extra, payload,
+                         label=f"fatget: prime {label}")
+        reader = ctx.send("GET", key, ua=READER_UA,
+                          label=f"fatget: plain GET on the same key after {label}")
+        control = ctx.send("GET", ctx.key_for(target, token()), ua=READER_UA,
+                           label=f"fatget: control, an unprimed key for {label}")
+        row = {"variant": label, "key": key, "primed_target": prime_target,
+               "sent": {"headers": [list(h) for h in extra], "body_bytes": len(payload)},
+               "prime": brief(prime), "reader": brief(reader),
+               "negative_control": brief(control),
+               "signal_the_verdict_rests_on": reader["cache"]["rests_on"],
+               "signal_confidence": reader["cache"]["confidence"],
+               "traffic": [prime["id"], reader["id"], control["id"]],
+               "replay": replay_block([prime["id"], reader["id"]], reader["id"],
+                                      f"the {m} response", a,
+                                      f"scripts/cache fatget {a.url} "
+                                      f"--override-method {m}")}
+        drop = ctx.drop()
+        reached = (prime["status"] != base["status"]
+                   or not same(prime["body"], base["body"], drop))
+        served = (reader["status"] == prime["status"]
+                  and same(reader["body"], prime["body"], drop)
+                  and not same(reader["body"], control["body"], drop))
+        if reached and served:
+            row["verdict"] = "candidate"
+            row["oracle"] = (
+                f"the origin answered the overridden request with {prime['status']} "
+                f"(a plain GET gets {base['status']}), and a plain GET with no body and no "
+                f"override header was then served that same response from the key; an "
+                f"unprimed key still answers {control['status']}. Cache reported "
+                f"{reader['cache']['rests_on'] or 'nothing'}")
+            hits += 1
+        elif reached:
+            row["verdict"] = "inconclusive"
+            row["oracle"] = (f"the override reached the origin ({base['status']} -> "
+                             f"{prime['status']}), but the response was not served back to a "
+                             "plain GET on the same key, so the cache did not store it")
+        else:
+            row["verdict"] = "no"
+            row["oracle"] = "the origin answered exactly as it does for a plain GET"
+        row["cleanup"] = cleanup(ctx, key, "", a, stored=False) if not served else \
+            cleanup_body(ctx, key, prime, base, a)
+        if row["cleanup"]["state"] == "FAILED":
+            failed.append(key)
+        out["variants"].append(row)
+
+    out["verdict"] = "candidate" if hits else "inconclusive"
+    out["cleanup_failures"] = failed
+    out["requests_sent"] = ctx.sent
+    return out, (5 if failed else 1 if hits else 0)
+
+
+def cleanup_body(ctx, key, poisoned, base, a):
+    """Cleanup where the stored thing is a whole response rather than a marker:
+    the entry is gone when the key answers like a plain GET again."""
+    tries, reads = [], []
+    for i in range(max(1, a.cleanup_tries)):
+        bust = ctx.send("GET", key, Ctx.FRESH,
+                        label=f"cleanup: revalidate {key} (try {i + 1})")
+        check = ctx.send("GET", key, ua=READER_UA,
+                         label=f"cleanup: verify the key answers normally (try {i + 1})")
+        tries.append(bust["id"])
+        reads.append(brief(check))
+        if (check["status"] == base["status"]
+                and not same(check["body"], poisoned["body"], ctx.drop())):
+            return {"state": "verified", "tries": i + 1, "key": key,
+                    "bust_requests": tries, "verify_reads": reads,
+                    "why": f"the key answers {check['status']} again, as a plain GET does"}
+    return {"state": "FAILED", "tries": len(tries), "key": key,
+            "bust_requests": tries, "verify_reads": reads,
+            "collateral": (f"the entry for `{key}` still serves the overridden response "
+                           f"after {len(tries)} revalidation attempts. DISCLOSE THIS KEY "
+                           "to the programme and ask for a purge."),
+            "why": "the stored response survived every bust attempt"}
+
+
+# ------------------------------------------- 5. normdiff: edge versus origin
+
+
+def canon(target):
+    """What a framework in the origin's position resolves this target to.
+
+    One %-decode (the common case: a single decode pass), path parameters
+    dropped, dot segments resolved, duplicate slashes collapsed. This is a
+    hypothesis about the origin, not a claim about it, which is why it is
+    *tested* below by fetching it and comparing — and why a double-encoded
+    variant correctly fails to match on a tier that decodes only once."""
+    path, _, query = target.partition("?")
+    path = urllib.parse.unquote(path)
+    out = []
+    for seg in path.split("/"):
+        seg = seg.partition(";")[0]
+        if seg == ".":
+            continue
+        if seg == "..":
+            if out[1:]:
+                out.pop()
+            continue
+        out.append(seg)
+    path = re.sub(r"/{2,}", "/", "/".join(out)) or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path + (f"?{query}" if query else "")
+
+
+def normdiff_variants(path, tok):
+    """Byte-exact variants, each with the kind of oracle it can be judged by.
+
+    This is a normalization question and nothing else: the finding is always
+    "the edge and the origin disagree about what this request says", which is
+    the bug whether or not anything is blocked anywhere. There is no bypass
+    library here, nothing is scored by whether it got past a filter, and
+    detection evasion is not what any of these are for.
+
+      path     the oracle is the resolved path: does the edge store this target
+               while the origin answers for a different one
+      cloak    duplicate parameters: which occurrence the edge keys and which
+               the origin reads
+      fold     obs-fold: the header value the edge delivers is not the one that
+               was sent, which only the origin's own answer can show
+      framing  ambiguous framing accepted rather than rejected. A fact, never a
+               candidate here: the baseline/trigger pair belongs to `desync`
+    """
+    base = path.rstrip("/") or "/"
+    seg = base.strip("/").split("/")[-1] or "x"
+    return [
+        ("encoded-slash", "path", "GET", f"{base}%2f.%2f", [], b"", True),
+        ("encoded-dot-segment", "path", "GET", f"/static/..%2f{seg}", [], b"", True),
+        ("plain-dot-segment", "path", "GET", f"/static/../{seg}", [], b"", True),
+        ("double-encoded-dots", "path", "GET",
+         f"/static/%252e%252e%252f{seg}", [], b"", True),
+        ("double-slash", "path", "GET", "/" + base.lstrip("/").replace("/", "//", 1)
+         if "/" in base.lstrip("/") else f"//{base.lstrip('/')}", [], b"", True),
+        ("path-parameter", "path", "GET", f"{base};mythos={tok}", [], b"", True),
+        ("trailing-dot", "path", "GET", f"{base}.", [], b"", True),
+        ("semicolon-segment", "path", "GET", f"{base}/..;/{seg}", [], b"", True),
+        ("duplicate-parameter", "cloak", "GET",
+         f"{base}?mythos={tok}f&mythos={tok}l", [], b"", True),
+        ("header-folding", "fold", "GET", base,
+         [("X-Forwarded-Host", f"{tok}f.invalid\r\n\t{tok}l.invalid")], b"", True),
+        # Self-terminating chunked body, so nothing on either tier waits for
+        # bytes that are not coming. That is the line between a normalization
+        # question and a denial of service, and it is not crossed here.
+        ("content-length-and-transfer-encoding", "framing", "POST", base,
+         [("Content-Type", "text/plain"), ("Content-Length", "0"),
+          ("Transfer-Encoding", "chunked")], b"5\r\nhello\r\n0\r\n\r\n", False),
+        ("two-content-lengths", "framing", "POST", base,
+         [("Content-Type", "text/plain"), ("Content-Length", "5"),
+          ("Content-Length", "5")], b"hello", False),
+    ]
+
+
+def cmd_normdiff(ctx, a):
+    target = ctx.aim(a.url)
+    path = target.partition("?")[0]
+    tok = token()
+    out = {"command": "normdiff", "url": a.url, "origin": a.origin, "variants": [],
+           "verdict": "inconclusive",
+           "framing": ("every request below is written byte for byte on a fresh socket "
+                       "and recorded as a `kind: \"raw\"` traffic record, so nothing in "
+                       "this process re-frames the ambiguity that is the experiment")}
+
+    # The two reference reads are revalidations, so a reference is never a
+    # stale entry somebody else (or an earlier pass) left in the cache.
+    fresh = Ctx.FRESH
+    base = ctx.send("GET", path, fresh,
+                    label="normdiff: baseline for the plain path, revalidated")
+    out["baseline"] = brief(base)
+    octx = None
+    if a.origin:
+        octx = Ctx(a)
+        octx.aim(a.origin)
+        out["origin_baseline"] = brief(
+            octx.send("GET", path, fresh, label="normdiff: origin baseline"))
+
+    hits = 0
+    for label, kind, method, variant, extra, payload, auto in \
+            normdiff_variants(path, tok)[:a.n]:
+        edge = ctx.send(method, variant, extra, payload, auto_len=auto,
+                        label=f"normdiff: edge, {label}")
+        reread = ctx.send("GET", variant, ua=READER_UA,
+                          label=f"normdiff: edge re-read, {label}")
+        stored = reread["cache"]["state"] == "hit"
+        row = {"variant": label, "kind": kind, "method": method, "target": variant,
+               "request_bytes": len(edge["request"]), "stored_by_edge": stored,
+               "edge": brief(edge), "reread": brief(reread),
+               "traffic": [edge["id"], reread["id"]],
+               "signal_the_verdict_rests_on": reread["cache"]["rests_on"],
+               "signal_confidence": reread["cache"]["confidence"]}
+        # Masked out of every comparison below: the buster tokens, the probe
+        # token, and the request targets themselves — a page that echoes its own
+        # URL would otherwise never compare equal to anything.
+        drop = ctx.drop() + (tok, variant, canon(variant), path)
+
+        if octx:
+            o = octx.send(method, variant, extra, payload, auto_len=auto,
+                          label=f"normdiff: origin, {label}")
+            row["origin"] = brief(o)
+            row["traffic"].append(o["id"])
+            row["disagree"] = (o["status"] != edge["status"]
+                               or not same(o["body"], edge["body"], drop))
+
+        if kind == "path":
+            resolved = canon(variant)
+            row["resolved_path"] = resolved
+            if resolved == variant:
+                row["verdict"] = "no"
+                row["oracle"] = "nothing in this target needs resolving"
+                out["variants"].append(row)
+                continue
+            res = ctx.send("GET", resolved, fresh,
+                           label=f"normdiff: the resolved path, revalidated, {label}")
+            # The control: the same shape pointing at a path that does not
+            # exist. It must not answer like the variant, or the shape is being
+            # ignored rather than resolved.
+            ctrl_target = variant.replace(path.strip("/") or "x",
+                                          f"mythos-{tok}", 1) if path.strip("/") else variant
+            ctrl = ctx.send("GET", ctrl_target, fresh, ua=READER_UA,
+                            label=f"normdiff: control, {label} at a path that does not exist")
+            row["resolved"] = brief(res)
+            row["negative_control"] = {**brief(ctrl), "target": ctrl_target}
+            row["traffic"] += [res["id"], ctrl["id"]]
+            matches = (edge["status"] == res["status"]
+                       and same(edge["body"], res["body"], drop))
+            control_ok = (ctrl["status"] != edge["status"]
+                          or not same(ctrl["body"], edge["body"], drop))
+            if matches and control_ok and stored:
+                row["verdict"] = "candidate"
+                row["oracle"] = (
+                    f"the edge stored an entry under `{variant}` and the response is the "
+                    f"one for `{resolved}` (same status {res['status']}, same body with "
+                    f"the target string masked); the cache keyed a path the origin never "
+                    f"served. The same shape at a path that does not exist answers "
+                    + (f"{ctrl['status']} against {edge['status']}"
+                       if ctrl["status"] != edge["status"] else
+                       f"{ctrl['status']} with a different body")
+                    + ", so the shape is being resolved and this is not a catch-all "
+                      "route. Cache: "
+                    f"{reread['cache']['rests_on']}")
+                hits += 1
+            elif matches and control_ok:
+                row["verdict"] = "inconclusive"
+                row["oracle"] = (
+                    f"the origin resolved `{variant}` to `{resolved}`, which is the "
+                    "normalization gap, but the edge did not report storing it "
+                    f"({reread['cache']['rests_on'] or 'no signal'}), so no key was "
+                    "written under the unresolved form")
+            elif matches:
+                row["verdict"] = "inconclusive"
+                row["oracle"] = ("the variant and the resolved path answer alike, but so "
+                                 "does the same shape at a path that does not exist: this "
+                                 "target is not being resolved, it is being ignored")
+            else:
+                row["verdict"] = "no"
+                row["oracle"] = (f"the origin did not resolve `{variant}` to `{resolved}` "
+                                 f"({edge['status']} vs {res['status']})")
+
+        elif kind == "cloak":
+            first = f"{path}?mythos={tok}f"
+            read = ctx.send("GET", first, ua=READER_UA,
+                            label=f"normdiff: read only the first occurrence, {label}")
+            row["first_only"] = {**brief(read), "target": first}
+            row["traffic"].append(read["id"])
+            saw_last = f"{tok}l" in read["body"] and f"{tok}l" not in read["request"]
+            if saw_last and read["cache"]["state"] == "hit":
+                row["verdict"] = "candidate"
+                row["oracle"] = (
+                    f"`?mythos={tok}f` alone was served a cached response built from the "
+                    f"second occurrence ({tok}l), which its own request did not carry: the "
+                    f"edge keyed the first value and the origin read the last. Cache: "
+                    f"{read['cache']['rests_on']}")
+                hits += 1
+            elif saw_last:
+                row["verdict"] = "inconclusive"
+                row["oracle"] = ("the origin read the last occurrence, but the read of the "
+                                 "first alone was not reported as a hit, so the two keys "
+                                 "may simply be two keys")
+            else:
+                row["verdict"] = "no"
+                row["oracle"] = ("the two occurrences do not produce a response that "
+                                 "distinguishes which one the origin read")
+
+        elif kind == "fold":
+            folded = f"{tok}l.invalid"
+            if row.get("disagree"):
+                row["verdict"] = "candidate"
+                how = ("different status" if edge["status"] != row["origin"]["status"]
+                       else "the same status and a different body")
+                row["oracle"] = (
+                    f"the same folded header bytes gave {how}: edge {edge['status']} "
+                    f"{row['edge']['body_sha256_12']}, origin {row['origin']['status']} "
+                    f"{row['origin']['body_sha256_12']}. The two tiers do not agree on "
+                    "what an obs-fold continuation line means, so the header value one "
+                    "of them acts on is not the one the other saw")
+                hits += 1
+            elif folded in edge["body"]:
+                row["verdict"] = "inconclusive"
+                row["oracle"] = (
+                    "the continuation line reached the application as part of the header "
+                    "value, which is a folding difference worth reporting — but without "
+                    "the origin's own answer (--origin) it cannot be attributed to a tier")
+            else:
+                row["verdict"] = "no"
+                row["oracle"] = "the folded value is not observable in the response"
+
+        else:  # framing
+            row["verdict"] = "inconclusive"
+            row["oracle"] = (
+                f"the edge answered {edge['status']} rather than rejecting a message that "
+                "carries two contradictory framing headers"
+                + (f"; the origin answered {row['origin']['status']}" if octx else ""))
+            row["note"] = ("ambiguous framing accepted rather than rejected is a "
+                           "normalization fact, not a desync proof, and this script will "
+                           "not promote it: the baseline/trigger pair on a fresh "
+                           "connection belongs to `skills/desync` and the `raw` tool.")
+        out["variants"].append(row)
+
+    out["verdict"] = "candidate" if hits > 0 else "inconclusive"
+    out["requests_sent"] = ctx.sent + (octx.sent if octx else 0)
+    return out, (1 if hits > 0 else 0)
+
+
+# -------------------------------------------------------------- the printer
+
+
+def show(out):
+    """One screen a person reads. `--json` is what a validator reads."""
+    L = []
+    cmd = out["command"]
+    L.append(f"# cache {cmd}  {out['url']}")
+    if out.get("isolated") is False:
+        L.append("  !! --no-buster: the bare key real users request was touched")
+    if cmd == "keys":
+        c = out["cacheable"]
+        L.append(f"  cacheable: {c['verdict']}   rests on: {c['rests_on'] or '(nothing)'}")
+        if out.get("warning"):
+            L.append(f"  warning: {out['warning']}")
+        for row in out["inputs"] + out["key_shape"]:
+            L.append(f"  {row['verdict']:<24} {row['kind']:<10} {row['input']}")
+            L.append(f"      {row['why']}")
+            L.append(f"      signal: {row['signal_the_verdict_rests_on'] or '(none)'} "
+                     f"[{row['signal_confidence']}]   traffic {row['traffic']}")
+        for n in out["next"]:
+            L.append(f"  next: {n}")
+    elif cmd == "poison":
+        L.append(f"  injected {out['injected']} = {out['marker']}")
+        L.append(f"  key      {out['key']}")
+        L.append(f"  VERDICT  {out['verdict']}")
+        L.append(f"      {out['oracle']}")
+        L.append(f"  signal   {out['signal_the_verdict_rests_on'] or '(none)'} "
+                 f"[{out['signal_confidence']}]")
+        L.append(f"  control  unprimed key carried the marker: "
+                 f"{out['negative_control']['marker_present']}")
+        L += cleanup_lines(out["cleanup"])
+    elif cmd in ("deception", "fatget"):
+        if cmd == "deception":
+            L.append(f"  marker   {out.get('marker')} ({out.get('marker_source', '-')})")
+        for row in out["variants"]:
+            name = row.get("variant")
+            L.append(f"  {row['verdict']:<13} {name:<32} {row.get('path') or row.get('key')}")
+            L.append(f"      {row['oracle']}")
+            L.append(f"      signal: {row['signal_the_verdict_rests_on'] or '(none)'} "
+                     f"[{row['signal_confidence']}]   traffic {row['traffic']}")
+            L += ["    " + x for x in cleanup_lines(row["cleanup"])]
+        L.append(f"  VERDICT  {out['verdict']}")
+        if out.get("note"):
+            L.append(f"  note: {out['note']}")
+    elif cmd == "normdiff":
+        L.append(f"  {out['framing']}")
+        for row in out["variants"]:
+            L.append(f"  {row['verdict']:<13} {row['variant']:<36} "
+                     f"{row['method']} {row['target']}")
+            L.append(f"      {row['oracle']}")
+            if row.get("note"):
+                L.append(f"      note: {row['note']}")
+            L.append(f"      stored_by_edge={row['stored_by_edge']} traffic {row['traffic']}")
+        L.append(f"  VERDICT  {out['verdict']}")
+    L.append(f"  requests sent: {out.get('requests_sent')}")
+    L.append("  no verdict here is `confirmed`: the validate phase replays the recorded "
+             "bytes on a different model and decides that.")
+    return "\n".join(L)
+
+
+def cleanup_lines(c):
+    if not c:
+        return []
+    if c["state"] == "FAILED":
+        return ["  CLEANUP FAILED — COLLATERAL", "      " + c["collateral"]]
+    return [f"  cleanup  {c['state']} after {c['tries']} try(s): {c['why']}"]
+
+
+# ---------------------------------------------------------------- selftest
+
+
+def _lab():
+    """The lab fixture, imported rather than copied: one description of the bug."""
+    loader = importlib.machinery.SourceFileLoader(
+        "cachelab", str(ROOT / "lab" / "cachelab" / "cachelab.py"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    return m
+
+
+def _args(**kw):
+    base = dict(url="", json=False, timeout=5, insecure=False, rate=200.0,
+                max_requests=400, dir=None, buster_param="cb", no_buster=False,
+                i_own_this_cache=False, cleanup_tries=3, n=99, only=None, param=None,
+                header=None, marker=None, owner_header=None, override_method="POST",
+                body="", origin=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _selftest():
+    fails = []
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    # ---- offline: the safety rules are the rules, whatever the network says
+    for bad in ("<script>", 'a"b', "javascript:1", "a\r\nb", "ab", "x" * 65,
+                "http://x.test/", "a/b"):
+        try:
+            inert(bad)
+            fails.append(f"a non-inert marker was accepted: {bad!r}")
+        except Refusal:
+            pass
+    eq(inert("mythos-cache_1.2"), "mythos-cache_1.2", "an inert marker passes")
+    ok(host_marker("mabc").endswith(".invalid"), "a host marker is under .invalid")
+
+    c = Ctx(_args(no_buster=True))
+    try:
+        c.key_for("/x", "t")
+        fails.append("--no-buster poisoned a bare key with no --i-own-this-cache")
+    except Refusal as e:
+        ok("--i-own-this-cache" in str(e), "the refusal names the flag that would allow it")
+    eq(Ctx(_args()).key_for("/x", "tok"), "/x?cb=tok", "the default key is busted")
+    eq(Ctx(_args(no_buster=True, i_own_this_cache=True)).key_for("/x", "t"), "/x",
+       "the flag allows the bare key")
+
+    # ---- offline: the cache signal is read, and its worth is reported
+    eq(cache_view({"x-cache": "HIT"})["state"], "hit", "X-Cache HIT reads as a hit")
+    eq(cache_view({"x-cache": "HIT"})["confidence"], "explicit", "and as explicit")
+    eq(cache_view({"age": "7"})["state"], "hit", "Age>0 reads as a hit")
+    eq(cache_view({"age": "7"})["confidence"], "weak", "but only weakly")
+    eq(cache_view({"age": "0"})["state"], "unknown", "Age: 0 is not a hit")
+    eq(cache_view({"server": "nginx"})["state"], "unknown", "no signal, no state")
+    eq(cache_view({"server": "nginx"})["confidence"], "none", "and no confidence")
+    eq(cache_view({"cache-status": 'cdn; fwd=miss'})["state"], "miss", "RFC 9211 fwd=miss")
+    ok("age" in cache_view({"age": "3", "via": "1.1 v"})["signals"], "signals are carried")
+
+    eq(parse(b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nbody")["status"], 200, "status parsed")
+    eq(parse(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+             b"3\r\nabc\r\n0\r\n\r\n")["body"], "abc", "a chunked body is decoded")
+    ok(b"X-A: 1\r\nX-A: 2" in build("GET", "h", "/", [("X-A", "1"), ("X-A", "2")]),
+       "duplicate headers survive verbatim")
+    ok(b"GET /a%2f..%2fb HTTP/1.1" in build("GET", "h", "/a%2f..%2fb"),
+       "the request target is written exactly as given")
+    ok(b"Content-Length" not in build("GET", "h", "/", [("Transfer-Encoding", "chunked")]),
+       "a caller's own framing is not second-guessed")
+    eq(with_param("/a?x=1", "cb", "t"), "/a?x=1&cb=t", "the buster is appended")
+    ok(same("a  1763130000 b", "a 1763130001 b"), "an epoch is masked out of a compare")
+    ok(not same("a", "b"), "different bodies are different")
+
+    # ---- offline: the verdict table
+    def R(body, cache, request="GET / HTTP/1.1\r\n\r\n", status=200):
+        return {"body": body, "status": status, "cache": cache_view(cache),
+                "headers": [], "request": request}
+    ref = R("clean", {})
+    eq(classify(R("poisoned", {}), R("poisoned", {"x-cache": "HIT"}), ref, "", ())[0],
+       "unkeyed", "a changed body served back on a hit is unkeyed")
+    eq(classify(R("poisoned", {}), R("clean", {"x-cache": "HIT"}), ref, "", ())[0],
+       "keyed", "the clean body on a hit means the input was keyed")
+    eq(classify(R("poisoned", {}), R("poisoned", {}), ref, "", ())[0],
+       "inconclusive", "no hit signal, no keyedness verdict")
+    eq(classify(R("clean", {}), R("clean", {"x-cache": "HIT"}), ref, "", ())[0],
+       "ignored", "an input that changes nothing is ignored")
+    eq(classify(R("x", {}), R("mark.invalid here", {"x-cache": "HIT"}), ref,
+                "mark.invalid", ())[0],
+       "unkeyed-and-reflected", "the marker in an unprimed read is the strong verdict")
+    eq(classify(R("x", {}), R("mark.invalid", {"x-cache": "HIT"},
+                              request="GET /?q=mark.invalid HTTP/1.1\r\n\r\n"), ref,
+                "mark.invalid", ())[0],
+       "keyed", "a marker the read's own request carried is never the strong verdict")
+    eq(exit_for({"verdict": "candidate", "cleanup": {"state": "verified"}}), 1,
+       "a candidate exits 1")
+    eq(exit_for({"verdict": "candidate", "cleanup": {"state": "FAILED"}}), 5,
+       "a failed cleanup outranks the candidate")
+    eq(exit_for({"verdict": "inconclusive", "cleanup": {"state": "verified"}}), 0,
+       "nothing found exits 0")
+
+    try:
+        cmd_fatget(Ctx(_args()), _args(override_method="DELETE"))
+        fails.append("a destructive method override was accepted")
+    except Refusal as e:
+        ok("non-destructive" in str(e), "the refusal says why")
+
+    # ---- live: a loopback origin behind a caching proxy of our own
+    #
+    # The scope file is pinned to a temporary loopback-only one. Without that,
+    # whichever engagement scope happens to be newest on this machine decides
+    # whether the selftest can talk to its own fixture, and a check that depends
+    # on that is not a check.
+    lab = _lab()
+    edge, origin, stop = lab.start("127.0.0.1", 0, 0)
+    url = f"http://127.0.0.1:{edge[1]}/"
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    (tmp / "scope.yaml").write_text("in_scope:\n  - 127.0.0.1\nout_of_scope: []\n")
+    prev = os.environ.get("MYTHOS_SCOPE")
+    os.environ["MYTHOS_SCOPE"] = str(tmp / "scope.yaml")
+    try:
+        k = cmd_keys(Ctx(_args(url=url, n=4)), _args(url=url, n=4))[0]
+        eq(k["cacheable"]["verdict"], "caches", "the proxy reports a hit on a second read")
+        xfh = [i for i in k["inputs"] if i["input"] == "X-Forwarded-Host"]
+        eq(len(xfh), 1, "X-Forwarded-Host was tested")
+        eq(xfh[0]["verdict"], "unkeyed-and-reflected",
+           "an unkeyed reflected header is classified as such")
+        ok(xfh[0]["signal_the_verdict_rests_on"], "the verdict names the signal it rests on")
+        ok(any("poison" in n for n in k["next"]), "keys points at the next subcommand")
+
+        a = _args(url=url, header="X-Forwarded-Host: AUTO")
+        p, code = cmd_poison(Ctx(a), a)
+        eq(p["verdict"], "candidate", "the poisoning is proven to a second client")
+        ok(p["marker"] in p["oracle"], "the oracle names the marker")
+        eq(p["negative_control"]["marker_present"], False, "the unprimed key stayed clean")
+        eq(p["cleanup"]["state"], "verified", "the entry was busted and the bust verified")
+        eq(code, 1, "a candidate with a clean cleanup exits 1")
+        ok(p["verdict"] != "confirmed", "this script never writes `confirmed`")
+        ok("cb=" in p["key"], "the poisoned key was an isolated one")
+
+        acct = f"http://127.0.0.1:{edge[1]}/account"
+        d = _args(url=acct, owner_header=[f"Cookie: session={lab.SESSION}"], n=4)
+        dec, code = cmd_deception(Ctx(d), d)
+        eq(dec["verdict"], "candidate", "a private page cached under a static suffix")
+        ok(dec["marker"], "an owner-only marker was found")
+        wins = [v for v in dec["variants"] if v["verdict"] == "candidate"]
+        ok(wins, "at least one deception variant held")
+        ok(all(v["cleanup"]["state"] == "verified" for v in wins),
+           "every proven deception entry was cleaned up")
+        ok(all(not v["negative_control"]["marker_present"] for v in wins),
+           "an unprimed deception key never carried the marker")
+        eq(code, 1, "deception with a clean cleanup exits 1")
+
+        item = f"http://127.0.0.1:{edge[1]}/api/item"
+        f = _args(url=item, n=6)
+        fg, code = cmd_fatget(Ctx(f), f)
+        eq(fg["verdict"], "candidate", "a method override reached the POST handler")
+        got = {v["variant"] for v in fg["variants"] if v["verdict"] == "candidate"}
+        ok("x-http-method-override" in got, "the override header variant held")
+        ok(all(v["cleanup"]["state"] in ("verified", "nothing to clean up")
+               for v in fg["variants"]), "every fat-GET entry was cleaned up")
+        eq(code, 1, "fatget exits 1 on a candidate")
+
+        e = _args(url=f"http://127.0.0.1:{edge[1]}/echo", n=12,
+                  origin=f"http://127.0.0.1:{origin[1]}/echo")
+        nd, code = cmd_normdiff(Ctx(e), e)
+        ok(any(v["verdict"] == "candidate" for v in nd["variants"]),
+           "normdiff found a tier disagreement")
+        te = [v for v in nd["variants"]
+              if v["variant"] == "content-length-and-transfer-encoding"]
+        eq(te[0]["verdict"], "inconclusive",
+           "ambiguous framing alone is never a candidate here")
+        ok("desync" in te[0]["note"], "and it is handed to the skill that owns it")
+        ok(all(v["request_bytes"] > 0 for v in nd["variants"]),
+           "every normdiff variant recorded the bytes it wrote")
+
+        # The traffic record a validator replays.
+        ctx = Ctx(_args(url=url))
+        ctx.aim(url)
+        r = ctx.send("GET", "/?cb=rec", label="selftest record")
+        rec = ctx.records[-1]
+        eq(rec["kind"], "raw", "the record is a raw record")
+        eq(rec["tool"], "cache", "and names this tool")
+        ok(base64.b64decode(rec["req"]).startswith(b"GET /?cb=rec HTTP/1.1"),
+           "the record carries the bytes as written")
+        ok(base64.b64decode(rec["res"]).startswith(b"HTTP/1.1 200"),
+           "and the bytes as read back")
+        t = mod("traffic")
+        ok(t.raw_label(rec) == "selftest record", "scripts/traffic reads our label")
+        ok("RAW" not in t.byte_shape(base64.b64decode(rec["req"])),
+           "and its byte shape is computable from our record")
+        eq(r["cache"]["state"], "miss", "a fresh key is a miss")
+
+        # The request cap is a cap.
+        small = Ctx(_args(url=url, max_requests=2))
+        small.aim(url)
+        try:
+            for _ in range(5):
+                small.send("GET", "/?cb=cap")
+            fails.append("the request cap did not stop anything")
+        except Overspend as e:
+            ok("--max-requests" in str(e), "the cap says how to raise it deliberately")
+        eq(small.sent, 2, "and it stopped at the cap, not after it")
+
+        # A cleanup that cannot work must be loud. The fixture's `/account`
+        # entries are busted by a revalidation; a key whose own query carries
+        # the marker can never come back clean, which is what the FAILED branch
+        # is for, so run it against exactly that and require exit 5.
+        stuck = Ctx(_args(url=url, cleanup_tries=1))
+        stuck.aim(url)
+        mark = host_marker(token())
+        # /echo reflects the raw request target, so this key answers with the
+        # marker no matter how often it is revalidated.
+        bad = cleanup(stuck, with_param("/echo?cb=stuck", "q", mark), mark,
+                      _args(cleanup_tries=1), stored=True)
+        eq(bad["state"], "FAILED", "an entry that keeps answering with the marker FAILS")
+        ok("DISCLOSE" in bad["collateral"], "and the failure says what to disclose")
+        eq(exit_for({"verdict": "candidate", "cleanup": bad}), 5, "which is exit 5")
+    finally:
+        stop()
+        if prev is None:
+            os.environ.pop("MYTHOS_SCOPE", None)
+        else:
+            os.environ["MYTHOS_SCOPE"] = prev
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"cache selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# --------------------------------------------------------------------- cli
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="cache", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="same as the `selftest` subcommand")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p, buster=True):
+        p.add_argument("--json", action="store_true", help="what the validator reads")
+        p.add_argument("--timeout", type=float, default=10)
+        p.add_argument("--insecure", action="store_true", help="skip TLS verification")
+        p.add_argument("--rate", type=float, default=None,
+                       help="requests per second; default is rules.rate_limit_rps from "
+                            "$MYTHOS_SCOPE, else 5")
+        p.add_argument("--max-requests", type=int, default=150,
+                       help="hard cap on requests (default 150). Exceeding it exits 4; "
+                            "this is what keeps a pass away from anything that looks "
+                            "like a flood")
+        p.add_argument("--n", type=int, default=12,
+                       help="how many variants to try (default 12). Small on purpose")
+        p.add_argument("--dir", help="engagement directory: append every request and "
+                                     "response to <dir>/traffic/log.jsonl as a raw "
+                                     "record the validator replays")
+        if buster:
+            p.add_argument("--buster-param", default="cb",
+                           help="the cache-buster parameter that isolates the key "
+                                "(default cb)")
+            p.add_argument("--no-buster", action="store_true",
+                           help="store on the bare key real users request. Requires "
+                                "--i-own-this-cache")
+            p.add_argument("--i-own-this-cache", action="store_true",
+                           help="the cache is yours: your own lab, never a bug-bounty "
+                                "target. Without it --no-buster is refused")
+            p.add_argument("--cleanup-tries", type=int, default=3,
+                           help="revalidation attempts before the entry is declared "
+                                "collateral (default 3)")
+
+    k = sub.add_parser("keys", help="discover the cache key, one input at a time",
+                       description="Send a request on a busted key, then vary one input "
+                                   "at a time and classify each as keyed, "
+                                   "unkeyed-and-reflected, unkeyed, ignored or "
+                                   "inconclusive, naming the cache signal the verdict "
+                                   "rests on. Read-only apart from the entries it stores "
+                                   "on its own busted keys.")
+    k.add_argument("url")
+    k.add_argument("--only", action="append", help="test only this header name (repeatable)")
+    k.add_argument("--param", action="append",
+                   help="query parameter to test (repeatable; default: the ones in the URL)")
+    common(k)
+
+    p = sub.add_parser("poison", help="prove an unkeyed input is served to another client",
+                       description="Place an inert marker through an unkeyed input on an "
+                                   "isolated key, prove a second independent client was "
+                                   "served it, control on a key that was never primed, "
+                                   "then bust the entry and prove it is gone. A cleanup "
+                                   "that fails exits 5 and must be disclosed.")
+    p.add_argument("url")
+    p.add_argument("--header", help="'Name: value', or 'Name: AUTO' for a generated "
+                                    "inert host marker under .invalid")
+    p.add_argument("--param", help="query parameter to carry the marker instead")
+    p.add_argument("--marker", help="the inert marker: [A-Za-z0-9._-]{4,64} and nothing "
+                                    "else. Anything executable is refused")
+    common(p)
+
+    d = sub.add_parser("deception", help="cache a private page under a static-looking path",
+                       description="Cache a response that should be private under a path "
+                                   "the edge treats as static, with the owner's own "
+                                   "session as the victim role and an anonymous second "
+                                   "context as the reader. Owner means you.")
+    d.add_argument("url", help="the private page, e.g. https://app.test/account")
+    d.add_argument("--owner-header", action="append",
+                   help="the victim role's own credential, e.g. 'Cookie: session=...' "
+                        "(repeatable)")
+    d.add_argument("--marker", help="the owner-only string that is the oracle; derived "
+                                    "from the two baselines when absent")
+    common(d)
+
+    f = sub.add_parser("fatget", help="a GET that the origin handles as a POST",
+                       description="A GET carrying a body, a method-override header or a "
+                                   "`_method` parameter where the origin expects a POST, "
+                                   "and whether the edge stored the answer under the GET "
+                                   "key. An override to PUT, PATCH or DELETE is refused.")
+    f.add_argument("url")
+    f.add_argument("--override-method", default="POST",
+                   help=f"one of {', '.join(SAFE_OVERRIDES)} (default POST)")
+    f.add_argument("--body", default="", help="the GET's body, at most 4 KiB")
+    common(f)
+
+    n = sub.add_parser("normdiff", help="where edge and origin disagree",
+                       description="Path encoding, dot segments, duplicate parameters, "
+                                   "header folding and Content-Length/Transfer-Encoding "
+                                   "disagreement, each written byte-exact on a fresh "
+                                   "socket. The finding is always 'the two tiers "
+                                   "disagree', never a bypass: this is a normalization "
+                                   "question and not signature evasion.")
+    n.add_argument("url")
+    n.add_argument("--origin", help="the origin's own URL, if the engagement authorizes "
+                                    "reaching it by name; without it a difference cannot "
+                                    "be attributed to a tier")
+    common(n)
+
+    s = sub.add_parser("selftest", help="loopback origin + our own caching proxy")
+    s.add_argument("--json", action="store_true")
+    return ap
+
+
+HANDLERS = {"keys": cmd_keys, "poison": cmd_poison, "deception": cmd_deception,
+            "fatget": cmd_fatget, "normdiff": cmd_normdiff}
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    if a.selftest or a.cmd == "selftest":
+        return _selftest()
+    if not a.cmd:
+        build_parser().print_help()
+        return 2
+    try:
+        ctx = Ctx(a)
+        out, code = HANDLERS[a.cmd](ctx, a)
+    except Refusal as e:
+        print(f"cache: refusing: {e}", file=sys.stderr)
+        return 3
+    except Overspend as e:
+        print(f"cache: {e}", file=sys.stderr)
+        return 4
+    if a.json:
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(show(out))
+    if code == 5:
+        print("\ncache: CLEANUP FAILED. A cache entry you created is still being served. "
+              "Disclose the key above to the programme and ask for a purge.",
+              file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

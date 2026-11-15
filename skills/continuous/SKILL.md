@@ -10,6 +10,11 @@ the list `scripts/watch` produced: the few things that changed since the last
 engagement, and the stored proofs worth replaying. It is not a re-engagement.
 The proof standard does not relax because the run is small or unattended.
 
+Triage never selects this skill: it is not part of a run. A `scripts/watch`
+work list selects it, or the operator does. It drives `watch`, `findings`,
+`lessons` and `cvefeed`. Its entry in `skills/registry.yaml` carries no
+triggers for that reason.
+
 ## Hard rules
 
 - **Scope and authorization are fixed, not inherited from the last run.**

@@ -79,4 +79,11 @@ publish rights, monitor payment-page scripts (6.4.3, 11.6.1).
   SecurityWeek, Sonatype)
 - PCI DSS v4.0.1 (2024-06-11), requirements 6.4.3 and 11.6.1 (via vendor summaries, e.g. Report URI)
 - W3C Subresource Integrity (SRI) specification
-- Related: `subdomain-takeover.md`, `client-side-dom.md`, `headers-cors.md`
+- Related: `subdomain-takeover.md`, `client-side-dom.md`, `headers-cors.md`,
+  `sbom-known-cves.md` (the inventory half: which library versions are served, and
+  why a version-only CVE match is a candidate). SRI coverage and CSP script hosts
+  are reported mechanically by `scripts/sbom sri <url>`.
+- `dependency-confusion.md` is the other supply-chain family: the package *names* the
+  bundle, source maps and lockfiles leak, and the registry a build resolves them from.
+  The rule above — state that a name appears free and never claim it — is that note's
+  central rule too.
