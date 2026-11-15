@@ -1,0 +1,1684 @@
+#!/usr/bin/env python3
+"""Mythos supplychain — dependency confusion and typosquatting, from the web surface.
+
+A target tells you its dependency names whether it means to or not: a bundle
+keeps `node_modules/@acme-internal/telemetry` in its module ids, a published
+source map keeps the whole tree, a forgotten `/package-lock.json` keeps the
+registry each package was resolved from, and a `/.npmrc` keeps the internal
+registry URL and sometimes the token next to it. This script collects those
+names, separates the ones that look private from the ones that are obviously
+public, and then asks the public registries a single read-only question about
+each private-looking name: does a package of this name already exist there?
+
+  scripts/supplychain extract <url|path> ...    names, registry hosts and config
+                                                leaks the target itself emits
+  scripts/supplychain classify --from <json>    internal-looking vs public, with
+                                                the signal that decided each
+  scripts/supplychain claimable --from <json>   read-only existence lookup per
+                                                name on the public registries
+  scripts/supplychain typosquat <name> ...      the standard edit families, and
+                                                which neighbours already exist
+  scripts/supplychain amplifiers --from <json>  the four conditions that turn a
+                                                name into an actual attack path
+  scripts/supplychain selftest                  asserts, including one live
+                                                request against a loopback server
+
+THIS SCRIPT NEVER WRITES `confirmed`, AND NEVER CLAIMS A NAME.
+An internal name that resolves nowhere public is a `candidate`, with the
+evidence a validator re-reads. The proof that would make it `confirmed` is
+publishing a package under that name on a public registry — which is the attack
+itself, affects every machine that runs `npm install` anywhere in the world, and
+Mythos must never do it. `knowledge/web/dependency-confusion.md` says the same
+in more words. Any attempt to drive this script at a publish, register, reserve
+or unpublish action is refused in code, not left to judgement.
+
+WHICH THIRD PARTIES THIS CONTACTS. `extract` talks to the target only, and the
+scope file decides what that may be. `claimable` and `typosquat --check` talk to
+public registries, which are third-party infrastructure that `scope.yaml` has no
+business authorizing, so they are gated behind `--contact-registries` and send
+nothing but the package name:
+
+  npm            registry.npmjs.org
+  PyPI           pypi.org
+  Maven Central  search.maven.org
+  NuGet          api.nuget.org
+  RubyGems       rubygems.org
+  crates.io      crates.io
+
+No target host name, no engagement directory, no scope file content and no
+session ever goes to them; the User-Agent is fixed and carries no engagement
+data. `--registry-base <eco>=<url>` points an ecosystem at a different host
+(the lab's fake registry, or an internal mirror you are authorized to query),
+which is also how the lab exercises this path without touching npmjs.com.
+
+Exit codes: 0 ran and flagged nothing, 1 selftest failure, 2 usage,
+3 refused (out of scope, a write action, or registry contact not authorized),
+4 ran and at least one amplifier or claimable internal name was found.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-supplychain/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Registry hosts that serve the world. A name resolved from one of these is
+# public by construction; a name resolved from anything else is not.
+PUBLIC_REGISTRY_HOSTS = {
+    "registry.npmjs.org", "registry.yarnpkg.com", "npmjs.org", "npmjs.com",
+    "pypi.org", "files.pythonhosted.org", "pypi.python.org",
+    "repo.maven.apache.org", "repo1.maven.org", "search.maven.org",
+    "api.nuget.org", "nuget.org", "www.nuget.org",
+    "rubygems.org", "crates.io", "static.crates.io",
+    "packagist.org", "repo.packagist.org", "proxy.golang.org",
+    "unpkg.com", "cdn.jsdelivr.net", "esm.sh", "cdnjs.cloudflare.com",
+}
+# Hosts that are private-registry products. Seeing one is the strongest signal
+# in this whole file that a second, non-public namespace exists.
+PRIVATE_REGISTRY_MARKERS = (
+    "jfrog.io", "artifactory", "nexus", "pkgs.dev.azure.com", "_packaging",
+    "npm.pkg.github.com", "gitlab.com/api/v4", "codeartifact", "gemfury",
+    "cloudsmith.io", "packagecloud.io", "verdaccio", "registry.internal",
+)
+INTERNAL_WORDS = ("internal", "private", "corp", "corporate", "intranet",
+                  "inhouse", "in-house", "confidential", "restricted")
+
+# ----------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+class Refused(SystemExit):
+    """Exit 3: a boundary this script does not cross, whatever the flags say."""
+
+    def __init__(self, msg):
+        super().__init__(3)
+        self.msg = msg
+
+
+def require_in_scope(*items):
+    """Only for requests at the TARGET. Registries are handled separately.
+
+    A public registry is third-party infrastructure. Putting registry.npmjs.org
+    in an engagement's `scope.yaml` would be a lie about what the programme
+    authorized, so this script never checks registry URLs against the scope file
+    and never adds them to it. `--contact-registries` is the authorization for
+    those, and it is the operator's, not the scope file's.
+    """
+    sg = mod("scope-guard")
+    bad = []
+    for item in items:
+        if not item:
+            continue
+        probe = item if "//" in str(item) else f"https://{item}/"
+        bad += sg.check(probe)["offenders"]
+    if bad:
+        raise Refused(
+            "supplychain: refusing, out of scope: " + ", ".join(sorted(set(bad)))
+            + "\n  Add it to scope.yaml in an editor, outside the run, or point this "
+              "at a host already in scope.")
+
+
+def scope_rate(default=5.0):
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+class Pacer:
+    """One per destination class, so a slow registry limit never throttles the
+    target and a generous target limit never hammers npmjs.org."""
+
+    def __init__(self, rps):
+        self.gap = 1.0 / rps if rps and rps > 0 else 0.0
+        self.last = 0.0
+        self.sent = 0
+
+    def wait(self):
+        if self.gap > 0:
+            left = self.last + self.gap - time.monotonic()
+            if left > 0:
+                time.sleep(left)
+            self.last = time.monotonic()
+        self.sent += 1
+
+
+TARGET = Pacer(5.0)
+REGISTRY = Pacer(2.0)
+
+
+def _get(url, pacer, timeout=10, insecure=False, headers=None, limit=4_000_000):
+    """GET, and only ever GET. Both callers below go through here."""
+    pacer.wait()
+    req = urllib.request.Request(
+        url, method="GET", headers={"User-Agent": UA, **(headers or {})})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            raw = r.read(limit)
+            return {"status": r.status, "body": raw.decode("utf-8", "replace"),
+                    "headers": {k.lower(): v for k, v in r.headers.items()},
+                    "url": r.geturl(), "bytes": len(raw)}
+    except urllib.error.HTTPError as e:
+        raw = e.read(limit) if e.fp else b""
+        return {"status": e.code, "body": raw.decode("utf-8", "replace"),
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "url": url, "bytes": len(raw)}
+    except Exception as e:
+        return {"status": None, "body": f"{type(e).__name__}: {e}", "headers": {},
+                "url": url, "bytes": 0}
+
+
+def get_target(url, **kw):
+    require_in_scope(url)
+    return _get(url, TARGET, **kw)
+
+
+def get_registry(url, authorized, **kw):
+    if not authorized:
+        raise Refused(
+            "supplychain: a registry lookup is a request to a third party, so it needs "
+            "--contact-registries.\n  It sends the package name and nothing else; see "
+            "--help for the exact host list.")
+    return _get(url, REGISTRY, **kw)
+
+# ------------------------------------------------------- write-action refusal
+
+
+WRITE_ACTIONS = {"publish", "register", "reserve", "unpublish", "claim", "squat",
+                 "dist-tag", "deprecate", "owner", "yank", "upload"}
+
+
+def refuse_write_actions(argv):
+    """Mythos does not take a name. Not with a flag, not with a subcommand.
+
+    This is checked on the command line rather than relied upon by omission,
+    because "there is no publish subcommand" is a fact about today's file and
+    the refusal needs to be a fact about the tool. `claimable` is the read-only
+    question and is spelled differently on purpose.
+    """
+    for i, tok in enumerate(argv):
+        word = tok.lstrip("-").split("=")[0].lower()
+        if word in WRITE_ACTIONS and (i == 0 or tok.startswith("-")):
+            raise Refused(
+                f"supplychain: refusing '{tok}'. This script never publishes, registers, "
+                "reserves or unpublishes a package name.\n"
+                "  Claiming the name IS the attack: it executes code on every machine "
+                "that installs it, everywhere, not only the target's.\n"
+                "  The read-only question is `claimable`, and its answer is a candidate, "
+                "never a confirmation. Only a human, with the programme's written "
+                "agreement, may go further.")
+
+# ------------------------------------------------------------- name plumbing
+
+
+NAME_RE = r"(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*"
+NODE_MODULES_RE = re.compile(r"node_modules/(" + NAME_RE + r")")
+SPECIFIER_RE = re.compile(
+    r"""(?:require|import)\(\s*["'](""" + NAME_RE + r""")["']\s*\)"""
+    r"""|\bfrom\s*["'](""" + NAME_RE + r""")["']"""
+    r"""|\bimport\s*["'](""" + NAME_RE + r""")["']""")
+SOURCEMAP_RE = re.compile(r"""[#@]\s*sourceMappingURL\s*=\s*([^\s'"*]+)""")
+SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src\s*=\s*["']([^"']+)["']""", re.I)
+REGISTRY_LINE_RE = re.compile(
+    r"^\s*(?:(@[A-Za-z0-9._-]+)\s*:\s*)?(registry|index-url|extra-index-url|trusted-host|"
+    r"npmRegistryServer|npmPublishRegistry)\s*[=:]\s*(\S+)", re.I | re.M)
+EXTRA_INDEX_RE = re.compile(r"--(?:extra-)?index-url[= ]\s*(\S+)")
+VERSION_RANGE_RE = re.compile(r"^(?:[\^~]|>=?|<=?|\*|x$|latest$|\|\||\s*-\s*)")
+
+MANIFESTS = ["package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+             "bower.json", "composer.json", "composer.lock", "requirements.txt",
+             "Pipfile", "Pipfile.lock", "pyproject.toml", "pom.xml", "Gemfile",
+             "Gemfile.lock", "Cargo.toml", "go.mod", ".npmrc", ".yarnrc",
+             ".yarnrc.yml", "pip.conf", "nuget.config", "packages.config"]
+CONFIG_FILES = {".npmrc", ".yarnrc", ".yarnrc.yml", "pip.conf", "nuget.config"}
+
+
+def host_of(url):
+    try:
+        return (urllib.parse.urlsplit(url if "//" in url else "//" + url).hostname
+                or "").lower()
+    except ValueError:
+        return ""
+
+
+def registry_is_public(url):
+    h = host_of(url)
+    if not h:
+        return None
+    if h in PUBLIC_REGISTRY_HOSTS:
+        return True
+    low = url.lower()
+    if any(m in low for m in PRIVATE_REGISTRY_MARKERS):
+        return False
+    return False if h else None
+
+
+def scope_of(name):
+    return name.split("/")[0] if name.startswith("@") and "/" in name else None
+
+
+def org_label(target):
+    """The target's own organisation label, as the registrable name suggests it.
+
+    `shop.acme-internal.example` -> `acme-internal`. A scope that matches this is
+    the single best indicator that a package is the target's own, which is what
+    makes dependency confusion possible in the first place.
+    """
+    h = host_of(target)
+    if re.fullmatch(r"[0-9.]+|\[?[0-9a-f:]+\]?", h or ""):
+        return ""                      # an IP has no organisation label
+    parts = [p for p in h.split(".") if p]
+    if len(parts) < 2:
+        return parts[0] if parts else ""
+    skip = {"www", "app", "api", "shop", "static", "cdn", "assets", "web"}
+    labels = [p for p in parts[:-1] if p not in skip]
+    return labels[-1] if labels else parts[0]
+
+
+def version_tuple(v):
+    """Enough of a version compare for 'would a public release win this range'.
+
+    Not a semver implementation: numeric segments only, a pre-release suffix is
+    dropped. That is honest for the question asked (is the public one higher),
+    and anything finer belongs to the package manager, not to this script.
+    """
+    nums = re.findall(r"\d+", (v or "").split("+")[0].split("-")[0])
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+# ------------------------------------------------------------------- parsing
+
+
+def parse_json_manifest(text, origin, eco):
+    """package.json, bower.json, composer.json and their lock files."""
+    out, regs = [], []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out, regs
+    if not isinstance(data, dict):
+        return out, regs
+    for key in ("dependencies", "devDependencies", "peerDependencies",
+                "optionalDependencies", "require", "require-dev"):
+        block = data.get(key)
+        if not isinstance(block, dict):
+            continue
+        for name, spec in block.items():
+            if not isinstance(name, str) or name in ("php", "node"):
+                continue
+            if isinstance(spec, dict):              # package-lock v1 nesting
+                spec = spec.get("version") or ""
+            out.append({"name": name, "ecosystem": eco, "spec": str(spec),
+                        "origin": origin, "where": key})
+    # package-lock v2/v3: `packages` keyed by node_modules path, with `resolved`
+    pkgs = data.get("packages")
+    if isinstance(pkgs, dict):
+        for path, meta in pkgs.items():
+            if not isinstance(meta, dict) or not path:
+                continue
+            m = NODE_MODULES_RE.findall(path)
+            if not m:
+                continue
+            out.append({"name": m[-1], "ecosystem": eco,
+                        "spec": str(meta.get("version") or ""),
+                        "resolved": meta.get("resolved") or "",
+                        "origin": origin, "where": "packages"})
+    # package-lock v1: `dependencies` with `resolved`
+    deps = data.get("dependencies")
+    if isinstance(deps, dict):
+        for name, meta in deps.items():
+            if isinstance(meta, dict) and meta.get("resolved"):
+                out.append({"name": name, "ecosystem": eco,
+                            "spec": str(meta.get("version") or ""),
+                            "resolved": meta["resolved"], "origin": origin,
+                            "where": "dependencies.resolved"})
+    for name, url in (data.get("config") or {}).items() if isinstance(
+            data.get("config"), dict) else []:
+        if "registry" in str(name).lower():
+            regs.append({"url": str(url), "scope": None, "origin": origin,
+                         "key": str(name)})
+    return out, regs
+
+
+def parse_requirements(text, origin):
+    out, regs = [], []
+    for raw in text.splitlines():
+        line = raw.split("#")[0].strip()
+        if not line:
+            continue
+        for url in EXTRA_INDEX_RE.findall(line):
+            regs.append({"url": url, "scope": None, "origin": origin,
+                         "key": "index-url"})
+        if line.startswith("-"):
+            continue
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)$", line)
+        if m:
+            out.append({"name": m.group(1), "ecosystem": "pypi",
+                        "spec": m.group(2).split(";")[0].strip(), "origin": origin,
+                        "where": "requirements"})
+    return out, regs
+
+
+def parse_pom(text, origin):
+    out = []
+    for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
+        g = re.search(r"<groupId>\s*([^<]+?)\s*</groupId>", block)
+        a = re.search(r"<artifactId>\s*([^<]+?)\s*</artifactId>", block)
+        v = re.search(r"<version>\s*([^<]+?)\s*</version>", block)
+        if g and a:
+            out.append({"name": f"{g.group(1)}:{a.group(1)}", "ecosystem": "maven",
+                        "spec": v.group(1) if v else "", "origin": origin,
+                        "where": "dependency"})
+    regs = [{"url": u, "scope": None, "origin": origin, "key": "repository"}
+            for u in re.findall(r"<url>\s*(https?://[^<\s]+)\s*</url>", text)]
+    return out, regs
+
+
+def parse_lockfile_text(text, origin):
+    """yarn.lock, Gemfile.lock, Cargo.toml, composer.lock-as-text, go.mod.
+
+    Text rather than a per-format parser on purpose: what matters for this class
+    is the pair (name, the registry it was resolved from), and every one of these
+    formats puts a resolved URL on its own line.
+    """
+    out, regs = [], []
+    for url in re.findall(r"""(?:resolved|url|source)\s*[=:]?\s*["']?(https?://\S+?)["'#,\s]""",
+                          text + "\n"):
+        m = NODE_MODULES_RE.findall(url)
+        name = m[-1] if m else None
+        if not name:
+            m2 = re.search(r"/(?:@[^/]+/)?[^/]+/-/((?:@[^/]+/)?[^/]+)-\d", url)
+            name = m2.group(1) if m2 else None
+        if not name:
+            m3 = re.search(r"registry[^/]*/(" + NAME_RE + r")/-/", url)
+            name = m3.group(1) if m3 else None
+        if name:
+            out.append({"name": name, "ecosystem": "npm", "spec": "",
+                        "resolved": url, "origin": origin, "where": "resolved"})
+        else:
+            regs.append({"url": url, "scope": None, "origin": origin,
+                         "key": "resolved"})
+    for blk in re.findall(r'^\[\[package\]\](.*?)(?=^\[|\Z)', text, re.S | re.M):
+        n = re.search(r'^\s*name\s*=\s*"([^"]+)"', blk, re.M)
+        v = re.search(r'^\s*version\s*=\s*"([^"]+)"', blk, re.M)
+        if n:
+            out.append({"name": n.group(1), "ecosystem": "crates",
+                        "spec": v.group(1) if v else "", "origin": origin,
+                        "where": "Cargo.lock"})
+    return out, regs
+
+
+def parse_registry_config(text, origin):
+    """.npmrc, .yarnrc, .yarnrc.yml, pip.conf, nuget.config."""
+    regs, leaks = [], []
+    for scope, key, value in REGISTRY_LINE_RE.findall(text):
+        regs.append({"url": value.strip('"\''), "scope": scope or None,
+                     "origin": origin, "key": key.lower()})
+    for url in re.findall(r"""<add\s+key="[^"]*"\s+value="(https?://[^"]+)""", text):
+        regs.append({"url": url, "scope": None, "origin": origin, "key": "nuget-source"})
+    for m in re.finditer(r"(?im)^\s*[^#\s=]*?(_auth(?:Token)?|_password|password|"
+                         r"apikey|api_key|token)\s*[=:]\s*(\S+)", text):
+        leaks.append({"origin": origin, "key": m.group(1),
+                      "value_shape": shape(m.group(2))})
+    return regs, leaks
+
+
+def shape(secret):
+    """Never the secret itself. Its first and last four, per skills/client-side."""
+    s = secret.strip('"\'')
+    return s if len(s) <= 10 else f"{s[:4]}...{s[-4:]} ({len(s)} chars)"
+
+
+def parse_bundle(text, origin):
+    """A JS bundle or chunk: webpack module ids and bare import specifiers."""
+    out = []
+    seen = set()
+    for name in NODE_MODULES_RE.findall(text):
+        if name not in seen:
+            seen.add(name)
+            out.append({"name": name, "ecosystem": "npm", "spec": "",
+                        "origin": origin, "where": "node_modules path in bundle"})
+    for groups in SPECIFIER_RE.findall(text):
+        name = next((g for g in groups if g), "")
+        if not name or name in seen or "." not in name and "/" not in name and len(name) < 3:
+            continue
+        if name.startswith("@") and "/" not in name:
+            continue
+        seen.add(name)
+        out.append({"name": name, "ecosystem": "npm", "spec": "",
+                    "origin": origin, "where": "bare import specifier"})
+    return out
+
+
+def parse_sourcemap(text, origin):
+    out, seen = [], set()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+    for src in (data.get("sources") or []):
+        for name in NODE_MODULES_RE.findall(str(src)):
+            if name not in seen:
+                seen.add(name)
+                out.append({"name": name, "ecosystem": "npm", "spec": "",
+                            "origin": origin, "where": f"sourcemap sources ({src[:60]})"})
+    return out
+
+
+def parse_by_name(basename, text, origin):
+    """One dispatch table, used by both the HTTP and the local-tree path."""
+    base = basename.lower()
+    if base in ("package.json", "bower.json", "package-lock.json", "npm-shrinkwrap.json"):
+        pk, rg = parse_json_manifest(text, origin, "npm")
+        if base.endswith("lock.json") or base == "npm-shrinkwrap.json":
+            pk2, rg2 = parse_lockfile_text(text, origin)
+            pk += pk2
+            rg += rg2
+        return pk, rg, []
+    if base in ("composer.json", "composer.lock"):
+        pk, rg = parse_json_manifest(text, origin, "packagist")
+        pk2, rg2 = parse_lockfile_text(text, origin)
+        return pk + pk2, rg + rg2, []
+    if base in ("requirements.txt", "pipfile", "pipfile.lock", "pyproject.toml"):
+        return (*parse_requirements(text, origin), [])
+    if base == "pom.xml":
+        return (*parse_pom(text, origin), [])
+    if base in ("yarn.lock", "gemfile.lock", "cargo.toml", "cargo.lock", "go.mod",
+                "gemfile"):
+        return (*parse_lockfile_text(text, origin), [])
+    if base in CONFIG_FILES or base == "packages.config":
+        rg, leaks = parse_registry_config(text, origin)
+        return [], rg, leaks
+    return [], [], []
+
+# ------------------------------------------------------------------ classify
+
+
+def classify(packages, registries, org="", extra_scopes=(), extra_words=()):
+    """Internal-looking or public, with the signal that decided it.
+
+    Every signal below is something the target emitted. "It sounds internal" is
+    only ever one signal among several and never enough on its own to send a
+    name anywhere, which is why the signal list travels with the verdict.
+    """
+    scope_map = {r["scope"]: r for r in registries if r.get("scope")}
+    private_hosts = {host_of(r["url"]) for r in registries
+                     if r.get("url") and registry_is_public(r["url"]) is False}
+    words = tuple(INTERNAL_WORDS) + tuple(w.lower() for w in extra_words)
+    scopes = {s.lower() for s in extra_scopes}
+    out = []
+    for p in packages:
+        name, sig = p["name"], []
+        sc = scope_of(name)
+        low = name.lower()
+        if sc and sc.lower() in scopes:
+            sig.append(f"scope {sc} named internal by --internal-scope")
+        if sc and sc in scope_map:
+            r = scope_map[sc]
+            if registry_is_public(r["url"]) is False:
+                sig.append(f"scope {sc} is mapped to the non-public registry "
+                           f"{host_of(r['url'])} in {r['origin']}")
+        for w in words:
+            if re.search(r"(?:^|[@/._:-])" + re.escape(w) + r"(?:$|[/._:-])", low):
+                sig.append(f"name carries the non-public token '{w}'")
+                break
+        if org and len(org) > 2 and (
+                (sc and org in sc.lower()) or low.startswith(org + "-")
+                or low.startswith(org + ".") or low.startswith(org + "/")):
+            sig.append(f"name begins with the target's own org label '{org}'")
+        res = p.get("resolved") or ""
+        if res:
+            h = host_of(res)
+            if h in private_hosts or (h and registry_is_public(res) is False):
+                sig.append(f"resolved from the non-public registry {h} in {p['origin']}")
+        pub = [q for q in packages if q["name"] == name and q.get("resolved")
+               and registry_is_public(q["resolved"]) is True]
+        rec = dict(p)
+        rec["scope"] = sc
+        rec["internal"] = bool(sig)
+        rec["signals"] = sig
+        rec["public_resolution"] = bool(pub)
+        out.append(rec)
+    return out
+
+
+def merge(packages):
+    """One record per (name, ecosystem), evidence accumulated."""
+    by = {}
+    for p in packages:
+        key = (p["name"], p["ecosystem"])
+        rec = by.setdefault(key, {"name": p["name"], "ecosystem": p["ecosystem"],
+                                  "scope": scope_of(p["name"]),
+                                  "specs": [], "resolved": [], "evidence": []})
+        if p.get("spec") and p["spec"] not in rec["specs"]:
+            rec["specs"].append(p["spec"])
+        if p.get("resolved") and p["resolved"] not in rec["resolved"]:
+            rec["resolved"].append(p["resolved"])
+        ev = {"origin": p["origin"], "where": p["where"]}
+        if ev not in rec["evidence"]:
+            rec["evidence"].append(ev)
+    return list(by.values())
+
+# ------------------------------------------------------------------- extract
+
+
+def absolutize(base, ref):
+    return urllib.parse.urljoin(base, ref)
+
+
+def cmd_extract(a):
+    target = a.target
+    packages, registries, leaks, sources = [], [], [], []
+    local = pathlib.Path(target)
+    if local.exists():
+        files = [local] if local.is_file() else [p for p in local.rglob("*")
+                                                if p.is_file()][:5000]
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            origin = str(f)
+            pk, rg, lk = parse_by_name(f.name, text, origin)
+            if f.suffix in (".js", ".mjs", ".cjs"):
+                pk += parse_bundle(text, origin)
+            if f.suffix == ".map" or f.name.endswith(".js.map"):
+                pk += parse_sourcemap(text, origin)
+            if pk or rg or lk:
+                sources.append({"url": origin, "status": "file", "bytes": len(text)})
+            packages += pk
+            registries += rg
+            leaks += lk
+    else:
+        if not target.startswith("http"):
+            raise SystemExit(2)
+        page = get_target(target, timeout=a.timeout, insecure=a.insecure)
+        sources.append({"url": target, "status": page["status"], "kind": "html",
+                        "bytes": page["bytes"]})
+        scripts, host = [], host_of(target)
+        for ref in SCRIPT_SRC_RE.findall(page["body"]):
+            url = absolutize(target, ref)
+            if host_of(url) == host:
+                scripts.append(url)
+            else:
+                registries.append({"url": url, "scope": None, "origin": target,
+                                   "key": "cross-origin script host"})
+                for name in re.findall(r"/((?:@[^/@]+/)?[^/@]+)@\d", url):
+                    packages.append({"name": name, "ecosystem": "npm", "spec": "",
+                                     "resolved": url, "origin": target,
+                                     "where": "third-party CDN script URL"})
+        packages += parse_bundle(page["body"], target)
+        for url in scripts[:a.max_scripts]:
+            r = get_target(url, timeout=a.timeout, insecure=a.insecure)
+            sources.append({"url": url, "status": r["status"], "kind": "script",
+                            "bytes": r["bytes"]})
+            if r["status"] != 200:
+                continue
+            packages += parse_bundle(r["body"], url)
+            maps = SOURCEMAP_RE.findall(r["body"])
+            hdr = r["headers"].get("sourcemap") or r["headers"].get("x-sourcemap")
+            for ref in (maps + ([hdr] if hdr else []))[:2]:
+                if ref.startswith("data:"):
+                    continue
+                murl = absolutize(url, ref)
+                mr = get_target(murl, timeout=a.timeout, insecure=a.insecure)
+                sources.append({"url": murl, "status": mr["status"],
+                                "kind": "sourcemap", "bytes": mr["bytes"]})
+                if mr["status"] == 200:
+                    packages += parse_sourcemap(mr["body"], murl)
+        if not a.no_manifests:
+            for prefix in a.prefix:
+                for name in MANIFESTS:
+                    url = absolutize(target, prefix.rstrip("/") + "/" + name)
+                    r = get_target(url, timeout=a.timeout, insecure=a.insecure)
+                    looks_html = "<html" in r["body"][:400].lower()
+                    sources.append({"url": url, "status": r["status"],
+                                    "kind": "manifest", "bytes": r["bytes"]})
+                    if r["status"] != 200 or looks_html:
+                        continue
+                    pk, rg, lk = parse_by_name(name, r["body"], url)
+                    packages += pk
+                    registries += rg
+                    leaks += lk
+                    if name in CONFIG_FILES:
+                        leaks.append({"origin": url, "key": "reachable config file",
+                                      "value_shape": f"{r['bytes']} bytes served at "
+                                                      f"{urllib.parse.urlsplit(url).path}"})
+
+    org = a.org if a.org is not None else (
+        org_label(target) if target.startswith("http") else "")
+    classified = classify(packages, registries, org, a.internal_scope, a.internal_word)
+    records = merge(classified)
+    internal_names = {(p["name"], p["ecosystem"]) for p in classified if p["internal"]}
+    for r in records:
+        own = [p for p in classified if p["name"] == r["name"]
+               and p["ecosystem"] == r["ecosystem"]]
+        r["internal"] = (r["name"], r["ecosystem"]) in internal_names
+        r["signals"] = sorted({s for p in own for s in p["signals"]})
+        r["public_resolution"] = any(p["public_resolution"] for p in own)
+    regs = []
+    for g in registries:
+        key = (g.get("url"), g.get("scope"), g.get("key"))
+        if key in {(x.get("url"), x.get("scope"), x.get("key")) for x in regs}:
+            continue
+        g = dict(g)
+        g["host"] = host_of(g.get("url") or "")
+        g["public"] = registry_is_public(g.get("url") or "")
+        regs.append(g)
+    res = {"subcommand": "extract", "target": target, "org_label": org,
+           "sources": [s for s in sources if s.get("status") in (200, "file")
+                       or a.verbose],
+           "packages": sorted(records, key=lambda r: (not r["internal"], r["name"])),
+           "registries": regs, "leaks": leaks,
+           "counts": {"packages": len(records),
+                      "internal": sum(1 for r in records if r["internal"]),
+                      "registries": len(regs), "leaks": len(leaks),
+                      "requests": TARGET.sent}}
+    res["next"] = [
+        "scripts/supplychain claimable --from <this json> --contact-registries",
+        "scripts/supplychain amplifiers --from <this json>",
+    ]
+    res["exit"] = 4 if res["counts"]["internal"] or leaks else 0
+    return res
+
+# ------------------------------------------------------------------ claimable
+
+
+def registry_endpoints(bases=None):
+    """base + path template per ecosystem. Existence only, never credentials."""
+    b = dict({"npm": "https://registry.npmjs.org",
+              "pypi": "https://pypi.org",
+              "maven": "https://search.maven.org",
+              "nuget": "https://api.nuget.org",
+              "rubygems": "https://rubygems.org",
+              "crates": "https://crates.io"}, **(bases or {}))
+    return b
+
+
+def registry_url(eco, name, bases):
+    base = registry_endpoints(bases).get(eco)
+    if not base:
+        return None
+    base = base.rstrip("/")
+    if eco == "npm":
+        return f"{base}/{urllib.parse.quote(name, safe='')}"
+    if eco == "pypi":
+        return f"{base}/pypi/{urllib.parse.quote(name, safe='')}/json"
+    if eco == "maven":
+        if ":" not in name:
+            return None
+        g, art = name.split(":", 1)
+        q = urllib.parse.quote(f'g:"{g}" AND a:"{art}"', safe=":")
+        return f"{base}/solrsearch/select?q={q}&rows=1&wt=json"
+    if eco == "nuget":
+        return f"{base}/v3/registration5-semver1/{urllib.parse.quote(name.lower())}/index.json"
+    if eco == "rubygems":
+        return f"{base}/api/v1/gems/{urllib.parse.quote(name)}.json"
+    if eco == "crates":
+        return f"{base}/api/v1/crates/{urllib.parse.quote(name)}"
+    return None
+
+
+def read_registry_answer(eco, body, status):
+    """exists / owner / latest, or an honest None when the answer is unreadable."""
+    exists, owner, latest = None, None, None
+    if status == 404:
+        return False, None, None
+    if status != 200:
+        return None, None, None
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None, None, None
+    if eco == "npm":
+        exists = bool(data.get("name") or data.get("versions"))
+        owner = ", ".join(m.get("name", "") for m in (data.get("maintainers") or [])
+                          if isinstance(m, dict)) or None
+        latest = ((data.get("dist-tags") or {}).get("latest")
+                  or max((data.get("versions") or {}), key=version_tuple, default=None))
+    elif eco == "pypi":
+        info = data.get("info") or {}
+        exists = bool(info)
+        owner = info.get("author") or info.get("maintainer") or None
+        latest = info.get("version")
+    elif eco == "maven":
+        docs = ((data.get("response") or {}).get("docs") or [])
+        exists = bool(docs)
+        owner = docs[0].get("g") if docs else None
+        latest = docs[0].get("latestVersion") if docs else None
+    elif eco == "nuget":
+        exists = bool(data.get("items") or data.get("count"))
+        latest = (data.get("items") or [{}])[-1].get("upper") if data.get("items") else None
+    elif eco == "rubygems":
+        exists = bool(data.get("name"))
+        owner = ", ".join(data.get("authors", "").split(",")[:3]) or None
+        latest = data.get("version")
+    elif eco == "crates":
+        crate = data.get("crate") or {}
+        exists = bool(crate)
+        latest = crate.get("max_version")
+        owner = crate.get("homepage") or None
+    return exists, owner, latest
+
+
+def lookup(eco, name, bases, authorized, timeout=10, insecure=False):
+    url = registry_url(eco, name, bases)
+    if not url:
+        return {"name": name, "ecosystem": eco, "status": None, "exists": None,
+                "note": f"no read-only existence endpoint known for ecosystem '{eco}'"}
+    r = get_registry(url, authorized, timeout=timeout, insecure=insecure)
+    exists, owner, latest = read_registry_answer(eco, r["body"], r["status"])
+    return {"name": name, "ecosystem": eco, "url": url, "status": r["status"],
+            "exists": exists, "owner": owner, "latest_version": latest}
+
+
+def claim_verdict(rec, internal):
+    """`candidate` or nothing. The word `confirmed` is not reachable from here."""
+    if rec.get("note"):
+        return "skipped", rec["note"]
+    if rec["exists"] is None:
+        return "unknown", ("the registry did not answer readably, so nothing is claimed "
+                           "either way")
+    if not internal:
+        if rec["exists"]:
+            return "public", "a public package of this name exists; not a confusion target"
+        return "tested", ("no public package of this name, but nothing marked it as the "
+                          "target's own either")
+    if rec["exists"]:
+        return "tested", ("the name is already taken on the public registry, so the "
+                          f"confusion window is closed (owner: {rec.get('owner') or 'unknown'})")
+    return "candidate", (
+        "an internal-looking name with no package of that name on the public registry: "
+        "a package manager configured to fall back here would install whatever is "
+        "published under it. Proving it would mean publishing that package, which Mythos "
+        "never does; a human with the programme's written agreement decides.")
+
+
+def cmd_claimable(a):
+    bases = dict(kv.split("=", 1) for kv in a.registry_base)
+    items = []
+    if a.from_json:
+        data = json.loads(pathlib.Path(a.from_json).read_text(encoding="utf-8"))
+        for p in data.get("packages") or []:
+            if p.get("internal") or a.all:
+                items.append((p["ecosystem"], p["name"], True if p.get("internal") else False,
+                              p))
+    for n in a.name:
+        eco, _, nm = n.partition(":") if n.count(":") == 1 and n.split(":")[0] in \
+            registry_endpoints() else ("", "", n)
+        items.append((eco or a.ecosystem, nm, True, {}))
+    if not items:
+        raise SystemExit(2)
+    results = []
+    for eco, name, internal, src in items[:a.limit]:
+        rec = lookup(eco, name, bases, a.contact_registries, a.timeout, a.insecure)
+        state, why = claim_verdict(rec, internal)
+        rec.update({"internal": internal, "state": state, "why": why,
+                    "evidence": src.get("evidence") or [],
+                    "signals": src.get("signals") or []})
+        results.append(rec)
+    res = {"subcommand": "claimable", "results": results,
+           "counts": {"checked": len(results),
+                      "candidates": sum(1 for r in results if r["state"] == "candidate"),
+                      "requests": REGISTRY.sent},
+           "notes": ["No name was claimed, reserved or published. `claimable` is a GET.",
+                     "A candidate here is evidence for the validate phase, not a finding."]}
+    res["exit"] = 4 if res["counts"]["candidates"] else 0
+    return res
+
+# ------------------------------------------------------------------ typosquat
+
+
+HOMOGLYPHS = {"l": ["1", "i"], "i": ["1", "l"], "o": ["0"], "0": ["o"],
+              "1": ["l", "i"], "e": ["3"], "a": ["4"], "s": ["5"], "m": ["rn"],
+              "b": ["6"], "g": ["q"], "n": ["m"]}
+SEPARATORS = ["-", "_", "."]
+
+
+def neighbours(name):
+    """The standard edit families, each labelled with the family it came from.
+
+    Labelled because the families are not equally interesting: a transposition
+    of a popular package is a classic squat, while a separator swap is often a
+    legitimate alias the same author also owns.
+    """
+    scope, _, bare = name.rpartition("/") if name.startswith("@") and "/" in name \
+        else ("", "", name)
+    out = {}
+
+    def add(cand, family):
+        if cand and cand != name and cand not in out:
+            out[cand] = family
+
+    def rejoin(b):
+        return f"{scope}/{b}" if scope else b
+
+    # Separators first: dropping a hyphen is also an omission, and "separator
+    # drop" is the family a reader needs, so it has to claim the name first.
+    for i, ch in enumerate(bare):
+        if ch in SEPARATORS:
+            for s in SEPARATORS:
+                if s != ch:
+                    add(rejoin(bare[:i] + s + bare[i + 1:]), "separator swap")
+            add(rejoin(bare[:i] + bare[i + 1:]), "separator drop")
+    for i in range(len(bare)):
+        add(rejoin(bare[:i] + bare[i + 1:]), "omission")
+        add(rejoin(bare[:i] + bare[i] * 2 + bare[i + 1:]), "repetition")
+        for g in HOMOGLYPHS.get(bare[i], []):
+            add(rejoin(bare[:i] + g + bare[i + 1:]), "homoglyph")
+    for i in range(len(bare) - 1):
+        add(rejoin(bare[:i] + bare[i + 1] + bare[i] + bare[i + 2:]), "transposition")
+    if scope:
+        add(bare, "scope drop")
+        add(f"{scope.lstrip('@')}-{bare}", "scope flattened to a prefix")
+        add(f"{scope.lstrip('@')}.{bare}", "scope flattened to a prefix")
+    return [{"name": n, "family": f} for n, f in sorted(out.items())]
+
+
+def cmd_typosquat(a):
+    bases = dict(kv.split("=", 1) for kv in a.registry_base)
+    out = []
+    for name in a.name:
+        cands = neighbours(name)[:a.limit]
+        if a.check:
+            for c in cands:
+                rec = lookup(a.ecosystem, c["name"], bases, a.contact_registries,
+                             a.timeout, a.insecure)
+                c.update({"exists": rec["exists"], "owner": rec.get("owner"),
+                          "latest_version": rec.get("latest_version"),
+                          "status": rec["status"]})
+        taken = [c for c in cands if c.get("exists")]
+        out.append({"name": name, "ecosystem": a.ecosystem,
+                    "neighbours": cands, "existing": len(taken),
+                    "note": ("A neighbour that exists is worth reading, not reporting: "
+                             "the same author often owns their own aliases. A neighbour "
+                             "owned by someone else, published recently, with the "
+                             "victim's name in its description, is the squat.")
+                    if a.check else
+                    "Add --check --contact-registries to see which of these exist."})
+    res = {"subcommand": "typosquat", "results": out,
+           "counts": {"names": len(out),
+                      "neighbours": sum(len(r["neighbours"]) for r in out),
+                      "requests": REGISTRY.sent}}
+    res["exit"] = 0
+    return res
+
+# ----------------------------------------------------------------- amplifiers
+
+
+def amplifiers(data, claims=None):
+    """The four conditions that turn a leaked name into an attack path.
+
+    A private name on its own is trivia. It becomes a path when the installer
+    would actually reach a public registry for it, which is what each of these
+    four describes.
+    """
+    out = []
+    claims = {(c["name"], c["ecosystem"]): c for c in (claims or {}).get("results", [])}
+    pkgs = data.get("packages") or []
+    regs = data.get("registries") or []
+    pub_cfg = [r for r in regs if r.get("public") is True and
+               r.get("key") in ("registry", "index-url", "extra-index-url", "nuget-source")]
+    priv_cfg = [r for r in regs if r.get("public") is False and
+                r.get("key") in ("registry", "index-url", "extra-index-url",
+                                 "npmregistryserver", "nuget-source")]
+    for p in pkgs:
+        if not p.get("internal"):
+            continue
+        c = claims.get((p["name"], p["ecosystem"]))
+        if c and c.get("exists") is False:
+            out.append({"kind": "unclaimed_internal_name", "name": p["name"],
+                        "ecosystem": p["ecosystem"], "state": "candidate",
+                        "evidence": p.get("evidence"), "signals": p.get("signals"),
+                        "detail": f"no package named {p['name']} exists on the public "
+                                  f"{p['ecosystem']} registry ({c.get('url')} -> "
+                                  f"{c.get('status')})",
+                        "proof_that_is_refused": "publishing the name"})
+        elif not c:
+            out.append({"kind": "internal_name_unchecked", "name": p["name"],
+                        "ecosystem": p["ecosystem"], "state": "tested",
+                        "evidence": p.get("evidence"), "signals": p.get("signals"),
+                        "detail": "internal-looking name, public registry not asked yet; "
+                                  "run `claimable --contact-registries`"})
+        for res in p.get("resolved") or []:
+            if registry_is_public(res) is True and p.get("scope"):
+                out.append({"kind": "private_scope_from_public_registry",
+                            "name": p["name"], "ecosystem": p["ecosystem"],
+                            "state": "candidate", "detail":
+                                f"the lockfile resolved the private-looking scope "
+                                f"{p['scope']} from {host_of(res)}: {res}",
+                            "evidence": p.get("evidence")})
+        for spec in p.get("specs") or []:
+            if not spec or not VERSION_RANGE_RE.match(spec):
+                continue
+            pub_latest = (c or {}).get("latest_version")
+            pinned = [v for v in p.get("specs") if re.match(r"^\d", v or "")]
+            worse = (pub_latest and pinned
+                     and version_tuple(pub_latest) > max(version_tuple(v) for v in pinned))
+            out.append({"kind": "range_a_higher_public_version_would_win",
+                        "name": p["name"], "ecosystem": p["ecosystem"],
+                        "state": "candidate" if worse else "tested",
+                        "detail": f"the dependency is declared as the range '{spec}', so "
+                                  f"the installer takes the highest version it can see"
+                                  + (f"; the public registry already offers {pub_latest} "
+                                     f"against the installed {pinned}" if worse else
+                                     "; no higher public version was observed"),
+                        "evidence": p.get("evidence")})
+            break
+    if pub_cfg and priv_cfg:
+        out.append({"kind": "mixed_registry_config", "state": "candidate",
+                    "name": None, "ecosystem": None,
+                    "detail": "the reachable configuration names both a public registry ("
+                              + ", ".join(sorted({r["host"] for r in pub_cfg}))
+                              + ") and a non-public one ("
+                              + ", ".join(sorted({r["host"] for r in priv_cfg}))
+                              + "): a name missing from the private one falls through to "
+                                "the public one",
+                    "evidence": [{"origin": r["origin"], "where": r["key"]}
+                                 for r in pub_cfg + priv_cfg]})
+    for r in priv_cfg:
+        if not r.get("scope"):
+            out.append({"kind": "private_registry_without_scope_binding",
+                        "state": "candidate", "name": None, "ecosystem": None,
+                        "detail": f"{r['host']} is configured as a registry in "
+                                  f"{r['origin']} with no scope binding, so which "
+                                  f"registry serves a given name depends on lookup order",
+                        "evidence": [{"origin": r["origin"], "where": r["key"]}]})
+    for lk in data.get("leaks") or []:
+        out.append({"kind": "registry_credential_or_config_reachable",
+                    "state": "candidate", "name": None, "ecosystem": None,
+                    "detail": f"{lk['origin']} exposes {lk['key']} = {lk['value_shape']}",
+                    "evidence": [{"origin": lk["origin"], "where": lk["key"]}],
+                    "note": "reported as exposed, never used: no authentication attempt "
+                            "is made against the registry with it"})
+    return out
+
+
+def cmd_amplifiers(a):
+    data = json.loads(pathlib.Path(a.from_json).read_text(encoding="utf-8"))
+    claims = (json.loads(pathlib.Path(a.claims).read_text(encoding="utf-8"))
+              if a.claims else None)
+    found = amplifiers(data, claims)
+    cand = [f for f in found if f["state"] == "candidate"]
+    res = {"subcommand": "amplifiers", "target": data.get("target"),
+           "amplifiers": found,
+           "counts": {"total": len(found), "candidates": len(cand)},
+           "notes": [
+               "Every state here is `candidate` or `tested`. This script cannot write "
+               "`confirmed`: the validate phase re-reads the evidence, and for this class "
+               "the only remaining proof is claiming the name, which Mythos refuses.",
+               "Write each candidate to candidates/<id>.md with the origin URL and the "
+               "exact line, per AGENTS.md."]}
+    res["exit"] = 4 if cand else 0
+    return res
+
+# --------------------------------------------------------------------- render
+
+
+def render(res):
+    out = [f"# supplychain {res['subcommand']}"]
+    if res["subcommand"] == "extract":
+        out += ["", f"target: {res['target']}  (org label: {res['org_label'] or '-'})",
+                f"sources read: {len(res['sources'])}", ""]
+        out += ["## packages"]
+        for p in res["packages"]:
+            out.append(f"{'INTERNAL' if p['internal'] else 'public  '} "
+                       f"{p['ecosystem']:<9} {p['name']} "
+                       f"{('spec ' + ','.join(p['specs'])) if p['specs'] else ''}")
+            for s in p["signals"]:
+                out.append(f"    signal: {s}")
+            for e in p["evidence"][:3]:
+                out.append(f"    seen in: {e['where']} ({e['origin']})")
+        out += ["", "## registries named by the target"]
+        out += [f"{'public ' if r['public'] else 'PRIVATE'} {r['host'] or '-':<34} "
+                f"{r.get('scope') or '(default)':<22} {r['key']} <- {r['origin']}"
+                for r in res["registries"]] or ["(none)"]
+        out += ["", "## config leaks"]
+        out += [f"{l['origin']}: {l['key']} = {l['value_shape']}"
+                for l in res["leaks"]] or ["(none)"]
+        out += ["", "## next"] + [f"- {n}" for n in res["next"]]
+    elif res["subcommand"] == "claimable":
+        for r in res["results"]:
+            out.append(f"{r['state']:<10} {r['ecosystem']:<9} {r['name']} "
+                       f"exists={r['exists']} http={r['status']} "
+                       f"owner={r.get('owner') or '-'} latest={r.get('latest_version') or '-'}")
+            out.append(f"    {r['why']}")
+        out += [""] + [f"- {n}" for n in res["notes"]]
+    elif res["subcommand"] == "typosquat":
+        for r in res["results"]:
+            out += ["", f"## {r['name']} ({r['ecosystem']})"]
+            for c in r["neighbours"]:
+                ex = c.get("exists")
+                mark = "EXISTS" if ex else ("free" if ex is False else "    ?")
+                out.append(f"{mark:<7} {c['family']:<28} {c['name']}"
+                           + (f"  owner={c.get('owner')}" if c.get("owner") else ""))
+            out.append(r["note"])
+    elif res["subcommand"] == "amplifiers":
+        for f in res["amplifiers"]:
+            out.append(f"[{f['state']}] {f['kind']}"
+                       + (f" {f['name']}" if f.get("name") else ""))
+            out.append(f"    {f['detail']}")
+            for e in (f.get("evidence") or [])[:3]:
+                out.append(f"    evidence: {e.get('where')} ({e.get('origin')})")
+        out += [""] + [f"- {n}" for n in res["notes"]]
+    for n in res.get("notes") or []:
+        if res["subcommand"] == "extract":
+            out += ["", n]
+    return "\n".join(out)
+
+# ------------------------------------------------------------------- selftest
+
+
+def _selftest():
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # --- the refusal that matters most: this tool never takes a name
+    for argv in (["publish", "@acme/x"], ["claimable", "--register"],
+                 ["reserve", "x"], ["typosquat", "x", "--reserve"]):
+        try:
+            refuse_write_actions(argv)
+            fails.append(f"a write action was not refused: {argv}")
+        except Refused as r:
+            ok("never publishes" in r.msg, f"the refusal explains itself: {argv}")
+            eq(r.code, 3, "a refusal exits 3")
+    refuse_write_actions(["claimable", "--from", "x.json", "--contact-registries"])
+    refuse_write_actions(["extract", "http://t/registry-client"])
+
+    # --- output flags work on either side of the subcommand
+    for argv in (["--json", "typosquat", "x"], ["typosquat", "x", "--json"]):
+        ns = build_parser().parse_args(argv)
+        ok(getattr(ns, "json", False), f"--json is honoured as {argv}")
+    ok(not getattr(build_parser().parse_args(["typosquat", "x"]), "json", False),
+       "and is off when not given")
+
+    # --- a registry lookup without the flag is refused, not silently skipped
+    try:
+        get_registry("https://registry.npmjs.org/x", False)
+        fails.append("a registry GET without --contact-registries was allowed")
+    except Refused as r:
+        ok("--contact-registries" in r.msg, "the refusal names the flag")
+
+    # --- internal vs public classification
+    regs = [{"url": "https://nexus.corp.acme.example/repository/npm-private/",
+             "scope": "@acme-internal", "origin": "/.npmrc", "key": "registry"},
+            {"url": "https://registry.npmjs.org/", "scope": None,
+             "origin": "/.npmrc", "key": "registry"}]
+    eq(registry_is_public("https://registry.npmjs.org/"), True, "npmjs is public")
+    eq(registry_is_public("https://nexus.corp.acme.example/repository/npm-private/"),
+       False, "a nexus host is not")
+    eq(registry_is_public("https://acme.jfrog.io/artifactory/api/npm/npm/"), False,
+       "artifactory is not")
+    pk = [{"name": "@acme-internal/telemetry", "ecosystem": "npm", "spec": "^1.2.0",
+           "origin": "/package.json", "where": "dependencies"},
+          {"name": "react", "ecosystem": "npm", "spec": "^18.2.0",
+           "origin": "/package.json", "where": "dependencies"},
+          {"name": "acme-internal-utils", "ecosystem": "pypi", "spec": ">=1.0",
+           "origin": "/requirements.txt", "where": "requirements"}]
+    c = {p["name"]: p for p in classify(pk, regs, org="acme")}
+    ok(c["@acme-internal/telemetry"]["internal"], "a scope mapped to a nexus is internal")
+    ok(any("mapped to the non-public registry" in s
+           for s in c["@acme-internal/telemetry"]["signals"]),
+       "and the signal names the registry, so a human can re-read it")
+    ok(not c["react"]["internal"], "react is not internal")
+    ok(c["acme-internal-utils"]["internal"], "an 'internal' token in the name counts")
+    eq(c["@acme-internal/telemetry"]["scope"], "@acme-internal", "the scope is recorded")
+    c2 = {p["name"]: p for p in classify(
+        [{"name": "@acme/widgets", "ecosystem": "npm", "spec": "1.0.0",
+          "origin": "/package.json", "where": "dependencies"}], [], org="acme")}
+    ok(c2["@acme/widgets"]["internal"], "a scope matching the target's org label counts")
+    c3 = {p["name"]: p for p in classify(
+        [{"name": "@acme/widgets", "ecosystem": "npm", "spec": "1.0.0",
+          "origin": "/package.json", "where": "dependencies"}], [], org="")}
+    ok(not c3["@acme/widgets"]["internal"],
+       "with no org label and no registry map, a bare scope is NOT called internal")
+    eq(org_label("http://shop.acme-internal.example:5025/"), "acme-internal",
+       "the org label skips the service label and takes the registrable one")
+
+    # --- parsers
+    pkj = json.dumps({"dependencies": {"@acme-internal/telemetry": "^1.2.0",
+                                       "react": "18.2.0"},
+                      "devDependencies": {"jest": "^29"}})
+    got, _ = parse_json_manifest(pkj, "/package.json", "npm")
+    eq(sorted(p["name"] for p in got),
+       ["@acme-internal/telemetry", "jest", "react"], "package.json deps and devDeps")
+    lock = json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"name": "app"},
+        "node_modules/@acme-internal/telemetry": {
+            "version": "1.2.0",
+            "resolved": "https://registry.npmjs.org/@acme-internal/telemetry/-/telemetry-1.2.0.tgz"},
+        "node_modules/@acme-internal/auth-sdk": {
+            "version": "0.4.1",
+            "resolved": "https://nexus.corp.acme.example/repository/npm-private/@acme-internal/auth-sdk/-/auth-sdk-0.4.1.tgz"}}})
+    got, _ = parse_json_manifest(lock, "/package-lock.json", "npm")
+    by = {p["name"]: p for p in got}
+    eq(host_of(by["@acme-internal/telemetry"]["resolved"]), "registry.npmjs.org",
+       "the lockfile's resolved host is kept, which is the whole amplifier")
+    eq(by["@acme-internal/auth-sdk"]["version"] if "version" in by["@acme-internal/auth-sdk"]
+       else by["@acme-internal/auth-sdk"]["spec"], "0.4.1", "and the version")
+    req, rg = parse_requirements(
+        "--extra-index-url https://pypi.org/simple\n"
+        "acme-internal-utils>=1.0\nrequests==2.31.0  # comment\n-e .\n", "/requirements.txt")
+    eq(sorted(p["name"] for p in req), ["acme-internal-utils", "requests"],
+       "requirements.txt names, editable and flag lines skipped")
+    eq(rg[0]["url"], "https://pypi.org/simple", "and the index URL it names")
+    pom, _ = parse_pom("<dependency><groupId>com.acme.internal</groupId>"
+                       "<artifactId>telemetry</artifactId><version>1.2.0</version>"
+                       "</dependency>", "/pom.xml")
+    eq(pom[0]["name"], "com.acme.internal:telemetry", "maven coordinates stay joined")
+    rgs, leaks = parse_registry_config(
+        "registry=https://registry.npmjs.org/\n"
+        "@acme-internal:registry=https://nexus.corp.acme.example/repository/npm-private/\n"
+        "//nexus.corp.acme.example/repository/npm-private/:_authToken=MYTHOS_LAB_CANARY\n",
+        "/.npmrc")
+    eq(len(rgs), 2, ".npmrc default and scoped registry")
+    eq(rgs[1]["scope"], "@acme-internal", "the scope is parsed off the left")
+    eq(len(leaks), 1, "the token line is reported as a leak")
+    ok("MYTH" in leaks[0]["value_shape"] and "MYTHOS_LAB_CANARY" not in leaks[0]["value_shape"],
+       "and the token is shaped, not reprinted in full")
+    bundle = ('var a=require("@acme-internal/feature-flags");'
+              'import x from "lodash";'
+              '{"./node_modules/@acme-internal/telemetry/dist/index.js":function(){}}'
+              '//# sourceMappingURL=app.js.map')
+    names = {p["name"] for p in parse_bundle(bundle, "/app.js")}
+    ok("@acme-internal/feature-flags" in names, "a require() specifier is a name")
+    ok("@acme-internal/telemetry" in names, "a webpack node_modules module id is a name")
+    ok("lodash" in names, "an import ... from specifier is a name")
+    ok(not any(n.startswith(".") for n in names), "relative specifiers are not packages")
+    eq(SOURCEMAP_RE.findall(bundle), ["app.js.map"], "the sourceMappingURL is found")
+    smap = json.dumps({"version": 3, "sources": [
+        "webpack:///./node_modules/@acme-internal/billing/src/index.ts",
+        "webpack:///./src/app.ts"]})
+    eq([p["name"] for p in parse_sourcemap(smap, "/app.js.map")],
+       ["@acme-internal/billing"], "a source map hands over the tree, app sources aside")
+
+    m = merge([{"name": "@acme-internal/t", "ecosystem": "npm", "spec": "^1.0.0",
+                "origin": "/package.json", "where": "dependencies"},
+               {"name": "@acme-internal/t", "ecosystem": "npm", "spec": "1.0.0",
+                "resolved": "https://registry.npmjs.org/@acme-internal/t/-/t-1.0.0.tgz",
+                "origin": "/package-lock.json", "where": "packages"}])
+    eq(len(m), 1, "the same name from two files is one record")
+    eq(m[0]["scope"], "@acme-internal",
+       "and the scope survives the merge — without it the lockfile amplifier is silent")
+    eq(len(m[0]["evidence"]), 2, "with both pieces of evidence")
+    eq(sorted(m[0]["specs"]), ["1.0.0", "^1.0.0"], "and both specs")
+
+    # --- registry endpoints: read-only, and the right shape per ecosystem
+    eq(registry_url("npm", "@acme/x", {}), "https://registry.npmjs.org/%40acme%2Fx",
+       "a scoped npm name is URL-encoded whole")
+    eq(registry_url("pypi", "acme-utils", {}), "https://pypi.org/pypi/acme-utils/json",
+       "the PyPI JSON API")
+    eq(registry_url("rubygems", "acme", {}), "https://rubygems.org/api/v1/gems/acme.json",
+       "the RubyGems API")
+    eq(registry_url("crates", "acme", {}), "https://crates.io/api/v1/crates/acme",
+       "the crates.io API")
+    ok(registry_url("nuget", "Acme.Internal", {}).endswith("acme.internal/index.json"),
+       "NuGet lowercases the id")
+    ok("g:%22com.acme%22" in registry_url("maven", "com.acme:x", {}),
+       "Maven Central takes a solr query on group and artifact")
+    eq(registry_url("maven", "nogroup", {}), None,
+       "a Maven name without a group has no endpoint rather than a guessed one")
+    eq(registry_url("npm", "x", {"npm": "http://127.0.0.1:1/__r/npm"}),
+       "http://127.0.0.1:1/__r/npm/x", "--registry-base redirects an ecosystem")
+    for eco in registry_endpoints():
+        u = registry_url(eco, "com.acme:x" if eco == "maven" else "x", {})
+        ok(host_of(u) in PUBLIC_REGISTRY_HOSTS,
+           f"the default {eco} endpoint is the documented public host")
+
+    eq(read_registry_answer("npm", "", 404), (False, None, None),
+       "404 means the name is free")
+    eq(read_registry_answer("npm", "nonsense", 500), (None, None, None),
+       "a 500 is unknown, never 'free'")
+    ex, owner, latest = read_registry_answer("npm", json.dumps(
+        {"name": "x", "dist-tags": {"latest": "2.0.0"},
+         "maintainers": [{"name": "squatter"}]}), 200)
+    eq((ex, owner, latest), (True, "squatter", "2.0.0"), "npm metadata is read back")
+    ex, owner, latest = read_registry_answer("pypi", json.dumps(
+        {"info": {"version": "9.9.9", "author": "someone"}}), 200)
+    eq((ex, owner, latest), (True, "someone", "9.9.9"), "PyPI metadata is read back")
+
+    # --- verdicts: `confirmed` is not reachable
+    st, why = claim_verdict({"exists": False}, True)
+    eq(st, "candidate", "an unclaimed internal name is a candidate")
+    ok("never does" in why and "publishing" in why,
+       "and the verdict says which proof is refused")
+    eq(claim_verdict({"exists": True, "owner": "o"}, True)[0], "tested",
+       "a taken name closes the window")
+    eq(claim_verdict({"exists": None}, True)[0], "unknown",
+       "an unreadable answer is unknown")
+    eq(claim_verdict({"exists": True}, False)[0], "public", "a public dep is public")
+    all_states = {claim_verdict({"exists": e, "owner": None}, i)[0]
+                  for e in (True, False, None) for i in (True, False)}
+    ok("confirmed" not in all_states, "no input produces `confirmed`")
+
+    # --- typosquat families
+    n = {c["name"]: c["family"] for c in neighbours("express")}
+    ok("expres" in n and n["expres"] == "omission", "omission")
+    ok("exrpess" in n and n["exrpess"] == "transposition", "transposition")
+    ok("exppress" in n and n["exppress"] == "repetition", "repetition")
+    ok("expr3ss" in n and n["expr3ss"] == "homoglyph", "homoglyph")
+    ok("express" not in n, "the original is not its own neighbour")
+    s = {c["name"]: c["family"] for c in neighbours("@acme/auth-sdk")}
+    eq(s.get("auth-sdk"), "scope drop", "scope drop")
+    eq(s.get("acme-auth-sdk"), "scope flattened to a prefix", "scope flattened")
+    eq(s.get("@acme/auth_sdk"), "separator swap", "hyphen to underscore")
+    eq(s.get("@acme/auth.sdk"), "separator swap", "hyphen to dot")
+    eq(s.get("@acme/authsdk"), "separator drop", "separator dropped")
+    ok(all(c["name"] != "@acme/auth-sdk" for c in neighbours("@acme/auth-sdk")),
+       "and the scoped original is excluded too")
+    ok(len({c["name"] for c in neighbours("express")}) ==
+       len(neighbours("express")), "no duplicate neighbours")
+
+    # --- amplifiers
+    data = {"target": "http://t.test", "packages": [
+        {"name": "@acme-internal/telemetry", "ecosystem": "npm", "internal": True,
+         "scope": "@acme-internal", "specs": ["^1.2.0", "1.2.0"],
+         "resolved": ["https://registry.npmjs.org/@acme-internal/telemetry/-/t-1.2.0.tgz"],
+         "evidence": [{"origin": "/package-lock.json", "where": "packages"}],
+         "signals": ["x"]},
+        {"name": "react", "ecosystem": "npm", "internal": False, "specs": ["^18"],
+         "resolved": [], "evidence": []}],
+        "registries": [
+            {"url": "https://registry.npmjs.org/", "host": "registry.npmjs.org",
+             "public": True, "scope": None, "key": "registry", "origin": "/.npmrc"},
+            {"url": "https://nexus.corp.acme.example/repository/npm-private/",
+             "host": "nexus.corp.acme.example", "public": False,
+             "scope": "@acme-internal", "key": "registry", "origin": "/.npmrc"}],
+        "leaks": [{"origin": "/.npmrc", "key": "_authToken",
+                   "value_shape": "MYTH...NARY (17 chars)"}]}
+    claims = {"results": [{"name": "@acme-internal/telemetry", "ecosystem": "npm",
+                           "exists": False, "status": 404,
+                           "url": "http://r/x", "latest_version": None}]}
+    kinds = {f["kind"]: f for f in amplifiers(data, claims)}
+    ok("unclaimed_internal_name" in kinds, "an unclaimed internal name is an amplifier")
+    eq(kinds["unclaimed_internal_name"]["state"], "candidate", "and it is a candidate")
+    ok("private_scope_from_public_registry" in kinds,
+       "a private scope resolved from npmjs.org is the lockfile amplifier")
+    ok("mixed_registry_config" in kinds, "public plus private config is the third")
+    ok("range_a_higher_public_version_would_win" in kinds, "a range is the fourth")
+    ok("registry_credential_or_config_reachable" in kinds, "the leak is reported")
+    ok(all(f["state"] in ("candidate", "tested") for f in amplifiers(data, claims)),
+       "no amplifier is ever `confirmed`")
+    nokinds = {f["kind"] for f in amplifiers(data, None)}
+    ok("internal_name_unchecked" in nokinds,
+       "without a claims file the name is `tested`, not assumed free")
+    ok("unclaimed_internal_name" not in nokinds,
+       "and never reported as unclaimed without having asked")
+    one_sided = {f["kind"] for f in amplifiers(
+        {"packages": [], "registries": [r for r in data["registries"] if r["public"]],
+         "leaks": []}, None)}
+    ok("mixed_registry_config" not in one_sided,
+       "a public registry alone is not a mixed configuration")
+
+    # --- version compare, for 'a higher public version would win'
+    ok(version_tuple("2.0.0") > version_tuple("1.9.9"), "2.0.0 beats 1.9.9")
+    ok(version_tuple("1.10.0") > version_tuple("1.9.0"),
+       "1.10.0 beats 1.9.0, so this is not a string compare")
+    ok(version_tuple("1.0.0") == version_tuple("1.0.0-beta.1"),
+       "a pre-release suffix is dropped rather than mis-ordered")
+    ok(VERSION_RANGE_RE.match("^1.2.0") and VERSION_RANGE_RE.match(">=1.0")
+       and VERSION_RANGE_RE.match("*") and not VERSION_RANGE_RE.match("1.2.0"),
+       "a range is recognised and an exact pin is not")
+
+    # --- ONE LIVE REQUEST, against a server started here.
+    #
+    # Every assert above is offline, and offline asserts cannot see a script
+    # that never sends a byte: `authflows` shipped exactly that bug (a TLS
+    # context passed to a method with no such keyword, swallowed by a broad
+    # except and reported as a dead target). So the extraction path and the
+    # registry-lookup path both make a real round trip here, through the same
+    # functions the subcommands use.
+    import http.server, socketserver, threading, tempfile
+
+    bundle_js = ('/*!*** ./node_modules/@acme-internal/telemetry/dist/index.js ***/\n'
+                 'var f=require("@acme-internal/feature-flags");\n'
+                 '//# sourceMappingURL=/static/app.js.map\n')
+    smap_js = json.dumps({"version": 3, "sources": [
+        "webpack:///./node_modules/@acme-internal/billing/src/index.ts"]})
+    npmrc = ("registry=https://registry.npmjs.org/\n"
+             "@acme-internal:registry=https://nexus.corp.acme.example/repository/npm-private/\n"
+             "//nexus.corp.acme.example/repository/npm-private/:_authToken=MYTHOS_LAB_CANARY\n")
+    pkg = json.dumps({"dependencies": {"@acme-internal/telemetry": "^1.2.0",
+                                       "react": "18.2.0"}})
+    seen_ua = []
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        ROUTES = {"/": (200, "text/html",
+                        '<html><script src="/static/app.js"></script></html>'),
+                  "/static/app.js": (200, "application/javascript", bundle_js),
+                  "/static/app.js.map": (200, "application/json", smap_js),
+                  "/.npmrc": (200, "text/plain", npmrc),
+                  "/package.json": (200, "application/json", pkg)}
+
+        def do_GET(self):
+            seen_ua.append((self.command, self.path, self.headers.get("User-Agent", "")))
+            if self.path.startswith("/__registry/npm/"):
+                name = urllib.parse.unquote(self.path[len("/__registry/npm/"):])
+                if name.startswith("@acme-internal/"):
+                    return self._send(404, "application/json", '{"error":"Not found"}')
+                return self._send(200, "application/json", json.dumps(
+                    {"name": name, "dist-tags": {"latest": "9.9.9"},
+                     "maintainers": [{"name": "lab-owner"}]}))
+            st, ct, body = self.ROUTES.get(self.path, (404, "text/plain", "no"))
+            self._send(st, ct, body)
+
+        def _send(self, st, ct, body):
+            raw = body.encode()
+            self.send_response(st)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *a):
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1},
+                         daemon=True).start()
+        with tempfile.TemporaryDirectory() as td:
+            scope = pathlib.Path(td) / "scope.yaml"
+            scope.write_text(f"target: http://127.0.0.1:{port}\nin_scope:\n  - 127.0.0.1\n"
+                             f"ports: [{port}]\nrules:\n  rate_limit_rps: 50\n")
+            prev = os.environ.get("MYTHOS_SCOPE")
+            os.environ["MYTHOS_SCOPE"] = str(scope)
+            TARGET.gap = REGISTRY.gap = 0.0
+            try:
+                _live(base=f"http://127.0.0.1:{port}", td=td, eq=eq, ok=ok,
+                      fails=fails, seen=seen_ua)
+            finally:
+                if prev is None:
+                    os.environ.pop("MYTHOS_SCOPE", None)
+                else:
+                    os.environ["MYTHOS_SCOPE"] = prev
+                srv.shutdown()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"supplychain selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+def _live(base, td, eq, ok, fails, seen):
+    """The live asserts, in their own frame so a raise here is a FAIL.
+
+    Without this, a broken wire made `cmd_claimable` find nothing and raise
+    SystemExit(2) straight past the summary: the selftest exited non-zero with
+    no output at all, which is a worse answer than a failing assert.
+    """
+    try:
+        seen_ua = seen
+        r = get_target(f"{base}/.npmrc")
+        eq(r["status"], 200, "a loopback GET comes back with a status, not None")
+        ok("Traceback" not in r["body"] and "Error" not in r["body"][:40],
+           "and the body is the server's, not an exception text")
+        ok("@acme-internal:registry" in r["body"], "the leaked .npmrc arrived")
+
+        a = build_parser().parse_args(["extract", base, "--prefix", "/"])
+        res = cmd_extract(a)
+        names = {p["name"] for p in res["packages"]}
+        for want in ("@acme-internal/telemetry", "@acme-internal/feature-flags",
+                     "@acme-internal/billing", "react"):
+            ok(want in names, f"extract recovered {want} over a real request")
+        internal = {p["name"] for p in res["packages"] if p["internal"]}
+        ok("@acme-internal/telemetry" in internal,
+           "and classified the scoped name as internal from the served .npmrc")
+        ok("react" not in internal, "while react stayed public")
+        ok(any(l["key"] == "_authToken" for l in res["leaks"]),
+           "the served token was reported as a leak")
+        ok(any(r["host"] == "nexus.corp.acme.example" and r["public"] is False
+               for r in res["registries"]),
+           "the internal registry host was recovered from the config")
+        ok(TARGET.sent > 1, "extract really sent more than one request")
+        eq(res["exit"], 4, "a target with an internal name exits 4")
+
+        cj = pathlib.Path(td) / "extract.json"
+        cj.write_text(json.dumps(res))
+        ca = build_parser().parse_args(
+            ["claimable", "--from", str(cj), "--contact-registries",
+             "--registry-base", f"npm={base}/__registry/npm"])
+        cres = cmd_claimable(ca)
+        by = {r["name"]: r for r in cres["results"]}
+        ok("@acme-internal/telemetry" in by,
+           "claimable looked the internal name up")
+        eq(by["@acme-internal/telemetry"]["exists"], False,
+           "the fake registry answered 404 over a real request")
+        eq(by["@acme-internal/telemetry"]["state"], "candidate",
+           "so it is a candidate")
+        ok(all(r["state"] != "confirmed" for r in cres["results"]),
+           "and nothing is confirmed")
+        ok(REGISTRY.sent > 0, "a registry lookup really went out")
+        ok(all(m == "GET" for m, _, _ in seen_ua),
+           "every request this script made was a GET")
+        ok(all(ua.startswith("mythos-supplychain/") for _, _, ua in seen_ua),
+           "the User-Agent is fixed and carries no engagement data")
+        ok(not any("127.0.0.1" in p for _, p, _ in seen_ua
+                   if p.startswith("/__registry/")),
+           "the registry request carries the package name and no target name")
+
+        ta = build_parser().parse_args(
+            ["typosquat", "telemetry", "--check",
+             "--contact-registries", "--limit", "4",
+             "--registry-base", f"npm={base}/__registry/npm"])
+        tres = cmd_typosquat(ta)
+        ns = tres["results"][0]["neighbours"]
+        ok(len(ns) == 4, "typosquat --limit really caps the neighbourhood")
+        ok(any(c.get("exists") is True for c in ns),
+           "a neighbour outside the internal scope exists on the fake registry")
+        ok(any(c.get("owner") == "lab-owner" for c in ns if c.get("exists")),
+           "and its owner came back with it")
+    except (Exception, SystemExit) as exc:
+        fails.append(f"the live loopback block raised {type(exc).__name__}: {exc}")
+
+# ------------------------------------------------------------------------ cli
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="supplychain", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="same as the `selftest` subcommand")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="requests per second at the TARGET; default is "
+                         "rules.rate_limit_rps from $MYTHOS_SCOPE, else 5")
+    ap.add_argument("--registry-rate", type=float, default=2.0,
+                    help="requests per second at the PUBLIC REGISTRIES (default 2). "
+                         "They are third-party infrastructure and owe us nothing; "
+                         "this is the only pace they see.")
+    # The same output flags on every subcommand as well as before it, so
+    # `extract <url> --json` works and is not a usage error. SUPPRESS is what
+    # makes that safe: without it a subparser's default would overwrite a value
+    # the main parser had already parsed off the left of the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    common.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
+    common.add_argument("--insecure", action="store_true", default=argparse.SUPPRESS,
+                        help="skip TLS verification")
+    common.add_argument("--rate", type=float, default=argparse.SUPPRESS,
+                        help="requests per second at the target")
+    common.add_argument("--registry-rate", type=float, default=argparse.SUPPRESS,
+                        help="requests per second at the public registries")
+    sub = ap.add_subparsers(dest="cmd", parser_class=lambda **kw: argparse.ArgumentParser(
+        parents=[common], **kw))
+
+    def regargs(p):
+        p.add_argument("--contact-registries", action="store_true",
+                       help="authorize read-only GETs to the public registries listed in "
+                            "--help (npm, PyPI, Maven Central, NuGet, RubyGems, "
+                            "crates.io). Without it this refuses and exits 3.")
+        p.add_argument("--registry-base", action="append", default=[],
+                       metavar="ECO=URL",
+                       help="point one ecosystem elsewhere, e.g. "
+                            "npm=http://127.0.0.1:5025/__registry/npm for the lab")
+
+    e = sub.add_parser("extract", help="package names, registry hosts and config leaks "
+                                       "the target itself emits",
+                       description="Reads the page, its same-origin scripts, any source "
+                                   "map they point at, and the reachable manifest and "
+                                   "registry-config files. Target only: nothing here "
+                                   "talks to a registry. A local path is read instead of "
+                                   "fetched, which is the grey-box form.")
+    e.add_argument("target", help="a URL, or a local file or directory")
+    e.add_argument("--prefix", action="append", default=None,
+                   help="path prefixes to look for manifests under (default /)")
+    e.add_argument("--no-manifests", action="store_true",
+                   help="skip the manifest and config probes; bundles and maps only")
+    e.add_argument("--max-scripts", type=int, default=20,
+                   help="how many same-origin scripts to fetch (default 20)")
+    e.add_argument("--org", default=None,
+                   help="the target's organisation label, for the 'this scope is theirs' "
+                        "signal; default is derived from the host name")
+    e.add_argument("--internal-scope", action="append", default=[], metavar="@SCOPE",
+                   help="treat this scope as internal (repeatable)")
+    e.add_argument("--internal-word", action="append", default=[], metavar="WORD",
+                   help="treat this token in a name as non-public (repeatable)")
+    e.add_argument("--verbose", action="store_true",
+                   help="list the paths that answered 404 too")
+    e.set_defaults(fn=cmd_extract)
+
+    c = sub.add_parser("classify", help="internal-looking vs public, with the signal that "
+                                        "decided each name",
+                       description="Offline. Re-reads an `extract --json` file and prints "
+                                   "the split again, with no requests, so a later phase "
+                                   "can read the classification without re-crawling.")
+    c.add_argument("--from", dest="from_json", required=True,
+                   help="an `extract --json` file")
+    c.set_defaults(fn=lambda a: dict(
+        json.loads(pathlib.Path(a.from_json).read_text(encoding="utf-8")),
+        subcommand="extract"))
+
+    k = sub.add_parser("claimable", help="read-only existence lookup per name on the "
+                                         "public registries",
+                       description="One GET per name. It asks whether a package of that "
+                                   "name exists and who owns it, and nothing else: no "
+                                   "account, no publish, no reservation. An internal name "
+                                   "with no public package is a `candidate`; the proof "
+                                   "that would confirm it is claiming the name, which "
+                                   "this tool refuses.")
+    k.add_argument("name", nargs="*", help="names to check (default: the internal ones "
+                                           "in --from)")
+    k.add_argument("--from", dest="from_json", help="an `extract --json` file")
+    k.add_argument("--all", action="store_true",
+                   help="check the public-looking names from --from as well")
+    k.add_argument("--ecosystem", default="npm",
+                   help="ecosystem for names given on the command line (npm, pypi, maven, "
+                        "nuget, rubygems, crates; default npm)")
+    k.add_argument("--limit", type=int, default=200, help="stop after this many lookups")
+    regargs(k)
+    k.set_defaults(fn=cmd_claimable)
+
+    t = sub.add_parser("typosquat", help="the standard edit families for a name, and which "
+                                         "neighbours already exist",
+                       description="Generates omission, transposition, repetition, "
+                                   "separator-swap, scope-drop and homoglyph neighbours. "
+                                   "Generating is offline; --check adds one read-only GET "
+                                   "per neighbour and needs --contact-registries.")
+    t.add_argument("name", nargs="+")
+    t.add_argument("--check", action="store_true",
+                   help="look each neighbour up and report whether it exists and who owns it")
+    t.add_argument("--ecosystem", default="npm")
+    t.add_argument("--limit", type=int, default=60,
+                   help="neighbours per name (default 60); each one is a request under "
+                        "--check")
+    regargs(t)
+    t.set_defaults(fn=cmd_typosquat)
+
+    m = sub.add_parser("amplifiers", help="the conditions that turn a leaked name into an "
+                                          "attack path",
+                       description="Offline. An unclaimed internal name, a lockfile that "
+                                   "resolved a private scope from a public registry, a "
+                                   "mixed registry configuration, a private registry with "
+                                   "no scope binding, and a version range a higher public "
+                                   "release would win.")
+    m.add_argument("--from", dest="from_json", required=True,
+                   help="an `extract --json` file")
+    m.add_argument("--claims", help="a `claimable --json` file, so an unclaimed name can "
+                                    "be stated as unclaimed instead of unchecked")
+    m.set_defaults(fn=cmd_amplifiers)
+
+    s = sub.add_parser("selftest", help="asserts, including a live loopback request")
+    s.set_defaults(fn=None)
+    return ap
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    refuse_write_actions(argv)
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if a.selftest or a.cmd == "selftest":
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    rate = scope_rate() if a.rate is None else a.rate
+    TARGET.gap = 1.0 / rate if rate and rate > 0 else 0.0
+    REGISTRY.gap = (1.0 / a.registry_rate) if a.registry_rate and a.registry_rate > 0 else 0.0
+    if getattr(a, "prefix", None) is None and a.cmd == "extract":
+        a.prefix = ["/"]
+    res = a.fn(a)
+    print(json.dumps(res, indent=1) if a.json else render(res))
+    if TARGET.sent or REGISTRY.sent:
+        print(f"\n({TARGET.sent} request(s) at the target <= {rate}/s, "
+              f"{REGISTRY.sent} at public registries <= {a.registry_rate}/s)",
+              file=sys.stderr)
+    return res.get("exit", 0)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Refused as r:
+        print(r.msg, file=sys.stderr)
+        sys.exit(3)

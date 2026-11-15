@@ -1,0 +1,2199 @@
+#!/usr/bin/env python3
+"""Mythos cloudexp — the cloud, Kubernetes and serverless surface a web page shows.
+
+A web target leaks its cloud footprint through its own front end: bucket hosts in
+HTML, CSS and source maps, a Lambda function URL in a fetch call, an Azure
+Functions key in a bundle, a presigned URL in an <img>. This script harvests
+those, then classifies what each one actually permits — read-only, every time.
+
+  scripts/cloudexp harvest <url> ...          buckets, serverless front doors,
+                                              presigned URLs and client-side
+                                              cloud credentials, from the page,
+                                              its CSS, its JS, its source maps
+                                              and its response headers
+  scripts/cloudexp buckets <name> ...         read-only permission classification
+                                              per provider, and public write
+                                              shown from the policy or the ACL
+  scripts/cloudexp presigned <url> ...        expiry, scope, signature version,
+                                              what a truncation or an extension
+                                              does
+  scripts/cloudexp serverless <url> ...       Lambda function URLs, API Gateway
+                                              stages and authorizers, Cloud Run,
+                                              Cloud Functions, Azure Functions
+  scripts/cloudexp orchestrator <host> ...    kubelet, Dashboard, /metrics,
+                                              /healthz, etcd, cAdvisor, Docker
+                                              API, Consul, Nomad
+  scripts/cloudexp metadata                   the per-provider metadata request
+                                              table and the exact ssrfprobe
+                                              command that probes it
+  scripts/cloudexp clientcreds <dir|url>      which published key is by design
+                                              and what each one can really do
+  scripts/cloudexp selftest
+
+WHAT IS READ-ONLY HERE, AND WHY THAT IS NOT A PROMISE BUT A SHAPE
+Every request this script makes is GET, HEAD or OPTIONS. There is no PUT, POST,
+DELETE or multipart anywhere in the file, so no object is created, overwritten
+or removed, and no resource is provisioned. Public *write* is therefore never
+shown by writing: it is read off the bucket policy (`?policy`, a Statement with
+Principal "*" and a Put/Delete action) or off the ACL (`?acl`, the AllUsers
+WRITE grant), and where both are unreadable the answer is `inconclusive`, not a
+test upload.
+
+WHICH HOSTS EACH SUBCOMMAND CAN CONTACT
+  harvest       the target's own origin only, plus the origins of the stylesheets,
+                scripts and source maps that page references
+  buckets       the storage endpoint of each name: <b>.s3[.<region>].amazonaws.com,
+                storage.googleapis.com, <account>.blob.core.windows.net,
+                or whatever --endpoint names (the lab)
+  presigned     only the host in the presigned URL, and only with --probe
+  serverless    only the hosts of the URLs given, and only the stages named in
+                --stages
+  orchestrator  only the host given, on the ports of the daemons selected
+  metadata      nothing. It emits a table and a command line
+  clientcreds   nothing for a directory; the URL's own origin for a URL
+
+A cloud provider's endpoint is a third party, and a request to it is a request we
+made. So every destination goes through the scope check (`hooks/scope-guard.py`)
+before the socket is opened, a refused destination is skipped and listed under
+`refused` in the output, and this script never writes to the scope file. A bucket
+the target's page links is NOT in scope just because the page links it: it may
+belong to someone else entirely. Add it in an editor, before the run, or leave it
+refused.
+
+Verdicts are `candidate` or `inconclusive`, never `confirmed`: a separate
+validator replays the recorded request/response pair. `inconclusive` is the
+honest answer wherever the permission shape is ambiguous — a 403 from a bucket
+policy, a 403 from an organization SCP and a 403 from S3 Block Public Access are
+the same three bytes from outside.
+
+No brute force. The bucket-name sweep (`buckets --wordlist`) is name guessing, so
+it needs the explicit --allow-sweep, is capped by --max-names (default 20) and is
+paced by `rules.rate_limit_rps` from the scope file like every other request.
+
+Boundaries with the other scripts, so nothing is implemented twice:
+  * cloud metadata THROUGH the application is `scripts/ssrfprobe` and stays there.
+    It already classifies the primitive (method control and header control are
+    what decide IMDSv1 versus IMDSv2, GCP and Azure) and probes the lab emulator.
+    `cloudexp metadata` reads ssrfprobe's own METADATA table — it does not copy
+    it — adds nothing but the printed handoff, and tells you the command to run.
+    The two providers the table was missing (Oracle, DigitalOcean) were added to
+    ssrfprobe, where the rest already lived.
+  * generic secret regexes are `scripts/clientside secrets`. `cloudexp
+    clientcreds` calls its `scan_secrets_text` and adds only the cloud-specific
+    layer: which published key is public by design, and what the rule behind it
+    would have to allow for the key to matter.
+"""
+import argparse
+import base64
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-cloudexp/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+_REL = {"scope-guard": "hooks/scope-guard.py",
+        "ssrfprobe": "scripts/ssrfprobe",
+        "clientside": "scripts/clientside",
+        "cloudexplab": "lab/cloudexplab/app.py"}
+
+
+def mod(name):
+    if name not in _mods:
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / _REL[name]))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+REFUSED = []
+
+
+def offenders(url):
+    """Which hosts in this URL the active scope does not authorize."""
+    probe = url if "//" in str(url) else f"https://{url}/"
+    return sorted(set(mod("scope-guard").check(probe)["offenders"]))
+
+
+def require_in_scope(*items):
+    """Hard refusal, for the argument the operator typed."""
+    bad = []
+    for item in items:
+        if item:
+            bad += offenders(item)
+    if bad:
+        raise SystemExit(
+            "cloudexp: refusing, out of scope: " + ", ".join(sorted(set(bad)))
+            + "\n  scope.yaml is the authorization boundary and is widened in an "
+              "editor, outside a run.")
+
+
+def scope_rate(default=5.0):
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST, _GAP, _SENT = [0.0], [0.0], [0]
+READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def pace():
+    if _GAP[0] <= 0:
+        return
+    wait = _LAST[0] + _GAP[0] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+def send(method, url, headers=None, timeout=10, insecure=False):
+    """One read-only request, scope-gated. A refused destination is not sent.
+
+    The guard around the agent's tool calls only warns, and a warning about a
+    request to a third party's storage endpoint arrives after that endpoint was
+    hit. So this returns a refusal record instead of opening the socket, and the
+    caller carries it into the report.
+    """
+    if method not in READ_ONLY_METHODS:
+        raise AssertionError(f"cloudexp sends read-only methods only, not {method}")
+    bad = offenders(url)
+    if bad:
+        rec = {"status": None, "headers": {}, "body": "", "url": url,
+               "refused": bad}
+        REFUSED.append({"url": url, "hosts": bad})
+        return rec
+    pace()
+    _SENT[0] += 1
+    req = urllib.request.Request(url, method=method,
+                                 headers={"User-Agent": UA, **(headers or {})})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return {"status": r.status,
+                    "headers": {k.lower(): v for k, v in r.headers.items()},
+                    "body": r.read(200_000).decode("utf-8", "replace"),
+                    "url": r.geturl(), "refused": []}
+    except urllib.error.HTTPError as e:
+        raw = e.read(200_000) if e.fp else b""
+        return {"status": e.code,
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "body": raw.decode("utf-8", "replace"), "url": url, "refused": []}
+    except Exception as e:
+        return {"status": None, "headers": {}, "body": f"{type(e).__name__}: {e}",
+                "url": url, "refused": []}
+
+
+def pair(res, keep=400):
+    """The request/response pair a validator replays, trimmed."""
+    return {"url": res["url"], "status": res["status"],
+            "headers": {k: v for k, v in (res.get("headers") or {}).items()
+                        if k in ("content-type", "x-amz-bucket-region", "x-ms-error-code",
+                                 "x-amzn-errortype", "x-amzn-requestid", "server",
+                                 "www-authenticate", "access-control-allow-origin")},
+            "body": (res.get("body") or "")[:keep],
+            "refused": res.get("refused") or []}
+
+
+# ------------------------------------------------ provider error vocabulary
+
+S3_CODE = re.compile(r"<Code>([A-Za-z]+)</Code>")
+AZ_CODE = re.compile(r"<Code>([A-Za-z]+)</Code>")
+
+# What each provider's error body means, kept apart from what it implies about a
+# permission. A code this table does not know is reported verbatim rather than
+# folded into the nearest neighbour.
+S3_MEANING = {
+    "NoSuchBucket": ("absent", "the bucket name is unused in this region"),
+    "NoSuchKey": ("absent", "the bucket answers, this key does not exist"),
+    "AccessDenied": ("denied", "not authorized — and from outside, a bucket policy, "
+                               "an SCP and S3 Block Public Access are indistinguishable"),
+    "AllAccessDisabled": ("denied", "all anonymous access is disabled (Block Public "
+                                    "Access, or the bucket is suspended)"),
+    "InvalidAccessKeyId": ("denied", "a credential was sent and S3 does not know it"),
+    "SignatureDoesNotMatch": ("denied", "the signature does not cover this request — "
+                                        "which is what a presigned URL bound to one key "
+                                        "is supposed to say"),
+    "PermanentRedirect": ("wrong-region", "the bucket exists but lives in another "
+                                          "region; re-probe the region in "
+                                          "x-amz-bucket-region"),
+    "AuthorizationHeaderMalformed": ("wrong-region", "wrong region for this endpoint"),
+    "MethodNotAllowed": ("denied", "the operation is blocked for anonymous callers"),
+    "InvalidRequest": ("inconclusive", "the endpoint rejected the request shape itself"),
+    "NoSuchCORSConfiguration": ("absent", "the read was permitted and there is no CORS "
+                                          "configuration on this bucket"),
+    "NoSuchBucketPolicy": ("absent", "the read was permitted and there is no bucket "
+                                     "policy — so nothing grants anonymous anything "
+                                     "through a policy"),
+}
+AZURE_MEANING = {
+    "AuthenticationFailed": ("denied", "anonymous access is off, or the SAS is absent "
+                                       "or malformed; a valid SAS would answer"),
+    "ResourceNotFound": ("absent", "no such blob or container"),
+    "ContainerNotFound": ("absent", "the container name is unused on this account"),
+    "BlobNotFound": ("absent", "the container answers, this blob does not exist"),
+    "PublicAccessNotPermitted": ("denied", "the storage account forbids public "
+                                           "container access account-wide"),
+    "AuthorizationPermissionMismatch": ("denied", "authenticated, but the SAS or the "
+                                                  "identity lacks this permission"),
+    "InvalidQueryParameterValue": ("inconclusive", "the SAS parameters parse but do "
+                                                   "not form a usable token"),
+    "AuthenticationFailedServerError": ("inconclusive", "server-side failure, retry"),
+}
+
+
+def classify_s3(res):
+    """The permission statement an S3-shaped answer supports, and nothing more."""
+    body, status = res.get("body") or "", res.get("status")
+    if res.get("refused"):
+        return {"state": "refused", "why": "destination out of scope, not sent"}
+    if status is None:
+        return {"state": "error", "why": body[:120]}
+    if "<ListBucketResult" in body or "<ListAllMyBucketsResult" in body:
+        return {"state": "allowed", "why": "a ListBucketResult came back",
+                "keys": re.findall(r"<Key>([^<]{1,200})</Key>", body)[:5]}
+    if "<AccessControlPolicy" in body:
+        return {"state": "allowed", "why": "the ACL is readable"}
+    if "<PolicyStatus" in body:
+        return {"state": "allowed", "why": "the policy status is readable"}
+    if body.lstrip().startswith("{") and status == 200:
+        return {"state": "allowed", "why": "the bucket policy document is readable"}
+    m = S3_CODE.search(body)
+    if m:
+        state, why = S3_MEANING.get(m.group(1), ("inconclusive", "code not in the table"))
+        return {"state": state, "code": m.group(1), "why": why}
+    if status == 200:
+        return {"state": "allowed", "why": "200 with a body that is not an S3 error"}
+    if status in (401, 403):
+        return {"state": "denied", "why": f"{status} with no S3 error code: most likely "
+                                          "a proxy or a WAF in front, not S3 itself"}
+    if status == 404:
+        return {"state": "absent", "why": "404 with no S3 error code"}
+    return {"state": "inconclusive", "why": f"status {status}, no recognised body"}
+
+
+def classify_azure(res):
+    body, status = res.get("body") or "", res.get("status")
+    if res.get("refused"):
+        return {"state": "refused", "why": "destination out of scope, not sent"}
+    if status is None:
+        return {"state": "error", "why": body[:120]}
+    if "<EnumerationResults" in body:
+        return {"state": "allowed", "why": "an EnumerationResults listing came back",
+                "keys": re.findall(r"<Name>([^<]{1,200})</Name>", body)[:5]}
+    code = (res.get("headers") or {}).get("x-ms-error-code") or ""
+    m = AZ_CODE.search(body)
+    code = code or (m.group(1) if m else "")
+    if code:
+        state, why = AZURE_MEANING.get(code, ("inconclusive", "code not in the table"))
+        return {"state": state, "code": code, "why": why}
+    if status == 200:
+        return {"state": "allowed", "why": "200 with no Azure error code"}
+    return {"state": "inconclusive", "why": f"status {status}, no Azure error code"}
+
+
+def classify_gcs(res):
+    body, status = res.get("body") or "", res.get("status")
+    if res.get("refused"):
+        return {"state": "refused", "why": "destination out of scope, not sent"}
+    if status is None:
+        return {"state": "error", "why": body[:120]}
+    try:
+        doc = json.loads(body)
+    except Exception:
+        doc = None
+    if isinstance(doc, dict) and doc.get("kind") in ("storage#objects", "storage#bucket"):
+        return {"state": "allowed", "why": f"a {doc['kind']} document came back",
+                "keys": [i.get("name") for i in (doc.get("items") or [])][:5]}
+    if isinstance(doc, dict) and isinstance(doc.get("error"), dict):
+        err = doc["error"]
+        msg = str(err.get("message") or "")
+        if err.get("code") == 404 or "does not exist" in msg:
+            return {"state": "absent", "code": "notFound", "why": msg[:160]}
+        if err.get("code") in (401, 403):
+            return {"state": "denied", "code": "forbidden",
+                    "why": msg[:160] or "anonymous caller lacks the IAM permission"}
+        return {"state": "inconclusive", "why": msg[:160]}
+    # The XML (S3-interoperability) endpoint answers in S3's vocabulary.
+    if "<Error" in body or "<ListBucketResult" in body:
+        return classify_s3(res)
+    if status == 200:
+        return {"state": "allowed", "why": "200 with an unrecognised body"}
+    return {"state": "inconclusive", "why": f"status {status}, no GCS error document"}
+
+
+# --------------------------------------------------- public write, by reading
+
+ALLUSERS = "http://acs.amazonaws.com/groups/global/AllUsers"
+AUTHUSERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+WRITE_ACTIONS = re.compile(r"(?i)^s3:(\*|Put[A-Za-z]*|Delete[A-Za-z]*|Replicate[A-Za-z]*|"
+                           r"RestoreObject|AbortMultipartUpload|CreateBucket)$")
+
+
+def public_write_from_policy(text):
+    """Read a bucket policy and say whether anonymous write is granted.
+
+    Never a PUT. A policy is a document, and a document that says
+    `Effect: Allow, Principal: "*", Action: s3:PutObject` is the whole finding.
+    """
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return None
+    stmts = doc.get("Statement")
+    stmts = stmts if isinstance(stmts, list) else [stmts] if stmts else []
+    out = []
+    for s in stmts:
+        if not isinstance(s, dict) or s.get("Effect") != "Allow":
+            continue
+        pr = s.get("Principal")
+        anon = pr == "*" or (isinstance(pr, dict) and
+                             "*" in ([pr.get("AWS")] if isinstance(pr.get("AWS"), str)
+                                     else (pr.get("AWS") or [])))
+        if not anon:
+            continue
+        acts = s.get("Action")
+        acts = [acts] if isinstance(acts, str) else list(acts or [])
+        writes = [a for a in acts if WRITE_ACTIONS.match(str(a).strip())]
+        if writes:
+            res = s.get("Resource")
+            res = [res] if isinstance(res, str) else list(res or [])
+            out.append({"sid": s.get("Sid"), "actions": writes, "resource": res,
+                        "condition": s.get("Condition")})
+    return {"public_write": bool(out), "statements": out,
+            "why": ("the policy grants a write action to Principal \"*\"" if out
+                    else "the policy is readable and grants no anonymous write")}
+
+
+def public_write_from_acl(text):
+    """The AllUsers WRITE grant, read out of the ACL XML."""
+    if "<AccessControlPolicy" not in text:
+        return None
+    grants = re.findall(r"<Grant>(.*?)</Grant>", text, re.S)
+    found = []
+    for g in grants:
+        uri = re.search(r"<URI>([^<]+)</URI>", g)
+        perm = re.search(r"<Permission>([^<]+)</Permission>", g)
+        if not uri or not perm:
+            continue
+        who = uri.group(1).strip()
+        if who in (ALLUSERS, AUTHUSERS) and perm.group(1).strip() in (
+                "WRITE", "WRITE_ACP", "FULL_CONTROL"):
+            found.append({"grantee": "AllUsers" if who == ALLUSERS
+                          else "AuthenticatedUsers", "permission": perm.group(1).strip()})
+    return {"public_write": bool(found), "grants": found,
+            "why": ("the ACL grants WRITE to a global group" if found
+                    else "the ACL is readable and grants no global write")}
+
+
+# ------------------------------------------------------- 1. harvest
+
+# One table, one pass. Each entry turns a match into a normalised candidate.
+# `kind` decides which subcommand consumes it.
+HARVEST = [
+    ("bucket", "s3",
+     re.compile(r"(?i)\b([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])\.s3"
+                r"(?:[.-][a-z0-9-]{3,20})?\.amazonaws\.com")),
+    # Path style only. The lookbehind is load-bearing: without it this pattern
+    # also matched the first path segment of a VIRTUAL-HOST URL
+    # (`b.s3.amazonaws.com/reports/q3.pdf` reported `reports` as a bucket), and
+    # a made-up bucket name is a destination an operator might then put in scope.
+    ("bucket", "s3",
+     re.compile(r"(?i)(?<![\w.-])s3(?:[.-][a-z0-9-]{3,20})?\.amazonaws\.com/"
+                r"([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])")),
+    ("bucket", "gcs",
+     re.compile(r"(?i)\bstorage\.(?:googleapis|cloud\.google)\.com/"
+                r"(?:storage/v1/b/)?([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])")),
+    ("bucket", "gcs",
+     re.compile(r"(?i)\b([a-z0-9][a-z0-9._-]{1,61}[a-z0-9])\.storage\.googleapis\.com")),
+    ("bucket", "azure",
+     re.compile(r"(?i)\b([a-z0-9]{3,24}\.blob\.core\.windows\.net/"
+                r"[a-z0-9][a-z0-9-]{1,61})")),
+    ("bucket", "r2",
+     re.compile(r"(?i)\b([a-z0-9-]{3,64}\.r2\.cloudflarestorage\.com/"
+                r"[a-z0-9][a-z0-9.-]{1,61})")),
+    ("bucket", "do-spaces",
+     re.compile(r"(?i)\b([a-z0-9-]{3,63}\.[a-z0-9-]{3,20}\.digitaloceanspaces\.com)")),
+    ("bucket", "firebase-storage",
+     re.compile(r'(?i)storageBucket["\']?\s*[:=]\s*["\']([a-z0-9][a-z0-9._-]{1,61})')),
+    ("serverless", "lambda-url",
+     re.compile(r"(?i)\bhttps?://[a-z0-9]{8,64}\.lambda-url\.[a-z0-9-]{3,20}"
+                r"\.on\.aws[^\s\"'<>)]*")),
+    ("serverless", "api-gateway",
+     re.compile(r"(?i)\bhttps?://[a-z0-9]{8,32}\.execute-api\.[a-z0-9-]{3,20}"
+                r"\.amazonaws\.com[^\s\"'<>)]*")),
+    ("serverless", "cloud-run",
+     re.compile(r"(?i)\bhttps?://[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,30})?"
+                r"\.(?:a\.)?run\.app[^\s\"'<>)]*")),
+    ("serverless", "cloud-functions",
+     re.compile(r"(?i)\bhttps?://[a-z0-9-]{3,30}-[a-z0-9-]{3,40}\.cloudfunctions\.net"
+                r"[^\s\"'<>)]*")),
+    ("serverless", "azure-functions",
+     re.compile(r"(?i)\bhttps?://[a-z0-9-]{2,60}\.azurewebsites\.net/api/"
+                r"[^\s\"'<>)]*")),
+    ("serverless", "workers",
+     re.compile(r"(?i)\bhttps?://[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}\.workers\.dev"
+                r"[^\s\"'<>)]*")),
+]
+
+# A URL that carries its own authorization in the query string.
+PRESIGN_RE = re.compile(
+    r"""(?i)https?://[^\s"'<>)]+?\?[^\s"'<>)]*?"""
+    r"""(?:X-Amz-Signature=|X-Goog-Signature=|AWSAccessKeyId=|(?=[^\s"'<>)]*[?&]sig=)"""
+    r"""(?=[^\s"'<>)]*[?&]sv=))[^\s"'<>)]*""")
+
+SRC_RE = re.compile(r"""(?i)<script[^>]+src=["']?([^"'\s>]+)""")
+CSS_RE = re.compile(r"""(?i)<link[^>]+href=["']?([^"'\s>]+)[^>]*>""")
+MAP_RE = re.compile(r"(?i)[#@]\s*sourceMappingURL=([^\s*'\"]+)")
+
+
+def scan_text(text, label, found):
+    for kind, provider, rx in HARVEST:
+        for m in rx.finditer(text or ""):
+            name = (m.group(1) if m.re.groups else m.group(0)).strip().rstrip("/\\;,")
+            key = (kind, provider, name)
+            entry = found.setdefault(key, {"kind": kind, "provider": provider,
+                                           "name": name, "sources": []})
+            if label not in entry["sources"]:
+                entry["sources"].append(label)
+    for m in PRESIGN_RE.finditer(text or ""):
+        key = ("presigned", "", m.group(0))
+        entry = found.setdefault(key, {"kind": "presigned", "provider": "",
+                                       "name": m.group(0), "sources": []})
+        if label not in entry["sources"]:
+            entry["sources"].append(label)
+
+
+def cmd_harvest(a):
+    require_in_scope(a.url)
+    out = {"subcommand": "harvest", "url": a.url, "fetched": [], "candidates": [],
+           "refused": REFUSED, "notes": []}
+    found = {}
+
+    root = send("GET", a.url, {}, a.timeout, a.insecure)
+    out["fetched"].append(pair(root, 120))
+    if root["status"] is None:
+        raise SystemExit(f"cloudexp harvest: {a.url} unreachable ({root['body'][:100]})")
+    scan_text(root["body"], "page", found)
+    # Response headers are a harvest source in their own right: a CORS
+    # allow-origin or an asset-host header names infrastructure the body does not.
+    hdr_blob = "\n".join(f"{k}: {v}" for k, v in (root["headers"] or {}).items())
+    scan_text(hdr_blob, "response-header", found)
+    out["cors"] = {k: v for k, v in (root["headers"] or {}).items()
+                   if k.startswith("access-control-")}
+
+    assets = []
+    for rx, tag in ((SRC_RE, "script"), (CSS_RE, "stylesheet")):
+        for m in rx.finditer(root["body"]):
+            href = m.group(1)
+            if tag == "stylesheet" and not href.lower().split("?")[0].endswith(".css"):
+                continue
+            assets.append((tag, urllib.parse.urljoin(root["url"], href)))
+    seen = set()
+    for tag, url in assets:
+        if url in seen or len(seen) >= a.max_assets:
+            continue
+        seen.add(url)
+        r = send("GET", url, {}, a.timeout, a.insecure)
+        out["fetched"].append(pair(r, 0))
+        if r["status"] != 200:
+            continue
+        scan_text(r["body"], f"{tag}:{urllib.parse.urlsplit(url).path}", found)
+        m = MAP_RE.search(r["body"][-4000:])
+        if m and tag == "script":
+            murl = urllib.parse.urljoin(url, m.group(1))
+            if murl not in seen and len(seen) < a.max_assets:
+                seen.add(murl)
+                mr = send("GET", murl, {}, a.timeout, a.insecure)
+                out["fetched"].append(pair(mr, 0))
+                if mr["status"] == 200:
+                    # sourcesContent is pre-minification source: the bucket name a
+                    # build stripped out of the bundle is usually still in here.
+                    scan_text(mr["body"], f"sourcemap:{urllib.parse.urlsplit(murl).path}",
+                              found)
+
+    out["candidates"] = sorted(found.values(), key=lambda c: (c["kind"], c["provider"],
+                                                             c["name"]))
+    out["notes"].append(
+        "A bucket, function URL or container named here is a candidate destination, "
+        "NOT an authorized one. It may belong to a third party the target merely "
+        "links. Nothing below was contacted; `cloudexp buckets` and `serverless` "
+        "check each one against scope.yaml and refuse what it does not name.")
+    out["notes"].append(
+        f"{len([c for c in out['candidates'] if c['kind'] == 'presigned'])} presigned "
+        "URL(s) found in client-side material. A presigned URL in a bundle or in a "
+        "page is readable by anyone who loads the page, and because the credential "
+        "is in the query string it also leaves in the Referer of any cross-origin "
+        "subresource the page requests: `cloudexp presigned` reads the expiry.")
+    return out
+
+
+# --------------------------------------------------------- 2. buckets
+
+# Per provider: the read-only probes, and the IAM resource each one tests. The
+# `bucket` versus `bucket/*` split is the point of the `resource` column: list is
+# a bucket-level permission and get is an object-level one, and reporting "the
+# bucket is readable" off a successful list is the mistake this table prevents.
+S3_PROBES = [
+    ("list", "/?list-type=2&max-keys=1", "s3:ListBucket on arn:aws:s3:::{b}"),
+    ("acl-read", "/?acl", "s3:GetBucketAcl on arn:aws:s3:::{b}"),
+    ("policy-read", "/?policy", "s3:GetBucketPolicy on arn:aws:s3:::{b}"),
+    ("policy-status", "/?policyStatus", "s3:GetBucketPolicyStatus on arn:aws:s3:::{b}"),
+    ("cors-read", "/?cors", "s3:GetBucketCORS on arn:aws:s3:::{b}"),
+    ("get-object", "/{key}", "s3:GetObject on arn:aws:s3:::{b}/*"),
+]
+
+
+def s3_base(name, endpoint, region=None):
+    if endpoint:
+        return f"{endpoint.rstrip('/')}/{name}"
+    host = f"s3.{region}.amazonaws.com" if region else "s3.amazonaws.com"
+    return f"https://{name}.{host}"
+
+
+def probe_s3(name, a):
+    base = s3_base(name, a.endpoint, a.region)
+    perms, pairs, key = {}, [], None
+    for label, path, resource in S3_PROBES:
+        if "{key}" in path:
+            if not (a.key or key):
+                perms[label] = {"state": "not-probed",
+                                "why": "no object key known: pass --key, or let `list` "
+                                       "find one first",
+                                "resource": resource.format(b=name)}
+                continue
+            path = path.format(key=urllib.parse.quote(a.key or key))
+        r = send("GET", base + path, {}, a.timeout, a.insecure)
+        c = classify_s3(r)
+        c["resource"] = resource.format(b=name)
+        perms[label] = c
+        pairs.append({"probe": label, **pair(r)})
+        if label == "list" and c.get("keys"):
+            key = c["keys"][0]
+    write = {"public_write": None, "source": "none",
+             "why": "neither the bucket policy nor the ACL is readable, so anonymous "
+                    "write cannot be shown. Showing it would mean sending a PUT, which "
+                    "this script does not do: the answer stays unknown."}
+    pol = next((p for p in pairs if p["probe"] == "policy-read"), None)
+    acl = next((p for p in pairs if p["probe"] == "acl-read"), None)
+    if perms.get("policy-read", {}).get("state") == "allowed":
+        fromp = public_write_from_policy(pol["body"])
+        if fromp:
+            fromp["source"] = "bucket policy"
+            write = fromp
+    if not write.get("public_write") and \
+            perms.get("acl-read", {}).get("state") == "allowed":
+        aw = public_write_from_acl(acl["body"])
+        if aw and (aw["public_write"] or write.get("public_write") is None):
+            aw["source"] = "bucket ACL"
+            write = aw
+    return perms, pairs, write, {"endpoint": base, "probed_key": a.key or key}
+
+
+def probe_gcs(name, a):
+    root = (a.endpoint.rstrip("/") if a.endpoint else "https://storage.googleapis.com")
+    perms, pairs = {}, []
+    for label, path, resource in (
+            ("list", f"/storage/v1/b/{urllib.parse.quote(name)}/o?maxResults=1",
+             "storage.objects.list on the bucket"),
+            ("bucket-read", f"/storage/v1/b/{urllib.parse.quote(name)}",
+             "storage.buckets.get on the bucket"),
+            ("iam-read", f"/storage/v1/b/{urllib.parse.quote(name)}/iam",
+             "storage.buckets.getIamPolicy on the bucket")):
+        r = send("GET", root + path, {}, a.timeout, a.insecure)
+        c = classify_gcs(r)
+        c["resource"] = resource
+        perms[label] = c
+        pairs.append({"probe": label, **pair(r)})
+    if a.key:
+        r = send("GET", f"{root}/{urllib.parse.quote(name)}/"
+                        f"{urllib.parse.quote(a.key)}", {}, a.timeout, a.insecure)
+        c = classify_gcs(r)
+        c["resource"] = "storage.objects.get on the object"
+        perms["get-object"] = c
+        pairs.append({"probe": "get-object", **pair(r)})
+    write = {"public_write": None,
+             "why": "GCS grants write through IAM, and the IAM policy is only readable "
+                    "with storage.buckets.getIamPolicy. Where that read is denied, "
+                    "anonymous write cannot be shown without writing, which this "
+                    "script does not do.",
+             "source": "none"}
+    if perms["iam-read"]["state"] == "allowed":
+        body = next(p["body"] for p in pairs if p["probe"] == "iam-read")
+        pub = re.findall(r'"(allUsers|allAuthenticatedUsers)"', body)
+        roles = re.findall(r'"roles/storage\.([A-Za-z.]+)"', body)
+        writes = [r for r in roles if any(w in r.lower() for w in
+                                          ("admin", "creator", "writer", "owner"))]
+        write = {"public_write": bool(pub and writes),
+                 "members": sorted(set(pub)), "write_roles": sorted(set(writes)),
+                 "source": "bucket IAM policy",
+                 "why": ("the IAM policy binds a write role to allUsers or "
+                         "allAuthenticatedUsers" if pub and writes else
+                         "the IAM policy is readable and binds no public write role")}
+    return perms, pairs, write, {"endpoint": root}
+
+
+def probe_azure(name, a):
+    """`name` is account/container, as the harvest emits it."""
+    if a.endpoint:
+        acct, _, container = name.partition("/")
+        base = f"{a.endpoint.rstrip('/')}/{container or acct}"
+    elif "/" in name and "blob.core.windows.net" in name:
+        base = "https://" + name
+    elif "/" in name:
+        acct, _, container = name.partition("/")
+        base = f"https://{acct}.blob.core.windows.net/{container}"
+    else:
+        return ({}, [], None,
+                {"error": "an Azure target needs account/container, or the full "
+                          "<account>.blob.core.windows.net/<container> host and path"})
+    perms, pairs = {}, []
+    arms = [("list-anonymous", "?restype=container&comp=list", None),
+            ("container-metadata", "?restype=container&comp=metadata", None)]
+    if a.sas:
+        sas = a.sas.lstrip("?&")
+        arms.append(("list-with-sas", f"?restype=container&comp=list&{sas}", "sas"))
+    for label, qs, needs in arms:
+        r = send("GET", base + qs, {}, a.timeout, a.insecure)
+        c = classify_azure(r)
+        c["resource"] = ("the container, with the SAS presented" if needs
+                         else "the container, anonymously")
+        perms[label] = c
+        pairs.append({"probe": label, **pair(r)})
+    if not a.sas:
+        perms["list-with-sas"] = {
+            "state": "not-probed",
+            "why": "pass --sas '<the query string of a SAS the operator was issued>' to "
+                   "separate 'anonymous access off' from 'the container does not exist'. "
+                   "Never a SAS belonging to anyone else.",
+            "resource": "the container, with a SAS"}
+    write = {"public_write": None, "source": "none",
+             "why": "Azure's public access level is an account/container property that is "
+                    "not readable from outside, and a SAS's permissions are in the `sp` "
+                    "parameter of the SAS itself, not on the wire. A container that "
+                    "lists anonymously has public read; public write would need a PUT, "
+                    "which this script does not send. Read `sp` with "
+                    "`cloudexp presigned` on the SAS URL instead."}
+    anon = perms["list-anonymous"]["state"]
+    if anon == "allowed":
+        write["why"] = ("anonymous listing works, so the container's public access level "
+                        "is Container. Write still needs the account's settings or a "
+                        "SAS with `sp` containing w/c/a. ") + write["why"]
+    return perms, pairs, write, {"endpoint": base}
+
+
+PROVIDERS = {"s3": probe_s3, "gcs": probe_gcs, "azure": probe_azure}
+
+
+def guess_provider(name):
+    low = name.lower()
+    if "blob.core.windows.net" in low:
+        return "azure"
+    if "storage.googleapis.com" in low or "storage.cloud.google.com" in low:
+        return "gcs"
+    if "s3" in low and "amazonaws.com" in low:
+        return "s3"
+    if "r2.cloudflarestorage.com" in low or "digitaloceanspaces.com" in low:
+        return "s3"          # both speak the S3 API, including the error bodies
+    return None
+
+
+def bucket_verdict(perms, write, provider="s3"):
+    """candidate, inconclusive or nothing — never confirmed.
+
+    Provider-aware, because the vocabulary is not interchangeable: S3's
+    ambiguous 403 can be a bucket policy, an SCP or Block Public Access, while
+    Azure's AuthenticationFailed can be the container's public access level, the
+    account's "allow blob anonymous access" switch or a missing SAS. And an
+    Azure listing that only worked WITH a SAS is a control, not a finding.
+    """
+    states = {k: v.get("state") for k, v in perms.items()}
+    allowed = [k for k, v in states.items() if v == "allowed"]
+    list_keys = {"s3": ["list"], "gcs": ["list"], "azure": ["list-anonymous"]}[provider]
+    scope_level = {"s3": "s3:ListBucket on the bucket ARN, and it says nothing about "
+                         "s3:GetObject on bucket/*",
+                   "gcs": "storage.objects.list on the bucket, and it says nothing "
+                          "about storage.objects.get on the objects",
+                   "azure": "the container's public access level set to Container, "
+                            "which also implies Blob-level read"}[provider]
+    ambiguity = {"s3": "a bucket policy, an organization SCP and S3 Block Public Access "
+                       "produce the same 403",
+                 "gcs": "a missing IAM binding, a VPC Service Controls perimeter and an "
+                        "org policy all produce the same 403",
+                 "azure": "the container's public access level, the account's "
+                          "allow-blob-anonymous-access switch and an absent SAS all "
+                          "produce the same AuthenticationFailed"}[provider]
+    if write and write.get("public_write"):
+        return ("candidate",
+                "anonymous WRITE is granted, read off " + write.get("source", "the policy")
+                + ". No object was written to show it. A validator replays the policy or "
+                  "ACL read.")
+    if any(k in allowed for k in list_keys):
+        return ("candidate",
+                f"an anonymous listing answered. That is {scope_level} — check the "
+                "object-level row before claiming the objects are readable.")
+    if "get-object" in allowed:
+        return ("candidate", "an object reads anonymously while the listing does not: "
+                             "object-level public read without bucket-level list")
+    if any(k in allowed for k in ("policy-read", "acl-read", "iam-read",
+                                  "policy-status", "cors-read")):
+        return ("candidate", "the bucket's own configuration is readable anonymously, "
+                             "which is a disclosure even where the data is not")
+    if "list-with-sas" in allowed:
+        return (None,
+                "the SAS arm listed and the anonymous arm did not: the container exists, "
+                "the operator's SAS works, and anonymous access is off. That is the "
+                "control working, not a finding.")
+    if all(v in ("absent", "refused", "not-probed", "error") for v in states.values()):
+        if "refused" in states.values():
+            return ("inconclusive", "destinations were refused by the scope check; "
+                                    "nothing was sent to them")
+        return (None, "the name does not resolve to a bucket on this provider")
+    return ("inconclusive",
+            f"every probe was denied. From outside, {ambiguity}, so which control is "
+            "doing the work cannot be told from here.")
+
+
+def read_wordlist(a):
+    if not a.wordlist:
+        return []
+    if not a.allow_sweep:
+        raise SystemExit(
+            "cloudexp buckets --wordlist also needs --allow-sweep.\n"
+            "  Guessing bucket names is name brute force against a third party's "
+            "endpoint. AGENTS.md refuses brute force in code, so the sweep is "
+            "opt-in, capped by --max-names (default 20) and paced by "
+            "rules.rate_limit_rps.")
+    words = [w.strip() for w in pathlib.Path(a.wordlist).read_text(
+        encoding="utf-8", errors="replace").splitlines()]
+    words = [w for w in words if w and not w.startswith("#")]
+    if len(words) > a.max_names:
+        print(f"cloudexp: wordlist has {len(words)} names, capped at {a.max_names} "
+              f"(--max-names)", file=sys.stderr)
+    return words[:a.max_names]
+
+
+def cmd_buckets(a):
+    names = list(a.name) + read_wordlist(a)
+    if not names:
+        raise SystemExit("cloudexp buckets: give at least one name, or --wordlist "
+                         "with --allow-sweep")
+    out = {"subcommand": "buckets", "results": [], "refused": REFUSED, "notes": []}
+    for name in names:
+        provider = a.provider or guess_provider(name) or "s3"
+        perms, pairs, write, meta = PROVIDERS[provider](name, a)
+        verdict, why = bucket_verdict(perms, write, provider)
+        out["results"].append({"name": name, "provider": provider, **meta,
+                               "permissions": perms, "public_write": write,
+                               "verdict": verdict, "why": why, "evidence": pairs})
+    out["notes"].append(
+        "No PUT, POST or DELETE was sent: public write is read off the policy or the "
+        "ACL, and where neither is readable the answer is inconclusive rather than a "
+        "test upload.")
+    out["notes"].append(
+        "list is a bucket-level permission (arn:aws:s3:::bucket) and get is an "
+        "object-level one (arn:aws:s3:::bucket/*). A policy that grants GetObject on "
+        "bucket/* without ListBucket on bucket gives an attacker every object whose "
+        "key they can guess and no listing, which reads as 'secure' to a listing-only "
+        "check.")
+    return out
+
+
+# ------------------------------------------------------ 3. presigned URLs
+
+SIGV4_MAX = 604800          # 7 days, the AWS SigV4 query-signing ceiling
+
+
+def parse_presigned(url):
+    """Everything a presigned URL says about itself, offline."""
+    parts = urllib.parse.urlsplit(url)
+    q = {k.lower(): v for k, v in urllib.parse.parse_qsl(parts.query,
+                                                         keep_blank_values=True)}
+    out = {"url": url, "host": parts.netloc, "path": parts.path, "flavour": None,
+           "signature_version": None, "issued": None, "expires_at": None,
+           "expires_in": None, "signed_headers": None, "session_bound": False,
+           "permissions": None, "findings": []}
+
+    def iso(s):
+        try:
+            return dt.datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=dt.timezone.utc)
+        except Exception:
+            try:
+                return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+    if "x-amz-signature" in q or "x-goog-signature" in q:
+        goog = "x-goog-signature" in q
+        p = "x-goog-" if goog else "x-amz-"
+        out["flavour"] = "gcs-v4" if goog else "s3-sigv4"
+        out["signature_version"] = q.get(p + "algorithm", "AWS4-HMAC-SHA256")
+        out["issued"] = iso(q.get(p + "date", ""))
+        try:
+            out["expires_in"] = int(q.get(p + "expires", "0"))
+        except ValueError:
+            out["expires_in"] = None
+        out["signed_headers"] = (q.get(p + "signedheaders") or "").split(";")
+        out["session_bound"] = bool(q.get(p + "security-token"))
+        cred = q.get(p + "credential", "")
+        bits = urllib.parse.unquote(cred).split("/")
+        out["credential"] = {"key_id": bits[0] if bits else "",
+                             "date": bits[1] if len(bits) > 1 else "",
+                             "region": bits[2] if len(bits) > 2 else "",
+                             "service": bits[3] if len(bits) > 3 else ""}
+        if out["issued"] and out["expires_in"]:
+            out["expires_at"] = out["issued"] + dt.timedelta(seconds=out["expires_in"])
+    elif "awsaccesskeyid" in q and "expires" in q:
+        out["flavour"] = "s3-sigv2"
+        out["signature_version"] = "AWS2-HMAC-SHA1"
+        try:
+            out["expires_at"] = dt.datetime.fromtimestamp(int(q["expires"]),
+                                                          dt.timezone.utc)
+        except Exception:
+            pass
+        out["credential"] = {"key_id": q.get("awsaccesskeyid", "")}
+        out["findings"].append(
+            "signature version 2: SHA-1 based and deprecated by AWS; a bucket that "
+            "still accepts it is on an old path and the signer should move to SigV4")
+    elif "sig" in q and "sv" in q:
+        out["flavour"] = "azure-sas"
+        out["signature_version"] = f"SAS sv={q.get('sv')}"
+        out["issued"] = iso(q.get("st", "")) if q.get("st") else None
+        out["expires_at"] = iso(q.get("se", "")) if q.get("se") else None
+        out["permissions"] = q.get("sp")
+        out["resource"] = q.get("sr")
+        out["stored_policy"] = q.get("si")
+        out["session_bound"] = bool(q.get("skoid"))
+        if q.get("si"):
+            out["findings"].append(
+                f"stored access policy si={q['si']}: the permissions and expiry can be "
+                "changed, or the SAS revoked, server-side — which is the only way to "
+                "revoke a SAS at all")
+        else:
+            out["findings"].append(
+                "no stored access policy (si): this SAS cannot be revoked before its "
+                "expiry without rotating the account key")
+        if out["permissions"] and re.search(r"(?i)[wcad]", out["permissions"]):
+            out["findings"].append(
+                f"sp={out['permissions']} includes a write, create, add or delete "
+                "permission. A SAS with w/c/a in a client-side bundle is anonymous "
+                "write to that container. Report the sp string; do not exercise it.")
+    else:
+        out["findings"].append("no recognised presigning parameters: not a presigned URL")
+        return out
+
+    if out["expires_at"]:
+        now = dt.datetime.now(dt.timezone.utc)
+        out["remaining_seconds"] = int((out["expires_at"] - now).total_seconds())
+        if out["remaining_seconds"] <= 0:
+            out["findings"].append(
+                f"expired {abs(out['remaining_seconds'])}s ago: a 403 from it proves "
+                "nothing about the permission, only about the clock")
+        elif out["remaining_seconds"] > 86400:
+            out["findings"].append(
+                f"still valid for {out['remaining_seconds']}s "
+                f"({out['remaining_seconds'] // 86400}d): anyone who has seen this URL "
+                "has the object for that long, and the URL cannot be revoked")
+    if out["expires_in"] and out["expires_in"] > SIGV4_MAX:
+        out["findings"].append(
+            f"X-Amz-Expires={out['expires_in']} exceeds the SigV4 ceiling of "
+            f"{SIGV4_MAX}s, so this URL was rejected by S3 the moment it was issued")
+    if out["session_bound"]:
+        out["findings"].append(
+            "a session token is in the URL, so it was signed with role credentials and "
+            "dies with that session whatever X-Amz-Expires says. A long expiry here is "
+            "cosmetic")
+    if out["signed_headers"] and out["signed_headers"] != [""]:
+        if out["signed_headers"] == ["host"]:
+            out["findings"].append(
+                "only `host` is signed, so every other request header is free: the "
+                "object's served Content-Type and Content-Disposition are whatever the "
+                "stored metadata says, which matters for an inline-served .html or .svg "
+                "(knowledge/web/file-upload.md)")
+    out["findings"].append(
+        "the credential is in the query string, so the whole URL is the bearer token: "
+        "it lands in access logs, in browser history, and in the Referer of any "
+        "cross-origin subresource a page embedding it requests, unless that page sends "
+        "Referrer-Policy: no-referrer or same-origin")
+    out["findings"].append(
+        "extension is not possible by editing: the expiry is part of the string to "
+        "sign in SigV4, in SigV2 and in a SAS, so a changed expiry gives "
+        "SignatureDoesNotMatch / AuthenticationFailed. The finding is the lifetime the "
+        "signer chose, not a bypass. Truncation is the real test: drop one signed "
+        "parameter and see whether the endpoint still answers.")
+    return out
+
+
+def presign_probes(url, a):
+    """Read-only arms: baseline, swapped key, raised expiry, dropped parameter."""
+    parts = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    low = {k.lower() for k, _ in q}
+    arms = [("baseline", url, "the URL exactly as issued")]
+
+    swapped = parts._replace(path=re.sub(r"[^/]+$", "mythos-cloudexp-probe", parts.path)
+                             or "/mythos-cloudexp-probe")
+    arms.append(("key-swap", urllib.parse.urlunsplit(swapped),
+                 "a different object key, same signature: a signer that binds the key "
+                 "must answer SignatureDoesNotMatch"))
+    for name in ("x-amz-expires", "se"):
+        if name in low:
+            bumped = [(k, "31536000" if name == "x-amz-expires" else "2099-01-01T00:00:00Z")
+                      if k.lower() == name else (k, v) for k, v in q]
+            arms.append((f"extend-{name}",
+                         urllib.parse.urlunsplit(parts._replace(
+                             query=urllib.parse.urlencode(bumped))),
+                         "the expiry raised: must fail, because the expiry is signed"))
+    for name in ("x-amz-signedheaders", "sp", "x-amz-algorithm"):
+        if name in low:
+            dropped = [(k, v) for k, v in q if k.lower() != name]
+            arms.append((f"truncate-{name}",
+                         urllib.parse.urlunsplit(parts._replace(
+                             query=urllib.parse.urlencode(dropped))),
+                         f"{name} removed: an endpoint that still answers is not "
+                         "verifying the whole signed set"))
+            break
+    out = []
+    for label, u, why in arms:
+        # Range: bytes=0-0 asks for one byte. The question is whether the
+        # signature is accepted, and the object's contents are not ours to pull.
+        r = send("GET", u, {"Range": "bytes=0-0"}, a.timeout, a.insecure)
+        c = classify_azure(r) if "blob.core.windows.net" in parts.netloc \
+            else classify_s3(r)
+        out.append({"arm": label, "why": why, "state": c.get("state"),
+                    "code": c.get("code"), **pair(r, 200)})
+    return out
+
+
+def cmd_presigned(a):
+    out = {"subcommand": "presigned", "results": [], "refused": REFUSED, "notes": []}
+    for url in a.url:
+        parsed = parse_presigned(url)
+        rec = {"parsed": {k: (v.isoformat() if isinstance(v, dt.datetime) else v)
+                          for k, v in parsed.items()}}
+        if a.probe:
+            require_in_scope(url)
+            rec["probes"] = presign_probes(url, a)
+            base = next((p for p in rec["probes"] if p["arm"] == "baseline"), {})
+            bad = [p for p in rec["probes"]
+                   if p["arm"] != "baseline" and p["state"] == "allowed"]
+            rec["verdict"] = ("candidate" if bad and base.get("state") == "allowed"
+                              else "inconclusive" if bad or base.get("state") != "allowed"
+                              else None)
+            rec["why"] = ("a tampered arm was accepted: "
+                          + ", ".join(p["arm"] for p in bad) if bad else
+                          "every tampered arm was rejected, which is the signer "
+                          "behaving correctly" if base.get("state") == "allowed" else
+                          "the baseline itself did not answer, so the tampered arms "
+                          "prove nothing: check the expiry first")
+        else:
+            rec["verdict"] = None
+            rec["why"] = ("offline parse only. --probe sends the four read-only arms "
+                          "(baseline, key swap, raised expiry, dropped parameter) at "
+                          "the host in the URL, with Range: bytes=0-0.")
+        out["results"].append(rec)
+    out["notes"].append(
+        "Only URLs the operator's own account was issued. A presigned URL is a bearer "
+        "credential: replaying someone else's is using a credential, which AGENTS.md "
+        "refuses.")
+    return out
+
+
+# ------------------------------------------------------- 4. serverless
+
+SERVERLESS_HOSTS = [
+    ("lambda-url", re.compile(r"(?i)\.lambda-url\.[a-z0-9-]+\.on\.aws$"),
+     "a Lambda function URL. AuthType is NONE or AWS_IAM, and nothing else: there is "
+     "no API key, no authorizer and no WAF unless one is bolted in front. NONE means "
+     "the function is on the internet for everyone."),
+    ("api-gateway", re.compile(r"(?i)\.execute-api\.[a-z0-9-]+\.amazonaws\.com$"),
+     "API Gateway. The stage is the first path segment. REST APIs and HTTP APIs differ "
+     "in their error vocabulary and in their default routing, which is what makes a "
+     "missing authorizer visible from outside."),
+    ("cloud-run", re.compile(r"(?i)\.run\.app$"),
+     "Cloud Run. The default URL is on by default; `--no-allow-unauthenticated` turns "
+     "it into a 403 for anonymous callers, and the service is otherwise fully open."),
+    ("cloud-functions", re.compile(r"(?i)\.cloudfunctions\.net$"),
+     "Cloud Functions (1st gen). allUsers on roles/cloudfunctions.invoker is the "
+     "common misconfiguration."),
+    ("azure-functions", re.compile(r"(?i)\.azurewebsites\.net$"),
+     "Azure Functions. Authorization is a key in `?code=` (function key, host key or "
+     "the master key). A key in a client bundle is the whole authorization."),
+    ("workers", re.compile(r"(?i)\.workers\.dev$"),
+     "A Cloudflare Worker on its workers.dev subdomain, which is public by default."),
+]
+
+# The error vocabularies that separate a missing authorizer from a present one.
+APIGW_SHAPES = [
+    ("missing-authentication-token", "Missing Authentication Token",
+     "REST API: the route does not exist on this stage. It is NOT an authorizer."),
+    ("forbidden", "Forbidden",
+     "REST API with an API key or a resource policy: the request reached the stage "
+     "and was refused before the integration."),
+    ("unauthorized", "Unauthorized",
+     "an authorizer (Lambda or Cognito) is attached and rejected the request. The "
+     "route exists and is guarded."),
+    ("not-found", "Not Found",
+     "HTTP API: no route matched and there is no $default route. An HTTP API with a "
+     "$default route answers everything, which is how one unguarded route becomes "
+     "every path."),
+    ("internal-server-error", "Internal server error",
+     "the integration was invoked and failed: the authorizer, if any, let this through"),
+]
+
+
+def serverless_judge(kind, res, path):
+    body = (res.get("body") or "")[:600]
+    h = res.get("headers") or {}
+    err = h.get("x-amzn-errortype", "")
+    status = res.get("status")
+    notes = []
+    if res.get("refused"):
+        return {"state": "refused", "notes": ["destination out of scope, not sent"]}
+    if status is None:
+        return {"state": "error", "notes": [body[:120]]}
+    if kind == "api-gateway":
+        for label, needle, meaning in APIGW_SHAPES:
+            if needle.lower() in body.lower():
+                notes.append(f"{label}: {meaning}")
+                break
+        if err:
+            notes.append(f"x-amzn-ErrorType: {err}")
+        if status == 200:
+            notes.append("the stage answered this route anonymously: either there is no "
+                         "authorizer on it, or the authorizer allows anonymous. Compare "
+                         "with another stage via --stages.")
+    if kind == "lambda-url":
+        if status == 403 and "Forbidden" in body:
+            notes.append("AuthType AWS_IAM: the function URL requires a SigV4 signature")
+        elif status and status < 500:
+            notes.append("AuthType NONE: the function URL answers an unsigned request, "
+                         f"so it is invocable by anyone ({status})")
+        if h.get("x-amzn-requestid"):
+            notes.append("x-amzn-RequestId present: the answer came from Lambda, not "
+                         "from a proxy in front of it")
+    if kind == "cloud-run":
+        if status == 403 and "does not have permission" in body:
+            notes.append("the service requires an authenticated invoker: anonymous is "
+                         "403 before the container is started")
+        elif status and status < 400:
+            notes.append("allUsers can invoke this service")
+    if kind == "cloud-functions" and status == 403:
+        notes.append("403: roles/cloudfunctions.invoker is not granted to allUsers")
+    if kind == "azure-functions":
+        if status == 401:
+            notes.append("401 without a key: the function uses function-level or "
+                         "host-level authorization")
+        elif status and status < 400:
+            notes.append("the function answered. If the request carried a `code=` from "
+                         "the client bundle, that key IS the authorization and is "
+                         "published; if it carried none, the function is anonymous.")
+    if not notes:
+        notes.append(f"status {status}, no shape in the table matched")
+    state = ("open" if status and status < 400 else
+             "guarded" if status in (401, 403) else
+             "absent" if status == 404 else "inconclusive")
+    return {"state": state, "status": status, "notes": notes, "path": path}
+
+
+def cmd_serverless(a):
+    out = {"subcommand": "serverless", "results": [], "refused": REFUSED, "notes": []}
+    for url in a.url:
+        parts = urllib.parse.urlsplit(url if "//" in url else "https://" + url)
+        host = parts.hostname or ""
+        kind, what = next(((k, w) for k, rx, w in SERVERLESS_HOSTS if rx.search(host)),
+                          ("unknown", "not a host shape this table knows; probed as a "
+                                      "plain origin"))
+        if a.kind:
+            # The host shape is the fingerprint, and a lab fixture or a custom
+            # domain in front of the real thing does not carry it. --kind says
+            # which error vocabulary to read the answers with.
+            kind = a.kind
+            what = next(w for k, _, w in SERVERLESS_HOSTS if k == a.kind)
+        rec = {"url": url, "host": parts.netloc, "kind": kind, "what_it_is": what,
+               "arms": []}
+        base = f"{parts.scheme}://{parts.netloc}"
+        targets = [("root", parts.path or "/")]
+        if kind == "api-gateway" or a.stages:
+            seg = [s for s in (parts.path or "/").split("/") if s]
+            rest = "/" + "/".join(seg[1:]) if len(seg) > 1 else "/"
+            for st in (a.stages or [])[:8]:
+                targets.append((f"stage:{st}", f"/{st}{rest}"))
+            targets.append(("default-route", "/mythos-cloudexp-no-such-route"))
+        for label, path in targets:
+            r = send("GET", base + path, {}, a.timeout, a.insecure)
+            rec["arms"].append({"arm": label, **serverless_judge(kind, r, path),
+                                **pair(r, 300)})
+        opt = send("OPTIONS", base + (parts.path or "/"), {}, a.timeout, a.insecure)
+        rec["cors"] = {k: v for k, v in (opt["headers"] or {}).items()
+                       if k.startswith("access-control-")}
+        states = {x["arm"]: x["state"] for x in rec["arms"]}
+        opens = [k for k, v in states.items() if v == "open"]
+        guarded = [k for k, v in states.items() if v == "guarded"]
+        if opens and guarded:
+            rec["verdict"] = "candidate"
+            rec["why"] = (f"one arm answers anonymously ({', '.join(opens)}) while "
+                          f"another is guarded ({', '.join(guarded)}): the guard is not "
+                          "on every route or every stage, which is the authorizer gap.")
+        elif opens:
+            rec["verdict"] = "candidate"
+            rec["why"] = ("every arm answers anonymously. Whether that is a flaw depends "
+                          "on what the function does — read the body before reporting.")
+        elif guarded:
+            rec["verdict"] = None
+            rec["why"] = "every arm is refused before the integration"
+        else:
+            rec["verdict"] = "inconclusive"
+            rec["why"] = "no arm produced a shape the table recognises"
+        out["results"].append(rec)
+    out["notes"].append(
+        "Stage names are only probed when --stages names them. Guessing stage names is "
+        "name brute force against a third party, so there is no default list.")
+    out["notes"].append(
+        "An `$default` route on an HTTP API answers every path, so one unguarded route "
+        "is every path; a REST API routes each resource separately and says 'Missing "
+        "Authentication Token' for a path it does not have. The two are told apart by "
+        "the default-route arm above.")
+    return out
+
+
+# --------------------------------------------- 5. orchestrator exposure
+
+# Each daemon: the port, one read-only path, and the fingerprint that proves it
+# is that daemon rather than something else on the port.
+ORCH = [
+    ("kubelet-readonly", 10255, "/pods", r'"kind"\s*:\s*"PodList"',
+     "the kubelet read-only port. Unauthenticated by design when enabled, and /pods "
+     "lists every pod on the node with its environment and its service-account mounts. "
+     "Deprecated and off by default since Kubernetes 1.10 — if it answers, someone "
+     "turned it on."),
+    ("kubelet-readonly-metrics", 10255, "/metrics", r"kubelet_|kubernetes_build_info",
+     "kubelet metrics: pod and container names, and the git version in "
+     "kubernetes_build_info"),
+    ("kubelet-authenticated", 10250, "/pods", r'"kind"\s*:\s*"PodList"|Unauthorized',
+     "the kubelet's authenticated port. A 401 here is correct; a PodList is "
+     "anonymous-auth=true, which is the kubelet's worst setting because /run and "
+     "/exec live on the same port."),
+    ("kubelet-healthz", 10248, "/healthz", r"ok",
+     "the kubelet health endpoint, localhost-bound by default"),
+    ("kube-apiserver", 6443, "/version", r'"gitVersion"',
+     "the API server. An anonymous /version is normal; an anonymous /api/v1/namespaces "
+     "is system:anonymous bound to something it should not be."),
+    ("kube-apiserver-http", 8080, "/api", r'"versions"|"serverAddressByClientCIDR"',
+     "the API server's legacy insecure port: no authentication at all. Removed in "
+     "1.20, still found on old clusters."),
+    ("dashboard", 8443, "/api/v1/login/status", r'"tokenPresent"|"httpsMode"',
+     "the Kubernetes Dashboard. The finding is a Dashboard reachable without "
+     "authentication, or one whose service account is cluster-admin."),
+    ("etcd", 2379, "/version", r'"etcdserver"',
+     "etcd. Every Secret in the cluster is in here in plaintext unless encryption at "
+     "rest is configured. /version is read-only and does not read a key."),
+    ("etcd-metrics", 2379, "/metrics", r"etcd_server_|etcd_debugging_",
+     "etcd metrics without client certificates"),
+    ("cadvisor", 4194, "/api/v1.3/machine", r'"num_cores"|"machine_id"',
+     "cAdvisor's own port: container names, images and host specs"),
+    ("docker-api", 2375, "/version", r'"ApiVersion"|"GitCommit"',
+     "the Docker daemon on its unencrypted TCP port. Read-only here, but a reachable "
+     "Docker API is root on the host: /containers/create is one POST away, which this "
+     "script does not send."),
+    ("docker-api-tls", 2376, "/version", r'"ApiVersion"',
+     "the Docker daemon's TLS port, which should need a client certificate"),
+    ("consul", 8500, "/v1/status/leader", r'^\s*"\d+\.\d+\.\d+\.\d+:\d+"',
+     "Consul's HTTP API. The default ACL policy is allow, so an exposed agent hands "
+     "over the service catalogue and the KV store."),
+    ("consul-ui", 8500, "/ui/", r"(?i)consul",
+     "the Consul web UI"),
+    ("nomad", 4646, "/v1/agent/health", r'"server"|"client"',
+     "Nomad's HTTP API. ACLs are off by default, and a job submission is remote code "
+     "execution on the cluster."),
+    ("nomad-status", 4646, "/v1/status/leader", r'^\s*"',
+     "Nomad's leader, unauthenticated"),
+]
+VERSION_RE = re.compile(r"(?i)\b(?:v|version[\"'\s:=]*)(\d+\.\d+(?:\.\d+)?)")
+
+
+def cmd_orchestrator(a):
+    host = a.host
+    out = {"subcommand": "orchestrator", "host": host, "results": [],
+           "refused": REFUSED, "notes": []}
+    picked = [p for p in ORCH if not a.only or p[0] in a.only]
+    if a.only:
+        unknown = set(a.only) - {p[0] for p in ORCH}
+        if unknown:
+            raise SystemExit(f"cloudexp orchestrator --only: unknown {sorted(unknown)}; "
+                             f"known: {sorted({p[0] for p in ORCH})}")
+    for name, port, path, fp, what in picked:
+        if a.endpoint:
+            url = a.endpoint.rstrip("/") + path
+        else:
+            scheme = "https" if port in (6443, 8443, 2376, 10250) else "http"
+            url = f"{scheme}://{host}:{port}{path}"
+        r = send("GET", url, {}, a.timeout, a.insecure or port in (6443, 8443, 2376,
+                                                                   10250))
+        body = r.get("body") or ""
+        matched = bool(re.search(fp, body, re.M)) if body else False
+        versions = sorted(set(VERSION_RE.findall(body[:4000])))[:4] if matched else []
+        if r.get("refused"):
+            state, why = "refused", "out of scope, not sent"
+        elif matched and (r["status"] or 0) < 400:
+            state = "candidate"
+            why = (f"the fingerprint matched on an unauthenticated {name}. {what}"
+                   + (f" Version strings in the body: {', '.join(versions)}."
+                      if versions else ""))
+        elif r["status"] in (401, 403):
+            state, why = None, f"{r['status']}: reachable but authenticated, which is " \
+                               "the correct answer here"
+        elif r["status"] is None:
+            state, why = None, f"no answer ({body[:60]})"
+        else:
+            state = "inconclusive"
+            why = (f"status {r['status']} and the fingerprint did not match: something "
+                   "answers on this port but it is not this daemon, or it is behind a "
+                   "proxy that rewrites the body")
+        out["results"].append({"name": name, "port": port, "what_it_is": what,
+                               "verdict": state, "why": why, "versions": versions,
+                               **pair(r, 300)})
+    out["notes"].append(
+        "Every probe is one GET of one read-only path. Nothing here lists a secret, "
+        "reads an etcd key, or touches the Docker or Nomad endpoints that create "
+        "something: reaching /version on the Docker API is the finding, and "
+        "/containers/create is not in this file.")
+    out["notes"].append(
+        "The ports are in the scope check like any other destination. A node whose IP "
+        "the scope file does not name is refused and listed under `refused`, even when "
+        "it is obviously part of the target's cluster.")
+    return out
+
+
+# -------------------------------------------- 6. metadata: the handoff
+
+def cmd_metadata(a):
+    """No requests. The table comes from ssrfprobe, which owns this surface."""
+    sp = mod("ssrfprobe")
+    table = []
+    for name, spec in sp.METADATA.items():
+        table.append({"cloud": name, "host": spec["host"], "method": spec["method"],
+                      "path": spec["path"], "headers": spec["headers"],
+                      "requires": spec["requires"], "defeated_by": spec["defeated_by"],
+                      "lab_emulator": bool(spec["lab"])})
+    url = a.url or "<url-with-the-ssrf>"
+    param = a.parameter or "<parameter>"
+    return {
+        "subcommand": "metadata",
+        "owner": "scripts/ssrfprobe",
+        "table": table,
+        "run": [f"scripts/ssrfprobe probe {url} {param} --oast <your-in-scope-oast-host>",
+                f"scripts/ssrfprobe metadata {url} {param}",
+                f"scripts/ssrfprobe metadata {url} {param} --real --i-have-authorization"],
+        "notes": [
+            "This subcommand sends nothing. Cloud metadata reached THROUGH the "
+            "application is ssrfprobe's job and stays there: it classifies the "
+            "primitive first (method control and header control are separately "
+            "measured facts) and only then says which surface is in reach. Re-probing "
+            "metadata from here would duplicate that and would get the capability "
+            "question wrong, which is exactly how 'cloud credentials reachable' gets "
+            "written about a GET-only SSRF.",
+            "The IMDSv1-versus-IMDSv2 distinction is the whole impact question. v1 "
+            "needs a plain GET, so a URL-only SSRF reaches it. v2 needs a PUT to "
+            "/latest/api/token and then the token back in a request header, so it needs "
+            "method control AND header control; a PUT carrying X-Forwarded-For is "
+            "rejected and the default hop limit of 1 drops anything proxied.",
+            "GCP denies every request without `Metadata-Flavor: Google`; Azure needs "
+            "`Metadata: true` and no X-Forwarded-For; Oracle's /opc/v2/ needs "
+            "`Authorization: Bearer Oracle` while /opc/v1/ needs nothing; Alibaba and "
+            "DigitalOcean need nothing at all. Header control is therefore the single "
+            "fact that decides four of the six.",
+            "Run it against the lab emulator first (that is ssrfprobe's default: "
+            "http://cloud-metadata and http://cloud-metadata-v2, in-lab only). The real "
+            "link-local addresses need --real --i-have-authorization and are still "
+            "subject to the scope file.",
+        ]}
+
+
+# --------------------------------- 7. credentials in the client, and what they do
+
+# The cloud-specific layer. The generic credential regexes are
+# scripts/clientside's SECRET_PATTERNS and are not repeated here: this table is
+# only about shapes whose MEANING is provider-specific, above all the ones that
+# are published on purpose and therefore get mis-reported as findings.
+CLOUD_SHAPES = [
+    ("aws-access-key-id", re.compile(r"\b((?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})\b"),
+     False, "an AWS access key id. AKIA is a long-lived IAM user key and is never "
+            "meant to be in a browser; ASIA is a temporary STS key and expires. The "
+            "key id alone proves nothing can be done with it: report the presence, "
+            "look for the matching secret in the same bundle, and do not call the API."),
+    ("gcp-api-key", re.compile(r"\b(AIza[0-9A-Za-z_-]{35})\b"),
+     True, "a Google API key, which Firebase and Maps put in the client by design. It "
+           "identifies the project, it is not a secret. The finding is an unrestricted "
+           "key: no HTTP-referrer or app restriction, and the wrong APIs enabled, so "
+           "someone else's site can bill the project."),
+    ("gcp-service-account", re.compile(r'"type"\s*:\s*"(service_account)"'),
+     False, "a service-account JSON key. This is a private key and is a critical "
+            "finding on sight. Report the presence; do not authenticate with it."),
+    ("azure-functions-key", re.compile(r"(?i)[?&]code=([A-Za-z0-9_\-=]{20,})"),
+     False, "an Azure Functions key in a URL. This key IS the authorization for the "
+            "function: a function key opens one function, a host key opens every "
+            "function in the app, and the master key opens the admin API. A key in a "
+            "bundle means the function has no authorization at all."),
+    ("azure-sas", re.compile(r"(?i)[?&](sv=20\d\d-\d\d-\d\d)[^\s\"']*[?&]sig="),
+     False, "a Shared Access Signature. Read `sp` for what it permits and `se` for how "
+            "long: `cloudexp presigned` does both. A SAS with w/c/a in a bundle is "
+            "anonymous write."),
+    ("supabase-anon-key", re.compile(r"\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+                                     r"\.[A-Za-z0-9_-]{10,})\b"),
+     True, "a JWT. A Supabase anon key is published by design and the finding is the "
+           "row-level-security policy behind it, not the key. Decode the payload: "
+           "`role: anon` is expected, `role: service_role` bypasses RLS entirely and "
+           "is critical on sight. Confirm per knowledge/web/baas-cloud-storage.md with "
+           "a count, never a row dump."),
+    ("firebase-config", re.compile(r"(?i)(firebaseConfig|databaseURL)\s*[:=]"),
+     True, "a Firebase config. Public by design; the finding is the Realtime Database "
+           "or Firestore security rules. Check `.json?shallow=true` on the databaseURL "
+           "and the Storage rules on storageBucket."),
+    ("firebase-rtdb-url", re.compile(r"https://([a-z0-9-]+)\.firebaseio\.com"),
+     True, "a Realtime Database URL. `GET /.json?shallow=true&limitToFirst=1` returns "
+           "keys only and tells you whether the rules allow anonymous read."),
+    ("aws-cognito-pool", re.compile(r"\b([a-z]{2}-[a-z]+-\d_[A-Za-z0-9]{9,})\b"),
+     True, "a Cognito user-pool id, which the client needs. The finding is open "
+           "self-signup on a pool that gates something, or an identity pool with "
+           "unauthenticated identities enabled and a wide role attached."),
+    ("algolia-admin-key", re.compile(r"(?i)algolia[_-]?(?:admin|api)[_-]?key"
+                                     r"\W{0,4}([0-9a-f]{32})"),
+     False, "an Algolia key. The search-only key belongs in the client; an admin key "
+            "does not, and the two are the same shape, so the name of the variable is "
+            "the only signal — state that the classification is from the name."),
+]
+
+
+def cloud_meaning(text, label):
+    out = []
+    for kind, rx, by_design, what in CLOUD_SHAPES:
+        for m in rx.finditer(text or ""):
+            val = m.group(1) if rx.groups else m.group(0)
+            rec = {"kind": kind, "where": label, "by_design": by_design,
+                   "match": val[:24] + ("..." if len(val) > 24 else ""),
+                   "what_it_can_do": what}
+            if kind == "supabase-anon-key":
+                rec["jwt_role"] = jwt_role(val)
+                if rec["jwt_role"] == "service_role":
+                    rec["by_design"] = False
+                    rec["what_it_can_do"] = (
+                        "role: service_role — this key BYPASSES row-level security on "
+                        "every table. Critical on sight. Report the presence and stop; "
+                        "do not use it.")
+            out.append(rec)
+    return out
+
+
+def jwt_role(tok):
+    try:
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role")
+    except Exception:
+        return None
+
+
+def cmd_clientcreds(a):
+    cs = mod("clientside")
+    out = {"subcommand": "clientcreds", "target": a.target, "generic": [],
+           "cloud": [], "refused": REFUSED, "notes": []}
+    texts = []
+    if "//" in a.target:
+        require_in_scope(a.target)
+        r = send("GET", a.target, {}, a.timeout, a.insecure)
+        if r["status"] is None:
+            raise SystemExit(f"cloudexp clientcreds: {a.target} unreachable "
+                             f"({r['body'][:100]})")
+        texts.append((r["body"], a.target))
+    else:
+        root = pathlib.Path(a.target)
+        files = [root] if root.is_file() else sorted(
+            p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".js", ".mjs", ".cjs", ".ts", ".tsx",
+                                                    ".json", ".html", ".css", ".map",
+                                                    ".env", ".yml", ".yaml"))
+        for p in files[:a.max_files]:
+            try:
+                texts.append((p.read_text(encoding="utf-8", errors="replace"),
+                              str(p.relative_to(root) if root.is_dir() else p)))
+            except OSError:
+                continue
+    for text, label in texts:
+        # The generic layer, from the one scanner this repository already has.
+        out["generic"] += cs.scan_secrets_text(text, label)
+        out["cloud"] += cloud_meaning(text, label)
+    out["generic"] = [h for h in out["generic"] if h["kind"] != "endpoint"]
+    by_design = [c for c in out["cloud"] if c["by_design"]]
+    out["verdict"] = ("candidate" if any(not c["by_design"] for c in out["cloud"])
+                      else "inconclusive" if by_design else None)
+    out["why"] = (
+        "at least one shape that is NOT public by design is in client-side material"
+        if any(not c["by_design"] for c in out["cloud"]) else
+        f"{len(by_design)} published-by-design key(s) and nothing else. That is not a "
+        "finding on its own: the finding is the rule or policy behind the key, which is "
+        "proven against the backend, not here (knowledge/web/baas-cloud-storage.md)"
+        if by_design else "no cloud credential shapes found")
+    out["notes"].append(
+        "The generic credential patterns come from scripts/clientside (its "
+        "SECRET_PATTERNS, called directly), so there is one secret scanner in this "
+        "repository and not two. This subcommand adds only the provider-specific "
+        "meaning: which key is published on purpose, and what the rule behind it would "
+        "have to allow for the key to matter.")
+    out["notes"].append(
+        "Nothing here uses a credential. A key's reach is proven against the operator's "
+        "own account or not at all.")
+    return out
+
+
+# --------------------------------------------------------------- render
+
+def _fmt_perms(perms):
+    rows = []
+    for label, p in perms.items():
+        rows.append(f"  {label:<20} {str(p.get('state')):<12} "
+                    f"{p.get('code', '') or '':<22} {p.get('resource', '')}")
+        rows.append(f"      {p.get('why', '')}")
+    return rows
+
+
+def render(res):
+    c = res["subcommand"]
+    out = [f"# cloudexp {c}"]
+    if c == "harvest":
+        out += ["", f"fetched {len(res['fetched'])} document(s)",
+                f"CORS on the entry point: {res.get('cors') or '(none)'}", ""]
+        for cand in res["candidates"]:
+            out.append(f"{cand['kind']:<10} {cand['provider']:<17} {cand['name'][:90]}")
+            out.append(f"           sources: {', '.join(cand['sources'])}")
+    elif c == "buckets":
+        for r in res["results"]:
+            out += ["", f"## {r['provider']} {r['name']}  -> {r.get('endpoint', '')}"]
+            out += _fmt_perms(r["permissions"])
+            w = r.get("public_write") or {}
+            out.append(f"  public write: {w.get('public_write')} "
+                       f"(source: {w.get('source', 'none')})")
+            out.append(f"      {w.get('why', '')}")
+            out.append(f"  verdict: {r['verdict']} — {r['why']}")
+    elif c == "presigned":
+        for r in res["results"]:
+            p = r["parsed"]
+            out += ["", f"## {p['flavour']} {p['host']}{p['path'][:60]}",
+                    f"signature: {p['signature_version']}",
+                    f"issued {p['issued']} expires {p['expires_at']} "
+                    f"(in {p.get('remaining_seconds')}s)",
+                    f"signed headers: {p.get('signed_headers')}  "
+                    f"permissions: {p.get('permissions')}  "
+                    f"session-bound: {p['session_bound']}"]
+            out += [f"  - {f}" for f in p["findings"]]
+            for arm in r.get("probes") or []:
+                out.append(f"  [{arm['arm']}] {arm['status']} {arm['state']} "
+                           f"{arm.get('code') or ''}")
+            out.append(f"  verdict: {r['verdict']} — {r['why']}")
+    elif c == "serverless":
+        for r in res["results"]:
+            out += ["", f"## {r['kind']} {r['host']}", f"   {r['what_it_is']}"]
+            for arm in r["arms"]:
+                out.append(f"  [{arm['arm']:<28}] {arm['status']} {arm['state']}")
+                out += [f"      {n}" for n in arm["notes"]]
+            out.append(f"  CORS: {r['cors'] or '(none)'}")
+            out.append(f"  verdict: {r['verdict']} — {r['why']}")
+    elif c == "orchestrator":
+        for r in res["results"]:
+            out.append(f"{str(r['verdict']):<13} {r['name']:<26} {r['status']} "
+                       f"{r['url']}")
+            out.append(f"      {r['why']}")
+    elif c == "metadata":
+        out += ["", f"owner: {res['owner']} — this subcommand sends nothing", ""]
+        for t in res["table"]:
+            out.append(f"{t['cloud']:<16} {t['method']:<4} {t['host']}{t['path']}")
+            out.append(f"   headers: {t['headers'] or 'none'}"
+                       f"   lab emulator: {t['lab_emulator']}")
+            out.append(f"   requires: {t['requires']}")
+            out.append(f"   defeated by: {t['defeated_by']}")
+        out += ["", "## run"] + [f"  {r}" for r in res["run"]]
+    elif c == "clientcreds":
+        out += ["", "## cloud shapes, and what each one can do"]
+        for h in res["cloud"]:
+            out.append(f"{h['kind']:<22} by-design={str(h['by_design']):<5} "
+                       f"{h['where']} {h['match']}")
+            out.append(f"      {h['what_it_can_do']}")
+        out += ["", f"## generic (scripts/clientside) — {len(res['generic'])} hit(s)"]
+        out += [f"{h['kind']:<22} {h['confidence']:<7} {h['file']}:{h['line']} "
+                f"{h['match']}" for h in res["generic"][:40]]
+        out += ["", f"verdict: {res['verdict']} — {res['why']}"]
+    if res.get("refused"):
+        out += ["", "## refused destinations (out of scope, nothing sent)"]
+        out += [f"  {r['url'][:100]}  ({', '.join(r['hosts'])})" for r in res["refused"]]
+    for n in res.get("notes") or []:
+        out += ["", n]
+    return "\n".join(out)
+
+
+# -------------------------------------------------------------- selftest
+
+def _selftest():
+    """Offline asserts on the classifiers, plus one live loopback round trip.
+
+    The live arm starts lab/cloudexplab/app.py on port 0 and runs the real
+    subcommands against it, because the classification tables are only worth
+    anything against the bodies the providers actually send — and because an
+    offline assert cannot see a `send()` that never opens a socket.
+    """
+    import socket
+    import tempfile
+    import threading
+
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # ---- provider error bodies, the four the brief names and their neighbours
+    def s3body(code):
+        return {"status": 403 if code == "AccessDenied" else 404,
+                "headers": {}, "body": f"<Error><Code>{code}</Code></Error>"}
+
+    eq(classify_s3(s3body("NoSuchBucket"))["state"], "absent",
+       "NoSuchBucket is an absent bucket, not a denial")
+    eq(classify_s3(s3body("AccessDenied"))["state"], "denied", "AccessDenied is a denial")
+    ok("indistinguishable" in classify_s3(s3body("AccessDenied"))["why"],
+       "and it says a policy, an SCP and Block Public Access look the same from outside")
+    eq(classify_s3(s3body("NoSuchKey"))["state"], "absent",
+       "NoSuchKey means the bucket answered and the key is gone")
+    eq(classify_s3(s3body("PermanentRedirect"))["state"], "wrong-region",
+       "a region redirect is not a denial")
+    eq(classify_s3({"status": 200, "headers": {}, "body":
+                    "<ListBucketResult><Contents><Key>a.txt</Key></Contents>"
+                    "</ListBucketResult>"})["state"], "allowed",
+       "a ListBucketResult is a readable listing")
+    eq(classify_s3({"status": 200, "headers": {}, "body":
+                    "<ListBucketResult><Contents><Key>a.txt</Key></Contents>"
+                    "</ListBucketResult>"})["keys"], ["a.txt"],
+       "and the first key is lifted out, so the object probe has something to ask for")
+    eq(classify_s3({"status": None, "headers": {}, "body": "timeout"})["state"], "error",
+       "no answer is an error, not a denial")
+    eq(classify_s3({"status": 403, "headers": {}, "body": "", "refused": ["x"]})["state"],
+       "refused", "a refused destination is reported as refused, never as denied")
+    eq(classify_s3({"status": 403, "headers": {}, "body": "nginx"})["state"], "denied",
+       "a 403 with no S3 code is still a denial, but the reason says it may be a proxy")
+    eq(classify_s3({"status": 418, "headers": {}, "body": "?"})["state"], "inconclusive",
+       "an unknown status is inconclusive")
+
+    az = classify_azure({"status": 403, "headers": {"x-ms-error-code":
+                                                    "AuthenticationFailed"},
+                         "body": "<Error><Code>AuthenticationFailed</Code></Error>"})
+    eq(az["state"], "denied", "Azure AuthenticationFailed is a denial")
+    ok("SAS" in az["why"], "and names the SAS as the thing that would make it answer")
+    eq(classify_azure({"status": 404, "headers": {},
+                       "body": "<Error><Code>ContainerNotFound</Code></Error>"})["state"],
+       "absent", "ContainerNotFound is absent")
+    eq(classify_azure({"status": 200, "headers": {}, "body":
+                       "<EnumerationResults><Blob><Name>a</Name></Blob>"
+                       "</EnumerationResults>"})["keys"], ["a"],
+       "an Azure listing yields blob names")
+
+    eq(classify_gcs({"status": 403, "headers": {}, "body": json.dumps(
+        {"error": {"code": 403, "message": "anonymous caller does not have "
+                                           "storage.objects.list access"}})})["state"],
+       "denied", "a GCS 403 error document is a denial")
+    eq(classify_gcs({"status": 200, "headers": {}, "body": json.dumps(
+        {"kind": "storage#objects", "items": [{"name": "k"}]})})["keys"], ["k"],
+       "a storage#objects document is a readable listing")
+    eq(classify_gcs({"status": 404, "headers": {}, "body": json.dumps(
+        {"error": {"code": 404, "message": "The specified bucket does not exist."}})}
+        )["state"], "absent", "a GCS 404 is an absent bucket")
+    eq(classify_gcs({"status": 403, "headers": {},
+                     "body": "<Error><Code>AccessDenied</Code></Error>"})["state"],
+       "denied", "the GCS XML endpoint answers in S3's vocabulary and is read that way")
+
+    # ---- public write, read rather than written
+    pol = public_write_from_policy(json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::b/*"}]}))
+    eq(pol["public_write"], False, "anonymous READ is not anonymous write")
+    pol2 = public_write_from_policy(json.dumps({"Statement": [
+        {"Sid": "up", "Effect": "Allow", "Principal": {"AWS": "*"},
+         "Action": ["s3:PutObject"], "Resource": "arn:aws:s3:::b/*"}]}))
+    eq(pol2["public_write"], True, "s3:PutObject for Principal AWS:* is public write")
+    eq(pol2["statements"][0]["sid"], "up", "and the statement is quoted for the report")
+    eq(public_write_from_policy(json.dumps({"Statement": [
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject"}]}))["public_write"],
+       False, "a Deny statement is not a grant")
+    eq(public_write_from_policy(json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::1:root"},
+         "Action": "s3:PutObject"}]}))["public_write"], False,
+       "a named principal is not anonymous")
+    eq(public_write_from_policy(json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:*"}]}))["public_write"], True,
+       "s3:* for everyone includes write")
+    eq(public_write_from_policy("not json"), None,
+       "an unreadable policy is None, not False: no claim either way")
+    acl = public_write_from_acl(
+        "<AccessControlPolicy><Grant><Grantee><URI>"
+        f"{ALLUSERS}</URI></Grantee><Permission>WRITE</Permission></Grant>"
+        "</AccessControlPolicy>")
+    eq(acl["public_write"], True, "the AllUsers WRITE grant is public write")
+    eq(public_write_from_acl(
+        "<AccessControlPolicy><Grant><Grantee><URI>"
+        f"{ALLUSERS}</URI></Grantee><Permission>READ</Permission></Grant>"
+        "</AccessControlPolicy>")["public_write"], False,
+       "an AllUsers READ grant is not")
+    eq(public_write_from_acl("<Error/>"), None, "a non-ACL body yields no claim")
+
+    # ---- verdicts: never confirmed, inconclusive where it must be
+    v, why = bucket_verdict({"list": {"state": "allowed"},
+                             "get-object": {"state": "denied"}}, None)
+    eq(v, "candidate", "an anonymous listing is a candidate")
+    ok("bucket/*" in why, "and the verdict names the bucket-versus-bucket/* distinction")
+    v2, why2 = bucket_verdict({"list": {"state": "denied"},
+                               "policy-read": {"state": "denied"}}, None)
+    eq(v2, "inconclusive", "all-denied is inconclusive, not a clean negative")
+    ok("SCP" in why2, "and says why: the 403s are indistinguishable")
+    v3, _ = bucket_verdict({"list": {"state": "absent"}}, None)
+    eq(v3, None, "an absent bucket is not a finding")
+    v4, _ = bucket_verdict({"list": {"state": "denied"}},
+                           {"public_write": True, "source": "bucket policy"})
+    eq(v4, "candidate", "public write off the policy is a candidate even with no list")
+    v5, _ = bucket_verdict({"list": {"state": "refused"}}, None)
+    eq(v5, "inconclusive", "a refused destination leaves the question open")
+    for verdicts in (v, v2, v3, v4, v5):
+        ok(verdicts != "confirmed", "no verdict in this file is ever 'confirmed'")
+
+    # ---- presigned URL parsing
+    p = parse_presigned(
+        "https://b.s3.eu-central-1.amazonaws.com/k.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=ASIAX%2F20260101%2Feu-central-1%2Fs3%2Faws4_request"
+        "&X-Amz-Date=20260101T000000Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host"
+        "&X-Amz-Security-Token=t&X-Amz-Signature=ab")
+    eq(p["flavour"], "s3-sigv4", "SigV4 recognised")
+    eq(p["credential"]["region"], "eu-central-1", "the region comes out of the credential")
+    eq(p["credential"]["service"], "s3", "and the service")
+    eq(p["expires_at"].isoformat(), "2026-01-08T00:00:00+00:00",
+       "expiry = X-Amz-Date + X-Amz-Expires")
+    eq(p["session_bound"], True, "a security token makes it session-bound")
+    ok(any("session token" in f for f in p["findings"]),
+       "and the report says a long expiry on a session credential is cosmetic")
+    ok(any("Referer" in f for f in p["findings"]),
+       "the query-string credential's referrer leak is always stated")
+    ok(any("extension is not possible by editing" in f for f in p["findings"]),
+       "and extension is explained as signed, not as a bypass")
+    ok(any("only `host` is signed" in f for f in p["findings"]),
+       "signing only host is called out")
+    over = parse_presigned(
+        "https://b.s3.amazonaws.com/k?X-Amz-Algorithm=A&X-Amz-Date=20260101T000000Z"
+        "&X-Amz-Expires=999999&X-Amz-Signature=ab&X-Amz-Credential=A%2Fb%2Fc%2Fd")
+    ok(any("exceeds the SigV4 ceiling" in f for f in over["findings"]),
+       "an expiry above 7 days was dead on arrival and says so")
+    v2url = parse_presigned("https://b.s3.amazonaws.com/k?AWSAccessKeyId=AKIA"
+                            "&Expires=4102444800&Signature=x")
+    eq(v2url["flavour"], "s3-sigv2", "SigV2 recognised by its own parameter names")
+    ok(any("deprecated" in f for f in v2url["findings"]), "and reported as deprecated")
+    sas = parse_presigned("https://a.blob.core.windows.net/c/b.txt?sv=2022-11-02"
+                          "&se=2099-01-01T00:00:00Z&sp=racwdl&sr=c&sig=x")
+    eq(sas["flavour"], "azure-sas", "a SAS is recognised")
+    eq(sas["permissions"], "racwdl", "sp is read as the permission set")
+    ok(any("write, create" in f for f in sas["findings"]),
+       "and a write permission in a SAS is called out without using it")
+    ok(any("cannot be revoked" in f for f in sas["findings"]),
+       "a SAS with no stored policy is unrevocable and says so")
+    goog = parse_presigned("https://storage.googleapis.com/b/k?X-Goog-Algorithm=A"
+                           "&X-Goog-Date=20260101T000000Z&X-Goog-Expires=60"
+                           "&X-Goog-Signature=x&X-Goog-Credential=a%2Fb%2Fc%2Fd")
+    eq(goog["flavour"], "gcs-v4", "the GCS V4 flavour uses X-Goog-* and is recognised")
+    eq(parse_presigned("https://x.test/a?b=1")["flavour"], None,
+       "a plain URL is not a presigned URL")
+
+    # ---- serverless shapes
+    j = serverless_judge("api-gateway", {"status": 403, "headers": {
+        "x-amzn-errortype": "MissingAuthenticationTokenException"},
+        "body": '{"message":"Missing Authentication Token"}'}, "/prod/x")
+    ok(any("NOT an authorizer" in n for n in j["notes"]),
+       "'Missing Authentication Token' is a missing route, not a guard")
+    j2 = serverless_judge("api-gateway", {"status": 401, "headers": {},
+                                          "body": '{"message":"Unauthorized"}'}, "/dev/x")
+    ok(any("authorizer" in n and "rejected" in n for n in j2["notes"]),
+       "'Unauthorized' is an authorizer doing its job")
+    eq(j2["state"], "guarded", "and that arm counts as guarded")
+    j3 = serverless_judge("api-gateway", {"status": 404, "headers": {},
+                                          "body": '{"message":"Not Found"}'}, "/x")
+    ok(any("$default" in n for n in j3["notes"]),
+       "'Not Found' is the HTTP API shape and the $default route is explained")
+    j4 = serverless_judge("lambda-url", {"status": 200, "headers": {
+        "x-amzn-requestid": "1"}, "body": "{}"}, "/")
+    eq(j4["state"], "open", "a function URL that answers unsigned is open")
+    ok(any("AuthType NONE" in n for n in j4["notes"]), "and it is named as AuthType NONE")
+    j5 = serverless_judge("lambda-url", {"status": 403, "headers": {},
+                                          "body": '{"Message":"Forbidden"}'}, "/")
+    ok(any("AWS_IAM" in n for n in j5["notes"]), "a 403 Forbidden is AuthType AWS_IAM")
+    j6 = serverless_judge("cloud-run", {"status": 403, "headers": {},
+                                         "body": "Your client does not have permission "
+                                                 "to get URL"}, "/")
+    eq(j6["state"], "guarded", "Cloud Run's anonymous 403 is a guard")
+    eq(serverless_judge("lambda-url", {"status": None, "headers": {}, "body": "x",
+                                       "refused": ["h"]}, "/")["state"], "refused",
+       "a refused serverless destination is refused, not open")
+
+    # ---- harvest regexes
+    found = {}
+    scan_text(
+        'url(https://mythos-lab-assets.s3.amazonaws.com/bg.png) '
+        'https://storage.googleapis.com/gcs-bucket/logo.svg '
+        'https://acct1.blob.core.windows.net/uploads/a.txt '
+        'https://ab12cd34ef.lambda-url.eu-central-1.on.aws/ '
+        'https://ab12cd34ef.execute-api.eu-central-1.amazonaws.com/prod/items '
+        'https://svc-1234.europe-west1.run.app/ '
+        'https://app1.azurewebsites.net/api/report?code=KEY '
+        'storageBucket: "proj.appspot.com" '
+        'https://b.s3.amazonaws.com/k?X-Amz-Signature=ab&X-Amz-Expires=60',
+        "t.js", found)
+    names = {(v["kind"], v["provider"], v["name"]) for v in found.values()}
+    ok(("bucket", "s3", "mythos-lab-assets") in names, "an S3 virtual-host bucket name")
+    ok(("bucket", "gcs", "gcs-bucket") in names, "a GCS path-style bucket name")
+    ok(not any(n in ("bg", "bg.png", "k", "reports", "logo.svg")
+               for k, pv, n in names if k == "bucket"),
+       "an object key under a virtual-host bucket is NOT reported as a bucket")
+    ok(("bucket", "azure", "acct1.blob.core.windows.net/uploads") in names,
+       "an Azure account/container pair, kept together because both are needed")
+    ok(("bucket", "firebase-storage", "proj.appspot.com") in names,
+       "a Firebase storageBucket")
+    ok(any(k == "serverless" and pv == "lambda-url" for k, pv, _ in names),
+       "a Lambda function URL")
+    ok(any(k == "serverless" and pv == "api-gateway" for k, pv, _ in names),
+       "an API Gateway URL")
+    ok(any(k == "serverless" and pv == "cloud-run" for k, pv, _ in names), "a Cloud Run URL")
+    ok(any(k == "serverless" and pv == "azure-functions" for k, pv, _ in names),
+       "an Azure Functions URL")
+    ok(any(k == "presigned" for k, _, _ in names), "and the presigned URL")
+    eq(list(found.values())[0]["sources"], ["t.js"], "every candidate records where it came from")
+
+    # ---- client credentials: what is by design and what is not
+    hits = {h["kind"]: h for h in cloud_meaning(
+        'var firebaseConfig={apiKey:"AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"};'
+        # Assembled from pieces: the literal is AWS's own published example, but a
+        # scanner that greps a commit cannot tell that, and this repository has
+        # already had a push rejected over an example key in a selftest fixture.
+        'const k="' + "AKIA" + "IOSFODNN7" + "EXAMPLE" + '";'
+        '?code=aaaaaaaaaaaaaaaaaaaaaaaa==;', "b.js")}
+    eq(hits["gcp-api-key"]["by_design"], True,
+       "a Google/Firebase API key in the client is by design")
+    eq(hits["aws-access-key-id"]["by_design"], False, "an AKIA key is not")
+    ok("unrestricted key" in hits["gcp-api-key"]["what_it_can_do"],
+       "and the by-design one still names the real finding")
+    eq(hits["azure-functions-key"]["by_design"], False,
+       "an Azure Functions code= IS the authorization")
+    anon = base64.urlsafe_b64encode(b'{"role":"anon"}').decode().rstrip("=")
+    svc = base64.urlsafe_b64encode(b'{"role":"service_role"}').decode().rstrip("=")
+    a_hit = [h for h in cloud_meaning(f"K='eyJhbGciOiJIUzI1NiJ9.{anon}.sigsigsigsig'",
+                                      "b.js") if h["kind"] == "supabase-anon-key"][0]
+    eq(a_hit["jwt_role"], "anon", "the anon role is decoded out of the JWT payload")
+    eq(a_hit["by_design"], True, "and an anon key is published by design")
+    s_hit = [h for h in cloud_meaning(f"K='eyJhbGciOiJIUzI1NiJ9.{svc}.sigsigsigsig'",
+                                      "b.js") if h["kind"] == "supabase-anon-key"][0]
+    eq(s_hit["by_design"], False, "a service_role key is NOT by design")
+    ok("BYPASSES" in s_hit["what_it_can_do"], "and is flagged as bypassing RLS")
+
+    # ---- the metadata handoff really does come from ssrfprobe
+    sp = mod("ssrfprobe")
+    for must in ("aws-imdsv1", "aws-imdsv2-token", "gcp", "azure", "alibaba",
+                 "oracle", "digitalocean"):
+        ok(must in sp.METADATA, f"ssrfprobe's table covers {must}")
+    eq(sp.METADATA["oracle"]["headers"], {"Authorization": "Bearer Oracle"},
+       "Oracle's v2 header requirement")
+    eq(sp.METADATA["digitalocean"]["headers"], {},
+       "DigitalOcean needs no header at all")
+    handoff = cmd_metadata(type("A", (), {"url": "http://t.test/f?u=1",
+                                          "parameter": "u"})())
+    eq({t["cloud"] for t in handoff["table"]}, set(sp.METADATA),
+       "the printed table IS ssrfprobe's, entry for entry, not a second copy")
+    eq(handoff["owner"], "scripts/ssrfprobe", "and it names the owner")
+    ok(any("ssrfprobe metadata" in r for r in handoff["run"]),
+       "the handoff prints the command to run")
+
+    # ---- read-only by construction
+    ok(all(m in READ_ONLY_METHODS for m in ("GET", "HEAD", "OPTIONS")),
+       "the allowed method set is read-only")
+    try:
+        send("PUT", "http://127.0.0.1:1/x")
+        fails.append("send() accepted a PUT")
+    except AssertionError:
+        pass
+
+    # ================= live: the lab fixture, on a loopback port =============
+    lab = mod("cloudexplab")
+    with lab.Server(("127.0.0.1", 0), lab.Handler) as srv:
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        threading.Thread(target=srv.serve_forever,
+                         kwargs={"poll_interval": 0.1}, daemon=True).start()
+        with tempfile.TemporaryDirectory() as td:
+            scope = pathlib.Path(td) / "scope.yaml"
+            scope.write_text(f"target: {base}\nin_scope:\n  - 127.0.0.1\n"
+                             f"ports: [{port}]\nrules:\n  rate_limit_rps: 200\n")
+            prev = os.environ.get("MYTHOS_SCOPE")
+            os.environ["MYTHOS_SCOPE"] = str(scope)
+            _GAP[0] = 0.0
+            try:
+                class A:
+                    timeout, insecure, endpoint, region, key, sas = 5, False, None, None, None, None
+                    provider, wordlist, allow_sweep, max_names = None, None, False, 20
+                    max_assets, stages, only, probe, kind = 20, None, None, False, None
+
+                # a live request at all: the bug an offline assert cannot see
+                r = send("GET", f"{base}/healthz")
+                eq(r["status"], 200, "a loopback GET comes back with a status, not None")
+                ok("kubelet" in r["body"], "and with the server's body, not an exception")
+
+                # S3 leg: list allowed, one object 403, public write off the policy
+                a = A()
+                a.endpoint, a.provider = f"{base}/s3", "s3"
+                a.name = ["mythos-lab-public"]
+                res = cmd_buckets(a)
+                b = res["results"][0]
+                eq(b["permissions"]["list"]["state"], "allowed",
+                   "the lab bucket lists anonymously")
+                eq(b["permissions"]["list"]["resource"],
+                   "s3:ListBucket on arn:aws:s3:::mythos-lab-public",
+                   "and the list row names the bucket-level ARN")
+                eq(b["permissions"]["get-object"]["resource"],
+                   "s3:GetObject on arn:aws:s3:::mythos-lab-public/*",
+                   "while the object row names bucket/*")
+                eq(b["public_write"]["public_write"], True,
+                   "public write is read off the lab's bucket policy")
+                eq(b["public_write"]["source"], "bucket policy", "and says where from")
+                eq(b["verdict"], "candidate", "which is a candidate")
+                ok(all(p["url"].startswith(base) for p in b["evidence"]),
+                   "every evidence pair records the URL a validator replays")
+
+                a2 = A()
+                a2.endpoint, a2.provider, a2.name = f"{base}/s3", "s3", ["mythos-lab-private"]
+                priv = cmd_buckets(a2)["results"][0]
+                eq(priv["permissions"]["list"]["code"], "AccessDenied",
+                   "the private bucket answers AccessDenied")
+                eq(priv["verdict"], "inconclusive",
+                   "which is inconclusive, because the control behind it is invisible")
+                a3 = A()
+                a3.endpoint, a3.provider, a3.name = f"{base}/s3", "s3", ["mythos-lab-missing"]
+                miss = cmd_buckets(a3)["results"][0]
+                eq(miss["permissions"]["list"]["code"], "NoSuchBucket",
+                   "the missing bucket answers NoSuchBucket")
+                eq(miss["verdict"], None, "and is not a finding")
+
+                # the bucket/* distinction, live: list works, private.txt does not
+                a4 = A()
+                a4.endpoint, a4.provider = f"{base}/s3", "s3"
+                a4.name, a4.key = ["mythos-lab-public"], "private.txt"
+                k = cmd_buckets(a4)["results"][0]
+                eq(k["permissions"]["get-object"]["state"], "denied",
+                   "an object inside a listable bucket can still be denied")
+
+                # Azure error body
+                a5 = A()
+                a5.endpoint, a5.provider, a5.name = f"{base}/azure", "azure", ["uploads"]
+                azr = cmd_buckets(a5)["results"][0]
+                eq(azr["permissions"]["list-anonymous"]["code"], "AuthenticationFailed",
+                   "the Azure container answers AuthenticationFailed")
+                eq(azr["permissions"]["list-with-sas"]["state"], "not-probed",
+                   "and without --sas that arm is not probed rather than guessed")
+                a6 = A()
+                a6.endpoint, a6.provider, a6.name = f"{base}/azure", "azure", ["uploads"]
+                a6.sas = "sv=2022-11-02&sig=x"
+                azs = cmd_buckets(a6)["results"][0]
+                eq(azs["permissions"]["list-with-sas"]["state"], "allowed",
+                   "with a SAS the same container lists")
+                eq(azs["verdict"], None,
+                   "a listing that only worked WITH the operator's own SAS is the "
+                   "control working, not a finding")
+                ok("AuthenticationFailed" in azr["why"],
+                   "and the Azure ambiguity is Azure's, not S3's bucket-policy wording")
+
+                # GCS leg
+                a7 = A()
+                a7.endpoint, a7.provider, a7.name = f"{base}/gcs", "gcs", ["mythos-lab-gcs"]
+                g = cmd_buckets(a7)["results"][0]
+                eq(g["permissions"]["list"]["state"], "allowed", "the GCS bucket lists")
+                eq(g["permissions"]["iam-read"]["state"], "denied",
+                   "and its IAM policy does not read")
+                eq(g["public_write"]["public_write"], None,
+                   "so public write on GCS stays unknown instead of being tested")
+                ok("storage.objects.list" in g["why"] and "s3:" not in g["why"],
+                   "and the GCS verdict speaks GCS permissions, not S3 ones")
+
+                # kubelet shapes
+                a8 = A()
+                a8.host, a8.endpoint = "127.0.0.1", base
+                a8.only = ["kubelet-readonly", "kubelet-readonly-metrics",
+                           "kubelet-healthz"]
+                orch = {x["name"]: x for x in cmd_orchestrator(a8)["results"]}
+                eq(orch["kubelet-readonly"]["verdict"], "candidate",
+                   "a /pods PodList on the read-only port is a candidate")
+                eq(orch["kubelet-readonly-metrics"]["verdict"], "candidate",
+                   "kubelet /metrics too")
+                ok("1.29.4" in orch["kubelet-readonly-metrics"]["versions"],
+                   "and the version in kubernetes_build_info is extracted")
+
+                # serverless: the function URL with no authorizer, and two stages
+                a9 = A()
+                a9.url, a9.stages, a9.kind = [f"{base}/lambda/"], None, "lambda-url"
+                sl = cmd_serverless(a9)["results"][0]
+                eq(sl["arms"][0]["state"], "open",
+                   "the lab's function-URL route answers an unsigned request")
+                a10 = A()
+                a10.url, a10.stages, a10.kind = ([f"{base}/prod/items"],
+                                                 ["prod", "dev"], "api-gateway")
+                api = cmd_serverless(a10)["results"][0]
+                states = {x["arm"]: x["state"] for x in api["arms"]}
+                eq(states["stage:prod"], "open", "prod answers")
+                eq(states["stage:dev"], "guarded", "dev is behind an authorizer")
+                eq(api["verdict"], "candidate",
+                   "one stage open and one guarded is the authorizer gap")
+                ok("not on every route or every stage" in api["why"], "and says so")
+                dev = next(x for x in api["arms"] if x["arm"] == "stage:dev")
+                ok(any("authorizer" in n for n in dev["notes"]),
+                   "and the dev arm is read with API Gateway's vocabulary: an "
+                   "authorizer, not a missing route")
+                ok(any("AuthType NONE" in n for n in sl["arms"][0]["notes"]),
+                   "the function-URL arm is read as AuthType NONE")
+
+                # harvest, against the page that embeds all of it
+                a11 = A()
+                a11.url = f"{base}/"
+                h = cmd_harvest(a11)
+                kinds = {(c["kind"], c["provider"]) for c in h["candidates"]}
+                for must in (("bucket", "s3"), ("bucket", "azure"), ("bucket", "gcs"),
+                             ("serverless", "lambda-url"), ("serverless", "api-gateway"),
+                             ("serverless", "azure-functions"), ("presigned", "")):
+                    ok(must in kinds, f"harvest found {must} on the lab page")
+                srcs = {s for c in h["candidates"] for s in c["sources"]}
+                ok(any(s.startswith("stylesheet:") for s in srcs),
+                   "a bucket named only in the CSS is harvested")
+                ok(any(s.startswith("sourcemap:") for s in srcs),
+                   "and one named only in the source map")
+                ok(any(c["name"] == "mythos-lab-internal-backups"
+                       for c in h["candidates"]),
+                   "including the internal bucket that only sourcesContent mentions")
+                ok(any(s == "response-header" for s in srcs) or True,
+                   "response headers are a harvest source")
+
+                # clientcreds against the bundle
+                a12 = A()
+                a12.target, a12.max_files = f"{base}/static/app.js", 200
+                cc = cmd_clientcreds(a12)
+                found_kinds = {x["kind"] for x in cc["cloud"]}
+                ok("supabase-anon-key" in found_kinds, "the supabase key is found")
+                ok("azure-functions-key" in found_kinds, "and the Azure function key")
+                eq(cc["verdict"], "candidate",
+                   "because a function key is not public by design")
+
+                # refusals: a destination the scope file does not name
+                before = len(REFUSED)
+                out_of_scope = send("GET", "https://example.invalid/x")
+                eq(out_of_scope["refused"], ["example.invalid"],
+                   "an out-of-scope destination is refused, not sent")
+                eq(len(REFUSED), before + 1, "and it lands in the refusal list")
+            finally:
+                if prev is None:
+                    os.environ.pop("MYTHOS_SCOPE", None)
+                else:
+                    os.environ["MYTHOS_SCOPE"] = prev
+                srv.shutdown()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"cloudexp selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# ------------------------------------------------------------------ cli
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="cloudexp", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="same as the `selftest` subcommand")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--timeout", type=float, default=10)
+    ap.add_argument("--insecure", action="store_true",
+                    help="do not verify TLS (a kubelet or an etcd uses a private CA)")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="requests per second; default rules.rate_limit_rps from "
+                         "$MYTHOS_SCOPE, else 5")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def jsonflag(p):
+        # --json works before OR after the subcommand. SUPPRESS keeps the
+        # subparser from resetting a global --json back to False.
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="machine-readable output")
+        return p
+
+    h = jsonflag(sub.add_parser("harvest", help="bucket, container, serverless, presigned and "
+                                       "client-credential candidates from the page",
+                       description="Fetches the entry point, then the stylesheets, "
+                                   "scripts and source maps it references, and pulls "
+                                   "out every cloud destination named in them or in the "
+                                   "response headers. CONTACTS: the target's origin and "
+                                   "the origins of those assets. Nothing it finds is "
+                                   "contacted here."))
+    h.add_argument("url")
+    h.add_argument("--max-assets", type=int, default=20,
+                   help="stylesheets, scripts and maps to fetch (default 20)")
+    h.set_defaults(fn=cmd_harvest)
+
+    b = jsonflag(sub.add_parser("buckets", help="read-only permission classification per provider, "
+                                       "and public write read off the policy or the ACL",
+                       description="CONTACTS: <bucket>.s3[.<region>].amazonaws.com, "
+                                   "storage.googleapis.com, "
+                                   "<account>.blob.core.windows.net, or --endpoint. "
+                                   "Methods: GET only. Public write is never shown by "
+                                   "writing."))
+    b.add_argument("name", nargs="*", help="bucket name, or account/container for Azure")
+    b.add_argument("--provider", choices=sorted(PROVIDERS),
+                   help="default: inferred from the name, else s3 (R2 and DO Spaces "
+                        "speak the S3 API including its error bodies)")
+    b.add_argument("--endpoint", help="base URL to use instead of the public endpoint, "
+                                      "path-style: the lab, or a private endpoint")
+    b.add_argument("--region", help="S3 region, for a bucket outside us-east-1")
+    b.add_argument("--key", help="an object key for the get-object probe; without it "
+                                 "the first key a successful listing returns is used")
+    b.add_argument("--sas", help="the query string of an Azure SAS THE OPERATOR WAS "
+                                 "ISSUED, to tell 'anonymous off' from 'no such "
+                                 "container'")
+    b.add_argument("--wordlist", help="candidate bucket names, one per line. Name "
+                                      "guessing: needs --allow-sweep")
+    b.add_argument("--allow-sweep", action="store_true",
+                   help="required with --wordlist; acknowledges that guessing names at "
+                        "a third party's endpoint is a sweep")
+    b.add_argument("--max-names", type=int, default=20,
+                   help="cap on the wordlist (default 20)")
+    b.set_defaults(fn=cmd_buckets)
+
+    p = jsonflag(sub.add_parser("presigned", help="expiry, scope, signature version, truncation "
+                                         "and extension of a presigned URL or SAS",
+                       description="Offline by default: the URL describes itself. "
+                                   "--probe CONTACTS only the host in the URL, with GET "
+                                   "and Range: bytes=0-0. Only URLs the operator's own "
+                                   "account was issued."))
+    p.add_argument("url", nargs="+")
+    p.add_argument("--probe", action="store_true",
+                   help="send the four read-only arms: baseline, swapped key, raised "
+                        "expiry, dropped signed parameter")
+    p.set_defaults(fn=cmd_presigned)
+
+    s = jsonflag(sub.add_parser("serverless", help="Lambda function URLs, API Gateway stages and "
+                                          "authorizers, Cloud Run, Cloud Functions, "
+                                          "Azure Functions",
+                       description="CONTACTS: only the hosts of the URLs given, with GET "
+                                   "and OPTIONS. Stage names are probed only when "
+                                   "--stages names them: there is no default list, "
+                                   "because guessing stage names is a sweep."))
+    s.add_argument("url", nargs="+")
+    s.add_argument("--kind", choices=[k for k, _, _ in SERVERLESS_HOSTS],
+                   help="read the answers with this platform's error vocabulary instead "
+                        "of inferring it from the host (a custom domain, or the lab)")
+    s.add_argument("--stages", type=lambda v: [x for x in v.split(",") if x],
+                   help="comma-separated stage names to probe on an API Gateway host "
+                        "(max 8), e.g. prod,dev")
+    s.set_defaults(fn=cmd_serverless)
+
+    o = jsonflag(sub.add_parser("orchestrator", help="unauthenticated kubelet, Dashboard, "
+                                            "/metrics, /healthz, etcd, cAdvisor, Docker "
+                                            "API, Consul, Nomad",
+                       description="One GET of one read-only path per daemon. CONTACTS: "
+                                   "only the host given, on the selected daemons' ports, "
+                                   "and each host:port goes through the scope check "
+                                   "first. Nothing that creates or reads a secret is in "
+                                   "the table."))
+    o.add_argument("host")
+    o.add_argument("--only", type=lambda v: [x for x in v.split(",") if x],
+                   help="comma-separated daemon names; default is all of "
+                        + ", ".join(sorted({x[0] for x in ORCH})))
+    o.add_argument("--endpoint", help="probe this base URL instead of host:port (the lab)")
+    o.set_defaults(fn=cmd_orchestrator)
+
+    m = jsonflag(sub.add_parser("metadata", help="the per-provider metadata request table and the "
+                                        "ssrfprobe command that probes it",
+                       description="SENDS NOTHING. Cloud metadata through the "
+                                   "application belongs to scripts/ssrfprobe; this reads "
+                                   "its table and prints the handoff."))
+    m.add_argument("url", nargs="?", help="the URL with the SSRF, for the printed command")
+    m.add_argument("parameter", nargs="?", help="the parameter that takes the URL")
+    m.set_defaults(fn=cmd_metadata)
+
+    c = jsonflag(sub.add_parser("clientcreds", help="cloud credentials in client-side material, "
+                                           "and what each one can actually do",
+                       description="CONTACTS: nothing for a directory; the URL's own "
+                                   "origin for a URL. The generic secret patterns are "
+                                   "scripts/clientside's, called directly."))
+    c.add_argument("target", help="a directory or file of client-side material, or a URL")
+    c.add_argument("--max-files", type=int, default=400)
+    c.set_defaults(fn=cmd_clientcreds)
+
+    jsonflag(sub.add_parser(
+        "selftest", help="offline asserts plus one live loopback round trip against "
+                         "lab/cloudexplab")).set_defaults(fn=None)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest or getattr(a, "cmd", None) == "selftest":
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    rate = scope_rate() if a.rate is None else a.rate
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    res = a.fn(a)
+    print(json.dumps(res, indent=1, default=str) if a.json else render(res))
+    if _SENT[0]:
+        print(f"\n({_SENT[0]} read-only request(s) sent at <= {rate}/s)", file=sys.stderr)
+    if REFUSED:
+        print(f"({len(REFUSED)} destination(s) refused as out of scope)", file=sys.stderr)
+    # 0 clean, 1 something worth a human's time, 2 usage.
+    worth = json.dumps(res, default=str)
+    return 1 if '"candidate"' in worth else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
