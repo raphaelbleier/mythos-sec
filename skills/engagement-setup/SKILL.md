@@ -11,6 +11,10 @@ host and that port and nothing else, in `engagements/<host>[-<port>]-<date>/`.
 For a real program that is not enough: write the file by hand and pass it with
 `--scope <file>`. Nothing in a run widens it, and no agent may edit it.
 
+Triage never selects this skill: scope is settled by a human before any traffic
+reaches the target, and no agent may edit it. It drives no script, and its
+entry in `skills/registry.yaml` carries no triggers for that reason.
+
 ## Steps
 
 1. **Identify the target** and the authorization: which program or client this

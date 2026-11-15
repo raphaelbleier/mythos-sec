@@ -67,16 +67,40 @@ jobs:
       - name: CLI selftest
         run: node cli/dist/selftest.js
 
+      - name: Web interface selftest
+        run: node cli/dist/web/selftest.js
+
       # Listed here as well as inside scripts/selftest.sh, so a failure names the
       # script in the job log instead of only the wrapper.
       - name: Script and guard selftests
         run: |
           for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
                    scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
-                   scripts/lessons-record scripts/models \
+                   scripts/lessons-record scripts/models scripts/triage scripts/evidence \
+                   scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
+                   scripts/aiplatform scripts/supplychain scripts/takeover scripts/sbom \
+                   scripts/race scripts/cache scripts/federation scripts/cloudexp \
+                   scripts/tools \
                    hooks/scope-guard.py hooks/budget-guard.py; do
             echo "== $s"
             python3 "$s" --selftest
+          done
+
+      # Again with PyYAML hidden. The scope guard parses a scope file with
+      # PyYAML when it is installed and with its own reader when it is not, and
+      # the two disagreed: the fallback read `ports: [80, 443]` as one opaque
+      # string and enforced no port restriction at all. That shipped for months
+      # because every machine that ran the tests had PyYAML.
+      - name: Guard selftests without PyYAML
+        run: |
+          mkdir -p /tmp/noyaml
+          printf 'raise ImportError("blocked for this check")\n' > /tmp/noyaml/yaml.py
+          for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
+                   scripts/triage scripts/apiproto scripts/supplychain scripts/takeover \
+                   scripts/sbom scripts/race scripts/cache scripts/federation \
+                   scripts/cloudexp scripts/tools; do
+            echo "== $s (no PyYAML)"
+            PYTHONPATH=/tmp/noyaml python3 "$s" --selftest
           done
 
       # The same selftests again, plus the guard behaviour end to end. Docker is
