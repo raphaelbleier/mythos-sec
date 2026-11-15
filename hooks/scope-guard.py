@@ -412,13 +412,17 @@ def check(command: str) -> dict:
     result.update(scope=str(scope_file), in_scope=list(in_list))
     pairs = _from_text(str(command))
     lab = _lab_mode(in_list)
-    exempt = set(PLUMBING) | (LOOPBACK if lab else set())
-    pairs = {(h, p) for h, p in pairs if h not in exempt}
+    # Plumbing is never a target. Loopback in lab mode is an authorized host,
+    # but its port still has to be in the list: a lab scope pinned to one port
+    # is the only thing between this run and the next lab container on the same
+    # machine, and dropping the pair here skipped the port check entirely.
+    pairs = {(h, p) for h, p in pairs if h not in PLUMBING}
+    lab_hosts = LOOPBACK if lab else set()
 
     if not in_list:
         # An empty in_scope authorizes nothing. Reading it as "allow all" is
         # how a half-written scope file becomes a blank cheque.
-        offenders = sorted({h for h, _ in pairs})
+        offenders = sorted({h for h, _ in pairs if h not in lab_hosts})
         if offenders:
             result["offenders"] = offenders
             result["message"] = (
@@ -429,11 +433,12 @@ def check(command: str) -> dict:
                 "    Fill in in_scope before testing anything.")
         return result
 
-    offenders = sorted({h for h, _ in pairs if not in_scope(h, in_list, out_list)})
+    offenders = sorted({h for h, _ in pairs
+                        if h not in lab_hosts and not in_scope(h, in_list, out_list)})
     bad_ports = sorted({f"{h}:{p}" for h, p in pairs
                         if p is not None and ports and p not in ports
                         and h not in offenders
-                        and in_scope(h, in_list, out_list)})
+                        and (h in lab_hosts or in_scope(h, in_list, out_list))})
     if offenders or bad_ports:
         result["offenders"] = offenders + bad_ports
         lines = ["⚠️  MYTHOS SCOPE GUARD: this command targets host(s) that are "
@@ -531,6 +536,21 @@ def _selftest() -> int:
         eq(check("curl http://127.0.0.1:5001/")["offenders"], [], "lab loopback")
         eq(check("curl https://evil.test/")["offenders"], ["evil.test"],
            "lab still guards elsewhere")
+
+        # A lab scope that pins a port must still enforce it. Exempting
+        # loopback wholesale dropped the pair before the port check, so the
+        # next lab container on the same machine was reachable from a run
+        # authorized for only one of them.
+        labp = Path(td) / "lab-ports.yaml"
+        labp.write_text("in_scope:\n  - 127.0.0.1\nrules:\n  ports: [5001]\n")
+        os.environ["MYTHOS_SCOPE"] = str(labp)
+        eq(check("curl http://127.0.0.1:5001/")["offenders"], [],
+           "lab: the pinned port passes")
+        eq(check("curl http://127.0.0.1:5024/")["offenders"], ["127.0.0.1:5024"],
+           "lab: an unlisted port is still out of scope")
+        eq(check("curl http://127.0.0.1/")["offenders"], [],
+           "lab: no port in the command is not a port violation")
+        os.environ["MYTHOS_SCOPE"] = str(lab)
 
         # The pin file is what a hook can actually read: an export inside the
         # agent's shell never reaches this process.

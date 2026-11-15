@@ -196,6 +196,12 @@ class Surface:
                     self.methods.add(str(form.get("method") or "GET").upper())
             for name, value in (page.get("headers") or {}).items():
                 self.headers.append((str(name), str(value)))
+            # `scripts/probe` records up to ten script sources per page, and a
+            # `path:` trigger naming a bundle or a source map can only fire if
+            # they are part of the matched set. Leaving them out made
+            # `skills/source-review`'s `\.js\.map$` trigger dead.
+            for src in page.get("scripts") or []:
+                add(str(src))
 
         for r in data.get("reachable_paths") or []:
             add(r.get("path", "") if isinstance(r, dict) else str(r))
@@ -420,6 +426,7 @@ SAMPLE_SURFACE = {
             "url": "http://app.test/login",
             "headers": {"server": "nginx/1.25.3", "x-powered-by": "Next.js"},
             "forms": [{"action": "/login", "method": "post"}],
+            "scripts": ["/static/app.js", "http://app.test/static/app.js.map"],
         }
     ],
     "reachable_paths": [{"path": "/graphql"}],
@@ -495,6 +502,10 @@ def selftest() -> int:
     check("technology is read", "Next.js/15.1.0" in surface.tech, True)
     check("parameters are read", sorted(surface.params), ["org_id", "redirect_uri"])
     check("headers are pairs", ("server", "nginx/1.25.3") in surface.headers, True)
+    # A bundle or a source map is a path a trigger may name, and
+    # `skills/source-review` names one. Dropping them left that trigger dead.
+    check("a script source is a path", "/static/app.js" in surface.paths, True)
+    check("a script source is origin-stripped", "/static/app.js.map" in surface.paths, True)
 
     # Both registry readers must agree. The fallback dropping a trigger would
     # silently stop a skill from ever being selected, which is exactly the bug
@@ -556,6 +567,31 @@ def selftest() -> int:
                 _crude_registry(REGISTRY.read_text(encoding="utf-8"))["skills"],
                 yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))["skills"],
             )
+
+        # A `header:` trigger can only ever fire for a header `scripts/probe`
+        # records, and probe keeps a fixed tuple. Three separate skills have
+        # shipped with a dead header trigger for exactly this reason, so the
+        # invariant is asserted rather than remembered: every header named in
+        # the shipped registry must be in probe's INTERESTING_HEADERS.
+        probe = REPO / "scripts" / "probe"
+        if probe.exists():
+            src = probe.read_text(encoding="utf-8")
+            m = re.search(r"INTERESTING_HEADERS\s*=\s*\((.*?)\)\n", src, re.S)
+            if not m:
+                fails.append("FAIL cannot find INTERESTING_HEADERS in scripts/probe")
+            else:
+                kept = {h.lower() for h in re.findall(r'"([^"]+)"', m.group(1))}
+                for entry in shipped:
+                    for t in entry.get("triggers") or []:
+                        if "header" in t:
+                            spec = t["header"]
+                            name = (next(iter(spec)) if isinstance(spec, dict)
+                                    else str(spec).partition(":")[0])
+                            if str(name).strip().lower() not in kept:
+                                fails.append(
+                                    f"FAIL {entry.get('name')!r} triggers on header "
+                                    f"{name!r}, which scripts/probe does not record, so it "
+                                    "can never be selected")
 
     # A regex trigger that matches nothing must not select, and an unknown
     # trigger form must fail loudly rather than be treated as no match.

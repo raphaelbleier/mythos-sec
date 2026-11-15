@@ -69,7 +69,18 @@ PRODUCT_RE = re.compile(
 INTERESTING_HEADERS = ("server", "x-powered-by", "x-aspnet-version", "via", "x-generator",
                        "access-control-allow-origin", "access-control-allow-credentials",
                        "content-security-policy", "strict-transport-security",
-                       "x-content-type-options", "set-cookie", "location", "www-authenticate")
+                       "x-content-type-options", "set-cookie", "location", "www-authenticate",
+                       # The cache's own signals. `skills/registry.yaml` can only
+                       # match headers this list keeps, and a cache in front of
+                       # the origin is a whole class's precondition, so the
+                       # cache-poisoning skill would be unselectable without them.
+                       "x-cache", "age", "cache-status", "cf-cache-status",
+                       # The platform's own fingerprint. Same reason: a trigger
+                       # naming one of these could never fire while only
+                       # `server` was kept, so the cloud-exposure skill had to
+                       # route on `Server: AmazonS3` alone.
+                       "x-amz-request-id", "x-amzn-requestid", "x-ms-request-id",
+                       "x-azure-ref")
 MISSING_HEADERS = ("content-security-policy", "strict-transport-security",
                    "x-content-type-options")
 # Paths worth one GET each: cheap, high signal, no payload.
