@@ -1,0 +1,1493 @@
+#!/usr/bin/env python3
+"""Mythos race — limit overrun, the single-packet attack and TOCTOU, measured.
+
+A race is stochastic. One success is not a finding, and the response body of a
+racing request is not evidence: an endpoint that answers 200 twice may have
+written once, and an endpoint that answers 409 may still have credited the
+balance. So every subcommand here does the same four things, and none of them
+is optional:
+
+  1. a SEQUENTIAL CONTROL wave of the same N requests, which must NOT overrun;
+  2. a PARALLEL wave, bounded by N, released together;
+  3. a READ-BACK of the authoritative endpoint as the object's owner, before
+     and after each wave — the delta in that counter is the oracle;
+  4. a HIT RATE over `--repeats` whole repeats, with Wilson and
+     Clopper-Pearson intervals, and the verdict `inconclusive` whenever the
+     parallel interval straddles the control's.
+
+  scripts/race limit --url <action> --state-url <authoritative> ...
+  scripts/race single-packet --url <action> --state-url <authoritative> ...
+  scripts/race toctou --first <step one> --second <raced step> ...
+  scripts/race selftest
+
+This script never writes `confirmed`, and never writes `candidate` into a
+report either: it prints a verdict and records the bytes. Every request it
+sends is appended to `<engagement>/traffic/log.jsonl` as a `kind: "raw"`
+record, byte for byte, in the shape `cli/src/agent/raw.ts` writes and
+`scripts/traffic` reads — so `traffic list`, `traffic show <id>` and
+`traffic replay <id>` work on them and a separate validator replays the proof.
+
+WHAT LOAD THIS GENERATES
+------------------------
+Per repeat: one setup request per wave, N sequential, N parallel, and four
+read-backs. With the defaults (--n 8, --repeats 6) that is 132 requests, of
+which 48 arrive in six bursts of 8. The sequential control and every setup and
+read-back honour `rules.rate_limit_rps` from the engagement scope. The parallel
+burst does not and cannot: arriving together is the experiment. It is bounded
+by N, not by a rate, which is why N is small — default 8, maximum 20, and
+$MYTHOS_RACE_MAX_N raises that ceiling to at most 50 for a lab you own. A race
+is load by nature; if the programme's rules do not permit a burst of N, do not
+run this.
+
+WHAT IS REFUSED, IN CODE
+------------------------
+* Data destruction, brute force and denial of service, through
+  `hooks/budget-guard.py`. No scope rule and no flag overrides it.
+* Any URL outside `engagements/<dir>/scope.yaml`, through
+  `hooks/scope-guard.py`. Refused, not warned about: a burst that has already
+  left is not something a warning can fix. This script never writes to a scope
+  file.
+* An object the operator does not own. Before any wave, the authoritative
+  owner endpoint (`--owner-url`) is read with the owner's headers and the
+  object id must appear in what comes back. It does not: refused.
+* A destructive verb (delete, cancel, transfer-out, revoke, refund…) on an
+  object that was not created in this run. With `--setup-url` the object is
+  minted by this invocation and may be raced; with `--object` it predates the
+  run and a destructive action on it is refused outright.
+"""
+import argparse
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import pathlib
+import re
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+import urllib.parse
+
+UA = "mythos-race/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+N_DEFAULT = 8
+N_MAX = 20                      # documented default ceiling
+N_CEILING = 50                  # $MYTHOS_RACE_MAX_N cannot go past this
+REPEATS_DEFAULT = 6             # below 6, 6/6 vs 0/6 cannot clear the control
+READ_CAP = 1 << 20
+
+EXIT_CANDIDATE = 0
+EXIT_NO_SIGNAL = 1
+EXIT_USAGE = 2
+EXIT_INCONCLUSIVE = 3
+EXIT_REFUSED = 4
+
+# Verbs whose race would destroy something. Racing one is only ever acceptable
+# on an object this run created, which is what the `--setup-url` path
+# guarantees and the `--object` path cannot.
+DESTRUCTIVE_VERBS = re.compile(
+    r"(delete|remove|destroy|purge|drop|cancel|revoke|deactivate|close|"
+    r"refund|chargeback|transfer[-_]?out|withdraw[-_]?all|unsubscribe)", re.I)
+
+# ---------------------------------------------------------------- guards
+
+
+_mods = {}
+
+
+def mod(name):
+    """Load one of the repository's hooks as a module (they are not packages)."""
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py",
+               "budget-guard": "hooks/budget-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+class Refused(Exception):
+    """Something this script will not do. Exits 4, never downgraded."""
+
+
+def require_in_scope(*urls):
+    bad = []
+    for u in urls:
+        if not u:
+            continue
+        bad += mod("scope-guard").check(u)["offenders"]
+    if bad:
+        raise Refused(
+            "out of scope: " + ", ".join(sorted(set(bad)))
+            + "\n  A race sends N requests at once; a scope warning arrives after they "
+              "have landed, so this is refused rather than warned about. Add the host "
+              "to scope.yaml in an editor, outside the run.")
+
+
+def require_non_destructive(*parts):
+    """The absolute denylist: destruction, brute force, denial of service.
+
+    `MYTHOS_DESTRUCTIVE=warn` downgrades that denylist elsewhere in the
+    repository, for a throwaway lab. Not here: a race is N concurrent writes,
+    so a destructive one is N of them, and the one downgrade switch in the
+    repository is pinned to `block` for the length of this check.
+    """
+    blob = " ".join(str(p) for p in parts if p)
+    keep = os.environ.get("MYTHOS_DESTRUCTIVE")
+    os.environ["MYTHOS_DESTRUCTIVE"] = "block"
+    try:
+        result = mod("budget-guard").check(blob)
+    finally:
+        if keep is None:
+            os.environ.pop("MYTHOS_DESTRUCTIVE", None)
+        else:
+            os.environ["MYTHOS_DESTRUCTIVE"] = keep
+    if result.get("action") == "block":
+        raise Refused((result.get("message") or "refused as destructive").strip())
+
+
+def require_owned_object(obj, owner_url, headers, timeout, insecure, dir_, label):
+    """The object must be one the operator owns, read from the owner endpoint.
+
+    This is the check that keeps a race off someone else's coupon, order or
+    balance. The owner endpoint's answer is the authority; the id being in the
+    command line proves nothing.
+    """
+    if not owner_url:
+        raise Refused(
+            "--owner-url is required: every attempt must act on an object you own, and "
+            "that is established by reading the owner's own listing, not by asserting it "
+            "on the command line.")
+    res = send_h1("GET", owner_url, headers, None, timeout, insecure, dir_,
+                  role="ownership", label=f"{label}: does the owner list {obj}?")
+    body = res["body"]
+    if res["status"] is None:
+        raise Refused(f"--owner-url did not answer ({body[:200]!r}); ownership unproven, "
+                      f"so nothing is raced.")
+    if obj not in body:
+        raise Refused(
+            f"object {obj!r} is not in what {owner_url} returns for this identity "
+            f"(HTTP {res['status']}). It is someone else's object, or the identity is "
+            f"wrong. Racing it would act on a third party's data, so it is refused.")
+    return res
+
+
+def require_creatable(destructive_blob, created_this_run):
+    if DESTRUCTIVE_VERBS.search(destructive_blob or "") and not created_this_run:
+        raise Refused(
+            "this action reads as destructive (delete/cancel/revoke/transfer-out/…) and "
+            "the object was given with --object, so it predates this run. A destructive "
+            "action is raced only against an object this invocation created: mint one "
+            "with --setup-url, or prove the flaw on a non-destructive action.")
+
+
+def scope_rate(default=5.0):
+    """`rules.rate_limit_rps` from the engagement scope, for the paced requests."""
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_PACE = {"gap": 0.0, "last": 0.0}
+_SENT = [0]
+
+
+def pace():
+    """Honoured by the sequential control, the setups and the read-backs.
+
+    Never by the parallel wave: pacing it would delete the experiment.
+    """
+    if _PACE["gap"] <= 0:
+        return
+    wait = _PACE["last"] + _PACE["gap"] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _PACE["last"] = time.monotonic()
+
+
+# ------------------------------------------------------- the traffic record
+#
+# The format is specified once, in the `raw records` comment of
+# `scripts/traffic`, and written by two other programs: `cli/src/agent/raw.ts`
+# and this file. Same file, same shape, so the id of a record stays its line
+# number and a finding cites `traffic/<id>` without caring who wrote it.
+#
+# `m`, `p` and `s` are a parser's opinion and `scripts/traffic` ignores them by
+# contract; they are written anyway, exactly as raw.ts writes them, because a
+# method and a path make the line readable in `traffic list`.
+
+
+def record(dir_, rec):
+    if not dir_:
+        return None
+    try:
+        path = pathlib.Path(dir_) / "traffic" / "log.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(rec, separators=(",", ":")) + "\n").encode())
+        finally:
+            os.close(fd)
+        with open(path, "rb") as fh:
+            return sum(1 for _ in fh)          # the record id: its line number
+    except OSError:
+        # An unrecorded request is still a request that was sent. The summary
+        # says what ran, so the loss is visible rather than hidden.
+        return None
+
+
+def raw_record(url, sent, received, dur, role, label, error=None, cut=False,
+               writes=None, ip=None, now=None):
+    u = urllib.parse.urlsplit(url)
+    first = sent[:8192].split(b"\n", 1)[0].rstrip(b"\r").decode("latin-1", "replace")
+    bits = first.split(" ")
+    status = status_of(received)
+    now = time.time() if now is None else now
+    return {
+        "kind": "raw",
+        "t": round(now - dur, 3),
+        "dur": round(dur, 3),
+        "ttfb": None,
+        "client": "mythos-race",
+        "scheme": u.scheme,
+        "host": u.hostname or "",
+        "port": u.port or (443 if u.scheme == "https" else 80),
+        "ip": ip,
+        "m": bits[0] if bits else "",
+        "p": bits[1] if len(bits) > 1 else "",
+        "s": status,
+        "ua": UA,
+        "req": base64.b64encode(sent).decode(),
+        "res": base64.b64encode(received).decode(),
+        "req_cut": False,
+        "res_cut": bool(cut),
+        "role": role,
+        "tool": "race",
+        "label": label,
+        "writes": writes or [{"bytes": len(sent), "delay_ms": 0}],
+        "half_close": False,
+        "why": label,
+        "error": error,
+    }
+
+
+def status_of(b):
+    m = re.search(rb"HTTP/[\d.]+ (\d{3})", b[:8192])
+    return int(m.group(1)) if m else None
+
+
+# ------------------------------------------------------------ HTTP/1.1, raw
+#
+# Written by hand for the same reason `raw.ts` exists: the last-byte-sync
+# fallback has to decide when the final byte of each request leaves, and no
+# library will hand that over. It also means the bytes recorded are the bytes
+# that crossed the wire rather than a reconstruction.
+
+
+def build_h1(method, url, headers, body, close=True):
+    u = urllib.parse.urlsplit(url)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    hdrs = {"Host": u.netloc, "User-Agent": UA}
+    if close:
+        hdrs["Connection"] = "close"
+    for k, v in (headers or {}).items():
+        hdrs[k] = v
+    raw_body = body.encode() if isinstance(body, str) else (body or b"")
+    if raw_body:
+        hdrs.setdefault("Content-Type", "application/json")
+        hdrs["Content-Length"] = str(len(raw_body))
+    head = f"{method} {path} HTTP/1.1\r\n" + "".join(
+        f"{k}: {v}\r\n" for k, v in hdrs.items()) + "\r\n"
+    return u, head.encode("latin-1") + raw_body
+
+
+def dial(u, timeout, insecure, alpn=None):
+    port = u.port or (443 if u.scheme == "https" else 80)
+    s = socket.create_connection((u.hostname, port), timeout=timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    ip = None
+    try:
+        ip = s.getpeername()[0]
+    except OSError:
+        pass
+    if u.scheme == "https":
+        ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()
+        if alpn:
+            ctx.set_alpn_protocols(alpn)
+        s = ctx.wrap_socket(s, server_hostname=u.hostname)
+    return s, ip
+
+
+def drain(sock, timeout):
+    sock.settimeout(timeout)
+    buf, cut, err = bytearray(), False, None
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            if len(buf) < READ_CAP:
+                buf += chunk
+            else:
+                cut = True
+                break
+    except Exception as e:                       # timeout, reset, TLS teardown
+        err = f"{type(e).__name__}: {e}"
+    return bytes(buf), cut, err
+
+
+def body_of(received):
+    head, _, body = received.partition(b"\r\n\r\n")
+    if b"transfer-encoding: chunked" in head.lower():
+        # Enough de-chunking to judge a small JSON answer.
+        out, rest = bytearray(), body
+        while True:
+            line, _, rest = rest.partition(b"\r\n")
+            try:
+                size = int(line.split(b";")[0], 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            out += rest[:size]
+            rest = rest[size + 2:]
+        body = bytes(out)
+    return body.decode("utf-8", "replace")
+
+
+def send_h1(method, url, headers, body, timeout, insecure, dir_, role, label,
+            paced=True):
+    """One paced request on a fresh socket, recorded byte for byte."""
+    require_in_scope(url)
+    if paced:
+        pace()
+    u, sent = build_h1(method, url, headers, body)
+    _SENT[0] += 1
+    t0 = time.monotonic()
+    received, cut, err = b"", False, None
+    ip = None
+    try:
+        sock, ip = dial(u, timeout, insecure)
+        try:
+            sock.sendall(sent)
+            received, cut, err = drain(sock, timeout)
+        finally:
+            sock.close()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    dur = time.monotonic() - t0
+    rid = record(dir_, raw_record(url, sent, received, dur, role, label,
+                                  error=err, cut=cut, ip=ip))
+    return {"status": status_of(received), "body": body_of(received),
+            "error": err, "traffic_id": rid, "bytes": len(received)}
+
+
+# ----------------------------------------------------- HTTP/2, by hand
+#
+# HPACK, two frame types, and one send(). The single-packet attack (Kettle,
+# "Smashing the state machine", BH USA 2023) needs exactly this much: the
+# requests are set up on N streams with their final frames withheld, and then
+# every final frame leaves in one TCP segment, so the server sees them within
+# one read and network jitter cannot stagger them. No h2 library is used — one
+# would own the connection and decide when frames leave, which is the whole
+# thing being controlled here.
+
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, FRAME_WINDOW_UPDATE = 0x0, 0x1, 0x4, 0x8
+FLAG_END_STREAM, FLAG_END_HEADERS, FLAG_ACK = 0x1, 0x4, 0x1
+SETTINGS_MAX_CONCURRENT_STREAMS = 0x3
+
+# The HPACK static table entries for `:status`, as an indexed field (0x80|i).
+# A response status is usually one of these one bytes; anything else arrives as
+# a literal whose value may be Huffman-coded, and a Huffman decoder is 257
+# table entries this file does not need: the read-back is the oracle, and the
+# DATA frames come through as plaintext either way.
+H2_STATIC_STATUS = {8: 200, 9: 204, 10: 206, 11: 304, 12: 400, 13: 404, 14: 500}
+
+
+def hpack_int(value, prefix_bits):
+    """An HPACK integer with an N-bit prefix (RFC 7541 §5.1)."""
+    limit = (1 << prefix_bits) - 1
+    if value < limit:
+        return bytes([value])
+    out = bytearray([limit])
+    value -= limit
+    while value >= 128:
+        out.append((value % 128) + 128)
+        value //= 128
+    out.append(value)
+    return bytes(out)
+
+
+def hpack_string(s):
+    raw = s.encode() if isinstance(s, str) else s
+    # Length with a 7-bit prefix, Huffman bit clear: a literal string.
+    return hpack_int(len(raw), 7) + raw
+
+
+def hpack_literal(name, value):
+    """Literal header field without indexing, new name (RFC 7541 §6.2.2).
+
+    0x00, then the name, then the value, neither Huffman-coded and neither
+    entering the dynamic table. It is the longest legal encoding and the only
+    one that needs no table state on either side, which is what makes the
+    encoder in this file auditable in one sitting.
+    """
+    return b"\x00" + hpack_string(name.lower()) + hpack_string(value)
+
+
+def frame(ftype, flags, stream_id, payload=b""):
+    if len(payload) > 0xFFFFFF:
+        raise ValueError("frame payload too large")
+    return (struct.pack(">I", len(payload))[1:]
+            + bytes([ftype, flags])
+            + struct.pack(">I", stream_id & 0x7FFFFFFF)
+            + payload)
+
+
+def parse_frames(buf):
+    """Every complete frame in `buf`, as (type, flags, stream_id, payload)."""
+    out, i = [], 0
+    while i + 9 <= len(buf):
+        length = int.from_bytes(buf[i:i + 3], "big")
+        if i + 9 + length > len(buf):
+            break
+        out.append((buf[i + 3], buf[i + 4],
+                    int.from_bytes(buf[i + 5:i + 9], "big") & 0x7FFFFFFF,
+                    buf[i + 9:i + 9 + length]))
+        i += 9 + length
+    return out
+
+
+def h2_status(payload):
+    """The `:status` of a HEADERS payload, when it is an indexed static field."""
+    if payload and payload[0] & 0x80:
+        return H2_STATIC_STATUS.get(payload[0] & 0x7F)
+    return None
+
+
+def h2_settings_limit(buf):
+    for ftype, flags, _sid, payload in parse_frames(buf):
+        if ftype != FRAME_SETTINGS or flags & FLAG_ACK:
+            continue
+        for i in range(0, len(payload) - 5, 6):
+            ident = int.from_bytes(payload[i:i + 2], "big")
+            if ident == SETTINGS_MAX_CONCURRENT_STREAMS:
+                return int.from_bytes(payload[i + 2:i + 6], "big")
+    return None
+
+
+def single_packet(method, url, headers, body, n, timeout, insecure, dir_, label,
+                  settle_ms=120):
+    """N requests whose final frames leave in one send(). HTTP/2 only.
+
+    Returns a dict with `mode` set to "h2-single-packet", or `mode: None` and a
+    reason when the peer would not negotiate h2 — the caller then falls back to
+    last-byte sync over HTTP/1.1 and says so in the output.
+    """
+    require_in_scope(url)
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https":
+        return {"mode": None, "why": "HTTP/2 here is ALPN over TLS; the URL is not https"}
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    raw_body = (body.encode() if isinstance(body, str) else body) or b""
+
+    t0 = time.monotonic()
+    try:
+        sock, ip = dial(u, timeout, insecure, alpn=["h2", "http/1.1"])
+    except Exception as e:
+        return {"mode": None, "why": f"{type(e).__name__}: {e}"}
+    chosen = sock.selected_alpn_protocol()
+    if chosen != "h2":
+        sock.close()
+        return {"mode": None, "why": f"the peer negotiated {chosen or 'nothing'}, not h2"}
+
+    sent = bytearray()
+    received = bytearray()
+    err, cut, released = None, False, None
+    streams = [1 + 2 * i for i in range(n)]
+    try:
+        def write(b):
+            sent.extend(b)
+            sock.sendall(b)
+
+        write(PREFACE + frame(FRAME_SETTINGS, 0, 0)
+              # Room for N bodies and N replies without a flow-control stall.
+              + frame(FRAME_WINDOW_UPDATE, 0, 0, struct.pack(">I", 0x00F00000)))
+        sock.settimeout(timeout)
+        try:
+            received.extend(sock.recv(65536))
+        except Exception:
+            pass
+        limit = h2_settings_limit(bytes(received))
+        if limit is not None and limit < n:
+            sock.close()
+            return {"mode": None, "why": f"the peer allows only {limit} concurrent streams, "
+                                         f"fewer than N={n}"}
+        write(frame(FRAME_SETTINGS, FLAG_ACK, 0))
+
+        # Every request, complete except for its last frame.
+        head = bytearray()
+        for sid in streams:
+            hdr = (hpack_literal(":method", method)
+                   + hpack_literal(":path", path)
+                   + hpack_literal(":scheme", "https")
+                   + hpack_literal(":authority", u.netloc)
+                   + hpack_literal("user-agent", UA))
+            if raw_body:
+                hdr += hpack_literal("content-type",
+                                     (headers or {}).get("Content-Type", "application/json"))
+                hdr += hpack_literal("content-length", str(len(raw_body)))
+            for k, v in (headers or {}).items():
+                if k.lower() not in ("host", "content-type", "content-length",
+                                     "connection", "user-agent"):
+                    hdr += hpack_literal(k, v)
+            # No END_STREAM: the request is deliberately unfinished.
+            head += frame(FRAME_HEADERS, FLAG_END_HEADERS, sid, bytes(hdr))
+            if len(raw_body) > 1:
+                head += frame(FRAME_DATA, 0, sid, raw_body[:-1])
+        write(bytes(head))
+
+        # Let the server park every stream, then release the last frames.
+        time.sleep(settle_ms / 1000.0)
+        tail = b"".join(
+            frame(FRAME_DATA, FLAG_END_STREAM, sid, raw_body[-1:] if raw_body else b"")
+            for sid in streams)
+        # THE single packet. One send() of every final frame: ~9 bytes of
+        # overhead each, so twenty fit inside one 1500-byte segment.
+        released = time.monotonic()
+        write(tail)
+        _SENT[0] += n
+
+        rest, cut, err = drain(sock, timeout)
+        received.extend(rest)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    dur = time.monotonic() - t0
+
+    per_stream = {sid: {"status": None, "body": ""} for sid in streams}
+    for ftype, _flags, sid, payload in parse_frames(bytes(received)):
+        if sid not in per_stream:
+            continue
+        if ftype == FRAME_HEADERS and per_stream[sid]["status"] is None:
+            per_stream[sid]["status"] = h2_status(payload)
+        elif ftype == FRAME_DATA:
+            per_stream[sid]["body"] += payload.decode("utf-8", "replace")
+
+    rid = record(dir_, raw_record(
+        url, bytes(sent), bytes(received), dur, "single-packet",
+        f"{label} — HTTP/2 single-packet attack, {n} streams, final frames in one send()",
+        error=err, cut=cut, ip=ip,
+        writes=[{"bytes": len(sent), "delay_ms": 0}]))
+    return {"mode": "h2-single-packet", "traffic_id": rid, "streams": per_stream,
+            "released_after_s": round(released - t0, 3) if released else None,
+            "error": err, "n": n,
+            "results": [{"status": v["status"], "body": v["body"]}
+                        for v in per_stream.values()]}
+
+
+def last_byte_sync(method, url, headers, body, n, timeout, insecure, dir_, label):
+    """The HTTP/1.1 fallback: N sockets, all but the last byte sent, then a
+    barrier releases every last byte at once.
+
+    Weaker than a single packet — N segments still cross the network
+    independently, so jitter can still stagger them — and that is exactly why
+    the mode is named in the output next to the hit rate.
+    """
+    require_in_scope(url)
+    u, sent = build_h1(method, url, headers, body)
+    socks, ips, errs = [], [], []
+    for _ in range(n):
+        try:
+            s, ip = dial(u, timeout, insecure)
+            socks.append(s)
+            ips.append(ip)
+        except Exception as e:
+            errs.append(f"{type(e).__name__}: {e}")
+    if not socks:
+        return {"mode": "h1-last-byte-sync", "results": [], "error": "; ".join(errs), "n": 0}
+
+    _SENT[0] += len(socks)
+    out = [None] * len(socks)
+    barrier = threading.Barrier(len(socks))
+    t0 = time.monotonic()
+
+    def go(i):
+        err = None
+        received, cut = b"", False
+        try:
+            socks[i].sendall(sent[:-1])
+            barrier.wait(timeout=timeout)
+            socks[i].sendall(sent[-1:])
+            received, cut, err = drain(socks[i], timeout)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                socks[i].close()
+            except OSError:
+                pass
+        out[i] = (received, cut, err, time.monotonic() - t0)
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(len(socks))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 5)
+
+    results = []
+    for i, item in enumerate(out):
+        received, cut, err, dur = item or (b"", False, "thread did not finish", 0.0)
+        rid = record(dir_, raw_record(
+            url, sent, received, dur, "parallel",
+            f"{label} — last-byte sync {i + 1}/{len(socks)}", error=err, cut=cut,
+            ip=ips[i] if i < len(ips) else None,
+            writes=[{"bytes": len(sent) - 1, "delay_ms": 0},
+                    {"bytes": 1, "delay_ms": 0}]))
+        results.append({"status": status_of(received), "body": body_of(received),
+                        "error": err, "traffic_id": rid})
+    return {"mode": "h1-last-byte-sync", "results": results, "n": len(socks),
+            "error": "; ".join(errs) or None}
+
+
+def sequential(method, url, headers, body, n, timeout, insecure, dir_, label):
+    """The control. The same N requests, one after another, paced.
+
+    A once-only action lets exactly one of these through. If more than one gets
+    through here, the endpoint is not once-only to begin with and no race can
+    be attributed to anything.
+    """
+    results = []
+    for i in range(n):
+        r = send_h1(method, url, headers, body, timeout, insecure, dir_,
+                    role="control", label=f"{label} — sequential control {i + 1}/{n}")
+        results.append(r)
+    return {"mode": "sequential", "results": results, "n": n}
+
+
+# ------------------------------------------------------------- statistics
+#
+# Same shape as `scripts/aiplatform`'s, deliberately: two scripts reporting a
+# rate in the same engagement must report it the same way. Wilson for the body
+# of the range, Clopper-Pearson because the edges (0/k and k/k) are where a
+# race measurement actually lives.
+
+
+def wilson(x, n, z=1.959963984540054):
+    if n <= 0:
+        return (0.0, 1.0)
+    p = x / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+def clopper_pearson(x, n, alpha=0.05):
+    if n <= 0:
+        return (0.0, 1.0)
+
+    def bisect(f, target):
+        lo, hi = 0.0, 1.0
+        for _ in range(200):
+            mid = (lo + hi) / 2
+            if f(mid) < target:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    def tail_ge(p):
+        return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(x, n + 1))
+
+    def tail_le(p):
+        return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(0, x + 1))
+
+    low = 0.0 if x == 0 else bisect(tail_ge, alpha / 2)
+    high = 1.0 if x == n else bisect(lambda p: -tail_le(p), -alpha / 2)
+    return (low, high)
+
+
+def report_rate(x, n, label):
+    w, cp = wilson(x, n), clopper_pearson(x, n)
+    return {"label": label, "successes": x, "trials": n,
+            "rate": round(x / n, 3) if n else None,
+            "wilson95": [round(w[0], 3), round(w[1], 3)],
+            "clopper_pearson95": [round(cp[0], 3), round(cp[1], 3)],
+            "reading": (f"{x}/{n} repeats, 95% interval {w[0]:.0%} to {w[1]:.0%} "
+                        f"(exact {cp[0]:.0%} to {cp[1]:.0%})"
+                        + (f". A clean arm at {n} repeats only bounds the rate below "
+                           f"{cp[1]:.0%}; it is not evidence of zero." if x == 0 else ""))}
+
+
+def judge(parallel_hits, control_hits, repeats, control_broken):
+    """The verdict, and why. `candidate` is as far as this script ever goes.
+
+    The parallel arm has to clear the control's upper bound, not merely beat
+    its point estimate: with six repeats, 6/6 against 0/6 gives a Wilson lower
+    bound of 61% against an exact upper bound of 46%, which clears. 2/2 against
+    0/2 does not, which is why two repeats is not the default.
+    """
+    par = report_rate(parallel_hits, repeats, "parallel wave overran the once-only action")
+    ctl = report_rate(control_hits, repeats, "sequential control overran")
+    if control_broken:
+        return "inconclusive", par, ctl, control_broken
+    if parallel_hits == 0:
+        return "no-signal", par, ctl, (
+            "no repeat overran the authoritative counter. The action held under a burst of "
+            "this size; a wider window or a different sync mode may still find one.")
+    if par["wilson95"][0] > ctl["clopper_pearson95"][1]:
+        return "candidate", par, ctl, (
+            f"the parallel arm's 95% lower bound ({par['wilson95'][0]:.0%}) clears the "
+            f"control's 95% upper bound ({ctl['clopper_pearson95'][1]:.0%}), and the "
+            f"authoritative state moved by more than one unit. The recorded bytes are the "
+            f"proof a validator replays; this script does not write `confirmed`.")
+    return "inconclusive", par, ctl, (
+        f"the parallel arm's interval ({par['wilson95'][0]:.0%}–{par['wilson95'][1]:.0%}) "
+        f"straddles the control's ({ctl['clopper_pearson95'][0]:.0%}–"
+        f"{ctl['clopper_pearson95'][1]:.0%}). At {repeats} repeats this is not a finding, "
+        f"it is a measurement too small to separate the arms. Raise --repeats.")
+
+
+# ---------------------------------------------------------------- the runs
+
+
+def extract(body, field, regex):
+    if regex:
+        m = re.search(regex, body)
+        if not m:
+            return None
+        return m.group(1) if m.groups() else m.group(0)
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return None
+    if isinstance(doc, dict) and field in doc:
+        return str(doc[field])
+    return None
+
+
+def counter(body, regex):
+    """The authoritative counter, as an int. None when it cannot be read."""
+    m = re.search(regex, body)
+    if not m:
+        return None
+    try:
+        return int(m.group(1) if m.groups() else m.group(0))
+    except ValueError:
+        return None
+
+
+def read_state(a, dir_, label):
+    r = send_h1("GET", a.state_url, a.owner_headers, None, a.timeout, a.insecure, dir_,
+                role="readback", label=label)
+    return counter(r["body"], a.count_regex), r
+
+
+def successes(results, a):
+    """How many racing requests looked successful — a diagnostic, not evidence.
+
+    Deliberately separate from the verdict. An endpoint can answer 200 N times
+    and have written once, and it can answer 409 and have written anyway, which
+    is why only the read-back decides.
+    """
+    hits, unknown = 0, 0
+    for r in results:
+        body, status = r.get("body") or "", r.get("status")
+        if a.success_regex:
+            hits += bool(re.search(a.success_regex, body))
+        elif status is not None:
+            hits += status in a.success_status
+        else:
+            unknown += 1
+    return hits, unknown
+
+
+def mint(a, dir_, label):
+    """One fresh object, from the endpoint that creates them. Recorded."""
+    r = send_h1(a.setup_method, a.setup_url, a.owner_headers, a.setup_data,
+                a.timeout, a.insecure, dir_, role="setup", label=label)
+    obj = extract(r["body"], a.setup_field, a.setup_regex)
+    if not obj:
+        raise Refused(
+            f"--setup-url answered HTTP {r['status']} and no object id could be read from it "
+            f"(field {a.setup_field!r}, regex {a.setup_regex!r}). Without a fresh object "
+            f"there is nothing this run owns to race.\n  body: {r['body'][:300]}")
+    return obj, r
+
+
+def wave(a, kind, obj, dir_, label):
+    """One wave against one object: the action N times, sequential or parallel."""
+    url = a.url.replace("{{R}}", obj)
+    data = a.data.replace("{{R}}", obj) if a.data else None
+    require_in_scope(url)
+    if kind == "control":
+        return sequential(a.method, url, a.owner_headers, data, a.n, a.timeout,
+                          a.insecure, dir_, label)
+    if a.engine == "h2":
+        out = single_packet(a.method, url, a.owner_headers, data, a.n, a.timeout,
+                            a.insecure, dir_, label, a.settle_ms)
+        if out["mode"]:
+            return out
+        fallback_why = out["why"]
+    else:
+        fallback_why = None          # --engine h1: this is the mode that was asked for
+    out = last_byte_sync(a.method, url, a.owner_headers, data, a.n, a.timeout,
+                         a.insecure, dir_, label)
+    out["fell_back_from_h2"] = fallback_why
+    return out
+
+
+def one_repeat(a, i, dir_, toctou=False):
+    """Control wave then parallel wave, each on its own fresh object."""
+    rep = {"repeat": i + 1, "arms": {}}
+    for arm in ("control", "parallel"):
+        label = f"{a.subcommand} repeat {i + 1} {arm}"
+        if a.setup_url:
+            obj, setup = mint(a, dir_, f"{label} — mint a fresh object")
+            rep.setdefault("objects", {})[arm] = obj
+        else:
+            obj, setup = a.object, None
+        require_owned_object(obj, a.owner_url, a.owner_headers, a.timeout, a.insecure,
+                             dir_, label)
+        before, _ = read_state(a, dir_, f"{label} — read-back before")
+        gap = None
+        if toctou:
+            # Step one of the two-step flow, then the gap it leaves open.
+            first_url = a.first.replace("{{R}}", obj)
+            first_data = (a.first_data or "").replace("{{R}}", obj) or None
+            send_h1(a.first_method, first_url, a.owner_headers, first_data, a.timeout,
+                    a.insecure, dir_, role="step-one",
+                    label=f"{label} — step one, the state the race exploits")
+            gap = a.gap_ms / 1000.0
+            if gap > 0:
+                time.sleep(gap)
+        out = wave(a, arm, obj, dir_, label)
+        after, _ = read_state(a, dir_, f"{label} — read-back after")
+        hits, unknown = successes(out.get("results") or [], a)
+        delta = None if None in (before, after) else after - before
+        rep["arms"][arm] = {
+            "mode": out.get("mode"),
+            "n": out.get("n"),
+            "apparent_successes": hits,
+            "undetermined_responses": unknown,
+            "state_before": before, "state_after": after, "delta": delta,
+            "overran": bool(delta is not None and delta > a.unit),
+            "statuses": [r.get("status") for r in (out.get("results") or [])],
+            "fell_back_from_h2": out.get("fell_back_from_h2"),
+            "gap_s": gap,
+            "error": out.get("error"),
+            # One record per request for a sequential or last-byte-sync wave; one
+            # record for the whole connection when the burst is a single packet,
+            # because that is what the bytes were.
+            "traffic_ids": ([r["traffic_id"] for r in (out.get("results") or [])
+                             if r.get("traffic_id")]
+                            + ([out["traffic_id"]] if out.get("traffic_id") else [])),
+            "note": "the read-back delta is the oracle; apparent_successes is a diagnostic",
+        }
+    return rep
+
+
+def run(a, toctou=False):
+    dir_ = engagement_dir(a)
+    _PACE["gap"] = 0.0 if a.rate <= 0 else 1.0 / a.rate
+
+    require_non_destructive(a.method, a.url, a.data or "", a.state_url, a.owner_url,
+                            getattr(a, "first", "") or "")
+    require_creatable(f"{a.method} {a.url} {a.data or ''} "
+                      f"{getattr(a, 'first', '') or ''}", bool(a.setup_url))
+    require_in_scope(a.url, a.state_url, a.owner_url, a.setup_url,
+                     getattr(a, "first", None))
+
+    repeats, broken = [], None
+    for i in range(a.repeats):
+        rep = one_repeat(a, i, dir_, toctou=toctou)
+        repeats.append(rep)
+        c = rep["arms"]["control"]
+        if c["delta"] is None:
+            broken = (f"repeat {i + 1}: the authoritative counter could not be read "
+                      f"(--count-regex {a.count_regex!r} did not match). Nothing can be "
+                      f"judged from a state nobody can read.")
+            break
+        if c["overran"]:
+            broken = (f"repeat {i + 1}: the SEQUENTIAL control overran too "
+                      f"(delta {c['delta']} > {a.unit}). The action is not once-only at "
+                      f"all, or the setup did not produce a fresh object. A race cannot "
+                      f"be attributed to concurrency here; fix the aim point first.")
+            break
+        if c["delta"] == 0:
+            broken = (f"repeat {i + 1}: the control did not move the counter at all. The "
+                      f"action, the identity or the counter is wrong, so there is no "
+                      f"baseline to race against.")
+            break
+
+    done = len(repeats)
+    par_hits = sum(1 for r in repeats if r["arms"]["parallel"]["overran"])
+    ctl_hits = sum(1 for r in repeats if r["arms"]["control"]["overran"])
+    verdict, par, ctl, why = judge(par_hits, ctl_hits, done, broken)
+    modes = sorted({r["arms"]["parallel"]["mode"] for r in repeats if r["arms"]["parallel"]["mode"]})
+    out = {
+        "tool": "race", "subcommand": a.subcommand, "verdict": verdict,
+        "sync_mode": modes[0] if len(modes) == 1 else modes,
+        "n": a.n, "repeats_requested": a.repeats, "repeats_run": done,
+        "unit": a.unit,
+        "oracle": {"state_url": a.state_url, "count_regex": a.count_regex,
+                   "read_as": "the object's owner",
+                   "why": "a racing response body is not evidence: the authoritative "
+                          "counter read back as the owner is"},
+        "parallel": par, "control": ctl, "why": why,
+        "repeats": repeats,
+        "load": {"requests_sent": _SENT[0],
+                 "paced_rps": a.rate,
+                 "burst_bounded_by": a.n,
+                 "note": "the sequential control, the setups and the read-backs are paced "
+                         "by rules.rate_limit_rps; the parallel burst is bounded by N and "
+                         "by nothing else, because arriving together is the experiment"},
+        "next": ("record this as a `candidate` with the traffic ids above and let the "
+                 "validate phase replay them" if verdict == "candidate" else
+                 "do not report this as a finding" ),
+    }
+    return out, {"candidate": EXIT_CANDIDATE, "no-signal": EXIT_NO_SIGNAL,
+                 "inconclusive": EXIT_INCONCLUSIVE}[verdict]
+
+
+def engagement_dir(a):
+    d = a.dir or (os.environ.get("MYTHOS_SCOPE")
+                  and str(pathlib.Path(os.environ["MYTHOS_SCOPE"]).parent))
+    if not d:
+        raise Refused(
+            "no engagement directory: pass --dir engagements/<dir> or pin $MYTHOS_SCOPE. "
+            "Every request this script sends is recorded there as a raw traffic record, "
+            "and an unrecorded race is not a proof anybody can replay.")
+    return d
+
+
+def render(out):
+    lines = [f"race {out['subcommand']}: {out['verdict'].upper()}  "
+             f"(sync mode: {out['sync_mode'] or 'n/a'}, N={out['n']}, "
+             f"{out['repeats_run']}/{out['repeats_requested']} repeats)"]
+    for arm in ("parallel", "control"):
+        r = out[arm]
+        lines.append(f"  {arm:8} {r['successes']}/{r['trials']} repeats overran  "
+                     f"wilson {r['wilson95'][0]:.2f}–{r['wilson95'][1]:.2f}  "
+                     f"exact {r['clopper_pearson95'][0]:.2f}–{r['clopper_pearson95'][1]:.2f}")
+    for rep in out["repeats"]:
+        p, c = rep["arms"]["parallel"], rep["arms"]["control"]
+        lines.append(f"  repeat {rep['repeat']}: control delta {c['delta']} "
+                     f"({c['apparent_successes']} apparent), parallel delta {p['delta']} "
+                     f"({p['apparent_successes']} apparent)"
+                     + (f"  [fell back to HTTP/1.1: {p['fell_back_from_h2']}]"
+                        if p.get("fell_back_from_h2") else ""))
+    lines.append(f"  oracle: {out['oracle']['state_url']} read as the owner, "
+                 f"counter /{out['oracle']['count_regex']}/")
+    lines.append(f"  why: {out['why']}")
+    ids = [i for rep in out["repeats"] for i in rep["arms"]["parallel"]["traffic_ids"] if i]
+    if ids:
+        lines.append(f"  recorded: traffic/{ids[0]}..{ids[-1]} "
+                     f"(scripts/traffic show <id>, scripts/traffic replay <id>)")
+    lines.append(f"  next: {out['next']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- selftest
+
+
+def _selftest():
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # --- HPACK, against bytes worked out by hand from RFC 7541
+    eq(hpack_int(5, 7), b"\x05", "a small HPACK integer is one byte")
+    eq(hpack_int(127, 7), b"\x7f\x00", "127 with a 7-bit prefix needs a continuation")
+    eq(hpack_int(1337, 5), b"\x1f\x9a\x0a", "RFC 7541 C.1.3: 1337 with a 5-bit prefix")
+    eq(hpack_string("POST"), b"\x04POST", "a literal string is length-prefixed, no Huffman")
+    eq(hpack_literal(":method", "POST"), b"\x00\x07:method\x04POST",
+       "literal without indexing, new name (RFC 7541 6.2.2)")
+    eq(hpack_literal("X-Role", "admin"), b"\x00\x06x-role\x05admin",
+       "header names are lowercased, as HTTP/2 requires")
+    long_value = "a" * 200
+    enc = hpack_literal("x-long", long_value)
+    eq(enc[:9], b"\x00\x06x-long\x7f", "a 200-byte value starts the 7-bit continuation")
+    eq(enc, b"\x00\x06x-long" + b"\x7f\x49" + long_value.encode(),
+       "200 = 127 + 73, so the continuation byte is 0x49")
+
+    # --- frames, against the wire format in RFC 9113 4.1
+    eq(frame(FRAME_SETTINGS, 0, 0), b"\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+       "an empty SETTINGS frame is nine bytes")
+    eq(frame(FRAME_SETTINGS, FLAG_ACK, 0), b"\x00\x00\x00\x04\x01\x00\x00\x00\x00",
+       "the SETTINGS ACK sets flag 0x1")
+    eq(frame(FRAME_DATA, FLAG_END_STREAM, 3, b""),
+       b"\x00\x00\x00\x00\x01\x00\x00\x00\x03",
+       "the withheld final frame: an empty DATA with END_STREAM on stream 3")
+    eq(frame(FRAME_DATA, FLAG_END_STREAM, 1, b"}"),
+       b"\x00\x00\x01\x00\x01\x00\x00\x00\x01}",
+       "the last byte of a body, with END_STREAM")
+    eq(frame(FRAME_HEADERS, FLAG_END_HEADERS, 5, b"\x00")[:9],
+       b"\x00\x00\x01\x01\x04\x00\x00\x00\x05",
+       "HEADERS carries END_HEADERS and NOT END_STREAM")
+    eq(PREFACE, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "the connection preface is exact")
+    # The claim in the knowledge note: twenty final frames fit in one segment.
+    ok(len(b"".join(frame(FRAME_DATA, FLAG_END_STREAM, 1 + 2 * i, b"}")
+                    for i in range(20))) < 1500,
+       "twenty final frames fit inside one 1500-byte TCP segment")
+
+    # --- frame parsing round trip, and the status read
+    wire = (frame(FRAME_SETTINGS, 0, 0, struct.pack(">HI", 0x3, 7))
+            + frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, b"\x88")
+            + frame(FRAME_DATA, FLAG_END_STREAM, 1, b'{"ok":true}'))
+    parsed = parse_frames(wire)
+    eq(len(parsed), 3, "three frames parse back out")
+    eq(h2_settings_limit(wire), 7, "MAX_CONCURRENT_STREAMS is read from SETTINGS")
+    eq(h2_status(b"\x88"), 200, "an indexed static :status decodes")
+    eq(h2_status(b"\x8d"), 404, "and so does 404")
+    eq(h2_status(b"\x48\x03409"), None,
+       "a literal status is not decoded here, and says so rather than guessing")
+    eq(parse_frames(wire[:-3]), parsed[:2], "a truncated trailing frame is not parsed")
+
+    # --- statistics: the rule that keeps one lucky hit from becoming a finding
+    eq(judge(2, 0, 2, None)[0], "inconclusive",
+       "2/2 against 0/2 does not clear the control: two repeats is not a measurement")
+    eq(judge(6, 0, 6, None)[0], "candidate", "6/6 against 0/6 clears it")
+    eq(judge(0, 0, 6, None)[0], "no-signal", "no overrun is no signal")
+    eq(judge(3, 2, 6, None)[0], "inconclusive", "overlapping arms are inconclusive")
+    eq(judge(6, 0, 6, "the control overran")[0], "inconclusive",
+       "a broken control outranks any parallel rate")
+    ok(wilson(6, 6)[0] > clopper_pearson(0, 6)[1], "6/6 clears the exact upper bound of 0/6")
+    eq(wilson(0, 0), (0.0, 1.0), "no trials is no information, not a rate of zero")
+    ok(clopper_pearson(0, 6)[1] > 0.4, "a clean arm at six repeats bounds little")
+
+    # --- the refusals
+    for verb, blob in (("delete", "DELETE http://t/api/items/7"),
+                       ("cancel", "POST http://t/order/cancel"),
+                       ("transfer-out", "POST http://t/transfer-out")):
+        try:
+            require_creatable(blob, created_this_run=False)
+            fails.append(f"a destructive race on a pre-existing object must be refused ({verb})")
+        except Refused as e:
+            ok("created it" in str(e) or "created" in str(e), f"{verb} refusal explains itself")
+    try:
+        require_creatable("POST http://t/order/cancel", created_this_run=True)
+    except Refused:
+        fails.append("an object this run created may be raced even on a destructive verb")
+    try:
+        require_non_destructive("POST", "http://t/graphql", '{"query":"{deleteAllPastes}"}')
+        fails.append("mass destruction must be refused in code")
+    except Refused as e:
+        ok("destruct" in str(e).lower(), "and the refusal says why")
+    try:
+        require_non_destructive("POST", "http://t/api/redeem", '{"code":"x"}')
+    except Refused as e:
+        fails.append(f"a benign redeem must not be refused: {e}")
+
+    eq(counter('{"redemptions": 3}', r'"redemptions":\s*(\d+)'), 3, "the counter is read")
+    eq(counter('{"x": 1}', r'"redemptions":\s*(\d+)'), None, "an unreadable counter is None")
+    eq(extract('{"code":"abc"}', "code", None), "abc", "the minted id is read from JSON")
+    eq(extract('code=abc;', None, r"code=(\w+)"), "abc", "or by regex")
+
+    # --- the record, against the format scripts/traffic specifies
+    rec = raw_record("http://t.test:8080/redeem", b"POST /redeem HTTP/1.1\r\n\r\n",
+                     b"HTTP/1.1 200 OK\r\n\r\nok", 0.25, "parallel", "a label", now=1000.0)
+    for key in ("kind", "t", "scheme", "host", "port", "req", "res"):
+        ok(key in rec, f"the raw record carries the required field {key}")
+    eq(rec["kind"], "raw", "it is a raw record")
+    eq((rec["host"], rec["port"], rec["scheme"]), ("t.test", 8080, "http"),
+       "host, port and scheme come off the URL")
+    eq(rec["t"], 999.75, "t is when the request started, not when it ended")
+    eq(base64.b64decode(rec["req"]), b"POST /redeem HTTP/1.1\r\n\r\n",
+       "req is the bytes that crossed the wire")
+    eq((rec["tool"], rec["role"]), ("race", "parallel"), "traffic reads tool and role")
+    eq(rec["s"], 200, "the status hint matches raw.ts's shape")
+    json.dumps(rec)
+
+    fails += _live_selftest()
+    for f in fails:
+        print(f"FAIL {f}", file=sys.stderr)
+    print(f"race selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+def _live_selftest():
+    """The whole protocol against a loopback server with a real race window.
+
+    The window is a `time.sleep` between reading the coupon's `used` flag and
+    writing it, which is the bug this class is about. Two things must come out
+    of it: the parallel wave overruns, and the sequential control does not. A
+    selftest that only asserted the first would pass on a server with no race
+    in it at all.
+    """
+    import http.server
+    fails = []
+
+    def want(got, expect, label):
+        if got != expect:
+            fails.append(f"live: {label}: got {got!r}, want {expect!r}")
+
+    state = {"coupons": {"victim-coupon": {"owner": "bob", "used": False}},
+             "balance": 0, "redemptions": 0, "n": 0}
+    lock = threading.Lock()
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        window = 0.05
+        atomic = False
+
+        def log_message(self, *a):
+            pass
+
+        def reply(self, status, doc):
+            raw = json.dumps(doc).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def me(self):
+            return (self.headers.get("Authorization") or "").replace("Bearer ", "")
+
+        def do_GET(self):
+            if self.path == "/balance":
+                return self.reply(200, {"owner": self.me(), "balance": state["balance"],
+                                        "redemptions": state["redemptions"]})
+            if self.path == "/mine":
+                return self.reply(200, {"owner": self.me(),
+                                        "coupons": [c for c, v in state["coupons"].items()
+                                                    if v["owner"] == self.me()]})
+            return self.reply(404, {"error": "no"})
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            try:
+                doc = json.loads(body or b"{}")
+            except ValueError:
+                doc = {}
+            if self.path == "/coupon/new":
+                with lock:
+                    state["n"] += 1
+                    code = f"cpn-{state['n']}"
+                state["coupons"][code] = {"owner": self.me(), "used": False}
+                return self.reply(201, {"code": code})
+            if self.path == "/redeem":
+                c = state["coupons"].get(str(doc.get("code")))
+                if c is None:
+                    return self.reply(404, {"error": "no such coupon"})
+                if c["owner"] != self.me():
+                    return self.reply(403, {"error": "not yours"})
+                if self.atomic:
+                    # The fixed version of the same endpoint: check and write
+                    # under one lock. Nothing can overrun it, which is what
+                    # makes it the control for the measurement itself.
+                    with lock:
+                        if c["used"]:
+                            return self.reply(409, {"error": "already redeemed"})
+                        time.sleep(self.window)
+                        c["used"] = True
+                        state["balance"] += 10
+                        state["redemptions"] += 1
+                    return self.reply(200, {"ok": True})
+                used = c["used"]                      # check…
+                time.sleep(self.window)               # …window…
+                if used:
+                    return self.reply(409, {"error": "already redeemed"})
+                c["used"] = True                      # …write
+                with lock:
+                    state["balance"] += 10
+                    state["redemptions"] += 1
+                return self.reply(200, {"ok": True})
+            return self.reply(404, {"error": "no"})
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    import tempfile
+    work = tempfile.mkdtemp(prefix="race-selftest-")
+    try:
+        owner = {"Authorization": "Bearer alice"}
+        a = argparse.Namespace(
+            subcommand="limit", url=f"{base}/redeem", method="POST",
+            data='{"code":"{{R}}"}', setup_url=f"{base}/coupon/new", setup_method="POST",
+            setup_data=None, setup_field="code", setup_regex=None,
+            owner_url=f"{base}/mine", owner_headers=owner, object=None,
+            state_url=f"{base}/balance", count_regex=r'"redemptions":\s*(\d+)',
+            success_status=[200, 201], success_regex=None, unit=1,
+            n=6, repeats=6, rate=0, timeout=10, insecure=False, engine="h1",
+            settle_ms=120, dir=work, json=True)
+        out, code = run(a)
+        want(out["verdict"], "candidate", "the overrun is detected")
+        want(code, EXIT_CANDIDATE, "and the exit code says so")
+        want(out["sync_mode"], "h1-last-byte-sync", "the mode that ran is named")
+        want(out["control"]["successes"], 0, "the SEQUENTIAL CONTROL DOES NOT OVERRUN")
+        want(all(r["arms"]["control"]["delta"] == 1 for r in out["repeats"]), True,
+             "the control credits exactly one unit per repeat")
+        want(all(r["arms"]["parallel"]["delta"] > 1 for r in out["repeats"]), True,
+             "every parallel wave credits more than one")
+        want(out["parallel"]["trials"], 6, "six whole repeats were run")
+        json.dumps(out)
+        want(isinstance(render(out), str), True, "it renders for a person too")
+
+        # Every request is in the traffic log, in the shape scripts/traffic reads.
+        lines = (pathlib.Path(work) / "traffic" / "log.jsonl").read_text().splitlines()
+        recs = [json.loads(x) for x in lines]
+        want(all(r["kind"] == "raw" for r in recs), True, "every record is a raw record")
+        want(all(base64.b64decode(r["req"]).startswith((b"GET ", b"POST ")) for r in recs),
+             True, "req holds the request bytes verbatim")
+        want(sorted({r["role"] for r in recs}),
+             ["control", "ownership", "parallel", "readback", "setup"],
+             "each leg is labelled with its role")
+        want(len(recs) >= 6 * (2 * 6 + 6), True, "nothing went unrecorded")
+        ids = [i for rep in out["repeats"] for i in rep["arms"]["parallel"]["traffic_ids"]]
+        want(all(isinstance(i, int) and 1 <= i <= len(recs) for i in ids), True,
+             "a traffic id is the record's line number")
+
+        # Ownership: bob's coupon is refused, and alice's own is not.
+        b = argparse.Namespace(**{**vars(a), "setup_url": None, "object": "victim-coupon",
+                                  "repeats": 1})
+        try:
+            run(b)
+            fails.append("live: racing someone else's object must be refused")
+        except Refused as e:
+            want("someone else's object" in str(e), True, "and the refusal names the reason")
+
+        # The same endpoint with the check and the write under one lock: a
+        # server with no race in it. The control for the measurement itself —
+        # a selftest that never ran this would pass on a tool that reports an
+        # overrun unconditionally.
+        Target.atomic = True
+        state.update(balance=0, redemptions=0)
+        out2, code2 = run(argparse.Namespace(**{**vars(a), "repeats": 3, "n": 6}))
+        want(out2["verdict"], "no-signal", "an atomic check-and-write never overruns")
+        want(code2, EXIT_NO_SIGNAL, "and the exit code separates it from a candidate")
+    except Refused as e:
+        fails.append(f"live: refused unexpectedly: {e}")
+    except Exception as e:                      # noqa: BLE001 - a selftest reports
+        import traceback
+        fails.append(f"live: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+    return fails
+
+
+# -------------------------------------------------------------------- cli
+
+
+def add_common(p, state_default=True):
+    p.add_argument("--header", action="append", default=[],
+                   help="a header for the OWNER identity, repeatable "
+                        "('Authorization: Bearer <own token>')")
+    p.add_argument("--owner-url", required=True,
+                   help="the endpoint that lists what this identity owns. The object id "
+                        "must appear in its answer or the race is refused.")
+    p.add_argument("--object", help="an object id to race, when it is not minted per wave "
+                                    "(a counter that resets, e.g. an MFA attempt counter). "
+                                    "Mutually exclusive with --setup-url.")
+    p.add_argument("--setup-url", help="mint a fresh object before every wave (the normal "
+                                       "path for a once-only action). Its id replaces "
+                                       "{{R}} in the action URL and body.")
+    p.add_argument("--setup-method", default="POST")
+    p.add_argument("--setup-data", help="body for the setup request")
+    p.add_argument("--setup-field", default="code",
+                   help="JSON field of the setup response holding the new object id")
+    p.add_argument("--setup-regex", help="read the id with this regex instead (group 1)")
+    if state_default:
+        p.add_argument("--state-url", required=True,
+                       help="the AUTHORITATIVE endpoint, read as the owner before and after "
+                            "every wave. The delta in --count-regex is the oracle.")
+        p.add_argument("--count-regex", required=True,
+                       help=r"regex whose group 1 is the counter, e.g. '\"uses\":\s*(\d+)'")
+    p.add_argument("--unit", type=int, default=1,
+                   help="how far the counter may legitimately move in one wave (default 1)")
+    p.add_argument("--n", type=int, default=N_DEFAULT,
+                   help=f"requests per wave (default {N_DEFAULT}, max {N_MAX}). The burst is "
+                        f"bounded by this and nothing else.")
+    p.add_argument("--repeats", type=int, default=REPEATS_DEFAULT,
+                   help=f"whole repeats, which are the Bernoulli trials behind the interval "
+                        f"(default {REPEATS_DEFAULT}; fewer cannot clear the control)")
+    p.add_argument("--success-status", type=int, nargs="+", default=[200, 201],
+                   help="statuses that look like a success (a diagnostic, not the oracle)")
+    p.add_argument("--success-regex", help="regex in the body that looks like a success")
+    p.add_argument("--rate", type=float, default=None,
+                   help="requests per second for the paced legs (default: "
+                        "rules.rate_limit_rps from the scope)")
+    p.add_argument("--timeout", type=float, default=15)
+    p.add_argument("--insecure", action="store_true", help="do not verify TLS certificates")
+    p.add_argument("--dir", help="engagements/<dir> (default: the directory of $MYTHOS_SCOPE)")
+    p.add_argument("--json", action="store_true")
+
+
+def parse_headers(items):
+    out = {}
+    for item in items or []:
+        if ":" not in item:
+            raise SystemExit(f"race: --header wants 'Name: value', got {item!r}")
+        k, _, v = item.partition(":")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def main():
+    if "--selftest" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "selftest"):
+        return _selftest()
+
+    ap = argparse.ArgumentParser(
+        prog="race", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="exit codes: 0 candidate, 1 no-signal, 2 usage, 3 inconclusive, 4 refused")
+    sub = ap.add_subparsers(dest="subcommand", required=True)
+
+    limit = sub.add_parser(
+        "limit", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="limit overrun: N attempts at a once-only action",
+        description="""Limit overrun. N parallel attempts at an action that may succeed once
+— a coupon, an invite, a withdrawal, an MFA attempt counter — against a
+sequential control of the same N, with the authoritative state read back as
+the owner after each wave.
+
+  scripts/race limit --url http://t/redeem --method POST --data '{"code":"{{R}}"}' \\
+      --setup-url http://t/coupon/new --setup-field code \\
+      --owner-url http://t/mine --state-url http://t/balance \\
+      --count-regex '"redemptions":\\s*(\\d+)' \\
+      --header 'Authorization: Bearer <own token>' --n 8 --repeats 6 --json
+""")
+    limit.add_argument("--url", required=True, help="the once-only action ({{R}} = object id)")
+    limit.add_argument("--method", default="POST")
+    limit.add_argument("--data", help="request body ({{R}} = object id)")
+    limit.add_argument("--engine", choices=("auto", "h2", "h1"), default="h1",
+                       help="h1 last-byte sync (default here), h2 single-packet, or auto")
+    limit.add_argument("--settle-ms", type=int, default=120,
+                       help="h2: pause between parking the streams and releasing them")
+    add_common(limit)
+
+    sp = sub.add_parser(
+        "single-packet", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="the HTTP/2 single-packet attack",
+        description="""The single-packet attack. Identical protocol to `limit`, with the
+parallel wave sent as N HTTP/2 streams whose final frames leave in one send(),
+so they arrive inside one server read and network jitter cannot stagger them
+(Kettle, "Smashing the state machine", BH USA 2023). HPACK and the frames are
+written by this script; no h2 library decides when bytes leave.
+
+Falls back to HTTP/1.1 last-byte sync when the peer will not negotiate ALPN
+`h2`, when the URL is not https, or when the peer's MAX_CONCURRENT_STREAMS is
+below N. The mode that actually ran is in `sync_mode`, and the reason for a
+fallback is in `fell_back_from_h2`.
+
+  scripts/race single-packet --url https://t/redeem --data '{"code":"{{R}}"}' \\
+      --setup-url https://t/coupon/new --owner-url https://t/mine \\
+      --state-url https://t/balance --count-regex '"redemptions":\\s*(\\d+)' \\
+      --header 'Authorization: Bearer <own token>' --insecure --json
+""")
+    sp.add_argument("--url", required=True)
+    sp.add_argument("--method", default="POST")
+    sp.add_argument("--data")
+    sp.add_argument("--settle-ms", type=int, default=120)
+    add_common(sp)
+
+    toc = sub.add_parser(
+        "toctou", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="a two-step flow raced at the gap",
+        description="""TOCTOU. The two-step state machine: step one leaves the object in a
+state step two consumes, and the gap between them is where the race lives.
+Step one is sent once, then N copies of step two go out together after
+--gap-ms, against a sequential control of the same pair.
+
+  scripts/race toctou --first http://t/order/confirm --first-data '{"id":"{{R}}"}' \\
+      --second http://t/order/use --data '{"id":"{{R}}"}' --gap-ms 0 \\
+      --setup-url http://t/order/new --setup-field id --owner-url http://t/mine \\
+      --state-url http://t/balance --count-regex '"uses":\\s*(\\d+)' \\
+      --header 'Authorization: Bearer <own token>' --json
+""")
+    toc.add_argument("--first", required=True, help="step one, sent once per wave")
+    toc.add_argument("--first-method", default="POST")
+    toc.add_argument("--first-data", help="step one's body ({{R}} = object id)")
+    toc.add_argument("--second", required=True, dest="url",
+                     help="the raced step, sent N times ({{R}} = object id)")
+    toc.add_argument("--method", default="POST", help="the raced step's method")
+    toc.add_argument("--data", help="the raced step's body ({{R}} = object id)")
+    toc.add_argument("--gap-ms", type=float, default=0,
+                     help="how long after step one the burst goes out (default 0)")
+    toc.add_argument("--engine", choices=("auto", "h2", "h1"), default="h1")
+    toc.add_argument("--settle-ms", type=int, default=120)
+    add_common(toc)
+
+    sub.add_parser("selftest", help="offline asserts plus a loopback server with a real "
+                                    "race window; needs no network")
+
+    a = ap.parse_args()
+    if a.subcommand == "single-packet":
+        a.engine = "h2"
+    if a.engine == "auto":
+        a.engine = "h2" if a.url.startswith("https") else "h1"
+
+    cap = N_MAX
+    env_cap = os.environ.get("MYTHOS_RACE_MAX_N")
+    if env_cap:
+        try:
+            cap = min(int(env_cap), N_CEILING)
+        except ValueError:
+            ap.error(f"MYTHOS_RACE_MAX_N={env_cap!r} is not a number")
+    if not 2 <= a.n <= cap:
+        ap.error(f"--n must be 2..{cap}. A race is load: the burst is bounded by N and by "
+                 f"nothing else, so N stays small. $MYTHOS_RACE_MAX_N raises the ceiling to "
+                 f"at most {N_CEILING}, for a lab you own.")
+    if not 1 <= a.repeats <= 20:
+        ap.error("--repeats must be 1..20")
+    if bool(a.object) == bool(a.setup_url):
+        ap.error("give exactly one of --setup-url (mint a fresh object per wave, the normal "
+                 "path) or --object (an id you already own, for a counter that resets)")
+    a.owner_headers = parse_headers(a.header)
+    if not a.owner_headers:
+        ap.error("--header is required: the read-back must be done as the object's OWNER, "
+                 "and an anonymous read-back proves nothing about whose state moved")
+    if a.rate is None:
+        a.rate = scope_rate()
+
+    try:
+        out, code = run(a, toctou=(a.subcommand == "toctou"))
+    except Refused as e:
+        print(f"race: refusing — {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    print(json.dumps(out, indent=1) if a.json else render(out))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

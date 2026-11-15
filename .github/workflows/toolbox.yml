@@ -69,10 +69,21 @@ jobs:
           load: true
           tags: mythos-toolbox:candidate
           cache-from: type=gha,scope=amd64
+      # The lab target gives the candidate image something real to reach: the
+      # loopback check runs curl inside the container over MYTHOS_NET=host.
+      - name: start the lab target
+        run: |
+          docker compose -f lab/docker-compose.yml up -d vulnapp
+          for _ in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5001/)" = "200" ] && exit 0
+            sleep 2
+          done
+          echo "lab target never answered on 127.0.0.1:5001" >&2
+          exit 1
       - name: self-test the candidate image
         env:
           MYTHOS_IMAGE: mythos-toolbox:candidate
-        run: scripts/selftest.sh
+        run: scripts/selftest.sh --with-docker
 
   build:
     # Runs for tags and dispatch (selftest skipped) and for the schedule once the

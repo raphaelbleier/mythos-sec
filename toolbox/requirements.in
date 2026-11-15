@@ -5,6 +5,9 @@
 # cloned from a pinned commit in the Dockerfile.
 arjun
 wafw00f
+# simplejson: a graphql-cop import. The tool itself is cloned in the Dockerfile
+# because it is not on PyPI, but its dependencies are, so they belong here.
+simplejson
 h2spacex==1.2.2
 playwright
 # jwt_tool dependencies

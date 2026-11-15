@@ -1,0 +1,1778 @@
+#!/usr/bin/env python3
+"""Mythos takeover — dangling DNS and dangling third-party references.
+
+A takeover finding is three facts, not one: a reference that still points
+somewhere, a destination that is unclaimed, and a path by which somebody else
+could claim it. Most scanner output carries only the first, which is why
+takeover reports have the reputation they do. So every subcommand here reports
+the three parts separately and refuses to merge them.
+
+  scripts/takeover cname  <host>...        CNAME/ALIAS to an unclaimed service
+  scripts/takeover ns     <zone>...        lame delegation, and a claimable zone
+  scripts/takeover dangling               cloud buckets and PaaS hosts referenced
+                                          from HTML, CSS, JS, CSP, preconnect
+                                          and source maps
+  scripts/takeover scripts                external <script src>: does the host
+                                          still exist, and is there any SRI
+  scripts/takeover records <zone>          CSP report-uri/form-action, SPF
+                                          include:, OAuth redirect allowlists
+  scripts/takeover fingerprints            the shipped fingerprint table
+  scripts/takeover selftest                asserts, including one live loopback
+
+THIS SCRIPT NEVER CLAIMS ANYTHING. It does not register a domain, create a
+bucket, add a PaaS app, start a tunnel, reserve a package name or change a DNS
+record, and there is no flag that makes it. `takeover claim` and its spellings
+exist only to print that refusal and exit 3.
+
+The reason is not squeamishness. Claiming is the attack: it takes control of a
+name a third party still trusts, it is irreversible from the target's side, it
+can put the operator in a contract with a cloud provider under the target's
+name, and on a bug-bounty programme it is usually the one step the programme
+text forbids by name. The evidence a report actually needs — the dangling
+record, the provider's own unclaimed-host response and a written claim path —
+is all read-only. Whether to take the last step is the operator's decision on
+a real engagement, made against that programme's text, not an agent's.
+
+So the strongest verdict here is `candidate`, and `inconclusive` wherever the
+fingerprint or the claimability is ambiguous. `confirmed` belongs to the
+validate phase (AGENTS.md) and appears nowhere in this file's output.
+
+SCOPE. `engagements/<dir>/scope.yaml` is the authorization boundary and this
+script never widens it. Reading DNS for a name is not touching a host, so DNS
+goes ahead for anything; sending HTTP to the destination is touching it, so
+every HTTP fingerprint is gated on the scope check and a refusal is reported
+with the destination that was refused, rather than silently skipped. Use
+`--map <host>=<url>` to point a fingerprint at a lab stand-in instead (the
+scope check then applies to the stand-in, which is the truth of what was sent).
+
+Exit codes: 0 nothing dangling, 1 at least one candidate, 2 usage or no input,
+3 refused (a claim verb), 4 a required external tool is missing.
+
+Python 3 standard library only. Record types the stdlib resolver cannot reach
+(CNAME, NS, TXT, SOA) go through `dig`, with `host` as a fallback and a
+"not installed" path that degrades to A/AAAA lookups instead of lying.
+"""
+import argparse
+import html.parser
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = "mythos-takeover/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+FINGERPRINTS = ROOT / "knowledge" / "web" / "takeover-fingerprints.json"
+
+#: The one sentence this file exists to keep. Printed by `--help`, by every
+#: `--json` result, and by the refused claim verbs.
+NEVER_CLAIM = (
+    "This script never claims: no domain registration, no bucket or app creation, "
+    "no DNS change, no package or tunnel name reserved. The proof is the dangling "
+    "reference plus the provider's own unclaimed-host fingerprint plus a stated "
+    "claim path. Taking that last step is the operator's call on a real "
+    "engagement, against the programme's text — not the agent's."
+)
+CLAIM_VERBS = ("claim", "register", "takeover", "take-over", "occupy", "create",
+               "pwn", "exploit", "squat")
+
+VERDICTS = ("candidate", "inconclusive", "dead-reference", "not-dangling")
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def scope_offenders(url):
+    """Which hosts in `url` the active scope file does not authorize.
+
+    Returns a list, never raises. HTTP is gated on this being empty; DNS is
+    not gated at all, because reading a public record is not reaching a host.
+    """
+    sg = mod("scope-guard")
+    probe = url if "//" in str(url) else f"https://{url}/"
+    try:
+        return sg.check(probe)["offenders"]
+    except Exception:
+        return []
+
+
+def scope_rate(default=5.0):
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        rules = (yaml.safe_load(text) or {}).get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST, _GAP, _SENT, _REFUSED = [0.0], [0.0], [0], []
+
+
+def pace():
+    """Honour rules.rate_limit_rps for HTTP and for DNS alike.
+
+    A wordlist sweep is the one thing in this file that can make hundreds of
+    lookups, so the pacing covers resolver traffic too.
+    """
+    if _GAP[0] <= 0:
+        return
+    wait = _LAST[0] + _GAP[0] - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+def send(url, timeout=10, insecure=True, method="GET"):
+    """One HTTP request, only if scope allows the destination.
+
+    `insecure` defaults to true here on purpose: an unclaimed provider host
+    usually has no certificate for the dangling name, and a TLS error would
+    hide the fingerprint that is the whole point. The certificate state is
+    reported instead of being enforced.
+    """
+    bad = scope_offenders(url)
+    if bad:
+        host = urllib.parse.urlsplit(url).hostname or url
+        _REFUSED.append({"url": url, "host": host, "offenders": bad})
+        return {"status": None, "headers": {}, "body": "", "url": url,
+                "refused_out_of_scope": bad}
+    pace()
+    _SENT[0] += 1
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": UA})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            raw = r.read(100_000)
+            return {"status": r.status,
+                    "headers": {k.lower(): v for k, v in r.headers.items()},
+                    "body": raw.decode("utf-8", "replace"), "url": r.geturl()}
+    except urllib.error.HTTPError as e:
+        raw = e.read(100_000) if e.fp else b""
+        return {"status": e.code,
+                "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
+                "body": raw.decode("utf-8", "replace"), "url": url}
+    except Exception as e:
+        return {"status": None, "headers": {}, "body": f"{type(e).__name__}: {e}",
+                "url": url, "error": type(e).__name__}
+
+# -------------------------------------------------------------------- DNS
+
+
+def dns_tool():
+    """`dig`, else `host`, else None. None is reported, never papered over."""
+    for name in ("dig", "host"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def resolves(host):
+    """A/AAAA through the system resolver. True, False, or None on an error
+    that is not 'this name does not exist'."""
+    pace()
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror as e:
+        if e.errno in (socket.EAI_NONAME, socket.EAI_NODATA, -2, -5):
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def records(name, rtype, server=None, timeout=5):
+    """One record type for one name. Returns (values, status, tool).
+
+    status is 'ok', 'nxdomain', 'refused', 'servfail', 'timeout', 'empty' or
+    'no-dns-tool'. The status matters as much as the values: a lame delegation
+    is precisely a REFUSED/SERVFAIL where an answer should be.
+    """
+    tool = dns_tool()
+    if tool is None:
+        return [], "no-dns-tool", None
+    pace()
+    if tool == "dig":
+        cmd = ["dig", "+time=%d" % max(1, int(timeout)), "+tries=1", "+noall",
+               "+answer", "+comments", name, rtype]
+        if server:
+            cmd.insert(1, "@" + server)
+    else:
+        cmd = ["host", "-W", str(max(1, int(timeout))), "-t", rtype, name]
+        if server:
+            cmd.append(server)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout + 5)
+    except (subprocess.TimeoutExpired, OSError):
+        return [], "timeout", tool
+    out = (p.stdout or "") + (p.stderr or "")
+    low = out.lower()
+    if "status: nxdomain" in low or "not found: 3(nxdomain)" in low:
+        return [], "nxdomain", tool
+    if "status: refused" in low or "refused" in low:
+        return [], "refused", tool
+    if "status: servfail" in low or "servfail" in low:
+        return [], "servfail", tool
+    if "connection timed out" in low or "no servers could be reached" in low:
+        return [], "timeout", tool
+    values = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if tool == "dig":
+            parts = line.split(None, 4)
+            if len(parts) >= 5 and parts[3].upper() == rtype.upper():
+                values.append(parts[4].strip())
+        else:
+            # host(1): "name has address 1.2.3.4" / "name is an alias for x."
+            m = re.search(r"(?:address|alias for|name server|"
+                          r"descriptive text|record)\s+(.+)$", line)
+            if m:
+                values.append(m.group(1).strip())
+    values = [v.rstrip(".") if rtype.upper() in ("CNAME", "NS") else v
+              for v in values]
+    return values, ("ok" if values else "empty"), tool
+
+
+def authoritative(zone, server, timeout=5):
+    """Does `server` answer authoritatively for `zone`? (the `aa` flag)
+
+    A nameserver in the delegation that answers without `aa`, or answers
+    REFUSED/SERVFAIL, or does not resolve at all, is a lame delegation: the
+    zone is delegated to somebody who is not serving it. Whoever can make that
+    nameserver answer owns the zone's answers.
+    """
+    if dns_tool() != "dig":
+        return {"server": server, "state": "unknown",
+                "why": "needs dig; `host` cannot show the aa flag"}
+    if resolves(server) is False:
+        return {"server": server, "state": "lame",
+                "why": "the nameserver's own hostname does not resolve"}
+    pace()
+    try:
+        p = subprocess.run(["dig", "@" + server, "+time=%d" % max(1, int(timeout)),
+                            "+tries=1", "+norecurse", zone, "SOA"],
+                           capture_output=True, text=True, timeout=timeout + 5)
+    except (subprocess.TimeoutExpired, OSError):
+        return {"server": server, "state": "lame", "why": "no answer (timeout)"}
+    low = (p.stdout or "").lower() + (p.stderr or "").lower()
+    if "status: refused" in low:
+        return {"server": server, "state": "lame", "why": "answers REFUSED for the zone"}
+    if "status: servfail" in low:
+        return {"server": server, "state": "lame", "why": "answers SERVFAIL for the zone"}
+    if "no servers could be reached" in low or "connection timed out" in low:
+        return {"server": server, "state": "lame", "why": "unreachable"}
+    if "flags:" in low and re.search(r"flags:[^;]*\baa\b", low):
+        return {"server": server, "state": "authoritative", "why": "answers with aa set"}
+    if "status: noerror" in low:
+        return {"server": server, "state": "non-authoritative",
+                "why": "answers NOERROR without the aa flag: it is not serving this zone"}
+    return {"server": server, "state": "unknown", "why": "could not classify the answer"}
+
+# ------------------------------------------------------- the fingerprint table
+
+
+def load_table(path=None):
+    p = pathlib.Path(path) if path else FINGERPRINTS
+    data = json.loads(p.read_text(encoding="utf-8"))
+    return data
+
+
+def suffix_match(host, pattern):
+    """`host` ends in `pattern`, where `*` matches one label-ish run.
+
+    Patterns in the table look like `s3.*.amazonaws.com` and
+    `s3-website-*.amazonaws.com`, so the wildcard has to work inside a label
+    as well as as a whole one.
+    """
+    host = (host or "").rstrip(".").lower()
+    pattern = (pattern or "").rstrip(".").lower()
+    if not host or not pattern:
+        return False
+    rx = re.escape(pattern).replace(r"\*", "[a-z0-9-]+")
+    return re.search(r"(^|\.)" + rx + r"$", host) is not None
+
+
+def match_service(host, table):
+    """The table entry whose CNAME suffix this host sits under, longest first."""
+    best = None
+    for entry in table["services"]:
+        for suffix in entry.get("cname_suffixes", []):
+            if suffix_match(host, suffix):
+                score = len(suffix.replace("*", ""))
+                if best is None or score > best[0]:
+                    best = (score, entry, suffix)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+def fingerprint_hit(entry, response):
+    """Does this response look like the provider's unclaimed-host page?"""
+    fp = entry.get("fingerprint") or {}
+    if fp.get("nxdomain_only"):
+        return False, "this service has no HTTP fingerprint: the signal is NXDOMAIN"
+    body = response.get("body") or ""
+    status = response.get("status")
+    wanted = fp.get("status") or []
+    for needle in fp.get("body_any") or []:
+        if needle in body:
+            if wanted and status not in wanted:
+                return True, (f"body matched {needle!r} but the status is {status}, "
+                              f"not one of {wanted}: weaker")
+            return True, f"body matched {needle!r} with status {status}"
+    for pattern in fp.get("body_regex_any") or []:
+        if re.search(pattern, body):
+            return True, f"body matched /{pattern}/ with status {status}"
+    if wanted and status in wanted and not (fp.get("body_any")
+                                            or fp.get("body_regex_any")):
+        return True, f"status {status} is the whole fingerprint for this service"
+    return False, f"no fingerprint string in the body (status {status})"
+
+
+def judge(entry, dns_dead, fp_hit, fp_why, http_refused=None, not_probed=False):
+    """The one place a verdict is decided. Never returns `confirmed`.
+
+    The honesty of the table is wired in here: a low-confidence or an
+    edge/unknown-claimability entry cannot reach `candidate`, however clean the
+    fingerprint looked.
+    """
+    if entry is None:
+        if dns_dead:
+            return ("inconclusive",
+                    "the reference is dangling, but its suffix matches no service in "
+                    "the fingerprint table, so there is no known claim path")
+        return ("not-dangling", "no known service, and the destination still answers")
+    claimable = entry.get("claimable", "unknown")
+    conf = entry.get("confidence", "low")
+    name = entry["service"]
+    if http_refused:
+        return ("inconclusive",
+                f"{name}: scope.yaml does not authorize HTTP to {http_refused}, so the "
+                f"unclaimed fingerprint was not read. DNS evidence only")
+    if not dns_dead and not_probed:
+        return ("inconclusive",
+                f"{name}: the destination still resolves, and {fp_why}. Whether it is "
+                f"claimed was never read: DNS evidence only")
+    if not dns_dead and not fp_hit:
+        return ("not-dangling", f"{name}: destination resolves and {fp_why}")
+    evidence = ("the CNAME target does not resolve" if dns_dead else fp_why)
+    if claimable == "no":
+        return ("dead-reference",
+                f"{name}: {evidence}, but the provider verifies domain ownership before "
+                f"serving a custom domain ({entry.get('claim_path', '')[:120]}). A dead "
+                f"reference and DNS hygiene, not a takeover")
+    if claimable in ("edge", "unknown") or conf == "low":
+        return ("inconclusive",
+                f"{name}: {evidence}. claimable={claimable}, table confidence={conf}"
+                + (" (stale entry, not corroborated)" if entry.get("stale") else "")
+                + ". A fingerprint match alone does not prove the name can be claimed")
+    return ("candidate",
+            f"{name}: {evidence}. claimable={claimable}, confidence={conf}. "
+            f"Claim path (NOT taken): {entry.get('claim_path', '')}")
+
+# --------------------------------------------------------- reference mining
+
+
+class _Refs(html.parser.HTMLParser):
+    """Everything in a page that names another origin.
+
+    Deliberately wider than `<script src>`: a dangling `preconnect` or a CSP
+    host is the same dangling name with a different consequence.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.scripts, self.links, self.others, self.csp = [], [], [], []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "script" and a.get("src"):
+            self.scripts.append({"url": a["src"], "integrity": a.get("integrity") or None,
+                                 "crossorigin": a.get("crossorigin"),
+                                 "type": a.get("type") or "classic"})
+        elif tag == "link" and a.get("href"):
+            self.links.append({"url": a["href"], "rel": (a.get("rel") or "").lower(),
+                               "integrity": a.get("integrity") or None})
+        elif tag in ("img", "iframe", "audio", "video", "source", "embed") and a.get("src"):
+            self.others.append({"url": a["src"], "tag": tag})
+        elif tag == "meta" and a.get("http-equiv", "").lower() == "content-security-policy":
+            self.csp.append(a.get("content", ""))
+
+
+URL_RE = re.compile(r"""https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+""")
+HOSTISH_RE = re.compile(r"""\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"""
+                        r"""(?:s3[a-z0-9.-]*\.amazonaws\.com|storage\.googleapis\.com|"""
+                        r"""blob\.core\.windows\.net|web\.core\.windows\.net|"""
+                        r"""trafficmanager\.net|azurewebsites\.net|azureedge\.net|"""
+                        r"""cloudapp\.(?:net|azure\.com)|github\.io|herokuapp\.com|"""
+                        r"""herokudns\.com|netlify\.app|vercel\.app|vercel-dns\.com|"""
+                        r"""fastly\.net|fastlylb\.net|myshopify\.com|"""
+                        r"""elasticbeanstalk\.com|pantheonsite\.io|readthedocs\.io|"""
+                        r"""ghost\.io|surge\.sh|bitbucket\.io|ngrok(?:-free)?\.(?:io|app))\b""",
+                        re.I)
+PATH_BUCKET_RE = re.compile(
+    r"""https?://(?:s3[a-z0-9.-]*\.amazonaws\.com|storage\.googleapis\.com)/"""
+    r"""([a-z0-9][a-z0-9._-]{1,62})""", re.I)
+
+
+def csp_sources(csp_text):
+    """CSP directives split into {directive: [source...]}, lowercased names."""
+    out = {}
+    for part in (csp_text or "").split(";"):
+        bits = part.split()
+        if not bits:
+            continue
+        out.setdefault(bits[0].lower(), []).extend(bits[1:])
+    return out
+
+
+def host_of(source):
+    """The hostname inside a CSP source, a URL or a bare host. None if there
+    is no host (keywords, schemes, `'self'`, data:)."""
+    s = (source or "").strip().strip("'\"")
+    if not s or s.startswith(("'", "*")) or s in ("self", "none", "unsafe-inline",
+                                                  "unsafe-eval", "strict-dynamic",
+                                                  "report-sample", "data:", "blob:"):
+        return None
+    if s.endswith(":") and "//" not in s:
+        return None
+    if "//" not in s:
+        s = "https://" + s
+    host = urllib.parse.urlsplit(s).hostname
+    if not host or host.startswith("*"):
+        return None
+    return host.lower()
+
+
+def mine(text, origin=None, kind="html"):
+    """Every outside reference in one document, with where it came from.
+
+    `kind` is html, css, js or sourcemap. A source map matters because its
+    `sources`/`sourceRoot` can name a bucket that the shipped bundle does not.
+    """
+    refs = []
+
+    def add(url, where, **extra):
+        full = urllib.parse.urljoin(origin or "", url) if origin else url
+        host = host_of(full) or host_of(url)
+        if not host:
+            return
+        refs.append({"host": host, "url": full, "where": where, **extra})
+
+    if kind == "html":
+        p = _Refs()
+        try:
+            p.feed(text)
+        except Exception:
+            pass
+        for s in p.scripts:
+            add(s["url"], "script-src-tag", integrity=s["integrity"],
+                crossorigin=s["crossorigin"], script_type=s["type"])
+        for l in p.links:
+            where = "link-" + (l["rel"].split()[0] if l["rel"] else "unknown")
+            add(l["url"], where, integrity=l["integrity"])
+        for o in p.others:
+            add(o["url"], "tag-" + o["tag"])
+        for csp in p.csp:
+            for directive, sources in csp_sources(csp).items():
+                for src in sources:
+                    h = host_of(src)
+                    if h:
+                        add(src if "//" in src else "https://" + src,
+                            "csp-meta-" + directive)
+    elif kind == "sourcemap":
+        try:
+            sm = json.loads(text)
+        except Exception:
+            sm = {}
+        for s in (sm.get("sources") or []):
+            if "//" in str(s):
+                add(str(s), "sourcemap-sources")
+        if sm.get("sourceRoot") and "//" in str(sm["sourceRoot"]):
+            add(str(sm["sourceRoot"]), "sourcemap-sourceRoot")
+        for m in URL_RE.finditer(json.dumps(sm.get("sourcesContent") or [])):
+            add(m.group(0), "sourcemap-sourcesContent")
+    else:
+        for m in URL_RE.finditer(text):
+            add(m.group(0), f"{kind}-url")
+
+    # Bare provider hostnames anywhere in the text: a bucket named in a string
+    # that is concatenated at runtime never appears as a full URL.
+    for m in HOSTISH_RE.finditer(text):
+        refs.append({"host": m.group(0).lower(), "url": None,
+                     "where": f"{kind}-bare-host"})
+    for m in PATH_BUCKET_RE.finditer(text):
+        refs.append({"host": m.group(0).split("//")[1].split("/")[0].lower(),
+                     "url": m.group(0), "where": f"{kind}-path-style-bucket",
+                     "bucket": m.group(1)})
+
+    # de-duplicate on (host, where), keeping the first URL seen
+    seen, out = set(), []
+    for r in refs:
+        key = (r["host"], r["where"], r.get("url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def read_input(a):
+    """(text, kind, origin) from --url / --file / --stdin, or a usage exit."""
+    if getattr(a, "url", None):
+        r = send(a.url, timeout=a.timeout)
+        if r.get("refused_out_of_scope"):
+            raise SystemExit(
+                f"takeover: refusing to fetch {a.url}: out of scope "
+                f"({', '.join(r['refused_out_of_scope'])}). scope.yaml is the "
+                f"authorization boundary and this script never widens it.")
+        kind = "html"
+        ct = r["headers"].get("content-type", "")
+        if "javascript" in ct:
+            kind = "js"
+        elif "css" in ct:
+            kind = "css"
+        elif a.url.endswith(".map") or "sourcemap" in ct:
+            kind = "sourcemap"
+        return r["body"], kind, a.url
+    if getattr(a, "file", None):
+        p = pathlib.Path(a.file)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        ext = p.suffix.lower()
+        kind = {".js": "js", ".mjs": "js", ".css": "css", ".map": "sourcemap",
+                ".json": "sourcemap"}.get(ext, "html")
+        return text, kind, getattr(a, "origin", None)
+    if getattr(a, "stdin", False):
+        return sys.stdin.read(), getattr(a, "kind", "html"), getattr(a, "origin", None)
+    raise SystemExit(2)
+
+# ------------------------------------------------------------- subcommands
+
+
+def usage(msg):
+    """A usage error is exit 2, never 1: the driver tells them apart."""
+    print(f"takeover: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def parse_map(pairs):
+    out = {}
+    for item in pairs or []:
+        if "=" not in item:
+            usage(f"--map wants host=url, got {item!r}")
+        host, url = item.split("=", 1)
+        out[host.strip().lower().rstrip(".")] = url.strip()
+    return out
+
+
+def fingerprint_host(host, table, maps, a, entry=None, suffix=None):
+    """DNS state plus, if scope allows, the provider's unclaimed-host response.
+
+    `maps` sends the HTTP somewhere else on purpose: a lab stand-in, or a
+    stored copy. A mapped host is recorded as resolve=overridden, because the
+    fingerprint then proves what the stand-in served and nothing about DNS.
+    """
+    if entry is None:
+        entry, suffix = match_service(host, table)
+    mapped = maps.get(host)
+    row = {"host": host, "service": entry["service"] if entry else None,
+           "matched_suffix": suffix, "mapped_to": mapped}
+    if mapped:
+        row["resolves"] = "overridden"
+        dns_dead = False
+    else:
+        res = resolves(host)
+        row["resolves"] = res
+        dns_dead = res is False
+    row["dns_dead"] = dns_dead
+    fp_hit, fp_why, refused, not_probed = False, "not fingerprinted", None, False
+    nxdomain_only = bool((entry or {}).get("fingerprint", {}).get("nxdomain_only"))
+    if not dns_dead and not a.no_http and not (nxdomain_only and not mapped):
+        url = mapped or f"{a.scheme}://{host}/"
+        r = send(url, timeout=a.timeout)
+        row["probe_url"] = url
+        row["status"] = r.get("status")
+        if r.get("refused_out_of_scope"):
+            refused = url
+            fp_why = "HTTP refused by scope"
+        elif entry:
+            fp_hit, fp_why = fingerprint_hit(entry, r)
+            row["body_head"] = (r.get("body") or "")[:200]
+        else:
+            fp_why = "no table entry, so no fingerprint to compare"
+            row["body_head"] = (r.get("body") or "")[:200]
+    elif dns_dead:
+        fp_why = "destination does not resolve, no HTTP attempted"
+    elif nxdomain_only:
+        fp_why = "service has no HTTP fingerprint; NXDOMAIN is the only signal"
+        not_probed = True
+    elif a.no_http:
+        fp_why = "--no-http, so nothing at all was sent to the destination"
+        not_probed = True
+    row["fingerprint_hit"] = fp_hit
+    row["verdict"], row["why"] = judge(entry, dns_dead, fp_hit, fp_why, refused,
+                                       not_probed)
+    if refused:
+        row["http_refused"] = refused
+    return row
+
+
+def cmd_cname(a):
+    """CNAME/ALIAS pointing at a service whose name is unclaimed."""
+    table = load_table(a.table)
+    maps = parse_map(a.map)
+    forced = parse_map(a.cname)
+    hosts = list(a.host)
+    if a.hosts_file:
+        hosts += [l.strip() for l in pathlib.Path(a.hosts_file).read_text().splitlines()
+                  if l.strip() and not l.startswith("#")]
+    if a.surface:
+        hosts += hosts_from_surface(a.surface)
+    if a.wordlist:
+        hosts += sweep(a.wordlist, a.zone, a.max_names)
+    hosts = list(dict.fromkeys(h.strip().lower().rstrip(".") for h in hosts if h.strip()))
+    if not hosts:
+        raise SystemExit(2)
+    rows = []
+    for host in hosts:
+        if host in forced:
+            chain, status, tool = [forced[host]], "overridden", "override"
+        else:
+            chain, status, tool = records(host, "CNAME", timeout=a.timeout)
+        row = {"name": host, "cname_chain": chain, "cname_status": status,
+               "dns_tool": tool}
+        if not chain:
+            # No CNAME. An A/alias record to a cloud address is explicitly NOT
+            # a takeover candidate here: claiming an IP is probabilistic and
+            # needs allocating addresses, which this script will not do.
+            row["verdict"] = "not-dangling"
+            row["why"] = ("no CNAME" + (f" ({status})" if status != "ok" else "")
+                          + ". An A record to a cloud address is not treated as a "
+                            "takeover candidate: claiming an address is "
+                            "probabilistic and allocating addresses is an action "
+                            "this script will not take")
+            rows.append(row)
+            continue
+        target = chain[-1]
+        row.update(fingerprint_host(target, table, maps, a))
+        row["name"] = host
+        row["cname_target"] = target
+        rows.append(row)
+    return {"subcommand": "cname", "checked": len(rows), "results": rows,
+            "refused": _REFUSED, "never_claim": NEVER_CLAIM}
+
+
+def hosts_from_surface(path):
+    """Hostnames probe already found. The one legitimate source of names:
+    recon's output, not a sweep."""
+    data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    out = []
+    for page in data.get("pages") or []:
+        for key in ("url", "redirected_to"):
+            h = host_of(page.get(key) or "")
+            if h:
+                out.append(h)
+        for src in page.get("scripts") or []:
+            h = host_of(urllib.parse.urljoin(page.get("url") or "", src))
+            if h:
+                out.append(h)
+    h = host_of(data.get("target") or "")
+    if h:
+        out.append(h)
+    return list(dict.fromkeys(out))
+
+
+def sweep(wordlist, zone, cap):
+    """A capped wordlist sweep, and only on explicit request.
+
+    AGENTS.md refuses brute force. A name sweep is the borderline case, so it
+    is off unless asked for, capped by default, and paced by
+    rules.rate_limit_rps like everything else. It exists because recon's
+    subdomain list is sometimes all that is available, not as a discovery
+    strategy.
+    """
+    if not zone:
+        usage("--wordlist needs --zone")
+    words = [w.strip() for w in pathlib.Path(wordlist).read_text().splitlines()
+             if w.strip() and not w.startswith("#")]
+    if len(words) > cap:
+        print(f"takeover: wordlist has {len(words)} names, using the first {cap} "
+              f"(--max-names raises it; keep it small, this is not a discovery tool)",
+              file=sys.stderr)
+    return [f"{w}.{zone.strip('.')}" for w in words[:cap]]
+
+
+def cmd_ns(a):
+    """NS delegation to a nameserver that does not answer authoritatively."""
+    rows = []
+    for zone in a.zone:
+        zone = zone.strip().rstrip(".")
+        ns, status, tool = records(zone, "NS", timeout=a.timeout)
+        row = {"zone": zone, "nameservers": ns, "ns_status": status, "dns_tool": tool}
+        if status == "no-dns-tool":
+            row["verdict"] = "inconclusive"
+            row["why"] = ("neither dig nor host is installed, so NS records cannot be "
+                          "read. Install bind9-dnsutils, or run this in the toolbox")
+            rows.append(row)
+            continue
+        if ns:
+            row["checks"] = [authoritative(zone, s, timeout=a.timeout) for s in ns]
+            row.update(ns_verdict(zone, row["checks"]))
+        else:
+            # No delegation. That is not "nothing": if the registrable domain is
+            # gone from the registry, this is the strongest case in the file,
+            # which is why the RDAP step below still runs.
+            row["verdict"] = "not-dangling"
+            row["why"] = (f"no NS records for this name ({status}): it is not a "
+                          f"delegation. Whether the domain itself is claimable is the "
+                          f"--rdap question")
+        if a.rdap:
+            row["rdap"] = rdap(registrable(zone), a)
+            row.update(zone_claimable(row["rdap"], row))
+        else:
+            row["registrar"] = ("not checked: --rdap sends HTTP to an RDAP service, "
+                                "which is a host scope.yaml must authorize")
+        rows.append(row)
+    return {"subcommand": "ns", "checked": len(rows), "results": rows,
+            "refused": _REFUSED, "never_claim": NEVER_CLAIM}
+
+
+def ns_verdict(zone, checks):
+    """All-lame is a zone whose answers nobody serves; part-lame is fragility.
+
+    This is the highest-impact and rarest case: if every nameserver in the
+    delegation is lame, whoever can make one of those names answer serves the
+    whole zone. It is also the case where the claim path is most often closed
+    (the nameserver hostname belongs to a provider), so the claim path is
+    stated and never taken.
+    """
+    states = [c["state"] for c in checks]
+    # `non-authoritative` belongs with `lame`: a server that answers NOERROR
+    # without the aa flag is a resolver or a parent giving a referral, not the
+    # zone's authority. Counting it as healthy is how an all-lame delegation
+    # reads as half-healthy.
+    lame = [c for c in checks if c["state"] in ("lame", "non-authoritative")]
+    auth = [c for c in checks if c["state"] == "authoritative"]
+    if "unknown" in states and not auth and not lame:
+        return {"verdict": "inconclusive",
+                "why": "could not classify any nameserver's answer (dig needed for the "
+                       "aa flag)"}
+    if lame and not auth:
+        return {"verdict": "candidate",
+                "why": (f"every nameserver in the delegation of {zone} is lame "
+                        f"({', '.join(c['server'] + ': ' + c['why'] for c in lame)}). "
+                        f"Nobody is serving this zone authoritatively. Claim path "
+                        f"(NOT taken): control one of those nameserver hostnames — "
+                        f"register its domain if it is unregistered, or claim it on "
+                        f"the provider that serves it — and the zone's answers become "
+                        f"yours. Verify the nameserver hostname's own registration "
+                        f"before claiming anything is possible")}
+    if lame:
+        return {"verdict": "inconclusive",
+                "why": (f"{len(lame)} of {len(checks)} nameservers are lame "
+                        f"({', '.join(c['server'] for c in lame)}) while "
+                        f"{len(auth)} still answer authoritatively. That is a "
+                        f"resolution-fragility finding, not a takeover: the zone is "
+                        f"still served")}
+    return {"verdict": "not-dangling",
+            "why": f"all {len(checks)} nameservers answer authoritatively"}
+
+
+def registrable(host):
+    """eTLD+1, without a public-suffix list.
+
+    Two labels, or three when the second-to-last is one of the common
+    second-level registry labels. This is a heuristic and says so: a wrong
+    answer here makes an RDAP lookup miss, it does not make a verdict.
+    """
+    labels = (host or "").rstrip(".").lower().split(".")
+    if len(labels) <= 2:
+        return ".".join(labels)
+    sld = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
+           "mil", "sch", "in", "web", "info"}
+    if labels[-2] in sld and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def claim_note(host):
+    """What claiming this name would actually take — stated, never done.
+
+    The distinction matters and scanners get it wrong: a dead name that IS a
+    registrable domain can be registered by anyone, while a dead subdomain of a
+    domain somebody still owns cannot. The second is only a takeover if that
+    owner's own zone or provider account can be reached, which is a different
+    finding.
+    """
+    reg = registrable(host)
+    if host == reg:
+        return (f"{reg} is a registrable domain, so whoever registers it receives "
+                f"whatever this reference sends there, or satisfies whatever it "
+                f"allows (claim path NOT taken: register it).")
+    return (f"{host} is a subdomain of {reg}. If {reg} is unregistered, registering "
+            f"it hands over this name; if it is still registered by somebody else, "
+            f"this is a dangling reference and a takeover only for whoever controls "
+            f"{reg}'s zone. Check which, before calling it either.")
+
+
+def rdap(domain, a):
+    """One RDAP lookup, gated on scope like any other HTTP request.
+
+    RDAP is a third party's server. Reading a public registration record is
+    about as harmless as HTTP gets, and it is still HTTP to a host the scope
+    file does not name, so it is off by default and refused rather than sent
+    when scope says no.
+    """
+    base = a.rdap_base.rstrip("/")
+    url = f"{base}/domain/{domain}"
+    r = send(url, timeout=a.timeout)
+    if r.get("refused_out_of_scope"):
+        return {"domain": domain, "state": "refused", "url": url,
+                "why": (f"scope.yaml does not authorize {host_of(url)}. Add the RDAP "
+                        f"service to in_scope in an editor if the engagement wants "
+                        f"registration checks, or read the record by hand")}
+    body = r.get("body") or ""
+    if r.get("status") == 404 or "not found" in body.lower()[:400]:
+        return {"domain": domain, "state": "unregistered", "status": r.get("status"),
+                "url": url}
+    statuses = []
+    try:
+        statuses = [str(s).lower() for s in (json.loads(body).get("status") or [])]
+    except Exception:
+        statuses = re.findall(r"(pendingDelete|redemptionPeriod|clientHold|serverHold)",
+                              body, re.I)
+        statuses = [s.lower() for s in statuses]
+    events = {}
+    try:
+        for ev in json.loads(body).get("events") or []:
+            events[str(ev.get("eventAction"))] = str(ev.get("eventDate"))
+    except Exception:
+        pass
+    return {"domain": domain, "state": "registered", "status": r.get("status"),
+            "rdap_status": statuses, "events": events, "url": url}
+
+
+def zone_claimable(rd, row):
+    """A zone whose registration makes the domain itself claimable."""
+    if not rd or rd.get("state") == "refused":
+        return {"registrar": rd.get("why") if rd else None}
+    if rd.get("state") == "unregistered":
+        return {"verdict": "candidate",
+                "why": (f"{rd['domain']} is not registered (RDAP {rd.get('status')}). "
+                        f"Anyone may register it and then serve every name under it, "
+                        f"including whatever still references it. Claim path (NOT "
+                        f"taken): register the domain at any registrar")}
+    expiring = [s for s in rd.get("rdap_status") or []
+                if s in ("pendingdelete", "redemptionperiod", "clienthold", "serverhold")]
+    if expiring:
+        return {"verdict": "candidate",
+                "why": (f"{rd['domain']} is registered but in state "
+                        f"{', '.join(expiring)}: it is on its way out of the registry "
+                        f"and will become registerable. Expiry events: "
+                        f"{rd.get('events')}. Claim path (NOT taken): wait for the "
+                        f"drop and register it")}
+    return {"registrar": f"registered, events {rd.get('events')}"}
+
+
+def cmd_dangling(a):
+    """Cloud buckets and PaaS hosts referenced from a page or a bundle."""
+    table = load_table(a.table)
+    maps = parse_map(a.map)
+    try:
+        text, kind, origin = read_input(a)
+    except SystemExit as e:
+        if e.code == 2:
+            usage("dangling: give --url, --file or --stdin")
+        raise
+    refs = mine(text, origin, kind)
+    by_host = {}
+    for r in refs:
+        by_host.setdefault(r["host"], []).append(r)
+    rows = []
+    for host, hits in by_host.items():
+        entry, suffix = match_service(host, table)
+        if entry is None and not a.all_hosts:
+            continue
+        row = fingerprint_host(host, table, maps, a, entry, suffix)
+        row["referenced_from"] = [{"where": h["where"], "url": h.get("url")}
+                                  for h in hits][:6]
+        row["buckets"] = sorted({h["bucket"] for h in hits if h.get("bucket")}) or None
+        rows.append(row)
+    rows.sort(key=lambda r: VERDICTS.index(r["verdict"]) if r["verdict"] in VERDICTS else 9)
+    return {"subcommand": "dangling", "kind": kind, "origin": origin,
+            "references": len(refs), "provider_hosts": len(rows), "results": rows,
+            "refused": _REFUSED, "never_claim": NEVER_CLAIM}
+
+
+def cmd_scripts(a):
+    """External scripts: does the host still exist, and is there any SRI.
+
+    A script-src takeover is stored XSS on every page that loads it, which is
+    why the resolution check and the SRI check belong in one table: SRI is the
+    mitigation that makes a dead host harmless, so its absence is what turns a
+    dangling script host from hygiene into execution.
+    """
+    table = load_table(a.table)
+    maps = parse_map(a.map)
+    try:
+        text, kind, origin = read_input(a)
+    except SystemExit as e:
+        if e.code == 2:
+            usage("scripts: give --url, --file or --stdin")
+        raise
+    p = _Refs()
+    try:
+        p.feed(text)
+    except Exception:
+        pass
+    own = host_of(origin or "") if origin else None
+    rows, covered, external = [], 0, 0
+    items = [dict(s, where="script") for s in p.scripts]
+    items += [dict(l, where="link-" + (l["rel"] or "?"))
+              for l in p.links
+              if any(k in (l["rel"] or "") for k in ("stylesheet", "modulepreload",
+                                                     "preload", "preconnect",
+                                                     "dns-prefetch"))]
+    for item in items:
+        url = urllib.parse.urljoin(origin or "", item["url"]) if origin else item["url"]
+        host = host_of(url)
+        if not host:
+            continue
+        same = (host == own)
+        row = {"url": url, "host": host, "where": item["where"], "same_origin": same,
+               "integrity": item.get("integrity"),
+               "crossorigin": item.get("crossorigin")}
+        if not same:
+            external += 1
+            if item.get("integrity"):
+                covered += 1
+            row["registrable"] = registrable(host)
+            fp = fingerprint_host(host, table, maps, a)
+            row["resolves"] = fp["resolves"]
+            row["service"] = fp["service"]
+            row["verdict"], row["why"] = fp["verdict"], fp["why"]
+            if fp["dns_dead"] and fp["service"] is None:
+                executable = item["where"] == "script" or "modulepreload" in item["where"]
+                if executable and not item.get("integrity"):
+                    row["verdict"] = "candidate"
+                    row["why"] = (
+                        f"{host} does not resolve and this page loads executable script "
+                        f"from it with no integrity=. Whoever makes that name answer "
+                        f"executes script in every visitor's session: a script-src "
+                        f"takeover is stored XSS on every page that loads it. Read-only "
+                        f"next step: is {registrable(host)} registered? "
+                        f"`takeover ns {registrable(host)} --rdap`")
+                elif executable:
+                    # SRI is the one control that survives a host takeover: a
+                    # changed body fails the hash and never executes. So this is
+                    # a dead reference and a broken page, not code execution.
+                    row["verdict"] = "dead-reference"
+                    row["why"] = (
+                        f"{host} does not resolve, but the tag carries integrity=, so a "
+                        f"takeover of the host cannot change what executes — only break "
+                        f"the load. Dead reference and availability, not XSS")
+                else:
+                    row["verdict"] = "dead-reference"
+                    row["why"] = (f"{host} does not resolve and is referenced by "
+                                  f"{item['where']}, which does not execute script")
+            if not item.get("integrity") and item["where"] == "script":
+                row["sri"] = ("absent: nothing would stop a changed body from "
+                              "executing")
+            elif item["where"] == "script":
+                row["sri"] = "present"
+        else:
+            row["verdict"] = "not-dangling"
+            row["why"] = "same-origin resource"
+        rows.append(row)
+    rows.sort(key=lambda r: VERDICTS.index(r["verdict"]) if r["verdict"] in VERDICTS else 9)
+    return {"subcommand": "scripts", "origin": origin,
+            "sri_coverage": f"{covered}/{external}",
+            "sri_coverage_fraction": (covered / external) if external else None,
+            "results": rows, "refused": _REFUSED, "never_claim": NEVER_CLAIM}
+
+
+def cmd_records(a):
+    """Parked or dead domains in CSP reporting, mail records and allowlists."""
+    table = load_table(a.table)
+    maps = parse_map(a.map)
+    rows = []
+
+    def check(host, where, extra=None, dead=None):
+        """One referenced host. `dead` overrides the A/AAAA test.
+
+        It has to be overridable: an SPF `include:` target legitimately has no
+        address record at all, only TXT, so judging it by `getaddrinfo` calls
+        every healthy mail provider dangling. For SPF the liveness question is
+        whether the NAME EXISTS (NXDOMAIN or not), which the TXT lookup already
+        answered.
+        """
+        if not host:
+            return
+        row = fingerprint_host(host, table, maps, a)
+        row["where"] = where
+        if extra:
+            row.update(extra)
+        if dead is not None:
+            row["dns_dead"] = dead
+            row["resolves"] = False if dead else row["resolves"]
+        if row["dns_dead"] and row["service"] is None:
+            row["verdict"] = "candidate"
+            row["why"] = (f"{host} does not exist and is still named in {where}. "
+                          + claim_note(host)
+                          + f" Read-only next step: `takeover ns "
+                            f"{registrable(host)} --rdap`")
+        elif dead is False and row["service"] is None:
+            row["verdict"] = "not-dangling"
+            row["why"] = (f"{host} exists in DNS ({where}, lookup "
+                          f"{row.get('spf_txt_status')}). An include target normally "
+                          f"has only a TXT record and no address, so the absence of an "
+                          f"A record is not a dangling name")
+        rows.append(row)
+
+    if not (a.csp or a.url or a.zone or a.redirect_uri):
+        usage("records: give --url or --csp, one or more zones for the SPF chain, "
+              "or --redirect-uri")
+    csp_text = a.csp or ""
+    if a.url and not csp_text:
+        r = send(a.url, timeout=a.timeout)
+        if r.get("refused_out_of_scope"):
+            raise SystemExit(f"takeover records: refusing to fetch {a.url}: out of "
+                             f"scope ({', '.join(r['refused_out_of_scope'])}). "
+                             f"scope.yaml is the authorization boundary")
+        csp_text = r["headers"].get("content-security-policy", "")
+        if not csp_text:
+            p = _Refs()
+            try:
+                p.feed(r["body"])
+            except Exception:
+                pass
+            csp_text = p.csp[0] if p.csp else ""
+    for directive, sources in csp_sources(csp_text).items():
+        if directive not in ("report-uri", "report-to", "form-action",
+                             "frame-ancestors", "base-uri"):
+            continue
+        for src in sources:
+            check(host_of(src), "csp-" + directive)
+
+    for zone in a.zone:
+        zone = zone.strip().rstrip(".")
+        spf_rows, _ = spf_chain(zone, a, depth=a.spf_depth)
+        for item in spf_rows:
+            check(item["domain"], f"spf-{item['mechanism']} of {item['from']}",
+                  {"spf_txt_status": item["status"]},
+                  dead=(item["status"] == "nxdomain"))
+
+    for uri in a.redirect_uri or []:
+        check(host_of(uri), "oauth-redirect-allowlist", {"redirect_uri": uri})
+
+    rows.sort(key=lambda r: VERDICTS.index(r["verdict"]) if r["verdict"] in VERDICTS else 9)
+    return {"subcommand": "records", "csp": csp_text or None, "checked": len(rows),
+            "results": rows, "refused": _REFUSED, "never_claim": NEVER_CLAIM}
+
+
+SPF_RE = re.compile(r"\b(include|redirect)[:=]([A-Za-z0-9._-]+)", re.I)
+
+
+def spf_targets(txt):
+    """[(mechanism, domain)] that one SPF record delegates to."""
+    return [(m.group(1).lower(), m.group(2).rstrip(".").lower())
+            for m in SPF_RE.finditer(txt or "")]
+
+
+def spf_chain(zone, a, depth=3, seen=None):
+    """Every domain an SPF record delegates to, breadth first, capped.
+
+    SPF's own limit is 10 DNS mechanisms; the cap here is lower, because this is
+    a takeover check and not an SPF audit. A dead `include:` is the finding:
+    mail receivers follow it, and whoever controls it decides who may send as
+    the target.
+
+    Each row carries the TARGET's own lookup status, not its parent's. That
+    distinction is the whole correctness of this subcommand: an include target
+    normally has only a TXT record and no address, so NXDOMAIN on the target is
+    the dead signal and "no A record" is not.
+    """
+    seen = seen if seen is not None else set()
+    out, notes, status_of = [], [], {}
+    frontier = [(zone, 0)]
+    while frontier:
+        domain, level = frontier.pop(0)
+        if domain in seen or level > depth:
+            continue
+        seen.add(domain)
+        txts, status, _ = records(domain, "TXT", timeout=a.timeout)
+        status_of[domain] = status
+        spf = [t for t in txts if "v=spf1" in t.lower()]
+        if not spf:
+            notes.append(f"{domain}: no SPF record ({status})")
+        for txt in spf:
+            for mech, target in spf_targets(txt):
+                out.append({"domain": target, "mechanism": mech, "from": domain})
+                frontier.append((target, level + 1))
+    for row in out:
+        row["status"] = status_of.get(row["domain"], "not-followed (depth cap)")
+    return out, notes
+
+
+def cmd_fingerprints(a):
+    """The shipped table, and a shape check over it."""
+    table = load_table(a.table)
+    problems = []
+    for e in table["services"]:
+        for field in ("service", "cname_suffixes", "fingerprint", "claimable",
+                      "confidence", "claim_path", "source"):
+            if field not in e:
+                problems.append(f"{e.get('service', '?')}: missing {field}")
+        if e.get("claimable") not in ("yes", "edge", "no", "unknown"):
+            problems.append(f"{e['service']}: claimable={e.get('claimable')!r}")
+        if e.get("confidence") not in ("high", "medium", "low"):
+            problems.append(f"{e['service']}: confidence={e.get('confidence')!r}")
+        if e.get("confidence") == "low" and not e.get("stale"):
+            problems.append(f"{e['service']}: confidence low but stale not set")
+    claimable = [e["service"] for e in table["services"]
+                 if e.get("claimable") == "yes"
+                 and e.get("confidence") in ("high", "medium")]
+    return {"subcommand": "fingerprints", "version": table.get("version"),
+            "services": len(table["services"]),
+            "reach_candidate": sorted(claimable),
+            "stale": sorted(e["service"] for e in table["services"] if e.get("stale")),
+            "problems": problems,
+            "table": table if a.full else None,
+            "never_claim": NEVER_CLAIM}
+
+
+def cmd_refuse(a):
+    """Every spelling of "do the thing", answered once, in code."""
+    print("takeover: refused.\n\n" + NEVER_CLAIM + "\n\n"
+          "What to do instead:\n"
+          "  takeover cname <host>      prove the reference dangles\n"
+          "  takeover dangling --url .. find the references\n"
+          "  takeover fingerprints      read the claim path this script will not take\n"
+          "Then write the finding with the DNS answer, the unclaimed-host response and\n"
+          "that claim path, and let the operator decide.", file=sys.stderr)
+    return 3
+
+# ------------------------------------------------------------------ render
+
+
+def render(res):
+    out = [f"# takeover {res['subcommand']}", ""]
+    cmd = res["subcommand"]
+    if cmd == "fingerprints":
+        out += [f"table version {res['version']}, {res['services']} services",
+                "",
+                "can reach `candidate` (claimable=yes, confidence>=medium):",
+                "  " + ", ".join(res["reach_candidate"]),
+                "",
+                "stale, never better than `inconclusive`:",
+                "  " + ", ".join(res["stale"]), ""]
+        out += ["shape problems:"] + [f"  {p}" for p in res["problems"]] if \
+            res["problems"] else ["shape: ok"]
+        if res.get("table"):
+            out += [""] + [json.dumps(res["table"], indent=1)]
+    elif cmd == "ns":
+        for r in res["results"]:
+            out += [f"## {r['zone']}  [{r['verdict']}]",
+                    f"NS: {', '.join(r['nameservers']) or '(none)'} ({r['ns_status']})"]
+            for c in r.get("checks") or []:
+                out.append(f"  {c['state']:<18} {c['server']} — {c['why']}")
+            if r.get("rdap"):
+                out.append(f"  rdap: {r['rdap'].get('state')} "
+                           f"{r['rdap'].get('rdap_status') or ''}"
+                           + (f" — {r['rdap']['why']}" if r["rdap"].get("why") else ""))
+            elif r.get("registrar"):
+                out.append(f"  registrar: {r['registrar']}")
+            out += [f"  -> {r['why']}", ""]
+    elif cmd == "scripts":
+        out += [f"origin {res['origin']}", f"SRI coverage {res['sri_coverage']}", ""]
+        for r in res["results"]:
+            out.append(f"{r['verdict']:<15} {r['where']:<18} {r['url'][:78]}")
+            out.append(f"  host={r['host']} resolves={r.get('resolves')} "
+                       f"sri={r.get('sri', '-')} service={r.get('service')}")
+            out += [f"  -> {r['why']}", ""]
+    else:
+        if cmd == "dangling":
+            out += [f"{res['references']} outside references, "
+                    f"{res['provider_hosts']} on a known provider", ""]
+        for r in res["results"]:
+            label = r.get("name") or r["host"]
+            out.append(f"{r['verdict']:<15} {label}")
+            if r.get("cname_target"):
+                out.append(f"  CNAME -> {' -> '.join(r['cname_chain'])} "
+                           f"({r['cname_status']})")
+            out.append(f"  service={r.get('service')} resolves={r.get('resolves')} "
+                       f"status={r.get('status')} fingerprint={r.get('fingerprint_hit')}")
+            for ref in r.get("referenced_from") or []:
+                where = ref["where"]
+                out.append(f"  from {where}: {ref['url'][:60]}" if ref.get("url")
+                           else f"  from {where} (a bare hostname, not a URL)")
+            if r.get("body_head"):
+                out.append(f"  body: {r['body_head'][:120]!r}")
+            out += [f"  -> {r['why']}", ""]
+    if res.get("refused"):
+        out += ["## HTTP refused, out of scope (reported, not sent)"]
+        out += [f"  {x['host']}: {', '.join(x['offenders'])} — {x['url']}"
+                for x in res["refused"]]
+        out += [""]
+    counts = {}
+    for r in res.get("results") or []:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    if counts:
+        out += ["## verdicts", "  " + ", ".join(f"{k}={v}" for k, v in counts.items()),
+                ""]
+    out += [NEVER_CLAIM]
+    return "\n".join(out)
+
+# ---------------------------------------------------------------- selftest
+
+
+def _selftest():
+    """Offline asserts on the judgement, plus one live loopback round trip.
+
+    The offline half guards the thing that goes wrong in this class: a clean
+    fingerprint on a service nobody can actually claim, reported as a finding.
+    The live half guards the thing offline asserts cannot see — that an HTTP
+    request is really sent, really scope-checked, and that the body the
+    provider returns is what the matcher sees.
+    """
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    table = load_table()
+
+    # --- the table itself
+    class _A:
+        table = None
+        full = False
+    shape = cmd_fingerprints(_A())
+    eq(shape["problems"], [], "the shipped fingerprint table passes its own shape check")
+    ok("aws-s3" in shape["reach_candidate"],
+       "S3 is claimable enough to reach candidate")
+    ok("github-pages" not in shape["reach_candidate"],
+       "GitHub Pages is an edge case (domain verification) and cannot reach candidate")
+    ok("vercel" not in shape["reach_candidate"],
+       "Vercel verifies domains, so it is never a candidate")
+    ok(shape["stale"], "the table admits to having stale entries")
+
+    # --- suffix matching, including the wildcard forms
+    ok(suffix_match("bucket.s3.amazonaws.com", "s3.amazonaws.com"), "plain suffix")
+    ok(suffix_match("b.s3.eu-central-1.amazonaws.com", "s3.*.amazonaws.com"),
+       "a regional S3 host matches the wildcard-label form")
+    ok(not suffix_match("s3.amazonaws.com.evil.test", "s3.amazonaws.com"),
+       "a suffix in the middle of a longer name does not match")
+    ok(not suffix_match("nots3.amazonaws.com", "s3.amazonaws.com"),
+       "the suffix must start at a label boundary")
+    entry, suffix = match_service("deleted.s3.amazonaws.com", table)
+    eq(entry["service"], "aws-s3", "an S3 host resolves to the S3 entry")
+    entry2, _ = match_service("gone.github.io", table)
+    eq(entry2["service"], "github-pages", "a github.io host resolves to Pages")
+    eq(match_service("www.example.com", table)[0], None,
+       "an ordinary host matches no service")
+
+    # --- fingerprint matching
+    s3 = [e for e in table["services"] if e["service"] == "aws-s3"][0]
+    hit, why = fingerprint_hit(s3, {"status": 404, "body": "<Error><Code>NoSuchBucket"})
+    ok(hit and "NoSuchBucket" in why, "the S3 unclaimed body matches")
+    hit2, _ = fingerprint_hit(s3, {"status": 200, "body": "welcome"})
+    ok(not hit2, "a normal page does not match")
+    hit3, why3 = fingerprint_hit(s3, {"status": 200, "body": "NoSuchBucket"})
+    ok(hit3 and "weaker" in why3,
+       "the right body with the wrong status still matches, and says it is weaker")
+    tm = [e for e in table["services"] if e["service"] == "azure-trafficmanager"][0]
+    hit4, why4 = fingerprint_hit(tm, {"status": 404, "body": "anything"})
+    ok(not hit4 and "NXDOMAIN" in why4,
+       "a service with no HTTP fingerprint is never matched on a body")
+    ngrok = [e for e in table["services"] if e["service"] == "ngrok"][0]
+    hit5, _ = fingerprint_hit(ngrok, {"status": 404,
+                                      "body": "Tunnel abc-123 not found"})
+    ok(hit5, "the regex fingerprint form works")
+
+    # --- the verdict ladder: this is where this class goes wrong
+    v, why = judge(s3, False, True, "body matched")
+    eq(v, "candidate", "S3 fingerprint + claimable=yes is a candidate")
+    ok("NOT taken" in why, "and the candidate states the claim path as not taken")
+    gh = [e for e in table["services"] if e["service"] == "github-pages"][0]
+    v2, why2 = judge(gh, False, True, "body matched")
+    eq(v2, "inconclusive",
+       "a clean GitHub Pages fingerprint is inconclusive, because the claim may be "
+       "blocked by domain verification")
+    ok("claimable=edge" in why2, "and the reason names the claimability, not the body")
+    vc = [e for e in table["services"] if e["service"] == "vercel"][0]
+    v3, _ = judge(vc, True, False, "")
+    eq(v3, "dead-reference",
+       "a dangling Vercel CNAME is a dead reference, never a takeover candidate")
+    stale = [e for e in table["services"] if e.get("stale")][0]
+    v4, why4b = judge(stale, True, False, "")
+    eq(v4, "inconclusive", "a stale table entry can never reach candidate")
+    ok("not corroborated" in why4b, "and it says the entry is not corroborated")
+    v5, why5 = judge(s3, False, False, "x", http_refused="deleted.s3.amazonaws.com")
+    eq(v5, "inconclusive", "a scope refusal downgrades, it does not invent a verdict")
+    ok("does not authorize HTTP" in why5, "and it names what was refused")
+    v8, why8 = judge(s3, False, False, "--no-http", not_probed=True)
+    eq(v8, "inconclusive",
+       "--no-http never produces not-dangling: nothing was read")
+    ok("never read" in why8, "and it says the destination was never read")
+    v6, _ = judge(None, True, False, "")
+    eq(v6, "inconclusive", "a dangling name with no known service has no claim path")
+    v7, _ = judge(None, False, False, "")
+    eq(v7, "not-dangling", "a live host with no service entry is nothing")
+    for e in table["services"]:
+        for dead in (True, False):
+            got = judge(e, dead, True, "body matched")[0]
+            ok(got in VERDICTS, f"{e['service']}: verdict {got} is one of VERDICTS")
+            ok(got != "confirmed", f"{e['service']}: never writes confirmed")
+
+    # --- reference mining
+    page = ('<html><head>'
+            '<meta http-equiv="Content-Security-Policy" '
+            'content="script-src https://cdn.dead.invalid; '
+            'report-uri https://reports.gone.invalid/r">'
+            '<script src="https://cdn.dead.invalid/a.js"></script>'
+            '<script src="https://ok.test/b.js" integrity="sha384-x"></script>'
+            '<link rel="preconnect" href="https://assets.old.s3.amazonaws.com">'
+            '<link rel="stylesheet" href="/local.css">'
+            '</head><body>'
+            '<img src="https://img.deleted.storage.googleapis.com/x.png">'
+            'var B="legacy-assets.s3.eu-west-1.amazonaws.com";'
+            '</body></html>')
+    refs = mine(page, "https://app.test/", "html")
+    wheres = {r["where"] for r in refs}
+    hosts = {r["host"] for r in refs}
+    ok("script-src-tag" in wheres, "script tags are mined")
+    ok("link-preconnect" in wheres, "a preconnect is mined: a dangling one is the same name")
+    ok("csp-meta-report-uri" in wheres, "a CSP report-uri in a meta tag is mined")
+    ok("assets.old.s3.amazonaws.com" in hosts, "the preconnect bucket host is found")
+    ok("legacy-assets.s3.eu-west-1.amazonaws.com" in hosts,
+       "a bucket named in a JS string, never as a URL, is still found")
+    ok("img.deleted.storage.googleapis.com" in hosts, "a GCS img host is found")
+    sm = json.dumps({"version": 3, "sourceRoot": "https://maps.gone.s3.amazonaws.com/",
+                     "sources": ["https://src.gone.github.io/app.ts", "webpack://x"]})
+    smrefs = mine(sm, None, "sourcemap")
+    smhosts = {r["host"] for r in smrefs}
+    ok("maps.gone.s3.amazonaws.com" in smhosts, "a source map's sourceRoot is mined")
+    ok("src.gone.github.io" in smhosts, "a source map's sources are mined")
+
+    # --- CSP and host parsing
+    cs = csp_sources("default-src 'self'; script-src https://a.test 'unsafe-inline'; "
+                     "report-uri https://r.test/x")
+    eq(cs["script-src"], ["https://a.test", "'unsafe-inline'"], "CSP splits per directive")
+    eq(host_of("'self'"), None, "a CSP keyword has no host")
+    eq(host_of("*.cdn.test"), None, "a wildcard source has no single host")
+    eq(host_of("data:"), None, "a scheme source has no host")
+    eq(host_of("cdn.test:443"), "cdn.test", "a bare host with a port parses")
+    eq(host_of("https://cdn.test/p"), "cdn.test", "a URL parses")
+
+    # --- eTLD+1 heuristic
+    eq(registrable("a.b.example.com"), "example.com", "two labels")
+    eq(registrable("x.example.co.uk"), "example.co.uk", "a known second level")
+    eq(registrable("example.com"), "example.com", "already registrable")
+
+    # --- SPF parsing
+    found = spf_targets("v=spf1 include:_spf.dead.invalid include:OK.test "
+                        "redirect=other.invalid. ip4:1.2.3.4 -all")
+    eq(found, [("include", "_spf.dead.invalid"), ("include", "ok.test"),
+               ("redirect", "other.invalid")],
+       "include: and redirect= are both followed, lowercased, trailing dot removed")
+    eq(spf_targets("v=spf1 -all"), [], "a record with no delegation yields nothing")
+
+    # --- NS judgement
+    allname = ns_verdict("z.test", [{"server": "a", "state": "lame", "why": "REFUSED"},
+                                    {"server": "b", "state": "lame", "why": "REFUSED"}])
+    eq(allname["verdict"], "candidate", "every nameserver lame is a candidate")
+    ok("NOT taken" in allname["why"], "and it states the claim path without taking it")
+    part = ns_verdict("z.test", [{"server": "a", "state": "lame", "why": "x"},
+                                 {"server": "b", "state": "authoritative", "why": "aa"}])
+    eq(part["verdict"], "inconclusive",
+       "one lame nameserver out of two is fragility, not a takeover")
+    mixed = ns_verdict("z.test", [{"server": "a", "state": "lame", "why": "REFUSED"},
+                                  {"server": "b", "state": "non-authoritative",
+                                   "why": "no aa"}])
+    eq(mixed["verdict"], "candidate",
+       "a server answering without the aa flag is not serving the zone either")
+    ok("b: no aa" in mixed["why"],
+       "and the non-authoritative server is named in the finding, not dropped")
+    good = ns_verdict("z.test", [{"server": "a", "state": "authoritative", "why": "aa"}])
+    eq(good["verdict"], "not-dangling", "a healthy delegation is nothing")
+    unk = ns_verdict("z.test", [{"server": "a", "state": "unknown", "why": "?"}])
+    eq(unk["verdict"], "inconclusive", "unclassifiable is never reported as healthy")
+
+    # --- the zone-claimable path
+    zc = zone_claimable({"domain": "gone.invalid", "state": "unregistered",
+                         "status": 404}, {})
+    eq(zc["verdict"], "candidate", "an unregistered zone is a candidate")
+    ok("NOT taken" in zc["why"],
+       "and it states the claim path as one this script did not take")
+    zp = zone_claimable({"domain": "x.invalid", "state": "registered",
+                         "rdap_status": ["pendingdelete"], "events": {}}, {})
+    eq(zp["verdict"], "candidate", "pendingDelete is a candidate")
+    zr = zone_claimable({"domain": "x.invalid", "state": "registered",
+                         "rdap_status": ["clienttransferprohibited"],
+                         "events": {"expiration": "2030-01-01"}}, {})
+    ok("verdict" not in zr, "a healthy registration does not create a verdict")
+    zf = zone_claimable({"domain": "x", "state": "refused", "why": "no scope"}, {})
+    ok("verdict" not in zf, "a refused RDAP lookup does not create a verdict either")
+
+    # --- the exit-code contract the driver reads
+    import contextlib, io
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            usage("a usage error")
+            fails.append("usage() did not exit")
+        except SystemExit as e:
+            eq(e.code, 2, "a usage error is exit 2, not 1")
+    with contextlib.redirect_stderr(io.StringIO()) as quiet:
+        code = cmd_refuse(None)
+    eq(code, 3, "a claim verb is exit 3")
+    ok("refused" in quiet.getvalue(), "and it says so on stderr")
+
+    # --- the refusal is real
+    ok("never claims" in NEVER_CLAIM, "the refusal says so in one sentence")
+    ap = build_parser()
+    for verb in CLAIM_VERBS:
+        a = ap.parse_args([verb])
+        eq(a.fn, cmd_refuse, f"`takeover {verb}` routes to the refusal, not to work")
+    # Every subprocess this file runs, named. The only external commands are
+    # read-only resolver queries; a reviewer checks this list rather than the
+    # whole file, and a new one has to be added here on purpose.
+    src = pathlib.Path(__file__).read_text()
+    spawns = set(re.findall(r'(?:cmd\s*=\s*|subprocess\.run\()\[\s*"([a-z0-9_+-]+)"',
+                            src))
+    eq(sorted(spawns), ["dig", "host"],
+       "the only commands this file ever spawns are the two read-only resolvers")
+    ok(src.count("+tries=1") >= 2 and "+norecurse" in src,
+       "the dig calls are single-try queries, not a retry storm")
+
+    # ---------------------------------------------------------------- live
+    # One real HTTP round trip against a server started here, impersonating two
+    # unclaimed-service pages and serving a page that references a dangling
+    # bucket, an SRI-less script and a CSP with a dead report-uri. Offline
+    # asserts cannot see a request that never leaves: `send()` swallows every
+    # exception into `status: None`, so a broken opener would read as "the
+    # provider did not answer" on every host in a real engagement.
+    import http.server, socketserver, threading, tempfile
+
+    GH_404 = ("<html><body><h1>404</h1><p>There isn't a GitHub Pages site here.</p>"
+              "</body></html>")
+    S3_404 = ('<?xml version="1.0"?><Error><Code>NoSuchBucket</Code>'
+              "<Message>The specified bucket does not exist</Message></Error>")
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/fp/github-pages"):
+                code, body = 404, GH_404
+            elif self.path.startswith("/fp/s3"):
+                code, body = 404, S3_404
+            elif self.path.startswith("/fp/live"):
+                code, body = 200, "<html>a real site</html>"
+            else:
+                code, body = 200, (
+                    '<html><head>'
+                    '<script src="https://cdn.takeoverlab.invalid/a.js"></script>'
+                    '<link rel="preconnect" href="https://lab-gone.s3.amazonaws.com">'
+                    '</head><body>ok</body></html>')
+            raw = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *a):
+            pass
+
+    class _Args:
+        timeout, scheme, no_http, table = 5, "http", False, None
+        map = cname = []
+        host = []
+        hosts_file = surface = wordlist = zone = None
+        max_names = 50
+
+    with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1},
+                         daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+        with tempfile.TemporaryDirectory() as td:
+            scope = pathlib.Path(td) / "scope.yaml"
+            scope.write_text(f"target: {base}\nin_scope:\n  - 127.0.0.1\n"
+                             f"ports: [{port}]\nrules:\n  rate_limit_rps: 50\n")
+            prev = os.environ.get("MYTHOS_SCOPE")
+            os.environ["MYTHOS_SCOPE"] = str(scope)
+            try:
+                live = send(base + "/fp/live")
+                eq(live["status"], 200,
+                   "a loopback GET comes back with a status, not None")
+                ok("a real site" in live["body"], "and with the server's own body")
+
+                a = _Args()
+                a.map = [f"lab-gone.s3.amazonaws.com={base}/fp/s3"]
+                row = fingerprint_host("lab-gone.s3.amazonaws.com", table,
+                                       parse_map(a.map), a)
+                eq(row["status"], 404, "the mapped fingerprint request really happened")
+                ok(row["fingerprint_hit"],
+                   "and the S3 NoSuchBucket body matched over the wire")
+                eq(row["verdict"], "candidate",
+                   "an S3 host serving NoSuchBucket is a candidate")
+
+                a2 = _Args()
+                a2.map = [f"lab-gone.github.io={base}/fp/github-pages"]
+                row2 = fingerprint_host("lab-gone.github.io", table,
+                                        parse_map(a2.map), a2)
+                ok(row2["fingerprint_hit"],
+                   "the GitHub Pages 404 body matched over the wire")
+                eq(row2["verdict"], "inconclusive",
+                   "and it is still only inconclusive, because claiming may be blocked")
+
+                a3 = _Args()
+                a3.map = [f"lab-gone.s3.amazonaws.com={base}/fp/live"]
+                row3 = fingerprint_host("lab-gone.s3.amazonaws.com", table,
+                                        parse_map(a3.map), a3)
+                eq(row3["verdict"], "not-dangling",
+                   "a live page on a provider host is not dangling")
+
+                # scope gate: a host the scope file does not name is refused,
+                # and the refusal is reported with the destination.
+                before = len(_REFUSED)
+                out = send("https://cdn.example.com/a.js")
+                ok(out.get("refused_out_of_scope"),
+                   "HTTP to an out-of-scope host is refused, not sent")
+                eq(len(_REFUSED), before + 1,
+                   "and the refused destination is recorded for the report")
+                eq(_REFUSED[-1]["host"] if _REFUSED else None, "cdn.example.com",
+                   "the report names the host that was refused")
+            finally:
+                if prev is None:
+                    os.environ.pop("MYTHOS_SCOPE", None)
+                else:
+                    os.environ["MYTHOS_SCOPE"] = prev
+                _REFUSED.clear()
+                srv.shutdown()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"takeover selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+# ------------------------------------------------------------------- cli
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="takeover", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="same as the `selftest` subcommand")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p, http=True):
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--timeout", type=float, default=8)
+        p.add_argument("--table", help=f"fingerprint table (default {FINGERPRINTS})")
+        p.add_argument("--rate", type=float, default=None,
+                       help="requests per second, DNS included; default "
+                            "rules.rate_limit_rps from $MYTHOS_SCOPE, else 5")
+        if http:
+            p.add_argument("--scheme", default="https",
+                           help="scheme for the fingerprint request (default https)")
+            p.add_argument("--no-http", action="store_true",
+                           help="DNS only: never fingerprint, so nothing is sent to "
+                                "the destination at all")
+            p.add_argument("--map", action="append", default=[], metavar="HOST=URL",
+                           help="fingerprint HOST by fetching URL instead. For a lab "
+                                "stand-in or a stored copy. The scope check applies "
+                                "to URL, which is what is actually sent")
+
+    c = sub.add_parser("cname", help="CNAME/ALIAS to a service whose name is unclaimed",
+                       description="Read the CNAME chain, match its target against the "
+                                   "shipped fingerprint table, and judge: a target that "
+                                   "does not resolve, or that serves the provider's own "
+                                   "unclaimed-host page, is a candidate — but only when "
+                                   "the table says the name is actually claimable today.")
+    c.add_argument("host", nargs="*", help="hostnames recon already found")
+    c.add_argument("--hosts-file", help="one hostname per line")
+    c.add_argument("--surface", help="take hostnames from a probe surface.json")
+    c.add_argument("--cname", action="append", default=[], metavar="HOST=TARGET",
+                   help="use this CNAME target instead of asking DNS: for replaying a "
+                        "stored dig answer, and for the lab")
+    c.add_argument("--wordlist", help="names to prepend to --zone. Off by default and "
+                                      "capped: this is not a discovery tool")
+    c.add_argument("--zone", help="the zone a --wordlist sweep hangs off")
+    c.add_argument("--max-names", type=int, default=50,
+                   help="cap on a --wordlist sweep (default 50)")
+    common(c)
+    c.set_defaults(fn=cmd_cname)
+
+    n = sub.add_parser("ns", help="lame delegation, and a zone the registry may hand out",
+                       description="A nameserver in the delegation that answers "
+                                   "REFUSED/SERVFAIL, answers without the aa flag, or "
+                                   "whose own hostname does not resolve, is not serving "
+                                   "the zone. All of them lame means nobody is.")
+    n.add_argument("zone", nargs="+")
+    n.add_argument("--rdap", action="store_true",
+                   help="also ask an RDAP service whether the registrable domain is "
+                        "registered or expiring. OFF by default: it is HTTP to a third "
+                        "party, so scope.yaml must name that host")
+    n.add_argument("--rdap-base", default="https://rdap.org",
+                   help="RDAP service base URL (default https://rdap.org)")
+    common(n, http=False)
+    n.set_defaults(fn=cmd_ns)
+
+    d = sub.add_parser("dangling", help="cloud buckets and PaaS hosts referenced from "
+                                        "HTML, CSS, JS, CSP, preconnect or a source map",
+                       description="Mine one document for every reference to an outside "
+                                   "origin, keep the ones on a provider in the "
+                                   "fingerprint table, and judge each.")
+    d.add_argument("--url", help="fetch this (scope-checked) and mine it")
+    d.add_argument("--file", help="a local HTML, CSS, JS or .map file")
+    d.add_argument("--stdin", action="store_true")
+    d.add_argument("--kind", default="html", choices=("html", "css", "js", "sourcemap"),
+                   help="how to read --stdin (default html)")
+    d.add_argument("--origin", help="base URL for resolving relative references")
+    d.add_argument("--all-hosts", action="store_true",
+                   help="also report outside hosts that match no provider")
+    common(d)
+    d.set_defaults(fn=cmd_dangling)
+
+    s = sub.add_parser("scripts", help="external script hosts and SRI coverage",
+                       description="A script-src takeover is stored XSS on every page "
+                                   "that loads it, so a dead script host is reported as "
+                                   "a candidate on its own, and SRI coverage is reported "
+                                   "next to it because SRI is what would have contained "
+                                   "it.")
+    s.add_argument("--url")
+    s.add_argument("--file")
+    s.add_argument("--stdin", action="store_true")
+    s.add_argument("--origin", help="base URL, needed with --file to tell same-origin "
+                                    "from third-party")
+    common(s)
+    s.set_defaults(fn=cmd_scripts)
+
+    r = sub.add_parser("records", help="CSP report-uri/form-action, SPF include:, OAuth "
+                                       "redirect allowlists",
+                       description="The references nobody looks at. A dead SPF "
+                                   "`include:` lets whoever registers it send mail as "
+                                   "the target; a dead CSP report-uri receives violation "
+                                   "reports; a dead host in an OAuth redirect allowlist "
+                                   "receives authorization codes.")
+    r.add_argument("zone", nargs="*", help="domains whose SPF chain to follow")
+    r.add_argument("--url", help="read the CSP from this page's headers or meta tag")
+    r.add_argument("--csp", help="a CSP string instead of fetching one")
+    r.add_argument("--redirect-uri", action="append", default=[],
+                   help="an OAuth redirect URI the app disclosed; repeatable")
+    r.add_argument("--spf-depth", type=int, default=3,
+                   help="how deep to follow SPF include:/redirect= (default 3)")
+    common(r)
+    r.set_defaults(fn=cmd_records)
+
+    f = sub.add_parser("fingerprints", help="the shipped table, and its shape check",
+                       description="Which services can reach `candidate` at all, which "
+                                   "entries are stale, and whether the table is "
+                                   "well-formed.")
+    f.add_argument("--full", action="store_true", help="print the whole table")
+    f.add_argument("--json", action="store_true")
+    f.add_argument("--table")
+    f.set_defaults(fn=cmd_fingerprints)
+
+    st = sub.add_parser("selftest", help="asserts, including one live loopback request")
+    st.add_argument("--json", action="store_true", help="ignored; output is a report")
+    st.set_defaults(fn=None)
+
+    # The refusal, as code. Every spelling of "now take it" lands here and
+    # exits 3 instead of doing anything.
+    for verb in CLAIM_VERBS:
+        rp = sub.add_parser(verb, help="refused: this script never claims a resource",
+                            description=NEVER_CLAIM)
+        rp.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
+        rp.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+        rp.set_defaults(fn=cmd_refuse)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest or a.cmd == "selftest":
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    rate = scope_rate() if getattr(a, "rate", None) is None else a.rate
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    if a.fn is cmd_refuse:
+        return cmd_refuse(a)
+    if (getattr(a, "zone", None) is None and getattr(a, "cmd", "") == "ns"):
+        return 2
+    try:
+        res = a.fn(a)
+    except SystemExit as e:
+        if e.code == 2:
+            sub = [x for x in ap._subparsers._group_actions[0].choices.items()
+                   if x[0] == a.cmd]
+            if sub:
+                sub[0][1].print_help()
+            return 2
+        raise
+    print(json.dumps(res, indent=1) if a.json else render(res))
+    if _SENT[0]:
+        print(f"\n({_SENT[0]} request(s) sent at <= {rate}/s)", file=sys.stderr)
+    if _REFUSED:
+        print(f"({len(_REFUSED)} destination(s) refused as out of scope: "
+              f"{', '.join(sorted({x['host'] for x in _REFUSED}))})", file=sys.stderr)
+    if dns_tool() is None and a.cmd in ("cname", "ns", "records"):
+        print("(neither dig nor host is installed: CNAME, NS and TXT lookups were "
+              "skipped. Install bind9-dnsutils or run this in the toolbox)",
+              file=sys.stderr)
+        return 4
+    if any(r.get("verdict") == "candidate" for r in res.get("results") or []):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

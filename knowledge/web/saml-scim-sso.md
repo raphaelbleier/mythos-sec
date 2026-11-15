@@ -1,6 +1,6 @@
 # SAML, SCIM and enterprise SSO
 
-**Class:** authentication  **Updated:** 2026-11-13
+**Class:** authentication  **Updated:** 2026-11-15
 
 ## What it is
 The service provider (SP) accepts a SAML assertion it should not, or a SCIM
@@ -33,6 +33,13 @@ library does the editing.
   `Recipient`, `InResponseTo`, `NotOnOrAfter`, and the signature `Reference`.
 - Fingerprint the SP library and version from headers, error pages and the
   product; compare against advisories (below). That alone is a `candidate`.
+- `scripts/federation` does the mechanical part of every row below, with the
+  unmodified capture as the control before the first mutation and again after
+  each candidate: `federation metadata <url>` for the certificates and
+  `WantAssertionsSigned`, `federation saml <acs> --own ... --response <capture>`
+  for the mutations (`--only` names one row), and `federation shapes` to print
+  a wrapping document without sending it. The skill is `sso-federation`.
+  It signs with HMAC-SHA256, not RSA: see "What a stdlib tool cannot do" below.
 
 ## How to confirm (non-destructive)
 **Oracle:** after posting a modified response to the ACS, the session belongs
@@ -74,7 +81,32 @@ with one signature byte flipped is rejected.
    own, configure tenant 1's IdP to assert an email in tenant 2's domain.
    A session in tenant 2 means the SP does not bind IdP to domain.
 7. **XXE and RelayState:** the SAML body is XML, so test it with
-   `xxe.md` (OAST); `RelayState` is an open-redirect candidate.
+   `xxe.md` (OAST); `RelayState` is an open-redirect candidate. Three separate
+   questions, in increasing order of what they prove: is a `DOCTYPE` accepted
+   at all (the precondition for every parser differential in 4), is an internal
+   entity expanded where the SP reads it (`NameID` is the readable place), and
+   is an external parameter entity fetched (OAST, blind). Never an expansion
+   bomb: that is denial of service. A `RelayState` the ACS follows is worse
+   than a plain open redirect, because the redirect carries a fresh session.
+8. **Metadata and certificate rotation:** read the SP's metadata and count the
+   signing certificates. Two means rotation is staged and the retiring key is
+   still accepted — ask when it leaves. One means a rotation is a flag day and
+   a stack that caches metadata keeps trusting the old key; no `Cache-Control`
+   on the document means nothing tells a consumer how long it may. A single
+   read cannot show rotation behaviour at all, so that one is `inconclusive`
+   and belongs in `scripts/watch`, not in a report.
+
+## What a stdlib tool cannot do
+Mythos adds no XML or crypto dependency, so `scripts/federation` signs with
+`xmldsig-more#hmac-sha256` over `ET.canonicalize` (C14N 2.0), not RSA-SHA256
+over Exclusive C14N 1.0. Two consequences, and neither is a reason to skip the
+test. A *minted* document will not verify at a production SP whatever it
+contains, which is exactly what makes it the right probe for "is a signature
+verified at all" — accepted means it is not. And the rows that genuinely need a
+valid foreign signature (re-signing with your own key while leaving the IdP's
+`KeyInfo` in place) cannot be built: they come back `inconclusive` with
+`rsa_not_covered`, and SAML Raider, a `cryptography` install or a test IdP you
+control is what does them. A row marked that way is not a row that held.
 
 ## SCIM (RFC 7643, 7644)
 Endpoints: `/scim/v2/Users`, `/Groups`, `/ServiceProviderConfig`, `/Schemas`.
