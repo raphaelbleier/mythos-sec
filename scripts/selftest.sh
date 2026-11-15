@@ -72,6 +72,43 @@ done
 rm -rf "$NOYAML"
 
 echo
+echo "== skills =="
+# CI validates every SKILL.md's frontmatter and this did not, so a description
+# containing a bare `word:` passed here and failed there. A check that only one
+# of the two runs is a check that finds things late.
+run "skill frontmatter is valid" python3 - <<'PY'
+import pathlib, re, sys
+try:
+    import yaml
+except ImportError:
+    print("PyYAML missing; the CI job covers this one")
+    sys.exit(0)
+errors = []
+skills = sorted(pathlib.Path("skills").glob("*/SKILL.md"))
+if not skills:
+    errors.append("skills/: no SKILL.md found")
+for p in skills:
+    m = re.match(r"---\r?\n(.*?)\r?\n---[ \t]*(\r?\n|$)", p.read_text(encoding="utf-8"), re.S)
+    if not m:
+        errors.append(f"{p}: no YAML frontmatter")
+        continue
+    try:
+        d = yaml.safe_load(m.group(1))
+    except Exception as e:
+        errors.append(f"{p}: {e}")
+        continue
+    if not isinstance(d, dict):
+        errors.append(f"{p}: frontmatter is not a mapping")
+        continue
+    if d.get("name") != p.parent.name:
+        errors.append(f"{p}: name {d.get('name')!r} != directory {p.parent.name!r}")
+    if not (isinstance(d.get("description"), str) and d["description"].strip()):
+        errors.append(f"{p}: missing description")
+print("\n".join(errors) or f"{len(skills)} skills valid")
+sys.exit(bool(errors))
+PY
+
+echo
 echo "== cli =="
 # Read-only on purpose: this never installs and never builds, so running it
 # cannot disturb a cli/dist an engagement is using. A fresh clone skips both
