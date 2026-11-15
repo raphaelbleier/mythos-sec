@@ -37,11 +37,20 @@ line at all: raw sockets, nmap, smuggling tools, h2, and anything that ignores
 HTTP(S)_PROXY. `summary` flags a toolbox tool that ran with no recorded
 request, which is how a silent bypass shows.
 
+Not everything goes through the proxy, and the one thing that must not is
+desync: a 0.CL probe deadlocks any parser, so the raw transport tool
+(`cli/src/agent/raw.ts`) writes byte-exact exchanges straight into the same
+log. Those are `raw` records, marked RAW everywhere they are shown, and
+`replay` resends their bytes without rebuilding anything. The format is
+specified in the "raw records" comment below; both writers follow it.
+
 Layout under engagements/<dir>/traffic/:
 
   log.jsonl     append-only, one JSON object per line, 0600. The id of a record is
                 its line number. Request and response are stored as the bytes that
                 crossed the wire (base64), plus method, host, path and status.
+                Kinds: `exchange` (parsed by the proxy), `raw` (byte-exact, not
+                parsed), `gap` (could not be recorded), `tunnel` (opaque CONNECT).
   events.jsonl  proxy start and stop, phase markers
   ca.crt        the per-run CA certificate (public)
   proxy.json    where the proxy listens while it runs
@@ -356,6 +365,97 @@ def exchange_record(t, dur, ttfb, client, key, ip, req, res, extra=None):
            "req_cut": bool(isinstance(req, Cap) and req.cut), "res_cut": bool(isinstance(res, Cap) and res.cut)}
     rec.update(extra or {})
     return rec
+
+
+# --------------------------------------------------------------- raw records
+#
+# This comment is the contract between this file and the raw transport tool in
+# `cli/src/agent/raw.ts`. Two programs in two languages write the same log, so
+# the format is specified here once and neither side may extend it quietly.
+#
+# A raw record holds an exchange that was never parsed: the tool wrote bytes to
+# a socket and read bytes back. That is the point of it — a 0.CL desync probe
+# has deliberately ambiguous framing, and anything that parses the framing
+# either deadlocks or records something other than what was sent.
+#
+# It is appended to the same `traffic/log.jsonl` as the proxy's records, with
+# O_WRONLY|O_APPEND|O_CREAT, mode 0600, in a directory created 0700, as one
+# `write` of one compact JSON object plus "\n". Same file, so the id of a
+# record stays its line number and a finding cites `traffic/<id>` without
+# knowing or caring which writer produced it.
+#
+#   {"kind": "raw",          required; this is what marks it unparsed
+#    "t": 1763130000.123,    required; epoch seconds, float
+#    "scheme": "https",      required; "http" or "https"
+#    "host": "app.test",     required; the host connected to, no brackets for IPv6
+#    "port": 443,            required; int
+#    "req": "<base64>",      required; exactly the bytes written to the socket
+#    "res": "<base64>",      required; exactly the bytes read back, "" if none
+#    "dur": 0.031,           optional; seconds from connect to the last byte read
+#    "ip": "10.0.0.5",       optional; the peer address actually connected to
+#    "client": "raw",        optional; defaults to "raw", "replay" for a replay
+#    "tool": "desync",       optional; which raw operation wrote it; `role` is
+#                            read as a synonym, which is what raw.ts sends
+#    "label": "0.CL probe",  optional; one line a human reads in `list`; `why`
+#                            is read as a synonym, which is what raw.ts sends
+#    "req_cut": false,       optional; true when "req" is not the whole thing
+#    "res_cut": false,       optional; true when "res" is not the whole thing
+#    "half_close": false,    optional; the write side was shut down after sending
+#    "writes": [{"bytes": 41, "delay_ms": 0}, ...]
+#                            optional; how `req` was written out, in pieces, with
+#                            the pause before each. A desync probe's timing is
+#                            part of it, so it is shown and carried, never used
+#                            to re-derive the bytes
+#    "error": "timeout",     optional; what went wrong. "res" may still hold bytes
+#    "note": "..."}          optional; free text for a human
+#
+# Nothing else is read, and two things are read but never trusted. Method, path
+# and status (`m`, `p`, `s`) do not belong in this format — they are a parser's
+# opinion sitting next to bytes whose whole value is that nobody parsed them —
+# but raw.ts writes them, so if they are present they are ignored rather than
+# rejected. `list` and `show` derive their own hint from the first line of the
+# bytes and label it RAW; `replay` looks at no hint at all and resends `req`
+# verbatim.
+
+RAW_READ_CAP = 1 << 20     # bytes of a raw reply to read back during a replay
+
+
+def raw_record(t, dur, key, ip, req, res, extra=None):
+    """A `raw` record, by the format above. The reference for the writer side."""
+    scheme, host, port = key
+    rec = {"kind": "raw", "t": round(t, 3), "dur": round(dur, 3), "client": "raw",
+           "scheme": scheme, "host": host, "port": port, "ip": ip,
+           "req": base64.b64encode(bytes(req)).decode(),
+           "res": base64.b64encode(bytes(res or b"")).decode()}
+    rec.update(extra or {})
+    return rec
+
+
+def raw_label(rec):
+    """What to call this exchange in one line. `why` and `role` are raw.ts's
+    names for the same two things, so both spellings are accepted."""
+    return rec.get("label") or rec.get("why") or rec.get("tool") or rec.get("role") \
+        or "raw bytes"
+
+
+def raw_hint(rec):
+    """(first line sent, first line received), for display only.
+
+    A raw record is unparsed by definition, so this is a hint a human reads and
+    never something a decision rests on. It is labelled RAW wherever it shows."""
+    def first(b):
+        return b.split(b"\n", 1)[0].rstrip(b"\r")[:120].decode("latin-1", "replace")
+    return first(raw_of(rec, "req")), first(raw_of(rec, "res"))
+
+
+def byte_shape(b):
+    """What a desync proof turns on: size, digest, and where the line endings are.
+
+    `show` prints raw bytes verbatim so they can be copied, which makes a bare
+    CR or a missing LF invisible. This line says it out loud."""
+    crlf = b.count(b"\r\n")
+    return (f"{len(b)} bytes, sha256 {hashlib.sha256(b).hexdigest()[:16]}, "
+            f"{crlf} CRLF, {b.count(b'\n') - crlf} bare LF, {b.count(b'\r') - crlf} bare CR")
 
 
 # ------------------------------------------------------------------ the proxy
@@ -998,11 +1098,18 @@ def analyse(d: Path, before=5):
     ex = [dict(r, id=i) for i, r in entries if r.get("kind") == "exchange"]
     gaps = [dict(r, id=i) for i, r in entries if r.get("kind") == "gap"]
     tunnels = [dict(r, id=i) for i, r in entries if r.get("kind") == "tunnel"]
+    # Raw exchanges are counted apart from the parsed ones, never folded in:
+    # they have no status to tally and no method to group by, and a summary
+    # that averaged them into the request count would be claiming it parsed
+    # them. They do get the same scope check, because a desync probe reaches a
+    # host just as much as a GET does.
+    raws = [dict(r, id=i) for i, r in entries if r.get("kind") == "raw"]
     ex.sort(key=lambda r: r["t"])
     info, alive = proxy_state(d)
     starts = [e for e in events if e.get("event") == "start"]
     stops = [e for e in events if e.get("event") == "stop"]
-    stamps = [r["t"] for r in ex] + [r["t"] for r in tunnels] + [e["t"] for e in events if e.get("event") in ("start", "stop")]
+    stamps = ([r["t"] for r in ex] + [r["t"] for r in tunnels] + [r["t"] for r in raws]
+              + [e["t"] for e in events if e.get("event") in ("start", "stop")])
     t_start = starts[0]["t"] if starts else (min(stamps) if stamps else None)
     t_end = time.time() if alive else (max(stamps + [r["t"] + r.get("dur", 0) for r in ex]) if stamps else None)
 
@@ -1011,7 +1118,8 @@ def analyse(d: Path, before=5):
         h = hosts.setdefault(f"{r['host']}:{r['port']}", collections.Counter())
         h["requests"] += 1
         h["error" if r.get("error") or r["s"] is None else f"{r['s'] // 100}xx"] += 1
-    hostports = {(r["host"], r["port"]) for r in ex} | {(r["host"], r["port"]) for r in tunnels}
+    hostports = ({(r["host"], r["port"]) for r in ex} | {(r["host"], r["port"]) for r in tunnels}
+                 | {(r["host"], r["port"]) for r in raws})
     off, scope_file = scope_offenders(d, hostports) if hostports else (set(), None)
     in_scope = None if scope_file is None else lambda hp: hp not in off
     for key, h in hosts.items():
@@ -1045,7 +1153,8 @@ def analyse(d: Path, before=5):
                            "before": [brief(p, r["t"]) for p in prior]})
 
     clients = collections.Counter((r.get("ua") or "(none)") for r in ex)
-    cuts = {"request": sum(r.get("req_cut", False) for r in ex), "response": sum(r.get("res_cut", False) for r in ex)}
+    cuts = {"request": sum(r.get("req_cut", False) for r in ex + raws),
+            "response": sum(r.get("res_cut", False) for r in ex + raws)}
     gap_counts = collections.Counter(g["reason"] for g in gaps)
     runs = audit_runs(d, t_start, t_end) if t_start else []
     tools = {}
@@ -1075,11 +1184,19 @@ def analyse(d: Path, before=5):
                     "opaque_tunnels": len(tunnels), "truncated": cuts, "tools_with_no_recorded_request": unseen},
         "requests": {"total": len(ex), "replays": sum(1 for r in ex if r.get("replay_of")),
                      "server_errors": sum(1 for r in ex if r["s"] and r["s"] >= 500),
-                     "failed": sum(1 for r in ex if r.get("error") or r["s"] is None)},
+                     "failed": sum(1 for r in ex if r.get("error") or r["s"] is None),
+                     "raw": len(raws)},
+        "raw": {"total": len(raws),
+                "replays": sum(1 for r in raws if r.get("replay_of")),
+                "errors": sum(1 for r in raws if r.get("error")),
+                "hosts": sorted({f"{r['host']}:{r['port']}" for r in raws}),
+                "tools": dict(collections.Counter(r.get("tool") or r.get("role") or "raw"
+                                                  for r in raws)),
+                "ids": [r["id"] for r in raws]},
         "hosts": {k: dict(v) for k, v in hosts.items()},
         "rate": rate,
         "scope": {"file": scope_file, "out_of_scope_hosts": sorted(f"{h}:{p}" for h, p in off),
-                  "out_of_scope_requests": sum(1 for r in ex if (r["host"], r["port"]) in off),
+                  "out_of_scope_requests": sum(1 for r in ex + raws if (r["host"], r["port"]) in off),
                   "tool_invocations_flagged": flagged},
         "breaks": breaks,
         "clients": dict(clients.most_common(10)),
@@ -1106,8 +1223,9 @@ def cmd_summary(d, a):
     if a.json:
         print(json.dumps(run, indent=2))
         return 0
-    w, c, rq, rt, sc = run["window"], run["capture"], run["requests"], run["rate"], run["scope"]
-    if not (rq["total"] or c["gaps"] or c["opaque_tunnels"]):
+    w, c, rq, rt, sc, raw = (run["window"], run["capture"], run["requests"], run["rate"],
+                             run["scope"], run["raw"])
+    if not (rq["total"] or raw["total"] or c["gaps"] or c["opaque_tunnels"]):
         # Distinguish the two causes, because they need different fixes and the
         # one-line version cost four measured cells to tell apart. The proxy
         # records a failed upstream connection as well as a successful one, so
@@ -1138,6 +1256,12 @@ def cmd_summary(d, a):
           f"   {w['duration_s']}s")
     print(f"requests     {rq['total']} recorded ({rq['replays']} replays), {rq['server_errors']} 5xx, "
           f"{rq['failed']} failed before a response")
+    if raw["total"]:
+        tools = ", ".join(f"{k} x{v}" for k, v in raw["tools"].items())
+        print(f"raw          {raw['total']} byte-exact exchange(s) that never went through the "
+              f"proxy and were never parsed ({tools}), {raw['errors']} with an error")
+        print(f"             on {', '.join(raw['hosts'])};  ids {', '.join(str(i) for i in raw['ids'][:20])}"
+              + (" ..." if len(raw["ids"]) > 20 else ""))
     lim = f", limit {rt['limit_rps']:g}, over it in {rt['seconds_over_limit']} s" if rt["limit_rps"] else ""
     print(f"rate         avg {rt['avg_rps']} rps, peak {rt['peak_rps']} rps{lim}")
     print(f"hosts        {len(run['hosts'])}")
@@ -1177,7 +1301,7 @@ def cmd_summary(d, a):
 
 
 def cmd_list(d, a):
-    rows = [(i, r) for i, r in read_log(d) if r.get("kind") == "exchange"]
+    rows = [(i, r) for i, r in read_log(d) if r.get("kind") in ("exchange", "raw")]
     if not rows:
         print("traffic: nothing recorded")
         return 0
@@ -1185,8 +1309,17 @@ def cmd_list(d, a):
     pat = re.compile(a.grep) if a.grep else None
     shown = 0
     for i, r in rows:
-        status = r["s"] if r["s"] is not None else "ERR"
-        line = f"{i:>6}  +{r['t'] - t0:8.2f}s  {r['m']:<6} {status:<4} {r['host']}:{r['port']}{redact(r['p'])[:90]}"
+        if r["kind"] == "raw":
+            # No method and no status: a raw record has neither. The first line
+            # of the bytes is a hint, and RAW says it was never parsed.
+            status = "ERR" if r.get("error") else "-"
+            sent, _ = raw_hint(r)
+            label = raw_label(r)
+            line = (f"{i:>6}  +{r['t'] - t0:8.2f}s  RAW    {status:<4} "
+                    f"{r['host']}:{r['port']}  {redact(label)[:40]}  | {redact(sent)[:60]}")
+        else:
+            status = r["s"] if r["s"] is not None else "ERR"
+            line = f"{i:>6}  +{r['t'] - t0:8.2f}s  {r['m']:<6} {status:<4} {r['host']}:{r['port']}{redact(r['p'])[:90]}"
         if a.host and a.host not in f"{r['host']}:{r['port']}" or a.status and not str(status).startswith(a.status) \
                 or pat and not pat.search(line):
             continue
@@ -1205,8 +1338,41 @@ def record(d, rid):
     sys.exit(f"traffic: no record {rid}")
 
 
+def show_raw(r, a):
+    """A raw exchange: the bytes, verbatim, and nothing interpreted."""
+    out = [f"# {a.id}  {iso(r['t'])}  RAW, never parsed  {r.get('dur')}s  "
+           f"{r['scheme']}://{r['host']}:{r['port']}  -> {r.get('ip')}"
+           + (f"  via {r.get('client')}" if r.get("client") else ""),
+           "# " + raw_label(r)
+           + ("  (write side shut down after sending)" if r.get("half_close") else ""),
+           *(["# error: " + r["error"]] if r.get("error") else []),
+           *(["# note: " + r["note"]] if r.get("note") else []),
+           *(["# written in %d piece(s): %s" % (
+               len(r["writes"]),
+               ", ".join(f"{w.get('bytes')} bytes after {w.get('delay_ms', 0)} ms"
+                         for w in r["writes"]))] if r.get("writes") else []),
+           "# Framing was never interpreted: what follows is the bytes, not a "
+           "message. Do not reconstruct a request from it — replay it."]
+    for key, what in (("req", "BYTES SENT"), ("res", "BYTES RECEIVED")):
+        raw = raw_of(r, key)
+        if not raw:
+            out += ["", f"# {what}: (none)"]
+            continue
+        text = raw.decode("latin-1")
+        if not a.full and len(text) > 4000:
+            text = text[:4000] + f"\n... {len(text) - 4000} more characters (--full)"
+        out += ["", f"# {what}: {byte_shape(raw)}"
+                    + ("  TRUNCATED in the record" if r.get(key + "_cut") else ""),
+                text]
+    text = "\n".join(out)
+    print(text if a.raw else redact(text))
+    return 0
+
+
 def cmd_show(d, a):
     r = record(d, a.id)
+    if r.get("kind") == "raw":
+        return show_raw(r, a)
     if r.get("kind") != "exchange":
         print(json.dumps({k: v for k, v in r.items() if k != "req"}, indent=2))
         return 0
@@ -1291,18 +1457,60 @@ def har_entry(i, r, red):
     return entry
 
 
+def har_raw(i, r, red):
+    """A raw exchange as HAR cannot hold it: the bytes, labelled, not an entry.
+
+    HAR's shape is a parsed request and a parsed response. Rebuilding one from
+    a desync probe's bytes would invent framing the tool deliberately left
+    ambiguous, and Burp would then import a request that was never sent. So the
+    bytes travel as bytes, next to the entries rather than among them."""
+    f = redact if red else (lambda s: s)
+
+    def bytes64(key):
+        raw = raw_of(r, key)
+        if not red:
+            return r.get(key, "")
+        # Redaction rewrites bytes, so a redacted export is no longer the
+        # byte-exact exchange and cannot be used as the desync proof. It says
+        # so in `bytesRedacted`; `export --raw` keeps the real bytes.
+        return base64.b64encode(f(raw.decode("latin-1")).encode("latin-1", "replace")).decode()
+
+    out = {"id": i, "kind": "raw", "startedDateTime": iso(r["t"]),
+           "url": f"{r['scheme']}://{r['host']}:{r['port']}",
+           "label": f(raw_label(r)),
+           "comment": "byte-exact exchange, never parsed; replay it with "
+                      f"`scripts/traffic replay {i}`, do not rebuild it",
+           "bytesRedacted": red,
+           "requestBytesBase64": bytes64("req"), "responseBytesBase64": bytes64("res"),
+           "requestShape": byte_shape(raw_of(r, "req")),
+           "responseShape": byte_shape(raw_of(r, "res"))}
+    for key in ("ip", "dur", "client", "tool", "role", "error", "note", "half_close",
+                "writes", "req_cut", "res_cut"):
+        if r.get(key) is not None:
+            out[key] = r[key]
+    return out
+
+
 def build_har(d, red=True):
     rows = read_log(d)
     ex = sorted(((i, r) for i, r in rows if r.get("kind") == "exchange"), key=lambda x: x[1]["t"])
+    raws = [har_raw(i, r, red) for i, r in rows if r.get("kind") == "raw"]
     other = [dict(r, id=i) for i, r in rows if r.get("kind") in ("gap", "tunnel")]
     for g in other:
         g.pop("req", None)
+    note = []
+    if other:
+        note.append("%d gap or tunnel record(s) in _mythos.not_captured" % len(other))
+    if raws:
+        note.append("%d raw exchange(s) in _mythos.raw, which are NOT entries: "
+                    "they were never parsed" % len(raws))
     return {"log": {
         "version": "1.2", "creator": {"name": "mythos-traffic", "version": "1"},
         "entries": [har_entry(i, r, red) for i, r in ex],
-        "comment": ("INCOMPLETE: %d gap or tunnel record(s) in _mythos.not_captured" % len(other)) if other
+        "comment": ("INCOMPLETE: " + "; ".join(note)) if note
                    else "every request that reached the proxy is an entry",
-        "_mythos": {"engagement": d.name, "redacted": red, "not_captured": other}}}
+        "_mythos": {"engagement": d.name, "redacted": red, "not_captured": other,
+                    "raw": raws}}}
 
 
 def cmd_export(d, a):
@@ -1356,16 +1564,105 @@ def compare(old_raw, new_raw, ignore, ignore_body, method, cut):
     return res
 
 
+def compare_raw(old: bytes, new: bytes):
+    """Two raw replies, compared as bytes.
+
+    Parsing them to compare them is exactly the mistake the raw path exists to
+    avoid: a desync reply's framing is the finding, so a parser that normalises
+    it away would call two different proofs identical."""
+    diff = []
+    if old != new:
+        diff = list(difflib.unified_diff(old.decode("latin-1").splitlines(),
+                                         new.decode("latin-1").splitlines(),
+                                         "recorded", "replayed", lineterm="", n=1))[:40]
+    return {"same": old == new,
+            "bytes": {"recorded": len(old), "replayed": len(new)},
+            "sha256": {"recorded": hashlib.sha256(old).hexdigest()[:16],
+                       "replayed": hashlib.sha256(new).hexdigest()[:16]},
+            "shape": {"recorded": byte_shape(old), "replayed": byte_shape(new)},
+            "diff": diff}
+
+
+def send_raw(r, raw, timeout, insecure):
+    """Write the recorded bytes and read whatever comes back. (bytes, ip, error).
+
+    No framing, no length, no chunk decoding: it reads until the peer closes or
+    the socket goes quiet. A desync probe's reply is often two responses, or
+    one and a hang, and either is the evidence."""
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(["http/1.1"])
+    if insecure:
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    got = bytearray()
+    try:
+        s = socket.create_connection((r["host"], r["port"]), timeout)
+        s.settimeout(timeout)
+        if r["scheme"] == "https":
+            s = ctx.wrap_socket(s, server_hostname=r["host"])
+        ip = s.getpeername()[0]
+        s.sendall(raw)
+        if r.get("half_close"):
+            s.shutdown(socket.SHUT_WR)   # the original did, and 0.CL needs it
+        while len(got) < RAW_READ_CAP:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+        s.close()
+        return bytes(got), ip, None
+    except socket.timeout:
+        # A hang is a result, not a failure: the bytes read so far are the reply.
+        return bytes(got), None, None
+    except (OSError, ssl.SSLError) as e:
+        return bytes(got), None, f"{type(e).__name__}: {e}"
+
+
+def replay_raw(d, r, a):
+    """Resend a raw record's bytes exactly and diff the reply byte for byte."""
+    raw = raw_of(r, "req")
+    t0 = time.time()
+    got, ip, err = send_raw(r, raw, a.timeout, a.insecure)
+    extra = {"client": "replay", "via": "replay", "replay_of": a.id,
+             "res_cut": len(got) >= RAW_READ_CAP,
+             **{k: r[k] for k in ("label", "tool", "half_close", "note") if r.get(k) is not None},
+             **({"error": err} if err else {})}
+    append(tdir(d) / "log.jsonl",
+           raw_record(t0, time.time() - t0, (r["scheme"], r["host"], r["port"]), ip,
+                      raw, got, extra))
+    if err:
+        print(f"traffic: raw replay of {a.id} failed: {err}", file=sys.stderr)
+        return 2
+    out = compare_raw(raw_of(r, "res"), got)
+    out.update(id=a.id, kind="raw", target=f"{r['scheme']}://{r['host']}:{r['port']}",
+               label=raw_label(r),
+               sent_bytes=len(raw), recorded_truncated=bool(r.get("res_cut")))
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return 0 if out["same"] else 1
+    print(f"raw replay of {a.id}: {out['sent_bytes']} bytes to {out['target']} "
+          f"({redact(out['label'])})   {'IDENTICAL' if out['same'] else 'DIFFERS'}")
+    print(f"  sent     {byte_shape(raw)}")
+    print(f"  recorded {out['shape']['recorded']}"
+          + ("   (truncated in the record, so a difference here may be the record)"
+             if out["recorded_truncated"] else ""))
+    print(f"  replayed {out['shape']['replayed']}")
+    for line in out["diff"]:
+        print("    " + redact(line))
+    return 0 if out["same"] else 1
+
+
 def cmd_replay(d, a):
     r = record(d, a.id)
     off, scope = scope_offenders(d, {(r["host"], r["port"])}) if r.get("host") else (set(), "")
-    problem = ("is not a request that can be replayed" if r.get("kind") != "exchange" or not r.get("req") else
+    problem = ("is not a request that can be replayed" if r.get("kind") not in ("exchange", "raw") or not r.get("req") else
                "was truncated at --max-body, so replaying it would send something else" if r.get("req_cut") else
                f"is for {r['host']}:{r['port']}, which has no scope file to check against" if scope is None else
                f"is for {r['host']}:{r['port']}, which the scope guard says is out of scope" if off else None)
     if problem:
         print(f"traffic: not replaying: record {a.id} {problem}", file=sys.stderr)
         return 2
+    if r["kind"] == "raw":
+        return replay_raw(d, r, a)
     raw = raw_of(r, "req")
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["http/1.1"])
@@ -1568,6 +1865,38 @@ def _selftest() -> int:
     want(compare(old, old.replace(b"nonce1", b"nonce2"), VOLATILE, [r"nonce\d"], "GET", False)["same"], True, "ignore-body pattern")
     want(compare(old, old + b" and more", VOLATILE, [], "GET", True)["body"]["same"], True, "truncated record compared as a prefix")
 
+    # a raw reply compares as bytes, with nothing normalised away
+    volatile_raw = b"HTTP/1.1 200 OK\r\nDate: a\r\nContent-Length: 0\r\n\r\n"
+    want(compare_raw(volatile_raw, volatile_raw)["same"], True, "identical bytes")
+    want(compare_raw(volatile_raw, volatile_raw.replace(b"Date: a", b"Date: b"))["same"], False,
+         "a raw comparison ignores nothing: a volatile header still differs")
+    want(compare_raw(volatile_raw, volatile_raw + volatile_raw)["same"], False,
+         "two responses where one was recorded is a difference, not a longer body")
+    # A record in exactly the shape cli/src/agent/raw.ts writes. The two sides
+    # are two programs in two languages writing one file, so this is the guard
+    # against them drifting: it must read, it must be labelled from `why`, and
+    # the method/path/status it carries must be ignored rather than believed.
+    from_raw_ts = {"kind": "raw", "t": 1763130000.5, "dur": 0.2, "ttfb": None,
+                   "client": "mythos-raw", "scheme": "https", "host": "app.test",
+                   "port": 443, "ip": None, "m": "POST", "p": "/x", "s": 200, "ua": "",
+                   "req": base64.b64encode(b"POST /x HTTP/1.1\r\n\r\n").decode(),
+                   "res": base64.b64encode(b"HTTP/1.1 200 OK\r\n\r\n").decode(),
+                   "req_cut": False, "res_cut": False, "role": "desync",
+                   "writes": [{"bytes": 20, "delay_ms": 0}], "half_close": True,
+                   "why": "0.CL baseline", "error": None}
+    want(raw_label(from_raw_ts), "0.CL baseline", "`why` is read as the label")
+    want(raw_label({"kind": "raw", "role": "smuggle"}), "smuggle", "`role` is read as the tool")
+    want(raw_label({"kind": "raw"}), "raw bytes", "and a record with neither still prints")
+    want(raw_of(from_raw_ts, "req"), b"POST /x HTTP/1.1\r\n\r\n", "its bytes decode")
+    entry = har_raw(7, from_raw_ts, False)
+    want((entry["label"], entry["half_close"], "m" in entry, "s" in entry),
+         ("0.CL baseline", True, False, False),
+         "the export carries the label and drops the parser's opinion of the bytes")
+
+    # the line endings are the finding in a desync proof, so they are counted
+    want(byte_shape(b"A: 1\r\nB: 2\nC: 3\r").endswith("1 CRLF, 1 bare LF, 1 bare CR"), True,
+         "byte_shape counts each line ending separately")
+
     failures += _live_selftest()
     for f in failures:
         print(f"FAIL {f}", file=sys.stderr)
@@ -1608,6 +1937,35 @@ def _live_selftest():
     class TLSTarget(Target):
         pass
 
+    raw_seen = []
+    # A 0.CL shape: Content-Length and Transfer-Encoding together, a bare LF in
+    # the headers, and a second request smuggled behind them. `framing` refuses
+    # to guess about exactly this, which is why the raw path exists.
+    PROBE = (b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n"
+             b"Transfer-Encoding: chunked\nX-Bare-LF: 1\r\n\r\n"
+             b"GET /smuggled HTTP/1.1\r\nFoo: bar\r\n\r\n")
+    # Two responses to one request: the answer a desync probe is looking for,
+    # and something no parser would record as one exchange.
+    PROBE_REPLY = (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                   b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+
+    class RawTarget(socketserver.BaseRequestHandler):
+        """Reads bytes, parses nothing, answers twice."""
+
+        def handle(self):
+            self.request.settimeout(2)
+            buf = bytearray()
+            with contextlib2.suppress(OSError):
+                while len(buf) < len(PROBE):
+                    chunk = self.request.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            raw_seen.append(bytes(buf))
+            with contextlib2.suppress(OSError):
+                self.request.sendall(PROBE_REPLY)
+
+    import contextlib as contextlib2
     import urllib.request
     with tempfile.TemporaryDirectory() as td:
         d = Path(td) / "eng"
@@ -1623,6 +1981,9 @@ def _live_selftest():
         target.daemon_threads = True
         proxy = Listener(("127.0.0.1", 0), cfg)
         servers = [target, proxy]
+        raw_target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), RawTarget)
+        raw_target.daemon_threads = True
+        servers.append(raw_target)
         tls_target = None
         if tls_ok:
             tls_target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TLSTarget)
@@ -1682,6 +2043,63 @@ def _live_selftest():
             run = analyse(d)
             want(run["requests"]["server_errors"], 1, "5xx seen live")
             want(run["requests"]["failed"], 1, "refused connection recorded, not dropped")
+
+            # A raw record, end to end: the writer side's format, then what
+            # this file does with it. The claim being tested is that a desync
+            # probe survives a round trip through the store byte for byte,
+            # which a parser cannot promise.
+            raw_port = raw_target.server_address[1]
+            append(t / "log.jsonl",
+                   raw_record(time.time(), 0.01, ("http", "127.0.0.1", raw_port), "127.0.0.1",
+                              PROBE, PROBE_REPLY,
+                              {"tool": "desync", "label": "0.CL probe", "half_close": True}))
+            raw_id = max(i for i, r in read_log(d) if r.get("kind") == "raw")
+            run = analyse(d)
+            want(run["raw"]["total"], 1, "the raw record is counted apart from the parsed ones")
+            want(run["raw"]["tools"], {"desync": 1}, "the writing tool is named")
+            want(run["requests"]["total"],
+                 sum(1 for _, r in read_log(d) if r.get("kind") == "exchange"),
+                 "raw records are not counted as requests")
+            want(f"127.0.0.1:{raw_port}" in run["raw"]["hosts"], True, "the raw host is listed")
+            want(run["scope"]["out_of_scope_requests"], 0, "the raw host is in scope")
+
+            buf = io.StringIO()
+            with contextlib2.redirect_stdout(buf):
+                cmd_list(d, argparse.Namespace(host=None, status=None, grep=None, limit=100))
+            line = next(l for l in buf.getvalue().splitlines() if l.strip().startswith(str(raw_id)))
+            want("RAW" in line and "0.CL probe" in line, True, "list marks it RAW and names it")
+
+            buf = io.StringIO()
+            with contextlib2.redirect_stdout(buf):
+                cmd_show(d, argparse.Namespace(id=raw_id, raw=True, full=True))
+            shown = buf.getvalue()
+            want("never parsed" in shown, True, "show says nothing parsed it")
+            want("1 bare LF" in shown, True, "show counts the bare LF a parser would have eaten")
+            want("GET /smuggled" in shown, True, "the smuggled request is visible in the bytes")
+
+            har = build_har(d, True)
+            want(len(har["log"]["entries"]), len([r for _, r in read_log(d)
+                                                  if r.get("kind") == "exchange"]),
+                 "a raw exchange is not a HAR entry")
+            entry = har["log"]["_mythos"]["raw"][0]
+            want(entry["kind"], "raw", "the HAR carries it as raw")
+            want("raw exchange" in har["log"]["comment"], True, "the HAR says raw records are not entries")
+            want(base64.b64decode(build_har(d, False)["log"]["_mythos"]["raw"][0]
+                                  ["requestBytesBase64"]), PROBE,
+                 "an unredacted export keeps the bytes exactly")
+
+            raw_seen.clear()
+            buf = io.StringIO()
+            with contextlib2.redirect_stdout(buf):
+                rc = cmd_replay(d, argparse.Namespace(id=raw_id, insecure=False, timeout=2,
+                                                      ignore_headers=VOLATILE, ignore_body=[], json=True))
+            want(rc, 0, "replaying an unchanged raw exchange is identical")
+            want(raw_seen[-1], PROBE, "the replay sent the recorded bytes, not a rebuilt request")
+            out = json.loads(buf.getvalue())
+            want((out["kind"], out["same"], out["sent_bytes"]), ("raw", True, len(PROBE)),
+                 "the raw replay compares as bytes")
+            want(sum(1 for _, r in read_log(d) if r.get("kind") == "raw"), 2,
+                 "the raw replay is itself recorded as raw")
 
             if tls_ok:
                 cafile = str(ca.crt)

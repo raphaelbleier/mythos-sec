@@ -23,7 +23,12 @@ Send it once, do not build a finding around expecting it. The live bugs in
 - Fetch `/.well-known/openid-configuration` and its `jwks_uri`. Which `kid`s
   and `use` (`sig`/`enc`) values are published tells you which tests apply.
 - `scripts/mythos jwt_tool <token> -M at` runs the scripted checks; treat its
-  output as candidates. Offline cracking of the agent's own HS256 token:
+  output as candidates. For an `id_token` specifically — where the question is
+  what the *relying party* accepts rather than what the token is —
+  `scripts/federation idtoken <rp-url>` presents each mutation to the endpoint
+  that consumes it, with the captured token unmodified as the control, and
+  marks the rows an RSA forgery would be needed for instead of faking one
+  (`oauth-oidc.md`, the `sso-federation` skill). Offline cracking of the agent's own HS256 token:
   `jwt_tool <token> -C -d <wordlist>` or `hashcat -m 16500`.
 
 ## How to confirm (non-destructive)

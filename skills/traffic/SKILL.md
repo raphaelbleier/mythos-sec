@@ -10,6 +10,10 @@ request. `scripts/traffic` records the requests themselves, per engagement,
 so an operator can review them in Burp, Caido or a browser's devtools and so a
 stored proof of concept can be checked by sending it again.
 
+Triage never selects this skill; any phase reads it on demand when a question
+about what was actually sent comes up. It drives `traffic`. Its entry in
+`skills/registry.yaml` carries no triggers for that reason.
+
 ## The driver starts it
 
 `scripts/traffic start` runs before the first phase and `scripts/traffic stop`

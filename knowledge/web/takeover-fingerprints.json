@@ -1,0 +1,703 @@
+{
+  "version": 1,
+  "written": "2026-11-15",
+  "about": [
+    "Fingerprints for dangling-resource takeover, read by `scripts/takeover`.",
+    "",
+    "Every published takeover list is partly stale. Providers add domain",
+    "verification, change their unclaimed-host body, or retire a product, and the",
+    "lists keep the entry. So each entry here carries three separate facts instead",
+    "of one 'vulnerable' bit:",
+    "",
+    "  fingerprint  what the provider's own unclaimed-host response looks like.",
+    "               This is the only part a black-box test observes directly.",
+    "  claimable    whether registering that name is actually possible TODAY.",
+    "               yes     the name is first-come and nothing else gates it.",
+    "               edge    a claim is possible only sometimes: the provider asks",
+    "                       for domain verification, a paid plan, or a support",
+    "                       ticket, so a fingerprint match alone proves nothing.",
+    "               no      the provider verifies domain ownership before it will",
+    "                       serve a custom domain, so the dangling record is a",
+    "                       hygiene problem and not a takeover.",
+    "               unknown nobody here checked. Treated like `edge`.",
+    "  confidence   how much this repository trusts the entry.",
+    "               high    corroborated against first-party provider behaviour or",
+    "                       documentation, or a published incident.",
+    "               medium  consistent across sources, provider side not re-checked.",
+    "               low     carried over from a published list and NOT corroborated.",
+    "                       `stale: true` says so again in one word.",
+    "",
+    "`scripts/takeover` writes `candidate` only for claimable=yes with",
+    "confidence>=medium. Everything else becomes `inconclusive`, with the reason.",
+    "It never writes `confirmed` (that word belongs to the validate phase) and it",
+    "never claims anything.",
+    "",
+    "Re-checking an entry means reading the provider's current documentation and,",
+    "on an engagement, the live unclaimed-host response \u2014 not copying another list.",
+    "Set `checked` to the date when you do, and raise `confidence`."
+  ],
+  "default_source": "https://github.com/EdOverflow/can-i-take-over-xyz",
+  "services": [
+    {
+      "service": "aws-s3",
+      "cname_suffixes": [
+        "s3.amazonaws.com",
+        "s3.*.amazonaws.com",
+        "s3-website-*.amazonaws.com",
+        "s3-website.*.amazonaws.com",
+        "s3.dualstack.*.amazonaws.com",
+        "s3-accelerate.amazonaws.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "NoSuchBucket",
+          "The specified bucket does not exist"
+        ]
+      },
+      "claimable": "yes",
+      "confidence": "high",
+      "stale": false,
+      "claim_path": "CreateBucket with the exact bucket name in the exact region, then a static-website or CloudFront origin. Bucket names are unique per AWS partition, so the first account to ask gets it.",
+      "note": "The strongest and oldest case. A virtual-hosted URL carries the bucket name in the host, so the dangling name IS the bucket name.",
+      "source": "AWS S3 bucket naming rules (globally unique per partition) + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "gcs",
+      "cname_suffixes": [
+        "storage.googleapis.com",
+        "c.storage.googleapis.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "NoSuchBucket",
+          "The specified bucket does not exist"
+        ]
+      },
+      "claimable": "yes",
+      "confidence": "high",
+      "stale": false,
+      "claim_path": "Create a bucket with that name in any project. GCS bucket names are globally unique. Google does require domain verification for a bucket whose NAME is a domain (`www.example.com`), which is a separate case from a CNAME to `c.storage.googleapis.com` fronting an arbitrary bucket name.",
+      "note": "Read the dangling reference carefully: `bucket.storage.googleapis.com` and `storage.googleapis.com/bucket` carry the bucket name in different places.",
+      "source": "Google Cloud Storage bucket naming + domain-named bucket verification docs",
+      "checked": null
+    },
+    {
+      "service": "azure-blob",
+      "cname_suffixes": [
+        "blob.core.windows.net",
+        "web.core.windows.net",
+        "z*.web.core.windows.net"
+      ],
+      "fingerprint": {
+        "status": [
+          400,
+          404
+        ],
+        "body_any": [
+          "The specified account does not exist",
+          "InvalidUri",
+          "ResourceNotFound"
+        ]
+      },
+      "claimable": "yes",
+      "confidence": "high",
+      "stale": false,
+      "claim_path": "Create a storage account with the same account name in any subscription; account names are globally unique in `*.blob.core.windows.net`.",
+      "note": "Deleted storage accounts free their name immediately, which is what makes this live.",
+      "source": "Azure storage account naming (globally unique) + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "azure-trafficmanager",
+      "cname_suffixes": [
+        "trafficmanager.net"
+      ],
+      "fingerprint": {
+        "nxdomain_only": true
+      },
+      "claimable": "yes",
+      "confidence": "high",
+      "stale": false,
+      "claim_path": "Create a Traffic Manager profile with the same DNS prefix. Profile names are globally unique in `trafficmanager.net`, and a deleted profile's name is reusable.",
+      "note": "There is no HTTP fingerprint: a deleted profile's name is simply NXDOMAIN. That makes it a DNS-only judgement and a clean one.",
+      "source": "Azure Traffic Manager profile naming + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "azure-app-service",
+      "cname_suffixes": [
+        "azurewebsites.net",
+        "cloudapp.net",
+        "cloudapp.azure.com",
+        "azureedge.net",
+        "azurecontainer.io",
+        "azurefd.net"
+      ],
+      "fingerprint": {
+        "nxdomain_only": true
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Create an App Service / CDN endpoint with the same name, then add the custom domain. Azure asks for a domain-verification TXT record (`asuid.<host>`) for a custom domain on App Service, so a bare CNAME is not always enough.",
+      "note": "NXDOMAIN on the `*.azurewebsites.net` target is the signal. Whether the claim then completes depends on which Azure product and whether `asuid` verification applies.",
+      "source": "Azure custom-domain verification (asuid TXT) docs + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "github-pages",
+      "cname_suffixes": [
+        "github.io",
+        "github.map.fastly.net"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "There isn't a GitHub Pages site here.",
+          "For root URLs (like http://example.com/) you must provide an index.html file"
+        ]
+      },
+      "claimable": "edge",
+      "confidence": "high",
+      "stale": false,
+      "claim_path": "Create a repository, enable Pages, add the dangling host as the Pages custom domain. GitHub introduced custom-domain verification for organizations: a verified domain cannot be taken by another account, so the claim succeeds only when the original owner never verified it.",
+      "note": "Fingerprint is reliable and easy to read; CLAIMABILITY is the uncertain half. Report the fingerprint, state the verification question, let the operator decide.",
+      "source": "GitHub docs: verifying a custom domain for GitHub Pages (verification added 2022) + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "heroku",
+      "cname_suffixes": [
+        "herokuapp.com",
+        "herokudns.com",
+        "herokussl.com",
+        "herokuspace.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "No such app",
+          "There's nothing here, yet.",
+          "herokucdn.com/error-pages/no-such-app.html"
+        ]
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Create an app and add the dangling host as a custom domain. Heroku refuses a domain already attached to another app, so this works only once the original app or domain entry is gone.",
+      "note": "Heroku's free tier ended in 2022 and a lot of dangling herokuapp CNAMEs date from that; the fingerprint is common, the claim is not always open.",
+      "source": "can-i-take-over-xyz (edge case) + Heroku custom-domain docs",
+      "checked": null
+    },
+    {
+      "service": "netlify",
+      "cname_suffixes": [
+        "netlify.app",
+        "netlify.com",
+        "netlifyglobalcdn.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "Not Found - Request ID",
+          "Not found - Request ID"
+        ]
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Create a site and add the custom domain. Netlify asks for verification when a domain is already registered to another team, so the outcome depends on whether the original team removed it.",
+      "note": "The body contains a request id, so match on the prefix, not the whole string.",
+      "source": "can-i-take-over-xyz (edge case) + Netlify custom-domain docs",
+      "checked": null
+    },
+    {
+      "service": "vercel",
+      "cname_suffixes": [
+        "vercel.app",
+        "cname.vercel-dns.com",
+        "vercel-dns.com",
+        "now.sh",
+        "zeit.sh"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "DEPLOYMENT_NOT_FOUND",
+          "The deployment could not be found",
+          "404: NOT_FOUND"
+        ]
+      },
+      "claimable": "no",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Not open: Vercel requires the domain to be verified (a TXT record, or the domain added to the account) before it serves it, so adding somebody else's dangling host to your own project does not work.",
+      "note": "A dangling Vercel CNAME is still worth reporting as DNS hygiene and as a phishing-adjacent dead reference, but it is not a takeover. `scripts/takeover` reports it as not-dangling-but-dead, never as a candidate.",
+      "source": "Vercel custom-domain verification docs + can-i-take-over-xyz (not vulnerable)",
+      "checked": null
+    },
+    {
+      "service": "fastly",
+      "cname_suffixes": [
+        "fastly.net",
+        "fastlylb.net",
+        "global.ssl.fastly.net",
+        "freetls.fastly.net"
+      ],
+      "fingerprint": {
+        "status": [
+          500,
+          404
+        ],
+        "body_any": [
+          "Fastly error: unknown domain",
+          "Please check that this domain has been added to a service"
+        ]
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Add the domain to a Fastly service on your own account. Fastly has historically allowed this; it needs a paid service and Fastly has added checks, so treat the fingerprint as a lead.",
+      "note": "The 'unknown domain' page is unambiguous about the state and says nothing about whether a claim is open.",
+      "source": "can-i-take-over-xyz (edge case) + Fastly error reference",
+      "checked": null
+    },
+    {
+      "service": "shopify",
+      "cname_suffixes": [
+        "myshopify.com",
+        "shops.myshopify.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "Sorry, this shop is currently unavailable",
+          "Only one step left!",
+          "To learn more about this store"
+        ]
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Add the domain to your own store. Shopify asks for domain verification and refuses a domain connected elsewhere, so the claim is conditional.",
+      "note": "Three different bodies appear depending on the store's state; only 'currently unavailable' means the store is gone.",
+      "source": "can-i-take-over-xyz (edge case) + Shopify connect-domain docs",
+      "checked": null
+    },
+    {
+      "service": "aws-elastic-beanstalk",
+      "cname_suffixes": [
+        "elasticbeanstalk.com",
+        "elb.amazonaws.com"
+      ],
+      "fingerprint": {
+        "nxdomain_only": true
+      },
+      "claimable": "edge",
+      "confidence": "medium",
+      "stale": false,
+      "claim_path": "Create an environment with the same CNAME prefix in the same region. Beanstalk environment CNAMEs are unique per region, and AWS added a random suffix to new environment URLs, so an old short name is claimable and a suffixed one is not.",
+      "note": "An `*.elb.amazonaws.com` target is an ELB hostname, not a claimable name: that is an A/alias case, not a takeover.",
+      "source": "AWS Elastic Beanstalk environment CNAME docs + can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "bitbucket",
+      "cname_suffixes": [
+        "bitbucket.io"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "Repository not found",
+          "The page you have requested does not exist"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Create a repository named after the host and enable the static-site feature. NOT corroborated here: Bitbucket's static-site hosting has changed, and the entry may no longer exist as a product.",
+      "note": "Carried from published lists and not re-checked. A match is inconclusive until somebody reads Bitbucket's current docs.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "ghost",
+      "cname_suffixes": [
+        "ghost.io"
+      ],
+      "fingerprint": {
+        "status": [
+          404,
+          302
+        ],
+        "body_any": [
+          "The thing you were looking for is no longer here",
+          "Domain error"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Add the domain to a Ghost(Pro) publication. NOT corroborated: Ghost(Pro) is paid and verifies domains.",
+      "note": "Stale list entry. Inconclusive on a fingerprint match.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "surge-sh",
+      "cname_suffixes": [
+        "surge.sh"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "project not found"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "`surge` CLI deploy to that domain. NOT corroborated here.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "pantheon",
+      "cname_suffixes": [
+        "pantheonsite.io",
+        "pantheon.io"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "The gods are wise",
+          "404 error unknown site"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Add the domain to a Pantheon site. NOT corroborated.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "readthedocs",
+      "cname_suffixes": [
+        "readthedocs.io",
+        "readthedocs.org"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "unknown to Read the Docs",
+          "Maybe you are trying to reach"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Create a project and attach the domain. Read the Docs added domain validation; NOT corroborated here.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "tumblr",
+      "cname_suffixes": [
+        "domains.tumblr.com",
+        "tumblr.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "Whatever you were looking for doesn't currently exist at this address",
+          "There's nothing here."
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Attach the domain to a Tumblr blog. NOT corroborated.",
+      "note": "Stale list entry; Tumblr has changed hands and products since the list entry was written.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "wordpress-com",
+      "cname_suffixes": [
+        "wordpress.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404,
+          200
+        ],
+        "body_any": [
+          "Do you want to register"
+        ]
+      },
+      "claimable": "no",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Not open: WordPress.com mapping requires a paid plan and domain verification.",
+      "note": "Listed historically; reported as a dead reference, not a takeover.",
+      "source": "can-i-take-over-xyz (not vulnerable)",
+      "checked": null
+    },
+    {
+      "service": "zendesk",
+      "cname_suffixes": [
+        "zendesk.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404,
+          200
+        ],
+        "body_any": [
+          "Help Center Closed",
+          "this help center no longer exists"
+        ]
+      },
+      "claimable": "no",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Not open: Zendesk host mapping needs the subdomain inside an account you own.",
+      "note": "Common false positive. Report as a dead reference.",
+      "source": "can-i-take-over-xyz (not vulnerable)",
+      "checked": null
+    },
+    {
+      "service": "statuspage",
+      "cname_suffixes": [
+        "statuspage.io"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "You are being redirected",
+          "Statuspage | Hosted Status Pages"
+        ]
+      },
+      "claimable": "no",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Not open: Atlassian requires the domain inside the account.",
+      "note": "Report as a dead reference.",
+      "source": "can-i-take-over-xyz (not vulnerable)",
+      "checked": null
+    },
+    {
+      "service": "unbounce",
+      "cname_suffixes": [
+        "unbouncepages.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "The requested URL was not found on this server",
+          "Unbounce"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry; the body is generic enough to false-positive on any Apache 404, so this entry needs a second signal before it means anything.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "strikingly",
+      "cname_suffixes": [
+        "s.strikinglydns.com",
+        "strikinglydns.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "page not found",
+          "But if you're looking to build your own website"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "helpscout",
+      "cname_suffixes": [
+        "helpscoutdocs.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "No settings were found for this company"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry, but the body string is specific, so a match is a real lead worth checking by hand.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "uservoice",
+      "cname_suffixes": [
+        "uservoice.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "This UserVoice subdomain is currently available"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry. The body literally says 'available', which is a strong hint and still not a verified claim path.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "campaignmonitor",
+      "cname_suffixes": [
+        "createsend.com",
+        "cmail19.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404,
+          302
+        ],
+        "body_any": [
+          "Trying to access your account?",
+          "double-check the address"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "bigcartel",
+      "cname_suffixes": [
+        "bigcartel.com"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "<h1>Oops! We couldn&#8217;t find that page.</h1>"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "acquia",
+      "cname_suffixes": [
+        "acquia-sites.com",
+        "acquia-test.co"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_any": [
+          "If you are an Acquia Cloud customer",
+          "Web Site Not Found"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "NOT corroborated.",
+      "note": "Stale list entry.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    },
+    {
+      "service": "ngrok",
+      "cname_suffixes": [
+        "ngrok.io",
+        "ngrok-free.app",
+        "ngrok.app"
+      ],
+      "fingerprint": {
+        "status": [
+          404
+        ],
+        "body_regex_any": [
+          "Tunnel [A-Za-z0-9.-]+ not found",
+          "ERR_NGROK_[0-9]+"
+        ]
+      },
+      "claimable": "unknown",
+      "confidence": "low",
+      "stale": true,
+      "claim_path": "Start a tunnel with that subdomain (paid reserved domains). NOT corroborated.",
+      "note": "A production reference to an ngrok tunnel is a finding on its own merits (a developer's laptop in the trust chain) regardless of claimability.",
+      "source": "can-i-take-over-xyz",
+      "checked": null
+    }
+  ]
+}

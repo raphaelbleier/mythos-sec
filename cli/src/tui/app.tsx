@@ -14,7 +14,7 @@
  */
 import React, { useEffect, useReducer, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
-import type { Bus, Event, PhaseState } from "../bus.js";
+import type { Bus, Event, PhaseState, Verdict } from "../bus.js";
 import { bar, c, clock, glyphs, theme, type Theme } from "./theme.js";
 import { TAGLINE, wordmarkRows } from "./banner.js";
 
@@ -57,14 +57,36 @@ interface State {
   workers: Worker[];
   feed: Line[];
   findings: Array<{ title: string; severity: string }>;
-  verdicts: { confirmed: number; tested: number; skipped: number };
+  verdicts: Record<Verdict["state"], number>;
+  /** The last state seen per endpoint, so a count follows the ledger. */
+  seen: Record<string, Verdict["state"]>;
   open: number;
   guards: { scope: number; budget: number; destructive: number };
   tokens: number;
   ended?: { ok: boolean; summary: string; wall: number };
 }
 
-const PHASE_ORDER = ["recon", "scan", "exploit", "report"];
+// The driver's own order, all six of it. A rail missing triage and validate
+// showed those phases only as feed lines, so the two phases that decide what
+// gets tested and what counts as confirmed were the two with no progress bar.
+const PHASE_ORDER = ["recon", "triage", "scan", "exploit", "validate", "report"];
+
+/**
+ * What closes each phase, from the table in AGENTS.md.
+ *
+ * The bar says how much of the budget is gone; this says what the phase still
+ * has to produce to count as done, which is the question an operator watching a
+ * phase run long actually has.
+ */
+const GATES: Record<string, string> = {
+  recon: "surface.json maps an endpoint, recon.md exists",
+  triage: "plan.json selected a skill",
+  scan: "candidates.md exists",
+  exploit: "every endpoint has a verdict",
+  validate: "no candidate left unresolved",
+  report: "report.md and findings.json exist",
+};
+
 const FEED_MAX = 400;
 
 const empty: State = {
@@ -76,7 +98,9 @@ const empty: State = {
   workers: [],
   feed: [],
   findings: [],
-  verdicts: { confirmed: 0, tested: 0, skipped: 0 },
+  verdicts: { candidate: 0, confirmed: 0, rejected: 0, tested: 0, skipped: 0,
+    inconclusive: 0 },
+  seen: {},
   open: 0,
   guards: { scope: 0, budget: 0, destructive: 0 },
   tokens: 0,
@@ -189,13 +213,28 @@ function reduce(s: State, e: Event): State {
         tone: "good",
         text: e.title,
       });
-    case "verdict":
-      return push({ ...s, verdicts: { ...s.verdicts, [e.verdict.state]: s.verdicts[e.verdict.state] + 1 } }, {
+    case "verdict": {
+      // One endpoint, one count. A candidate the validate phase then confirms
+      // emits twice, and counting both showed an open candidate that had
+      // already been answered — the one number an operator reads to know
+      // whether the run still owes them work.
+      const prev = s.seen[e.verdict.endpoint];
+      const verdicts = { ...s.verdicts, [e.verdict.state]: s.verdicts[e.verdict.state] + 1 };
+      if (prev) verdicts[prev] = Math.max(0, verdicts[prev] - 1);
+      return push({ ...s, verdicts, seen: { ...s.seen, [e.verdict.endpoint]: e.verdict.state } }, {
         kind: "verdict",
         tag: e.verdict.state,
-        tone: e.verdict.state === "confirmed" ? "good" : "dim",
+        tone:
+          e.verdict.state === "confirmed"
+            ? "good"
+            : e.verdict.state === "candidate"
+              ? "warn"
+              : e.verdict.state === "rejected"
+                ? "bad"
+                : "dim",
         text: e.verdict.endpoint,
       });
+    }
     case "note": {
       const open = /(\d+) open across/.exec(e.text);
       return push(open ? { ...s, open: Number(open[1]) } : s, {
@@ -230,15 +269,23 @@ export function App({ bus }: { bus: Bus }) {
   const [typing, setTyping] = useState(false);
   const [hint, setHint] = useState("");
   const [tick, setTick] = useState(0);
+  const [aborting, setAborting] = useState(false);
+  const [keys, setKeys] = useState(false);
   const [startedAt] = useState(() => Date.now());
   const { exit } = useApp();
   const { stdout } = useStdout();
   const t = theme();
   const g = glyphs();
 
-  const cols = Math.max(64, Math.min(stdout?.columns ?? 100, 170));
+  // No floor: pretending an 80-column terminal is 64 wide was one thing, but
+  // pretending a 50-column one is 64 wrapped every row and cost two lines each.
+  // 170 is the cap, because a feed line the width of an ultrawide is unreadable.
+  const cols = Math.max(20, Math.min(stdout?.columns ?? 100, 170));
   const rows = stdout?.rows ?? 30;
   const wordmark = rows >= 36 && cols >= 80;
+  // 80 columns is the floor the layout is designed for: the bars and the gate
+  // text are the first things to go below it, in that order.
+  const narrow = cols < 72;
 
   useEffect(() => {
     const onEvent = (e: Event) => dispatch(e);
@@ -285,7 +332,16 @@ export function App({ bus }: { bus: Bus }) {
       setPaused(!paused);
     }
     if (input === "h") setTyping(true);
-    if (input === "q" || (key.ctrl && input === "c")) bus.control({ t: "abort" });
+    if (input === "?") setKeys((k) => !k);
+    if (input === "q" || (key.ctrl && input === "c")) {
+      // Ink holds stdin in raw mode, so ctrl-c never becomes a SIGINT and the
+      // driver's "signal again to exit now" path is unreachable from here. The
+      // second press has to do it, or an operator whose model call is hanging
+      // has no way out of their own terminal short of another one.
+      if (aborting) exit();
+      setAborting(true);
+      bus.control({ t: "abort" });
+    }
   });
 
   void tick;
@@ -318,15 +374,18 @@ export function App({ bus }: { bus: Bus }) {
     failed: t.refused,
   };
 
-  const feedRows = Math.max(5, rows - 17 - (wordmark ? 7 : 0) - (live.length ? live.length + 2 : 0));
+  const feedRows = Math.max(5, rows - (13 + state.phases.length) - (wordmark ? 7 : 0) - (live.length ? live.length + 2 : 0));
   const sev = state.findings.reduce<Record<string, number>>(
     (a, f) => ({ ...a, [f.severity]: (a[f.severity] ?? 0) + 1 }),
     {},
   );
   const sevText = Object.entries(sev).map(([k, n]) => `${n} ${k}`).join(", ") || "none yet";
-  const decided = state.verdicts.confirmed + state.verdicts.tested + state.verdicts.skipped;
+  const v = state.verdicts;
+  // A candidate is not decided: the validate phase still owes it an answer,
+  // and counting it as progress would show a run as further along than it is.
+  const decided = v.confirmed + v.rejected + v.tested + v.skipped;
   const total = decided + state.open;
-  const barWidth = Math.max(10, Math.min(30, cols - 56));
+  const barWidth = narrow ? 0 : Math.max(10, Math.min(30, cols - 56));
 
   return (
     <Box flexDirection="column" paddingX={1} width={cols}>
@@ -342,8 +401,9 @@ export function App({ bus }: { bus: Bus }) {
       )}
       <Box justifyContent="space-between" width={cols - 2}>
         <Box>
-          {/* The name twice is noise when the wordmark is already above. */}
-          {!wordmark && (
+          {/* The name twice is noise when the wordmark is already above, and
+              below 72 columns the target is worth more than the brand. */}
+          {!wordmark && !narrow && (
             <>
               <Text color={c(t, t.accent)} bold>
                 MYTHOS
@@ -351,9 +411,11 @@ export function App({ bus }: { bus: Bus }) {
               <Text color={c(t, t.frame)}> {g.bullet} </Text>
             </>
           )}
-          <Text color={c(t, t.muted)}>target </Text>
-          <Text color={c(t, t.ink)}>{state.target || "…"}</Text>
-          {state.model ? <Text color={c(t, t.muted)}>{`   ${state.model}`}</Text> : null}
+          {!narrow && <Text color={c(t, t.muted)}>target </Text>}
+          <Text color={c(t, t.ink)} wrap="truncate-end">
+            {state.target ? flat(state.target, Math.max(12, cols - 34)) : g.pending}
+          </Text>
+          {state.model && !narrow ? <Text color={c(t, t.muted)}>{`   ${state.model}`}</Text> : null}
         </Box>
         <Text color={c(t, t.muted)}>
           {paused ? "PAUSED  " : ""}
@@ -380,17 +442,21 @@ export function App({ bus }: { bus: Bus }) {
           return (
             <Box key={p.name}>
               <Text color={c(t, phaseColour[p.state])}>
-                {mark[p.state]} {p.name.padEnd(8)}
+                {mark[p.state]} {p.name.padEnd(9)}
               </Text>
               <Text color={c(t, p.state === "pending" ? t.idle : phaseColour[p.state])}>
                 {bar(ratio, barWidth, g)[0]}
               </Text>
               <Text color={c(t, t.idle)}>{bar(ratio, barWidth, g)[1]}</Text>
-              <Text color={c(t, t.muted)}>
+              <Text color={c(t, t.muted)} wrap="truncate-end">
                 {"  "}
                 {right.padEnd(13)}
                 {p.attempt > 1 ? `try ${p.attempt}/${p.of}  ` : ""}
-                {p.reason ? flat(p.reason, Math.max(10, cols - barWidth - 40)) : ""}
+                {p.reason
+                  ? flat(p.reason, Math.max(10, cols - barWidth - 40))
+                  : p.state === "running" && cols >= 100
+                    ? flat(`gate: ${GATES[p.name] ?? ""}`, cols - barWidth - 40)
+                    : ""}
               </Text>
             </Box>
           );
@@ -398,18 +464,42 @@ export function App({ bus }: { bus: Bus }) {
       </Box>
 
       <Box marginTop={1} flexDirection="column">
-        <Box>
+        {narrow ? (
+          <>
+            <Text color={c(t, state.findings.length ? t.confirmed : t.idle)} wrap="truncate-end">
+              {`findings ${sevText}`}
+            </Text>
+            <Text color={c(t, t.muted)} wrap="truncate-end">
+              {`${v.confirmed}${g.confirmed} ${v.tested}${g.tested} ${v.skipped}${g.skipped}` +
+                `${v.rejected ? ` ${v.rejected}${g.refused}` : ""}${v.candidate ? ` ${v.candidate}${g.warn}` : ""}` +
+                `${total ? ` of ${total}` : ""}  guards ${state.guards.scope}/${state.guards.budget}/${state.guards.destructive}`}
+            </Text>
+          </>
+        ) : null}
+        <Box display={narrow ? "none" : "flex"}>
           <Text color={c(t, t.muted)}>findings  </Text>
           <Text color={c(t, state.findings.length ? t.confirmed : t.idle)}>{sevText}</Text>
           <Text color={c(t, t.muted)}>{"    endpoints  "}</Text>
-          <Text color={c(t, t.confirmed)}>{state.verdicts.confirmed}{g.confirmed}</Text>
+          <Text color={c(t, t.confirmed)}>{v.confirmed}{g.confirmed}</Text>
           <Text color={c(t, t.muted)}>{" "}</Text>
-          <Text color={c(t, t.ink)}>{state.verdicts.tested}{g.tested}</Text>
+          <Text color={c(t, t.ink)}>{v.tested}{g.tested}</Text>
           <Text color={c(t, t.muted)}>{" "}</Text>
-          <Text color={c(t, t.idle)}>{state.verdicts.skipped}{g.skipped}</Text>
+          <Text color={c(t, t.idle)}>{v.skipped}{g.skipped}</Text>
+          {v.rejected ? (
+            <>
+              <Text color={c(t, t.muted)}>{" "}</Text>
+              <Text color={c(t, t.refused)}>{v.rejected}{g.refused}</Text>
+            </>
+          ) : null}
+          {v.candidate ? (
+            <>
+              <Text color={c(t, t.muted)}>{" "}</Text>
+              <Text color={c(t, t.warn)}>{v.candidate}{g.warn}</Text>
+            </>
+          ) : null}
           <Text color={c(t, t.muted)}>{total ? ` of ${total}` : ""}</Text>
         </Box>
-        <Box>
+        <Box display={narrow ? "none" : "flex"}>
           <Text color={c(t, t.muted)}>guards    </Text>
           <Text color={c(t, state.guards.scope ? t.warn : t.idle)}>{state.guards.scope} scope</Text>
           <Text color={c(t, t.muted)}>, </Text>
@@ -468,13 +558,23 @@ export function App({ bus }: { bus: Bus }) {
             {state.ended.ok ? g.done : g.incomplete} {flat(state.ended.summary, cols - 6)}
           </Text>
         ) : (
-          <Text color={c(t, t.idle)}>
+          <Text color={c(t, t.idle)} wrap="truncate-end">
             <Text color={c(t, t.muted)}>p</Text> {paused ? "resume" : "pause"}
             {"   "}
             <Text color={c(t, t.muted)}>h</Text> hint
             {"   "}
-            <Text color={c(t, t.muted)}>q</Text> abort
-            {state.dir ? `   ${state.dir.split("/").slice(-2).join("/")}` : ""}
+            <Text color={c(t, t.muted)}>q</Text> {aborting ? "again: exit now" : "abort"}
+            {!narrow && (
+              <>
+                {"   "}
+                <Text color={c(t, t.muted)}>?</Text> {keys ? "hide keys" : "keys"}
+              </>
+            )}
+            {keys
+              ? "   p pauses between agent steps · h queues a hint for the next prompt · q unwinds, then exits"
+              : state.dir
+                ? `   ${state.dir.split("/").slice(-2).join("/")}`
+                : ""}
           </Text>
         )}
       </Box>

@@ -21,7 +21,7 @@ is missing, partial or client-side only.
 This note is the canonical reference for the class: what to try and what
 proves it. `techniques/auth-matrix.md` builds the subject x object x action
 table that says which cells to test. `skills/business-logic` carries the
-tools (`bola_diff.py`, `mass_assign.py`, `race.py`) and the run order.
+tools (`bola-diff`, `mass-assign`, `race`) and the run order.
 `mass-assignment.md` owns the write side of BOPLA, `race-conditions.md` and
 `techniques/state-machine-abuse.md` own ordering and concurrency.
 (The skill still holds its own copy of the method in sections 1 and 2; that
@@ -29,7 +29,7 @@ copy should shrink to a pointer here, which its owner has to do.)
 
 ## How Mythos detects it
 - Matrix first (`techniques/auth-matrix.md`), then triage with
-  `bola_diff.py`: owner, other user and anonymous classified SAME / SIMILAR /
+  `bola-diff`: owner, other user and anonymous classified SAME / SIMILAR /
   DIFFERENT. Output is candidates only.
 - Object references are everywhere, not just the path: query, JSON body,
   headers (`X-Tenant-ID`), cookies, JWT claims (`sub`, `tid`, `org`),

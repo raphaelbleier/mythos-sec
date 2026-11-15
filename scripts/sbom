@@ -1,0 +1,1766 @@
+#!/usr/bin/env python3
+"""Mythos sbom — what the target *serves*, as an inventory, a CycloneDX document
+and a ranked list of CVE candidates.
+
+The outside of an application leaks its dependency list: banner comments in
+bundles, runtime version assignments, webpack module paths, `node_modules/<pkg>/`
+entries in a published source map, framework banners in CSS, a `producers`
+section in a wasm module, and a `Server` header naming a product nobody has
+upgraded. This collects all of that into one inventory where **every row names
+the request that proved it**, emits CycloneDX 1.6, and hands the inventory to
+`scripts/cvefeed`, which already does the KEV/EPSS/NVD/GHSA/OSV ranking.
+
+  scripts/sbom inventory <url|@file.html> [--from-probe surface.json]
+  scripts/sbom cyclonedx <url|inventory.json> [--spdx] [--out FILE]
+  scripts/sbom cves      <url|inventory.json> [--allow-feeds]
+  scripts/sbom sri       <url|@file.html>
+  scripts/sbom diff      a.json b.json
+  scripts/sbom selftest
+
+`--json` works on every subcommand.
+
+## A client-side version match is weak evidence, and the output says so
+
+Vendors backport fixes without bumping the version, distributions patch in
+place, and bundlers mangle, tree-shake, inline and re-minify until the banner
+comment is the only thing left of the original file — and the banner is a
+comment, not a fact. So every component carries a `confidence` with the marker
+that produced it:
+
+    strong    0.9  the file's sha256 matches an operator-supplied release hash
+    moderate  0.6  a package.json inside the source map's sourcesContent
+    moderate  0.5  a banner comment or a runtime version assignment
+    weak      0.3  a version in a filename or URL, or a webpack module path
+    name-only 0.1  the library is present, the version is not readable
+
+Nothing here is ever `confirmed`. A version match is a `candidate`, and the
+`cves` subcommand prints, per row, the exact live check that would resolve it.
+What the literature says about version-only matching:
+`knowledge/web/sbom-known-cves.md`.
+
+## Requests and scope
+
+GET only, no payloads, no POST, no brute force. Every request goes through
+`hooks/scope-guard.py` and is **refused** for a host the engagement's
+`scope.yaml` does not authorize, so a cross-origin CDN script is recorded from
+the HTML attribute and never fetched (`--fetch-external` only lifts that for a
+host already in scope). The rate comes from `rules.rate_limit_rps` in
+$MYTHOS_SCOPE. `scope.yaml` is never written.
+
+## Hosts contacted
+
+Against the target: only the target, over GET.
+
+The CVE hand-off is a third party and is **gated**. By default `sbom cves` runs
+`scripts/cvefeed match --offline`, which reads only the on-disk cache
+($MYTHOS_CVE_CACHE, else $XDG_CACHE_HOME/mythos/cve) and the committed
+snapshot `knowledge/cve/snapshot.json` — no outbound request at all. With
+`--allow-feeds`, cvefeed may refresh, and then it contacts the hosts it
+documents in its own `--help`:
+
+    www.cisa.gov              CISA KEV catalog
+    api.first.org             EPSS scores
+    services.nvd.nist.gov     NVD 2.0 recent window
+    raw.githubusercontent.com nuclei-templates CVE map
+    api.github.com            GHSA (only where GITHUB_TOKEN exists)
+    api.osv.dev               OSV package queries
+
+Only `name@version` pairs leave this machine. The target's hostname, URLs,
+paths, headers, cookies, request ids and the engagement directory are never
+part of a feed query; `selftest` asserts that over the argv that is built.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+UA = "mythos-sbom/1.0 (authorized security testing)"
+SCHEMA = 1
+SPEC_VERSION = "1.6"
+
+
+class OutOfScope(Exception):
+    """A host scope.yaml does not authorize. Refused, not warned about."""
+
+
+# ------------------------------------------------------------ guards, paced I/O
+
+_mods: dict = {}
+
+
+def mod(name):
+    """Load a hook by path, so its logic is called and not copied."""
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py",
+               "budget-guard": "hooks/budget-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+_LAST = [0.0]
+_GAP = [0.0]
+
+
+def set_rate(explicit=None, default=5.0):
+    """The pace for this process: one script making dozens of GETs never passes
+    the PreToolUse budget guard, which paces tool calls and not the loop inside
+    one. So the rate is read from the scope file here and held here."""
+    rate = explicit
+    if rate is None:
+        try:
+            loaded = mod("budget-guard").load_rules()
+            rate = mod("budget-guard")._num(loaded[1], "rate_limit_rps") if loaded else None
+        except Exception:
+            rate = None
+    if rate is None:
+        rate = default
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    return rate
+
+
+def pace():
+    gap = _GAP[0]
+    if gap <= 0:
+        return
+    wait = _LAST[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+def in_scope(url):
+    try:
+        return not mod("scope-guard").check(url)["offenders"]
+    except Exception:
+        return True            # no scope machinery available: the caller's URL stands
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Fetcher:
+    """GET only, scope-checked, paced, with a request id per response.
+
+    The id is what every component's evidence points at, so an inventory row is
+    traceable to the bytes it came from. The sha256 is recorded too: that is how
+    a row is correlated with `scripts/traffic` (same URL, same body hash) when
+    the run went through the recording proxy, which it does whenever the proxy
+    variables are in the environment — urllib's default opener honours them and
+    this script never needs to know the recorder exists.
+    """
+
+    def __init__(self, timeout=10.0, insecure=False, limit=3_000_000):
+        self.timeout, self.insecure, self.limit = timeout, insecure, limit
+        self.requests: list[dict] = []
+        self.bodies: dict[str, bytes] = {}
+
+    def get(self, url):
+        """(request_id, status, headers, bytes) — or (None, None, {}, b"") on error."""
+        if not in_scope(url):
+            raise OutOfScope(url)
+        pace()
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        ctx = ssl._create_unverified_context() if self.insecure else None
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=ctx) as r:
+                raw, status = r.read(self.limit), r.status
+                hdrs = {k.lower(): v for k, v in r.headers.items()}
+        except urllib.error.HTTPError as e:
+            raw = e.read(self.limit) if e.fp else b""
+            status = e.code
+            hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
+        except Exception as e:
+            self.requests.append({"id": f"req-{len(self.requests) + 1}", "method": "GET",
+                                  "url": url, "status": None,
+                                  "error": f"{type(e).__name__}: {e}", "at": now_iso()})
+            return None, None, {}, b""
+        rid = f"req-{len(self.requests) + 1}"
+        self.requests.append({"id": rid, "method": "GET", "url": url, "status": status,
+                              "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                              "content_type": hdrs.get("content-type", "").split(";")[0],
+                              "at": now_iso()})
+        self.bodies[rid] = raw
+        return rid, status, hdrs, raw
+
+    def record_offline(self, label, raw):
+        """A local file, given an id so its components are traceable too."""
+        rid = f"req-{len(self.requests) + 1}"
+        self.requests.append({"id": rid, "method": "FILE", "url": label, "status": 200,
+                              "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                              "content_type": "", "at": now_iso()})
+        self.bodies[rid] = raw
+        return rid
+
+
+# ------------------------------------------------------------------- confidence
+
+# The whole point of this script: a marker is not a fact, and the marker that
+# produced a version decides how much the row is worth. `technique` is the
+# CycloneDX 1.6 `evidence.identity[].methods[].technique` enum value, so the
+# emitted document carries the same judgement in its own vocabulary.
+CONFIDENCE = {
+    "hash":            ("strong",    0.9, "hash-comparison",
+                        "the file's sha256 matches a release hash the operator supplied"),
+    "sourcemap-manifest": ("moderate", 0.6, "manifest-analysis",
+                        "a package.json inside the source map's sourcesContent"),
+    "banner":          ("moderate",  0.5, "source-code-analysis",
+                        "a banner comment, which a backport does not update"),
+    "runtime":         ("moderate",  0.5, "source-code-analysis",
+                        "a version assigned to a runtime property, which a backport "
+                        "does not update either"),
+    "header":          ("moderate",  0.5, "dynamic-analysis",
+                        "a response header, which the operator can set to anything"),
+    "filename":        ("weak",      0.3, "filename",
+                        "a version in a filename or URL, which says what was requested, "
+                        "not what was served"),
+    "module-path":     ("weak",      0.3, "source-code-analysis",
+                        "a bundler module path: it names the package, not its version"),
+    "name-only":       ("name-only", 0.1, "source-code-analysis",
+                        "the library is present; no version is readable from outside"),
+}
+
+TECHNIQUES = {"source-code-analysis", "binary-analysis", "manifest-analysis",
+              "ast-fingerprint", "hash-comparison", "instrumentation",
+              "dynamic-analysis", "filename", "attestation", "other"}
+IDENTITY_FIELDS = {"group", "name", "version", "purl", "cpe", "swid", "hash"}
+COMPONENT_TYPES = {"application", "framework", "library", "container", "platform",
+                   "operating-system", "device", "device-driver", "firmware", "file",
+                   "machine-learning-model", "data", "cryptographic-asset"}
+
+# Aliases a banner or a path can use, to the package the purl should name.
+# Everything outside this table is still reported, as a `pkg:generic/` row with
+# a note, because an unrecognised banner is information and dropping it is not.
+KNOWN = {
+    "jquery": ("npm", "jquery"), "jquery-ui": ("npm", "jquery-ui"),
+    "angularjs": ("npm", "angular"), "angular": ("npm", "angular"),
+    "react": ("npm", "react"), "react-dom": ("npm", "react-dom"),
+    "vue": ("npm", "vue"), "lodash": ("npm", "lodash"),
+    "underscore": ("npm", "underscore"), "moment": ("npm", "moment"),
+    "momentjs": ("npm", "moment"), "bootstrap": ("npm", "bootstrap"),
+    "d3": ("npm", "d3"), "backbone": ("npm", "backbone"),
+    "handlebars": ("npm", "handlebars"), "dompurify": ("npm", "dompurify"),
+    "axios": ("npm", "axios"), "three": ("npm", "three"),
+    "prototype": ("npm", "prototype"), "ember": ("npm", "ember-source"),
+    "knockout": ("npm", "knockout"), "swiper": ("npm", "swiper"),
+    "select2": ("npm", "select2"), "tinymce": ("npm", "tinymce"),
+    "ckeditor": ("npm", "ckeditor4"), "highcharts": ("npm", "highcharts"),
+    "chart.js": ("npm", "chart.js"), "chartjs": ("npm", "chart.js"),
+    "popper": ("npm", "popper.js"), "popper.js": ("npm", "popper.js"),
+    "font-awesome": ("npm", "font-awesome"), "fontawesome": ("npm", "font-awesome"),
+    "tailwindcss": ("npm", "tailwindcss"), "bulma": ("npm", "bulma"),
+    "foundation": ("npm", "foundation-sites"), "modernizr": ("npm", "modernizr"),
+    "requirejs": ("npm", "requirejs"), "polyfill": ("npm", "polyfill-service"),
+    "socket.io": ("npm", "socket.io-client"), "mustache": ("npm", "mustache"),
+    "next": ("npm", "next"), "nuxt": ("npm", "nuxt"), "svelte": ("npm", "svelte"),
+    "webpack": ("npm", "webpack"), "core-js": ("npm", "core-js"),
+    "emscripten": ("generic", "emscripten"),
+    # server side
+    "nginx": ("generic", "nginx"), "apache": ("generic", "apache"),
+    "express": ("npm", "express"), "iis": ("generic", "iis"),
+    "gunicorn": ("pypi", "gunicorn"), "uvicorn": ("pypi", "uvicorn"),
+    "tomcat": ("maven", "org.apache.tomcat/tomcat"), "jetty": ("generic", "jetty"),
+    "openresty": ("generic", "openresty"), "php": ("generic", "php"),
+    "openssl": ("generic", "openssl"), "wordpress": ("generic", "wordpress"),
+    "drupal": ("generic", "drupal"), "django": ("pypi", "django"),
+    "flask": ("pypi", "flask"), "rails": ("gem", "rails"),
+    "cloudflare": ("generic", "cloudflare"), "varnish": ("generic", "varnish"),
+}
+
+VER = r"(\d+\.\d+(?:\.\d+)?(?:[-+.][0-9A-Za-z.\-]+)?)"
+# `/*! jQuery v1.12.4 |`, `@license Lodash 3.10.1 <...>`, `* Bootstrap v3.3.7 (`
+BANNER_RE = re.compile(r"(?:/\*!|@license|\*|//!?|#)\s*"
+                       r"([A-Za-z][A-Za-z0-9_.\-]{1,28}?)(?:\.js|\.min)?\s+v?" + VER)
+# `jquery: "1.12.4"`, `version: {full: "1.5.8"`, `VERSION = '3.10.1'`
+RUNTIME_RE = re.compile(r"(?i)\b(?:version|VERSION|full|jquery|release)\s*[:=]\s*"
+                        r"[\"']" + VER + r"[\"']")
+MODULE_PATH_RE = re.compile(r"node_modules/((?:@[\w.\-]+/)?[\w.\-]+)/")
+# `/jquery-3.4.1.min.js`, `npm/bootstrap@3.3.7/dist/...`
+FILENAME_RE = re.compile(r"(?:^|[/])([a-zA-Z][\w.\-]*?)[-@]" + VER + r"(?:[./]|$)")
+SOURCEMAP_COMMENT = re.compile(r"(?://|/\*)[#@]\s*sourceMappingURL\s*=\s*([^\s*'\")]+)")
+WASM_STRING_RE = re.compile(rb"[\x20-\x7e]{4,}")
+PRODUCER_RE = re.compile(r"(?i)(emscripten|clang|rustc|wasm-bindgen|wasm-pack|tinygo|"
+                         r"llvm|binaryen|go)\D{0,4}" + VER)
+# Hosts that let a third party place content under an account anyone can open.
+# Same list the client-side-supply-chain note uses.
+WRITABLE_HOSTS = re.compile(r"(?i)(s3[.\-][\w.\-]*amazonaws\.com|raw\.githubusercontent\.com|"
+                            r"[\w.\-]*\.cloudfront\.net|unpkg\.com|cdn\.jsdelivr\.net|"
+                            r"[\w.\-]*\.appspot\.com|[\w.\-]*\.pages\.dev|"
+                            r"[\w.\-]*\.firebaseapp\.com|[\w.\-]*\.blob\.core\.windows\.net)")
+# Noise a banner regex picks up that is never a package name.
+BANNER_STOP = {"copyright", "version", "v", "license", "licensed", "mit", "apache", "bsd",
+               "released", "under", "the", "and", "see", "build", "generated", "compiled",
+               "sourcemappingurl", "http", "https", "c", "author", "date"}
+
+
+def resolve_name(alias):
+    """(package type, purl package, display name) for an alias.
+
+    `AngularJS` in a banner and `angular` in a module path are one dependency,
+    so both resolve to the package the purl names. Without this the inventory
+    carried two rows for the same library and the diff reported a phantom
+    change the first time a target switched which marker was readable.
+    """
+    known = KNOWN.get(alias.lower())
+    ptype, pkg = known or ("generic", alias.lower())
+    # A maven coordinate is group/artifact; the display name is the artifact. An
+    # uncatalogued name is left exactly as the target printed it, scope included,
+    # because `@scope/pkg` and `pkg` are different packages.
+    return ptype, pkg, (pkg.split("/")[-1].lower() if known else pkg.lower())
+
+
+def purl_for(kind, name, version=None):
+    ptype, pkg, _ = resolve_name(name)
+    base = f"pkg:{ptype}/{urllib.parse.quote(pkg, safe='@/')}"
+    return base + (f"@{urllib.parse.quote(version)}" if version else "")
+
+
+def component(name, version, marker_kind, marker, rid, url, layer,
+              ctype="library", excerpt=None, note=None):
+    label, score, technique, caveat = CONFIDENCE[marker_kind]
+    _, _, display = resolve_name(name)
+    return {"name": display, "version": version, "type": ctype, "layer": layer,
+            **({"alias": name.lower()} if display != name.lower() else {}),
+            "purl": purl_for(layer, name, version),
+            "confidence": label, "confidence_score": score,
+            "marker_kind": marker_kind, "marker": marker, "technique": technique,
+            "caveat": caveat,
+            "evidence": {"request": rid, "url": url,
+                         "excerpt": (excerpt or marker)[:160]},
+            **({"note": note} if note else {})}
+
+
+# --------------------------------------------------------------- HTML and assets
+
+class Tags(HTMLParser):
+    """Every tag that loads code or a font, with its integrity attribute."""
+
+    WANT = {"script", "link", "img", "iframe", "meta"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.resources: list[dict] = []
+        self.csp_meta = ""
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "meta":
+            if a.get("http-equiv", "").lower() == "content-security-policy":
+                self.csp_meta = a.get("content", "")
+            return
+        if tag not in self.WANT:
+            return
+        src = a.get("src") or a.get("href") or ""
+        if not src:
+            return
+        rel = (a.get("rel") or "").lower()
+        if tag == "link" and not any(r in rel for r in
+                                     ("stylesheet", "preload", "modulepreload", "prefetch")):
+            return
+        self.resources.append({"tag": tag, "rel": rel, "src": src,
+                               "integrity": a.get("integrity", ""),
+                               "crossorigin": a.get("crossorigin", ""),
+                               "as": a.get("as", "")})
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+
+def etld1(host):
+    """Crude registrable domain: the last two labels.
+
+    This is not a public-suffix lookup, so `foo.co.uk` reads as `co.uk`. It is
+    used only to group hosts and to say "third party"; no finding rests on it,
+    and the output says so.
+    """
+    parts = (host or "").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def read_entry(arg, fetch: Fetcher):
+    """(rid, headers, text, base_url). `@file` reads a saved HTML body offline."""
+    if arg.startswith("@"):
+        path = Path(arg[1:])
+        raw = path.read_bytes()
+        rid = fetch.record_offline(str(path), raw)
+        return rid, {}, raw.decode("utf-8", "replace"), "file://" + str(path.resolve())
+    rid, status, hdrs, raw = fetch.get(arg)
+    if rid is None:
+        raise SystemExit(f"sbom: {arg} unreachable "
+                         f"({fetch.requests[-1].get('error')})")
+    return rid, hdrs, raw.decode("utf-8", "replace"), arg
+
+
+# -------------------------------------------------------------- marker scanning
+
+def scan_banners(text, rid, url, layer="client"):
+    out = []
+    for m in BANNER_RE.finditer(text):
+        name, version = m.group(1), m.group(2)
+        if name.lower() in BANNER_STOP or len(name) < 2 or name.lower() == version:
+            continue
+        note = None if name.lower() in KNOWN else (
+            "banner names software this script does not catalogue: the purl is a "
+            "pkg:generic guess and the package may be named differently upstream")
+        out.append(component(name, version, "banner",
+                             m.group(0).strip()[:100], rid, url, layer, note=note))
+    return out
+
+
+def scan_runtime(text, rid, url, layer="client"):
+    """A version assigned to a property, attributed to the nearest library name.
+
+    `version: "1.5.8"` on its own says nothing about *what* is at 1.5.8, so an
+    assignment is attributed only to a catalogued name that appears within 300
+    characters before it **and** after the previous version assignment — one
+    name is claimed by one version at most. Over-attributing here is how a tool
+    reports the bundler's version as the framework's, and in a minified bundle
+    every library's name is within a few hundred bytes of every other's.
+    """
+    positions = []
+    low = text.lower()
+    for alias in KNOWN:
+        start = 0
+        while True:
+            i = low.find(alias, start)
+            if i < 0:
+                break
+            # a bare substring hit inside a longer identifier is not the name
+            before = low[i - 1] if i else " "
+            after = low[i + len(alias)] if i + len(alias) < len(low) else " "
+            # A name after a dot is a property, not an identifier naming the
+            # library: `jQuery.prototype` attributed jQuery's own version to
+            # Prototype.js, because `prototype` is also a catalogued package.
+            if before != "." and not (before.isalnum() or before == "_") \
+                    and not (after.isalnum() or after == "_"):
+                positions.append((i, alias))
+            start = i + len(alias)
+    positions.sort()
+    out, prev_end = [], 0
+    for m in RUNTIME_RE.finditer(text):
+        best = None
+        for i, alias in positions:
+            if prev_end <= i < m.start() and m.start() - i <= 300:
+                best = alias
+            elif i >= m.start():
+                break
+        prev_end = m.end()
+        if not best:
+            continue
+        out.append(component(best, m.group(1), "runtime", m.group(0).strip()[:100],
+                             rid, url, layer))
+    return out
+
+
+def scan_module_paths(text, rid, url, layer="client"):
+    out = []
+    for name in sorted({m.group(1) for m in MODULE_PATH_RE.finditer(text)}):
+        if name.startswith("."):
+            continue
+        out.append(component(name, None, "module-path", f"node_modules/{name}/",
+                             rid, url, layer))
+    return out
+
+
+def scan_sourcemap(doc, rid, url, layer="client"):
+    """node_modules paths from `sources`, versions from package.json in content."""
+    out = []
+    sources = [s for s in (doc.get("sources") or []) if isinstance(s, str)]
+    for s in sources:
+        for m in MODULE_PATH_RE.finditer(s):
+            out.append(component(m.group(1), None, "module-path",
+                                 f"sources[] {m.group(1)}", rid, url, layer,
+                                 excerpt=s[:160]))
+    contents = doc.get("sourcesContent") or []
+    for i, body in enumerate(contents):
+        if not isinstance(body, str) or '"version"' not in body:
+            continue
+        src = sources[i] if i < len(sources) else ""
+        if "package.json" not in src:
+            continue
+        try:
+            pkg = json.loads(body)
+        except ValueError:
+            continue
+        name, version = pkg.get("name"), pkg.get("version")
+        if isinstance(name, str) and isinstance(version, str):
+            out.append(component(name, version, "sourcemap-manifest",
+                                 f"{src} -> {name}@{version}", rid, url, layer,
+                                 excerpt=body[:160]))
+    return out
+
+
+def scan_filename(asset_url, rid, layer="client"):
+    out = []
+    path = urllib.parse.urlsplit(asset_url).path
+    for m in FILENAME_RE.finditer(path):
+        name = m.group(1)
+        if name.lower() in BANNER_STOP:
+            continue
+        out.append(component(name, m.group(2), "filename", m.group(0),
+                             rid, asset_url, layer))
+    return out
+
+
+def scan_wasm(raw, rid, url):
+    """A wasm module is a component in its own right; its `producers` custom
+    section names the toolchain, which is the only version a wasm blob offers
+    from the outside."""
+    out = []
+    name = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1] or "module.wasm"
+    if not raw.startswith(b"\x00asm"):
+        return out
+    out.append(component(name, None, "name-only", "wasm magic 0x00 'asm'", rid, url,
+                         "client", ctype="file",
+                         note="a wasm module: its own version is not readable, only "
+                              "the toolchain that produced it"))
+    text = " ".join(s.decode("ascii", "replace") for s in WASM_STRING_RE.findall(raw))
+    for m in PRODUCER_RE.finditer(text):
+        out.append(component(m.group(1), m.group(2), "banner",
+                             f"wasm producers section: {m.group(0)}", rid, url, "client",
+                             ctype="library"))
+    return out
+
+
+def dedupe(components):
+    """One row per (name, version, layer), keeping the strongest marker and
+    collecting the others, so a library proved three ways is one component with
+    three pieces of evidence rather than three components."""
+    best: dict[tuple, dict] = {}
+    for c in components:
+        key = (c["name"], c["version"], c["layer"])
+        cur = best.get(key)
+        if cur is None:
+            c["also_seen"] = []
+            best[key] = c
+            continue
+        weaker, stronger = (cur, c) if c["confidence_score"] > cur["confidence_score"] \
+            else (c, cur)
+        stronger["also_seen"] = (stronger.get("also_seen") or []) + \
+            (weaker.get("also_seen") or []) + \
+            [{"marker_kind": weaker["marker_kind"], "marker": weaker["marker"],
+              "request": weaker["evidence"]["request"]}]
+        best[key] = stronger
+    out = list(best.values())
+    # A name-only row is noise next to a versioned row for the same library in
+    # the same layer: it is the same dependency, read less well.
+    versioned = {(c["name"], c["layer"]) for c in out if c["version"]}
+    kept = []
+    for c in out:
+        if c["version"] is None and (c["name"], c["layer"]) in versioned:
+            continue
+        kept.append(c)
+    kept.sort(key=lambda c: (c["layer"], c["name"], c["version"] or ""))
+    return kept
+
+
+# ------------------------------------------------------------------- server side
+
+HEADER_FIELDS = ("server", "x-powered-by", "x-aspnet-version", "x-generator",
+                 "via", "x-runtime", "x-drupal-cache", "x-shopify-stage")
+
+
+def from_headers(headers, rid, url):
+    """Products the response headers name. One row per product, never more."""
+    out = []
+    for field in HEADER_FIELDS:
+        value = headers.get(field)
+        if not value:
+            continue
+        for m in re.finditer(r"([A-Za-z][\w.\-]{1,30})[/ ]v?" + VER, value):
+            name = m.group(1)
+            if name.lower() in BANNER_STOP:
+                continue
+            ctype = "framework" if KNOWN.get(name.lower(), ("", ""))[0] == "npm" \
+                else "application"
+            out.append(component(name, m.group(2), "header", f"{field}: {value[:80]}",
+                                 rid, url, "server", ctype=ctype))
+        if not out or not any(c["marker"].startswith(field) for c in out):
+            for name in re.findall(r"(?i)\b(" + "|".join(
+                    re.escape(k) for k in KNOWN) + r")\b", value):
+                out.append(component(name, None, "name-only", f"{field}: {value[:80]}",
+                                     rid, url, "server", ctype="application"))
+    return out
+
+
+def from_probe(path):
+    """Server-side inventory out of `scripts/probe --json`, not re-fingerprinted.
+
+    probe already fetched the entry point, the common paths and the headers it
+    keeps, and its `technology` list is exactly the product/version pairs this
+    inventory needs. Re-requesting them would double the traffic for the same
+    answer, so the probe's own output is the evidence and the row says which of
+    its pages carried it.
+    """
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    out, notes = [], []
+    label = f"probe:{doc.get('target') or path}"
+    for tech in doc.get("technology") or []:
+        name, _, version = tech.partition("/")
+        if not name:
+            continue
+        kind = "header" if version else "name-only"
+        ctype = "framework" if KNOWN.get(name.lower(), ("", ""))[0] == "npm" \
+            else "application"
+        where = next((p["url"] for p in doc.get("pages") or []
+                      if any(name.lower() in (v or "").lower()
+                             for v in (p.get("headers") or {}).values())), label)
+        out.append(component(name, version or None, kind,
+                             f"probe technology[] {tech}", f"probe:{where}", where,
+                             "server", ctype=ctype))
+    seen = {r.get("path") for r in doc.get("reachable_paths") or []}
+    for marker, product in (("/actuator/health", "spring-boot"),
+                            ("/server-status", "apache"),
+                            ("/.git/config", None)):
+        if marker in seen and product:
+            out.append(component(product, None, "name-only",
+                                 f"probe reachable_paths[] {marker}",
+                                 f"probe:{marker}", marker, "server",
+                                 ctype="application"))
+    if not out:
+        notes.append(f"{path} named no technology: the target leaks no server-side "
+                     f"product, which is a result and not an error")
+    return out, notes
+
+
+# -------------------------------------------------------------------- SRI / CDN
+
+def csp_script_hosts(csp):
+    """The hosts a policy's script-src and default-src trust, as written."""
+    out = {}
+    for directive in (csp or "").split(";"):
+        parts = directive.strip().split()
+        if not parts:
+            continue
+        name = parts[0].lower()
+        if name not in ("script-src", "script-src-elem", "default-src", "style-src"):
+            continue
+        hosts = [p for p in parts[1:] if not p.startswith("'")]
+        keywords = [p for p in parts[1:] if p.startswith("'")]
+        out[name] = {"hosts": hosts, "keywords": keywords}
+    return out
+
+
+def sri_report(entry_url, text, headers, resources):
+    origin = urllib.parse.urlsplit(entry_url).netloc.lower()
+    rows = []
+    for res in resources:
+        absolute = urllib.parse.urljoin(entry_url, res["src"])
+        host = urllib.parse.urlsplit(absolute).netloc.lower()
+        external = bool(host) and host != origin
+        executes = res["tag"] == "script" or "modulepreload" in res["rel"] or \
+            (res["as"] or "") == "script"
+        rows.append({"url": absolute, "host": host or origin, "etld1": etld1(host or origin),
+                     "tag": res["tag"], "rel": res["rel"], "external": external,
+                     "executes_script": executes,
+                     "integrity": res["integrity"] or None,
+                     "crossorigin": res["crossorigin"] or None})
+    parser = Tags()
+    try:
+        parser.feed(text)
+    except Exception:
+        pass
+    csp = headers.get("content-security-policy") or parser.csp_meta or ""
+    trusted = csp_script_hosts(csp)
+    ext_exec = [r for r in rows if r["external"] and r["executes_script"]]
+    covered = [r for r in ext_exec if r["integrity"]]
+    loaded_hosts = {r["host"] for r in rows if r["external"]}
+    csp_hosts = {h for d in trusted.values() for h in d["hosts"]}
+    findings = []
+    for r in ext_exec:
+        if not r["integrity"]:
+            findings.append({
+                "severity": "low",
+                "what": f"{r['url']} executes script from {r['host']} with no integrity "
+                        f"attribute",
+                "why_not_more": "missing SRI on a CDN the target contracts with is a "
+                                "hardening note. It is a candidate only if that eTLD+1 is "
+                                "takeover-able or the path is user-writable — see "
+                                "knowledge/web/client-side-supply-chain.md",
+                "writable_host": bool(WRITABLE_HOSTS.search(r["host"]))})
+        elif not r["crossorigin"]:
+            findings.append({"severity": "info",
+                             "what": f"{r['url']} has integrity but no crossorigin "
+                                     f"attribute, so the check is skipped by the browser",
+                             "why_not_more": "SRI requires CORS for a cross-origin "
+                                             "request; without it the attribute is inert",
+                             "writable_host": False})
+    for host in sorted(csp_hosts):
+        if WRITABLE_HOSTS.search(host) or host.startswith("*"):
+            findings.append({
+                "severity": "info",
+                "what": f"CSP trusts {host} for script",
+                "why_not_more": "a broadly writable or wildcard script source. Proof "
+                                "needs a demonstrated writable path on that host, on an "
+                                "account you own",
+                "writable_host": True})
+    return {"entry": entry_url, "origin": origin, "resources": rows,
+            "csp": {"present": bool(csp), "source": "header" if headers.get(
+                "content-security-policy") else ("meta" if parser.csp_meta else None),
+                "directives": trusted},
+            "coverage": {"external_script_resources": len(ext_exec),
+                         "with_integrity": len(covered),
+                         "without_integrity": len(ext_exec) - len(covered),
+                         "ratio": round(len(covered) / len(ext_exec), 3) if ext_exec else None},
+            "trusted_hosts": sorted(csp_hosts),
+            "loaded_external_hosts": sorted(loaded_hosts),
+            "trusted_but_not_loaded": sorted(csp_hosts - loaded_hosts),
+            "loaded_but_not_in_csp": sorted(loaded_hosts - csp_hosts) if csp_hosts else [],
+            "findings": findings,
+            "etld1_caveat": "the eTLD+1 column is the last two labels, not a public-suffix "
+                            "lookup; it groups hosts and proves nothing"}
+
+
+# -------------------------------------------------------------------- inventory
+
+def build_inventory(a):
+    fetch = Fetcher(timeout=a.timeout, insecure=a.insecure)
+    hashes = {}
+    if getattr(a, "hashes", None):
+        hashes = json.loads(Path(a.hashes).read_text(encoding="utf-8"))
+    rid, headers, text, base = read_entry(a.target, fetch)
+    parser = Tags()
+    try:
+        parser.feed(text)
+    except Exception:
+        pass
+    components, notes, externals = [], [], []
+    components += scan_banners(text, rid, base)
+    if headers:
+        components += from_headers(headers, rid, base)
+
+    same_origin_assets, origin = [], urllib.parse.urlsplit(base).netloc.lower()
+    for res in parser.resources:
+        absolute = urllib.parse.urljoin(base, res["src"])
+        host = urllib.parse.urlsplit(absolute).netloc.lower()
+        if host and host != origin:
+            externals.append({"url": absolute, "host": host, "etld1": etld1(host),
+                              "integrity": res["integrity"] or None,
+                              "tag": res["tag"], "fetched": False})
+            components += scan_filename(absolute, rid)
+            if host and ("font" in absolute or "fonts." in host):
+                components += [component(host, None, "name-only",
+                                         f"font from {host}", rid, absolute, "client",
+                                         ctype="file",
+                                         note="a webfont origin: another host the page "
+                                              "trusts, with no version to read")]
+            if a.fetch_external and in_scope(absolute):
+                same_origin_assets.append(absolute)
+                externals[-1]["fetched"] = True
+            continue
+        if res["tag"] in ("script", "link"):
+            same_origin_assets.append(absolute)
+
+    seen = set()
+    for url in same_origin_assets[:a.max_assets]:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            arid, status, ahdrs, raw = fetch.get(url)
+        except OutOfScope:
+            notes.append(f"{url}: refused, scope.yaml does not authorize that host")
+            continue
+        if arid is None or not raw:
+            continue
+        ctype = ahdrs.get("content-type", "").split(";")[0]
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest in hashes:
+            name, _, version = str(hashes[digest]).partition("@")
+            components.append(component(name, version or None, "hash",
+                                        f"sha256 {digest[:16]}… = {hashes[digest]}",
+                                        arid, url, "client"))
+        components += scan_filename(url, arid)
+        if ctype == "application/wasm" or url.endswith(".wasm") or raw.startswith(b"\x00asm"):
+            components += scan_wasm(raw, arid, url)
+            continue
+        body = raw.decode("utf-8", "replace")
+        components += scan_banners(body, arid, url)
+        if ctype.endswith("javascript") or url.endswith((".js", ".mjs")):
+            components += scan_runtime(body, arid, url)
+            components += scan_module_paths(body, arid, url)
+            m = SOURCEMAP_COMMENT.search(body)
+            if m and not m.group(1).startswith("data:"):
+                map_url = urllib.parse.urljoin(url, m.group(1))
+                try:
+                    mrid, mstatus, _, mraw = fetch.get(map_url)
+                except OutOfScope:
+                    notes.append(f"{map_url}: refused, out of scope")
+                    mrid = None
+                if mrid and mstatus == 200:
+                    try:
+                        components += scan_sourcemap(
+                            json.loads(mraw.decode("utf-8", "replace")), mrid, map_url)
+                    except ValueError:
+                        notes.append(f"{map_url}: not JSON, skipped")
+
+    if getattr(a, "from_probe", None):
+        probe_components, probe_notes = from_probe(a.from_probe)
+        components += probe_components
+        notes += probe_notes
+
+    components = dedupe(components)
+    if not components:
+        notes.append("no component marker found: either the target serves no identifiable "
+                     "third-party code, or it is bundled past every marker this script "
+                     "reads. Both are results; neither is an empty dependency list.")
+    sri = sri_report(base, text, headers, parser.resources)
+    return {"schema": SCHEMA, "tool": "mythos-sbom/1.0", "generated_at": now_iso(),
+            "target": base, "requests": fetch.requests, "components": components,
+            "externals": externals, "sri": sri, "notes": notes,
+            "disclaimer": DISCLAIMER}
+
+
+DISCLAIMER = (
+    "Every version here is a candidate, never confirmed. A client-side version comes "
+    "from a marker a backport does not update and a bundler may mangle, and a server "
+    "banner is whatever the operator set it to. Resolve a row with the live check "
+    "`sbom cves` prints for it before any of it reaches a report.")
+
+
+# ------------------------------------------------------------------- CycloneDX
+
+def cyclonedx(inv, serial=None):
+    """CycloneDX 1.6. The required fields are bomFormat, specVersion, version, and
+    per component `type` and `name`; everything else here is there to make a row
+    traceable. Evidence uses the spec's own `evidence.identity[]` with a
+    `methods[].technique` from its enum, and the request id rides in both the
+    method value and a `mythos:evidence:request` property."""
+    digest = hashlib.sha256((inv.get("target", "") + inv.get("generated_at", ""))
+                            .encode()).hexdigest()
+    uuid = serial or (f"urn:uuid:{digest[0:8]}-{digest[8:12]}-4{digest[13:16]}-"
+                      f"a{digest[17:20]}-{digest[20:32]}")
+    props = [{"name": f"mythos:request:{r['id']}",
+              "value": f"{r['method']} {r['url']} -> {r.get('status')} "
+                       f"sha256:{r.get('sha256', '')[:16]}"}
+             for r in inv.get("requests") or []]
+    # Rows that came from a probe document carry its request label instead.
+    for c in inv.get("components") or []:
+        rid = c["evidence"]["request"]
+        if rid.startswith("probe:") and not any(p["name"].endswith(rid) for p in props):
+            props.append({"name": f"mythos:request:{rid}",
+                          "value": f"RECORDED-BY-PROBE {c['evidence']['url']}"})
+    components = []
+    for c in inv.get("components") or []:
+        identity = [{
+            "field": "version" if c["version"] else "name",
+            "confidence": c["confidence_score"],
+            "concludedValue": c["version"] or c["name"],
+            "methods": [{"technique": c["technique"], "confidence": c["confidence_score"],
+                         "value": f"{c['marker']} [{c['evidence']['request']}]"}]
+            + [{"technique": CONFIDENCE[s["marker_kind"]][2],
+                "confidence": CONFIDENCE[s["marker_kind"]][1],
+                "value": f"{s['marker']} [{s['request']}]"}
+               for s in c.get("also_seen") or []],
+        }]
+        entry = {"type": c["type"], "bom-ref": f"{c['purl']}#{c['layer']}",
+                 "name": c["name"], "scope": "required",
+                 "purl": c["purl"],
+                 "evidence": {"identity": identity},
+                 "properties": [
+                     {"name": "mythos:evidence:request", "value": c["evidence"]["request"]},
+                     {"name": "mythos:evidence:url", "value": c["evidence"]["url"]},
+                     {"name": "mythos:marker", "value": c["marker_kind"]},
+                     {"name": "mythos:confidence", "value": c["confidence"]},
+                     {"name": "mythos:layer", "value": c["layer"]},
+                     {"name": "mythos:caveat", "value": c["caveat"]},
+                     {"name": "mythos:status", "value": "candidate"}]}
+        if c["version"]:
+            entry["version"] = c["version"]
+        if c.get("note"):
+            entry["properties"].append({"name": "mythos:note", "value": c["note"]})
+        components.append(entry)
+    return {"$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+            "bomFormat": "CycloneDX", "specVersion": SPEC_VERSION,
+            "serialNumber": uuid, "version": 1,
+            "metadata": {
+                "timestamp": inv.get("generated_at") or now_iso(),
+                "tools": {"components": [{"type": "application", "name": "mythos-sbom",
+                                          "version": "1.0"}]},
+                "component": {"type": "application", "name": inv.get("target") or "target",
+                              "bom-ref": "target"},
+                "properties": props + [
+                    {"name": "mythos:disclaimer", "value": inv.get("disclaimer", DISCLAIMER)}]},
+            "components": components}
+
+
+UUID_RE = re.compile(r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}"
+                     r"-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+
+def validate_cyclonedx(doc):
+    """The 1.6 schema's required fields and enums, plus the one invariant this
+    tool adds: every component's evidence names a request the document declares.
+
+    A malformed document must fail here, which is what the selftest breaks on
+    purpose to check.
+    """
+    errs = []
+    if not isinstance(doc, dict):
+        return ["not a JSON object"]
+    if doc.get("bomFormat") != "CycloneDX":
+        errs.append("bomFormat must be the literal 'CycloneDX' (required)")
+    if doc.get("specVersion") not in ("1.6",):
+        errs.append(f"specVersion must be '1.6', got {doc.get('specVersion')!r} (required)")
+    version = doc.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        errs.append(f"version must be an integer >= 1, got {version!r} (required)")
+    serial = doc.get("serialNumber")
+    if serial is not None and not UUID_RE.match(str(serial)):
+        errs.append(f"serialNumber must match urn:uuid:..., got {serial!r}")
+    meta = doc.get("metadata") or {}
+    declared = {p.get("name", "").split("mythos:request:")[-1]
+                for p in (meta.get("properties") or [])
+                if str(p.get("name", "")).startswith("mythos:request:")}
+    comps = doc.get("components")
+    if comps is not None and not isinstance(comps, list):
+        errs.append("components must be an array")
+        comps = []
+    for i, c in enumerate(comps or []):
+        at = f"components[{i}]"
+        if not isinstance(c, dict):
+            errs.append(f"{at}: not an object")
+            continue
+        if c.get("type") not in COMPONENT_TYPES:
+            errs.append(f"{at}.type must be one of the 1.6 enum, got {c.get('type')!r} "
+                        f"(required)")
+        if not isinstance(c.get("name"), str) or not c["name"].strip():
+            errs.append(f"{at}.name is required and must be a non-empty string")
+        if "version" in c and not isinstance(c["version"], str):
+            errs.append(f"{at}.version must be a string")
+        if "purl" in c and not str(c["purl"]).startswith("pkg:"):
+            errs.append(f"{at}.purl must be a package URL, got {c['purl']!r}")
+        for j, ident in enumerate((c.get("evidence") or {}).get("identity") or []):
+            iat = f"{at}.evidence.identity[{j}]"
+            if ident.get("field") not in IDENTITY_FIELDS:
+                errs.append(f"{iat}.field must be one of {sorted(IDENTITY_FIELDS)}, "
+                            f"got {ident.get('field')!r}")
+            conf = ident.get("confidence")
+            if conf is not None and not (isinstance(conf, (int, float))
+                                         and 0.0 <= conf <= 1.0):
+                errs.append(f"{iat}.confidence must be between 0 and 1, got {conf!r}")
+            for k, meth in enumerate(ident.get("methods") or []):
+                if meth.get("technique") not in TECHNIQUES:
+                    errs.append(f"{iat}.methods[{k}].technique must be a 1.6 technique, "
+                                f"got {meth.get('technique')!r}")
+        rid = next((p.get("value") for p in c.get("properties") or []
+                    if p.get("name") == "mythos:evidence:request"), None)
+        if rid is None:
+            errs.append(f"{at}: no mythos:evidence:request property, so the row is not "
+                        f"traceable to a request")
+        elif declared and rid not in declared:
+            errs.append(f"{at}: evidence names {rid}, which the document does not declare")
+    return errs
+
+
+SPDX_LICENSE = "NOASSERTION"
+
+
+def spdx_tag_value(inv):
+    """SPDX 2.3 tag-value. Optional output, for a pipeline that wants it."""
+    lines = ["SPDXVersion: SPDX-2.3", "DataLicense: CC0-1.0",
+             "SPDXID: SPDXRef-DOCUMENT",
+             f"DocumentName: mythos-sbom-{urllib.parse.urlsplit(inv.get('target', '')).netloc or 'target'}",
+             f"DocumentNamespace: https://mythos.invalid/sbom/"
+             f"{hashlib.sha256((inv.get('target', '') + inv.get('generated_at', '')).encode()).hexdigest()[:32]}",
+             f"Creator: Tool: mythos-sbom-1.0",
+             f"Created: {inv.get('generated_at') or now_iso()}",
+             f"DocumentComment: <text>{DISCLAIMER}</text>", ""]
+    for i, c in enumerate(inv.get("components") or [], 1):
+        ref = f"SPDXRef-Package-{i}"
+        lines += [f"PackageName: {c['name']}", f"SPDXID: {ref}",
+                  f"PackageVersion: {c['version'] or 'NOASSERTION'}",
+                  f"PackageDownloadLocation: NOASSERTION",
+                  f"FilesAnalyzed: false",
+                  f"PackageLicenseConcluded: {SPDX_LICENSE}",
+                  f"PackageLicenseDeclared: {SPDX_LICENSE}",
+                  f"PackageCopyrightText: NOASSERTION",
+                  f"ExternalRef: PACKAGE-MANAGER purl {c['purl']}",
+                  f"PackageComment: <text>confidence={c['confidence']} "
+                  f"({c['confidence_score']}) marker={c['marker_kind']} "
+                  f"evidence={c['evidence']['request']} {c['evidence']['url']} "
+                  f"caveat={c['caveat']}</text>",
+                  f"Relationship: SPDXRef-DOCUMENT DESCRIBES {ref}", ""]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------- CVE hand-off
+
+RESOLVE = {
+    "client": "re-GET {url} and read the marker again, then run the behavioural check "
+              "from the advisory in the `browser` tool: call the API the fix changed and "
+              "observe the patched behaviour. The banner alone resolves nothing — a "
+              "backport leaves it stale and a bundler may have inlined a patched copy.",
+    "server": "the banner is operator-settable, so confirm with a behaviour the fix "
+              "changed: `scripts/mythos nuclei -id {cve} -u {target}` when the row carries "
+              "a template, otherwise the advisory's own request/response pair, sent once, "
+              "non-destructively.",
+}
+
+
+def cvefeed_argv(components, extra=()):
+    """The argv for the hand-off. Nothing about the target is in it.
+
+    Only `name@version` pairs and a confidence split: a hash match is the one
+    marker that earns `--fingerprint` (cvefeed's 'exact'), everything else is a
+    `--banner` guess, and a component with no version is `--product`. The
+    target's host, the URLs, the request ids and the engagement directory stay
+    here; `selftest` asserts that over this list.
+    """
+    argv = [sys.executable, str(ROOT / "scripts" / "cvefeed"), "match", "--json"]
+    for c in components:
+        if not c["version"]:
+            argv += ["--product", c["name"]]
+        elif c["marker_kind"] == "hash":
+            argv += ["--fingerprint", f"{c['name']}@{c['version']}"]
+        else:
+            argv += ["--banner", f"{c['name']}@{c['version']}"]
+    return argv + list(extra)
+
+
+def run_cves(inv, a):
+    components = [c for c in inv.get("components") or []
+                  if c["confidence_score"] >= a.min_confidence]
+    if not components:
+        return {"candidates": [], "feed": {"status": "not run: no component passed "
+                                           f"--min-confidence {a.min_confidence}"},
+                "asked": [], "disclaimer": DISCLAIMER}
+    extra = [] if a.allow_feeds else ["--offline"]
+    if a.cve_cache:
+        extra += ["--cache", a.cve_cache]
+    extra += ["--limit", str(a.limit)]
+    argv = cvefeed_argv(components, extra)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=a.feed_timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"candidates": [], "asked": [c["purl"] for c in components],
+                "feed": {"status": f"failed: {type(e).__name__}: {e}"},
+                "disclaimer": DISCLAIMER}
+    if proc.returncode != 0:
+        return {"candidates": [], "asked": [c["purl"] for c in components],
+                "feed": {"status": f"cvefeed exited {proc.returncode}",
+                         "stderr": proc.stderr.strip()[:400],
+                         "hint": "with no cache and no network there is no CVE data: run "
+                                 "`scripts/cvefeed refresh` once with --allow-feeds, or "
+                                 "commit knowledge/cve/snapshot.json"},
+                "disclaimer": DISCLAIMER}
+    try:
+        feed = json.loads(proc.stdout)
+    except ValueError as e:
+        return {"candidates": [], "asked": [c["purl"] for c in components],
+                "feed": {"status": f"cvefeed output unreadable: {e}"},
+                "disclaimer": DISCLAIMER}
+    by_name: dict[str, dict] = {}
+    for c in components:
+        by_name.setdefault(c["name"], c)
+    target = inv.get("target") or "<target>"
+    out = []
+    for cand in feed.get("candidates") or []:
+        comp = by_name.get(cand.get("product"))
+        layer = comp["layer"] if comp else "server"
+        out.append({
+            "cve": cand.get("id"), "product": cand.get("product"),
+            "version": cand.get("version"), "purl": comp["purl"] if comp else None,
+            "state": "candidate",
+            "kev": cand.get("kev"), "epss": cand.get("epss"), "cvss": cand.get("cvss"),
+            "nuclei_template": cand.get("nuclei_template"),
+            "feed_match_confidence": cand.get("match_confidence"),
+            "inventory_confidence": comp["confidence"] if comp else None,
+            "inventory_marker": comp["marker_kind"] if comp else None,
+            "evidence_request": comp["evidence"]["request"] if comp else None,
+            "why": cand.get("why"),
+            "resolve": RESOLVE[layer].format(
+                url=comp["evidence"]["url"] if comp else target,
+                cve=(cand.get("id") or "").lower(), target=target),
+            "weakest_link": (
+                f"the inventory row is {comp['confidence']} "
+                f"({comp['marker_kind']}: {comp['caveat']})" if comp else
+                "no inventory row backs this product name"),
+        })
+    return {"asked": [{"purl": c["purl"], "sent_as":
+                       ("--product" if not c["version"] else
+                        "--fingerprint" if c["marker_kind"] == "hash" else "--banner"),
+                       "value": f"{c['name']}" + (f"@{c['version']}" if c["version"] else "")}
+                      for c in components],
+            "feed": {"status": "ok", "network": bool(a.allow_feeds),
+                     "data": feed.get("data", {}).get("origin"),
+                     "age": feed.get("data", {}).get("age"),
+                     "stale": feed.get("data", {}).get("stale"),
+                     "sent_to_feeds": "name@version pairs only; no target identity"},
+            "candidates": out,
+            "excluded_by_version": feed.get("excluded_by_version", [])[:20],
+            "disclaimer": DISCLAIMER}
+
+
+# ------------------------------------------------------------------------ diff
+
+def normalise(doc):
+    """{key: row} out of either an inventory or a CycloneDX document."""
+    rows = {}
+    if doc.get("bomFormat") == "CycloneDX":
+        for c in doc.get("components") or []:
+            props = {p.get("name"): p.get("value") for p in c.get("properties") or []}
+            key = c.get("purl") or c.get("name")
+            rows[key.split("@")[0] + "|" + props.get("mythos:layer", "?")] = {
+                "name": c.get("name"), "version": c.get("version"),
+                "layer": props.get("mythos:layer", "?"),
+                "confidence": props.get("mythos:confidence"),
+                "marker": props.get("mythos:marker"),
+                "evidence": props.get("mythos:evidence:request")}
+        return rows
+    for c in doc.get("components") or []:
+        rows[c["purl"].split("@")[0] + "|" + c["layer"]] = {
+            "name": c["name"], "version": c["version"], "layer": c["layer"],
+            "confidence": c["confidence"], "marker": c["marker_kind"],
+            "evidence": c["evidence"]["request"]}
+    return rows
+
+
+def diff_sboms(a_doc, b_doc):
+    a_rows, b_rows = normalise(a_doc), normalise(b_doc)
+    added = [b_rows[k] for k in sorted(set(b_rows) - set(a_rows))]
+    removed = [a_rows[k] for k in sorted(set(a_rows) - set(b_rows))]
+    changed, same = [], 0
+    for k in sorted(set(a_rows) & set(b_rows)):
+        old, new = a_rows[k], b_rows[k]
+        if old["version"] != new["version"]:
+            changed.append({"name": new["name"], "layer": new["layer"],
+                            "from": old["version"], "to": new["version"],
+                            "kind": "version",
+                            "confidence": f"{old['confidence']} -> {new['confidence']}"})
+        elif old["confidence"] != new["confidence"] or old["marker"] != new["marker"]:
+            changed.append({"name": new["name"], "layer": new["layer"],
+                            "from": f"{old['confidence']}/{old['marker']}",
+                            "to": f"{new['confidence']}/{new['marker']}",
+                            "kind": "evidence"})
+        else:
+            same += 1
+    sri_a = (a_doc.get("sri") or {}).get("coverage") or {}
+    sri_b = (b_doc.get("sri") or {}).get("coverage") or {}
+    return {"added": added, "removed": removed, "changed": changed, "unchanged": same,
+            "sri": {"before": sri_a, "after": sri_b,
+                    "worse": bool(sri_a and sri_b
+                                  and (sri_b.get("without_integrity") or 0)
+                                  > (sri_a.get("without_integrity") or 0))},
+            "retest": [f"{c['name']} {c['from']} -> {c['to']}" for c in changed
+                       if c["kind"] == "version"]
+                      + [f"{c['name']} (new)" for c in added],
+            "note": "a component that only changed confidence changed how well it is "
+                    "known, not necessarily what is deployed"}
+
+
+# -------------------------------------------------------------------- rendering
+
+def render_inventory(inv):
+    out = [f"# component inventory of {inv['target']}", "",
+           f"{len(inv['components'])} component(s) from "
+           f"{len(inv['requests'])} request(s); every row names the request that proved it",
+           ""]
+    for layer in ("client", "server"):
+        rows = [c for c in inv["components"] if c["layer"] == layer]
+        if not rows:
+            continue
+        out.append(f"## {layer}-side ({len(rows)})")
+        for c in rows:
+            out.append(f"- {c['name']}@{c['version'] or '?'}  [{c['confidence']} "
+                       f"{c['confidence_score']}]  {c['purl']}")
+            out.append(f"  marker:   {c['marker_kind']} — {c['marker']}")
+            out.append(f"  evidence: {c['evidence']['request']} {c['evidence']['url']}")
+            out.append(f"  caveat:   {c['caveat']}")
+            for also in c.get("also_seen") or []:
+                out.append(f"  also:     {also['marker_kind']} — {also['marker']} "
+                           f"[{also['request']}]")
+            if c.get("note"):
+                out.append(f"  note:     {c['note']}")
+        out.append("")
+    cov = inv["sri"]["coverage"]
+    out += [f"## SRI coverage",
+            f"{cov['with_integrity']}/{cov['external_script_resources']} external script "
+            f"resources carry an integrity attribute "
+            f"(ratio {cov['ratio'] if cov['ratio'] is not None else 'n/a'})",
+            f"hosts the CSP trusts for script: "
+            f"{', '.join(inv['sri']['trusted_hosts']) or '(no CSP script source)'}", ""]
+    if inv["externals"]:
+        out.append("## external resources")
+        for e in inv["externals"]:
+            out.append(f"- {e['url']}  integrity={e['integrity'] or 'NONE'}  "
+                       f"host={e['host']}  fetched={e['fetched']}")
+        out.append("")
+    out.append("## requests")
+    for r in inv["requests"]:
+        out.append(f"- {r['id']}  {r['method']} {r['url']} -> {r.get('status')} "
+                   f"{r.get('bytes', 0)}B sha256:{r.get('sha256', '')[:16]}")
+    if inv["notes"]:
+        out += ["", "## notes"] + [f"- {n}" for n in inv["notes"]]
+    out += ["", DISCLAIMER]
+    return "\n".join(out)
+
+
+def render_cves(res):
+    out = ["# CVE candidates from the inventory", "",
+           f"feed: {res['feed'].get('status')}  data: {res['feed'].get('data')} "
+           f"({res['feed'].get('age')})"
+           + ("  ** STALE **" if res["feed"].get("stale") else ""),
+           f"sent to the feeds: {res['feed'].get('sent_to_feeds', 'n/a')}", ""]
+    for n, c in enumerate(res["candidates"], 1):
+        out.append(f"{n}. {c['cve']}  [{c['product']}@{c['version'] or '?'}]  "
+                   f"state={c['state']}  kev={c['kev']}  epss={c['epss']}")
+        out.append(f"   inventory: {c['inventory_confidence']} "
+                   f"({c['inventory_marker']}) via {c['evidence_request']}")
+        out.append(f"   weakest link: {c['weakest_link']}")
+        out.append(f"   resolve: {c['resolve']}")
+        out.append("")
+    if not res["candidates"]:
+        out.append("no candidate rows. That is the data saying nothing matched, not that "
+                   "the target is clean.")
+        out.append("")
+    out.append(DISCLAIMER)
+    return "\n".join(out)
+
+
+def render_sri(rep):
+    cov = rep["coverage"]
+    out = [f"# SRI coverage and CDN trust for {rep['entry']}", "",
+           f"external script resources: {cov['external_script_resources']}, "
+           f"with integrity: {cov['with_integrity']}, without: "
+           f"{cov['without_integrity']}",
+           f"CSP: {'present via ' + str(rep['csp']['source']) if rep['csp']['present'] else 'absent'}",
+           ""]
+    out.append("## resources")
+    for r in rep["resources"]:
+        out.append(f"- [{'ext' if r['external'] else 'own'}] {r['url']}")
+        out.append(f"  tag={r['tag']} rel={r['rel'] or '-'} executes_script="
+                   f"{r['executes_script']} integrity={r['integrity'] or 'NONE'} "
+                   f"crossorigin={r['crossorigin'] or 'NONE'}")
+    out += ["", "## hosts"]
+    out.append(f"trusted by CSP: {', '.join(rep['trusted_hosts']) or '(none)'}")
+    out.append(f"actually loaded: {', '.join(rep['loaded_external_hosts']) or '(none)'}")
+    out.append(f"trusted but not loaded: {', '.join(rep['trusted_but_not_loaded']) or '(none)'}")
+    out.append(f"loaded but not in the CSP: "
+               f"{', '.join(rep['loaded_but_not_in_csp']) or '(none)'}")
+    if rep["findings"]:
+        out += ["", "## findings"]
+        for f in rep["findings"]:
+            out.append(f"- [{f['severity']}] {f['what']}")
+            out.append(f"  {f['why_not_more']}")
+    out += ["", rep["etld1_caveat"]]
+    return "\n".join(out)
+
+
+def render_diff(d):
+    out = ["# SBOM diff", "",
+           f"added {len(d['added'])}, removed {len(d['removed'])}, "
+           f"changed {len(d['changed'])}, unchanged {d['unchanged']}", ""]
+    for row in d["added"]:
+        out.append(f"+ {row['name']}@{row['version'] or '?'} ({row['layer']}, "
+                   f"{row['confidence']})")
+    for row in d["removed"]:
+        out.append(f"- {row['name']}@{row['version'] or '?'} ({row['layer']})")
+    for c in d["changed"]:
+        out.append(f"~ {c['name']} ({c['layer']}) {c['kind']}: {c['from']} -> {c['to']}")
+    if d["sri"]["before"] or d["sri"]["after"]:
+        out += ["", f"SRI without integrity: {d['sri']['before'].get('without_integrity')} "
+                    f"-> {d['sri']['after'].get('without_integrity')}"
+                    + ("  WORSE" if d["sri"]["worse"] else "")]
+    if d["retest"]:
+        out += ["", "## worth re-testing"] + [f"- {r}" for r in d["retest"]]
+    out += ["", d["note"]]
+    return "\n".join(out)
+
+
+# -------------------------------------------------------------------- selftest
+
+def _selftest():
+    """Marker asserts, CycloneDX validation (including a deliberately malformed
+    document), the feed argv's privacy invariant, and one live round trip against
+    a loopback server this function starts itself.
+
+    The live assert exists because every offline assert here would pass on a
+    script that never sends a byte: the HTML parse, the asset walk, the source
+    map follow and the request-id bookkeeping only happen on a real response.
+    """
+    import http.server
+    import json as _json
+    import socketserver
+    import tempfile
+    import threading
+
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    # ---- markers
+    banners = scan_banners("/*! jQuery v1.12.4 | (c) jQuery Foundation */\n"
+                           "/*! AngularJS v1.5.8 (c) 2010 Google */\n"
+                           " * Copyright 2011-2016 Twitter, Inc.\n", "req-1", "u")
+    got = {(c["name"], c["version"]) for c in banners}
+    ok(("jquery", "1.12.4") in got, "a jQuery banner yields the version")
+    ok(("angular", "1.5.8") in got,
+       "an AngularJS banner yields the version, under the package's own name")
+    ok(not any(c["name"] == "copyright" for c in banners),
+       "a copyright line is not read as a package name")
+    eq(banners[0]["confidence"], "moderate", "a banner is moderate, never strong")
+    eq(banners[0]["purl"], "pkg:npm/jquery@1.12.4", "the purl uses the npm package name")
+    ng = [c for c in banners if c["name"] == "angular"][0]
+    eq(ng["purl"], "pkg:npm/angular@1.5.8", "an alias maps to the real package name")
+    eq(ng["alias"], "angularjs", "and the alias the target actually printed is kept")
+    runtime_alias = scan_runtime('jQuery.fn=jQuery.prototype={jquery:"1.12.4"};',
+                                 "req-0", "u")
+    eq([(c["name"], c["version"]) for c in runtime_alias], [("jquery", "1.12.4")],
+       "a name after a dot is a property: jQuery.prototype is not Prototype.js")
+
+    runtime = scan_runtime('var angular={version:{full:"1.5.8"}};'
+                           'jQuery.fn={jquery:"1.12.4"};var x={version:"9.9.9"};',
+                           "req-2", "u")
+    pairs = {(c["name"], c["version"]) for c in runtime}
+    ok(("angular", "1.5.8") in pairs, "a runtime version is attributed to the library")
+    ok(("jquery", "1.12.4") in pairs, "the jquery property form is read")
+    ok(not any(v == "9.9.9" for _, v in pairs),
+       "an assignment with no catalogued name nearby is dropped, not guessed")
+
+    mods = scan_module_paths('__webpack_require__("./node_modules/moment/moment.js");'
+                             'r("./node_modules/@scope/pkg/index.js")', "req-3", "u")
+    names = {c["name"] for c in mods}
+    ok("moment" in names and "@scope/pkg" in names, "scoped and plain module paths")
+    eq([c for c in mods if c["name"] == "moment"][0]["confidence"], "weak",
+       "a module path is weak: it names the package and not the version")
+
+    smap = scan_sourcemap({
+        "sources": ["webpack:///./node_modules/moment/package.json",
+                    "webpack:///./node_modules/jquery/dist/jquery.js"],
+        "sourcesContent": ['{"name":"moment","version":"2.18.1"}', "/*! jQuery */"]},
+        "req-4", "u")
+    manifest = [c for c in smap if c["marker_kind"] == "sourcemap-manifest"]
+    eq([(c["name"], c["version"]) for c in manifest], [("moment", "2.18.1")],
+       "a package.json in sourcesContent gives name and version")
+    eq(manifest[0]["confidence_score"], 0.6,
+       "a manifest beats a banner and still is not strong")
+    ok(any(c["name"] == "jquery" and c["version"] is None for c in smap),
+       "a node_modules source path alone is a name-only row")
+
+    fn = scan_filename("https://cdn.test/npm/bootstrap@3.3.7/dist/css/bootstrap.min.css",
+                       "req-5")
+    eq([(c["name"], c["version"], c["confidence"]) for c in fn],
+       [("bootstrap", "3.3.7", "weak")], "a version in a URL is weak evidence")
+
+    wasm = scan_wasm(b"\x00asm\x01\x00\x00\x00" + b"\x00\x10processed-by\x01\x0bemscripten"
+                     b"\x063.1.45", "req-6", "http://t/x.wasm")
+    ok(any(c["name"] == "emscripten" and c["version"] == "3.1.45" for c in wasm),
+       "the wasm producers section names the toolchain and its version")
+    eq(scan_wasm(b"not wasm", "req-6", "http://t/x.wasm"), [],
+       "a file that is not wasm produces nothing")
+
+    hdr = from_headers({"server": "nginx/1.18.0", "x-powered-by": "Express/4.16.0"},
+                       "req-7", "u")
+    eq({(c["name"], c["version"]) for c in hdr},
+       {("nginx", "1.18.0"), ("express", "4.16.0")}, "both header products")
+    eq(hdr[0]["confidence"], "moderate", "a header is moderate: the operator sets it")
+    eq([c["layer"] for c in hdr], ["server", "server"], "header rows are server-side")
+
+    # ---- dedupe keeps the strongest marker and the others as evidence
+    merged = dedupe([component("jquery", "1.12.4", "banner", "b", "req-1", "u", "client"),
+                     component("jquery", "1.12.4", "runtime", "r", "req-2", "u", "client"),
+                     component("jquery", None, "module-path", "m", "req-3", "u", "client")])
+    eq(len(merged), 1, "three readings of one library are one component")
+    eq(len(merged[0]["also_seen"]), 1, "the weaker marker is kept as further evidence")
+    ok(merged[0]["marker_kind"] in ("banner", "runtime"), "the strongest marker wins")
+
+    # ---- CycloneDX 1.6
+    inv = {"schema": SCHEMA, "target": "http://t.test/", "generated_at": now_iso(),
+           "requests": [{"id": f"req-{n}", "method": "GET", "url": "http://t.test/",
+                         "status": 200, "sha256": "ab" * 32, "bytes": 10}
+                        for n in range(1, 8)],
+           "components": merged + hdr, "externals": [], "notes": [],
+           "sri": {"coverage": {}}, "disclaimer": DISCLAIMER}
+    bom = cyclonedx(inv)
+    eq(validate_cyclonedx(bom), [], "the emitted document validates")
+    eq(bom["bomFormat"], "CycloneDX", "bomFormat is the literal")
+    eq(bom["specVersion"], "1.6", "specVersion is 1.6")
+    ok(UUID_RE.match(bom["serialNumber"]), "the serial number is a urn:uuid")
+    ok(all("type" in c and "name" in c for c in bom["components"]),
+       "every component carries the two required fields")
+    first = bom["components"][0]
+    ident = first["evidence"]["identity"][0]
+    ok(ident["technique"] if False else ident["methods"][0]["technique"] in TECHNIQUES,
+       "the evidence technique is a 1.6 enum value")
+    ok("req-" in ident["methods"][0]["value"], "the identity method names the request id")
+    eq(next(p["value"] for p in first["properties"]
+            if p["name"] == "mythos:status"), "candidate",
+       "every component is marked candidate, never confirmed")
+    ok(_json.loads(_json.dumps(bom)), "the document round-trips as JSON")
+
+    # A malformed document must fail. If this validator shrugs, the whole
+    # CycloneDX claim is worthless, so break one required field at a time.
+    for mutate, why in (
+            (lambda d: d.update(bomFormat="cyclonedx"), "a wrong bomFormat"),
+            (lambda d: d.update(specVersion="1.5"), "a wrong specVersion"),
+            (lambda d: d.update(version="1"), "a string version"),
+            (lambda d: d.update(version=0), "version 0"),
+            (lambda d: d.update(serialNumber="not-a-uuid"), "a bad serial number"),
+            (lambda d: d["components"][0].pop("type"), "a component with no type"),
+            (lambda d: d["components"][0].update(name=""), "an empty component name"),
+            (lambda d: d["components"][0].update(purl="jquery"), "a purl that is not one"),
+            (lambda d: d["components"][0]["evidence"]["identity"][0].update(field="nope"),
+             "an identity field outside the enum"),
+            (lambda d: d["components"][0]["evidence"]["identity"][0].update(confidence=4),
+             "a confidence above 1"),
+            (lambda d: d["components"][0]["evidence"]["identity"][0]["methods"][0]
+             .update(technique="vibes"), "an invented technique"),
+            (lambda d: d["components"][0].update(properties=[]),
+             "a component with no request id"),
+            (lambda d: d["components"][0]["properties"].__setitem__(
+                0, {"name": "mythos:evidence:request", "value": "req-999"}),
+             "a request id the document does not declare")):
+        broken = _json.loads(_json.dumps(bom))
+        mutate(broken)
+        ok(validate_cyclonedx(broken), f"validation rejects {why}")
+
+    # ---- SPDX
+    spdx = spdx_tag_value(inv)
+    ok(spdx.startswith("SPDXVersion: SPDX-2.3"), "the SPDX output starts with the version")
+    ok("ExternalRef: PACKAGE-MANAGER purl pkg:" in spdx, "each package carries its purl")
+    ok("confidence=" in spdx, "the confidence survives into the SPDX comment")
+
+    # ---- the feed hand-off sends nothing about the target
+    argv = cvefeed_argv(inv["components"], ["--offline"])
+    joined = " ".join(argv)
+    for leak in ("t.test", "http://", "req-1", "engagements", "sha256", "/static/"):
+        ok(leak not in joined.replace(str(ROOT), ""),
+           f"the cvefeed argv leaks {leak!r}: {joined}")
+    ok("--offline" in argv, "the default hand-off is offline")
+    ok("--banner" in argv, "a banner-confidence version is handed over as a banner")
+    hashed = [component("jquery", "1.12.4", "hash", "sha256 …", "req-1", "u", "client")]
+    ok("--fingerprint" in cvefeed_argv(hashed),
+       "only a hash match earns cvefeed's exact confidence")
+    ok("--product" in cvefeed_argv(
+        [component("moment", None, "module-path", "m", "req-1", "u", "client")]),
+       "a version-less row is handed over as a product")
+
+    # ---- diff
+    b_inv = _json.loads(_json.dumps(inv))
+    b_inv["components"] = [dict(c) for c in inv["components"]]
+    b_inv["components"][0] = dict(b_inv["components"][0], version="3.7.1",
+                                 purl="pkg:npm/jquery@3.7.1")
+    b_inv["components"].append(component("axios", "0.21.1", "banner", "b", "req-9", "u",
+                                         "client"))
+    d = diff_sboms(inv, b_inv)
+    eq([c["name"] for c in d["changed"]], ["jquery"], "the version change is reported")
+    eq([c["from"] for c in d["changed"]], ["1.12.4"], "with the old version")
+    eq([r["name"] for r in d["added"]], ["axios"], "the new component is reported")
+    ok(d["retest"], "a changed version lands on the re-test list")
+    ok(diff_sboms(inv, cyclonedx(inv))["unchanged"] == len(inv["components"]),
+       "an inventory and its own CycloneDX document compare as identical")
+
+    # ---- CSP parsing and SRI judgement
+    hosts = csp_script_hosts("default-src 'self'; script-src 'self' cdn.test "
+                             "*.s3.amazonaws.com 'unsafe-inline'")
+    eq(hosts["script-src"]["hosts"], ["cdn.test", "*.s3.amazonaws.com"],
+       "host sources are separated from keywords")
+    eq(hosts["script-src"]["keywords"], ["'self'", "'unsafe-inline'"], "keywords kept")
+
+    # ---- one live round trip, against a server started here
+    class _H(http.server.BaseHTTPRequestHandler):
+        pages = {
+            "/": ("text/html", "<html><head>"
+                  "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src "
+                  "'self' cdn.test *.s3.amazonaws.com\">"
+                  "<link rel=stylesheet href=/v.css></head><body>"
+                  "<script src=/app.js></script>"
+                  "<script src=\"https://cdn.test/a.js\" integrity=\"sha384-x\" "
+                  "crossorigin=anonymous></script>"
+                  "<script src=\"https://tracker.test/t.js\"></script>"
+                  "</body></html>"),
+            "/app.js": ("application/javascript",
+                        "/*! jQuery v1.12.4 | (c) jQuery Foundation */\n"
+                        'var angular={version:{full:"1.5.8"}};\n'
+                        '__webpack_require__("./node_modules/moment/moment.js");\n'
+                        "//# sourceMappingURL=app.js.map\n"),
+            "/app.js.map": ("application/json", _json.dumps({
+                "version": 3, "sources": ["webpack:///./node_modules/moment/package.json"],
+                "sourcesContent": ['{"name":"moment","version":"2.18.1"}']})),
+            "/v.css": ("text/css", "/*! Bootstrap v3.3.7 (http://getbootstrap.com) */"),
+        }
+
+        def do_GET(self):
+            ctype, body = self.pages.get(self.path, ("text/plain", ""))
+            raw = body.encode()
+            self.send_response(200 if body else 404)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Server", "nginx/1.18.0")
+            self.send_header("X-Powered-By", "Express/4.16.0")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *a):
+            pass
+
+    class _S(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with _S(("127.0.0.1", 0), _H) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1},
+                         daemon=True).start()
+        with tempfile.TemporaryDirectory() as td:
+            scope = Path(td) / "scope.yaml"
+            scope.write_text(f"target: http://127.0.0.1:{port}\nin_scope:\n  - 127.0.0.1\n"
+                             f"ports: [{port}]\nrules:\n  rate_limit_rps: 50\n")
+            prev = os.environ.get("MYTHOS_SCOPE")
+            os.environ["MYTHOS_SCOPE"] = str(scope)
+            try:
+                set_rate(50)
+                args = argparse.Namespace(
+                    target=f"http://127.0.0.1:{port}/", timeout=5, insecure=False,
+                    max_assets=10, fetch_external=False, from_probe=None, hashes=None)
+                live = build_inventory(args)
+                found = {(c["name"], c["version"]) for c in live["components"]}
+                ok(("jquery", "1.12.4") in found,
+                   f"the bundle was fetched and read: {sorted(found)}")
+                ok(("angular", "1.5.8") in found, "the runtime assignment was read")
+                ok(("moment", "2.18.1") in found,
+                   "the source map was followed and its package.json read")
+                ok(("bootstrap", "3.3.7") in found, "the stylesheet banner was read")
+                ok(("nginx", "1.18.0") in found, "the server header was read")
+                ok(len(live["requests"]) >= 4,
+                   f"four requests at least: {len(live['requests'])}")
+                ok(all(r.get("status") == 200 for r in live["requests"]),
+                   "every recorded request has a status, not None")
+                ids = {r["id"] for r in live["requests"]}
+                ok(all(c["evidence"]["request"] in ids for c in live["components"]),
+                   "every component's evidence names a request that was really made")
+                jq = next(c for c in live["components"] if c["name"] == "jquery")
+                ok(jq["evidence"]["url"].endswith("/app.js"),
+                   "the evidence URL is the asset the marker was in")
+                eq(live["sri"]["coverage"]["external_script_resources"], 2,
+                   "both cross-origin scripts counted")
+                eq(live["sri"]["coverage"]["with_integrity"], 1, "one of them has SRI")
+                ok(any("tracker.test" in f["what"] for f in live["sri"]["findings"]),
+                   "the script with no integrity is named")
+                ok("*.s3.amazonaws.com" in live["sri"]["trusted_hosts"],
+                   "the CSP's wildcard host is reported as trusted")
+                ok(any("tracker.test" in h for h in live["sri"]["loaded_but_not_in_csp"]),
+                   "a loaded host the CSP never named is reported")
+                ok(not any(e["fetched"] for e in live["externals"]),
+                   "a cross-origin asset is recorded and never fetched")
+                eq(validate_cyclonedx(cyclonedx(live)), [],
+                   "the document built from a live inventory validates too")
+                # the inventory is self-consistent as a diff against itself
+                eq(diff_sboms(live, live)["changed"], [], "an SBOM does not differ from itself")
+            finally:
+                if prev is None:
+                    os.environ.pop("MYTHOS_SCOPE", None)
+                else:
+                    os.environ["MYTHOS_SCOPE"] = prev
+                srv.shutdown()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"sbom selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# ------------------------------------------------------------------------- cli
+
+def load_doc(arg, a):
+    """An inventory from a file, or built live from a URL / @file."""
+    if not arg.startswith(("http://", "https://", "@")):
+        doc = json.loads(Path(arg).read_text(encoding="utf-8"))
+        if doc.get("bomFormat") == "CycloneDX":
+            return doc
+        if doc.get("components") is None:
+            raise SystemExit(f"sbom: {arg} is neither an inventory nor a CycloneDX document")
+        return doc
+    return build_inventory(argparse.Namespace(
+        target=arg, timeout=a.timeout, insecure=a.insecure,
+        max_assets=a.max_assets, fetch_external=getattr(a, "fetch_external", False),
+        from_probe=getattr(a, "from_probe", None), hashes=getattr(a, "hashes", None)))
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="scripts/sbom", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the asserts, including one live loopback round trip")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p, assets=True):
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--timeout", type=float, default=10)
+        p.add_argument("--insecure", action="store_true", help="skip TLS verification")
+        p.add_argument("--rate", type=float, default=None,
+                       help="requests per second; default rules.rate_limit_rps from "
+                            "$MYTHOS_SCOPE, else 5")
+        if assets:
+            p.add_argument("--max-assets", type=int, default=20,
+                           help="same-origin assets to fetch (default 20)")
+            p.add_argument("--fetch-external", action="store_true",
+                           help="also fetch cross-origin assets, and only those the scope "
+                                "file already authorizes. Without it they are recorded "
+                                "from the HTML and never requested.")
+            p.add_argument("--hashes", metavar="FILE",
+                           help="JSON {\"<sha256>\": \"pkg@version\"} of known release "
+                                "hashes. No corpus ships with this script, because an "
+                                "unverified hash table is worse than none; build one from "
+                                "releases you downloaded yourself. A hit here is the only "
+                                "marker rated `strong`.")
+
+    p_inv = sub.add_parser("inventory", help="component inventory with per-row evidence",
+                           description="GET the entry point, then its same-origin scripts, "
+                                       "stylesheets, source maps and wasm, and report every "
+                                       "library marker with the request that proved it.")
+    p_inv.add_argument("target", metavar="url|@file.html")
+    p_inv.add_argument("--from-probe", metavar="surface.json",
+                       help="take the server-side products from `scripts/probe --json` "
+                            "instead of fingerprinting them again")
+    common(p_inv)
+
+    p_cdx = sub.add_parser("cyclonedx", help="emit CycloneDX 1.6 (and SPDX with --spdx)",
+                           description="Emit and validate. Exits 1 if the document fails "
+                                       "the 1.6 required-field checks.")
+    p_cdx.add_argument("target", metavar="url|inventory.json")
+    p_cdx.add_argument("--spdx", action="store_true", help="SPDX 2.3 tag-value instead")
+    p_cdx.add_argument("--out", help="write the document here as well as to stdout")
+    p_cdx.add_argument("--from-probe", metavar="surface.json")
+    common(p_cdx)
+
+    p_cve = sub.add_parser("cves", help="hand the inventory to scripts/cvefeed and rank",
+                           description="Offline by default: cvefeed reads its disk cache "
+                                       "and the committed snapshot. --allow-feeds lets it "
+                                       "refresh from the six third-party hosts named in "
+                                       "this script's --help. Only name@version pairs are "
+                                       "sent; nothing identifying the target.")
+    p_cve.add_argument("target", metavar="url|inventory.json")
+    p_cve.add_argument("--allow-feeds", action="store_true",
+                       help="permit cvefeed to reach the vulnerability databases")
+    p_cve.add_argument("--cve-cache", help="cvefeed cache directory (--cache)")
+    p_cve.add_argument("--min-confidence", type=float, default=0.0,
+                       help="skip components below this confidence score (default 0: ask "
+                            "about everything and let the row's confidence be read)")
+    p_cve.add_argument("--limit", type=int, default=25)
+    p_cve.add_argument("--feed-timeout", type=float, default=300)
+    p_cve.add_argument("--from-probe", metavar="surface.json")
+    common(p_cve)
+
+    p_sri = sub.add_parser("sri", help="SRI coverage and which CDN hosts the page trusts")
+    p_sri.add_argument("target", metavar="url|@file.html")
+    common(p_sri, assets=False)
+
+    p_diff = sub.add_parser("diff", help="what changed between two SBOMs or inventories")
+    p_diff.add_argument("a")
+    p_diff.add_argument("b")
+    p_diff.add_argument("--json", action="store_true")
+
+    sub.add_parser("selftest", help="the asserts, including one live loopback round trip")
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest or a.cmd == "selftest":
+        return _selftest()
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    if a.cmd != "diff":
+        set_rate(a.rate)
+
+    try:
+        if a.cmd == "inventory":
+            inv = build_inventory(a)
+            print(json.dumps(inv, indent=1) if a.json else render_inventory(inv))
+            return 0 if inv["components"] else 1
+
+        if a.cmd == "cyclonedx":
+            inv = load_doc(a.target, a)
+            if inv.get("bomFormat") == "CycloneDX":
+                raise SystemExit("sbom cyclonedx: that is already a CycloneDX document")
+            doc = spdx_tag_value(inv) if a.spdx else cyclonedx(inv)
+            errs = [] if a.spdx else validate_cyclonedx(doc)
+            text = doc if a.spdx else json.dumps(doc, indent=1)
+            if a.out:
+                Path(a.out).write_text(text + "\n", encoding="utf-8")
+            if a.json and not a.spdx:
+                print(json.dumps({"bom": doc, "validation": errs,
+                                  "valid": not errs}, indent=1))
+            else:
+                print(text)
+                if errs:
+                    print("\n".join(["", "## CycloneDX 1.6 validation FAILED"]
+                                    + [f"- {e}" for e in errs]), file=sys.stderr)
+                elif not a.spdx:
+                    print("\n(CycloneDX 1.6 required fields validated)", file=sys.stderr)
+            return 1 if errs else 0
+
+        if a.cmd == "cves":
+            inv = load_doc(a.target, a)
+            if inv.get("bomFormat") == "CycloneDX":
+                raise SystemExit("sbom cves: pass the inventory, not the CycloneDX "
+                                 "document — the inventory carries the marker a row's "
+                                 "confidence is read from")
+            res = run_cves(inv, a)
+            print(json.dumps(res, indent=1) if a.json else render_cves(res))
+            return 0 if res["feed"].get("status") == "ok" else 1
+
+        if a.cmd == "sri":
+            fetch = Fetcher(timeout=a.timeout, insecure=a.insecure)
+            rid, headers, text, base = read_entry(a.target, fetch)
+            parser = Tags()
+            try:
+                parser.feed(text)
+            except Exception:
+                pass
+            rep = sri_report(base, text, headers, parser.resources)
+            rep["requests"] = fetch.requests
+            print(json.dumps(rep, indent=1) if a.json else render_sri(rep))
+            return 0
+
+        if a.cmd == "diff":
+            a_doc = json.loads(Path(a.a).read_text(encoding="utf-8"))
+            b_doc = json.loads(Path(a.b).read_text(encoding="utf-8"))
+            d = diff_sboms(a_doc, b_doc)
+            print(json.dumps(d, indent=1) if a.json else render_diff(d))
+            return 1 if (d["added"] or d["removed"] or d["changed"]) else 0
+    except OutOfScope as e:
+        print(f"sbom: refused, scope.yaml does not authorize {e}. Widening scope is a "
+              f"human action taken in an editor, outside a run.", file=sys.stderr)
+        return 3
+    except (OSError, ValueError) as e:
+        print(f"sbom: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
