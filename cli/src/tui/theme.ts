@@ -11,6 +11,35 @@
  * convention drop every colour, which matters for a run piped into a file or
  * read on a terminal that renders dim text as invisible.
  */
+
+/**
+ * Whether to colour this stream, decided the way the conventions say.
+ *
+ * In precedence order, highest first: `--no-color` on the command line and
+ * `MYTHOS_THEME=mono` (clig.dev, "configuration parameters in order of
+ * precedence": a flag beats the environment); `NO_COLOR` set to anything
+ * non-empty (no-color.org: "not an empty string, regardless of its value");
+ * `FORCE_COLOR` and `CLICOLOR_FORCE`, which say colour even into a pipe —
+ * `FORCE_COLOR=0` and `false` mean the opposite, as Node and chalk read them;
+ * `TERM=dumb` and `CLICOLOR=0`; and finally the stream itself, because
+ * clig.dev's rule is to disable colour "when stdout or stderr is not an
+ * interactive terminal", checked per stream rather than once for the process.
+ *
+ * The env is a parameter so the selftest can decide without touching
+ * process.env, which is shared with whatever else the test run does.
+ */
+export function colourEnabled(
+  stream: { isTTY?: boolean } = process.stdout,
+  env: Record<string, string | undefined> = process.env,
+  argv: string[] = process.argv,
+): boolean {
+  if (argv.includes("--no-color") || (env.MYTHOS_THEME ?? "").toLowerCase() === "mono") return false;
+  if (env.NO_COLOR) return false;
+  const force = env.FORCE_COLOR ?? env.CLICOLOR_FORCE;
+  if (force !== undefined) return force !== "0" && force !== "false";
+  if (env.TERM === "dumb" || env.CLICOLOR === "0") return false;
+  return stream.isTTY === true;
+}
 export interface Theme {
   /** The hydra's steel blue: anything the eye should land on first. */
   accent: string;
@@ -57,10 +86,8 @@ const MONO: Theme = {
   mono: true,
 };
 
-export function theme(): Theme {
-  const want = (process.env.MYTHOS_THEME ?? "").toLowerCase();
-  if (want === "mono" || process.env.NO_COLOR !== undefined) return MONO;
-  return BRAND;
+export function theme(stream: { isTTY?: boolean } = process.stdout): Theme {
+  return colourEnabled(stream) ? BRAND : MONO;
 }
 
 /** A colour prop that disappears in mono, so one component serves both. */
@@ -84,6 +111,9 @@ export interface Glyphs {
   warn: string;
   bullet: string;
   arrow: string;
+  /** The two characters prose needs: a trailing elision and a parenthetical dash. */
+  ellipsis: string;
+  dash: string;
   barFull: string;
   barEmpty: string;
   spinner: string[];
@@ -102,6 +132,8 @@ const UNICODE: Glyphs = {
   warn: "▲",
   bullet: "·",
   arrow: "→",
+  ellipsis: "…",
+  dash: "—",
   barFull: "━",
   barEmpty: "┈",
   spinner: ["◐", "◓", "◑", "◒"],
@@ -120,6 +152,8 @@ const ASCII: Glyphs = {
   warn: "!",
   bullet: ".",
   arrow: "->",
+  ellipsis: "...",
+  dash: "--",
   barFull: "=",
   barEmpty: "-",
   spinner: ["|", "/", "-", "\\"],

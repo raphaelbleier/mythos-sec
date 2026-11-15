@@ -86,11 +86,13 @@ The skills and the per-class playbooks in `knowledge/` cover:
 | Injection | SQL (error, boolean, blind, UNION, and via sqlmap), NoSQL, OS command (reflected and blind over OOB), SSTI through to RCE, XXE, CRLF and response splitting, deserialization |
 | Access control | IDOR and BOLA with two identities, privilege escalation, multi-tenant isolation, mass assignment, broken function-level authorization |
 | Client side | Reflected, stored and DOM XSS proven by execution in a real Chromium, CSRF, clickjacking, WebSocket abuse, client-side supply chain, client-side path traversal |
-| Authentication | JWT forgery, weak signing keys and `alg` confusion, OAuth 2.0 and OIDC flow abuse (`redirect_uri`, `state`, PKCE), SAML and SCIM, session fixation, account-takeover chains |
-| Server side | SSRF with out-of-band confirmation, path traversal and LFI with filter evasion, file upload, request smuggling, web cache poisoning, race conditions, parser differentials, gateway bypass |
+| Authentication | JWT forgery, weak signing keys and `alg` confusion, OAuth 2.0 and OIDC flow abuse (`redirect_uri`, `state`, PKCE, `id_token` audience confusion), SAML signature wrapping and NameID comment truncation, SCIM, federated account linking, session fixation, account-takeover chains |
+| Server side | SSRF with out-of-band confirmation, path traversal and LFI with filter evasion, file upload, request smuggling, web cache poisoning and deception with a verified cleanup, race conditions including the HTTP/2 single-packet attack, edge-versus-origin parser differentials, gateway bypass |
 | APIs | GraphQL introspection, resolver injection and batching abuse, OpenAPI-driven parameter coverage, excessive data exposure, webhooks, BaaS and cloud-storage exposure |
 | AI applications | Prompt injection, unsafe tool invocation, output handling, MCP server exposure |
-| Configuration | Exposed secrets and `.env`, verbose debug endpoints, CORS, security headers and cookie flags, subdomain takeover |
+| Configuration | Exposed secrets and `.env`, verbose debug endpoints, CORS, security headers and cookie flags |
+| Cloud | Bucket and container permissions read from policy rather than by writing, presigned-URL and SAS hygiene, serverless front doors and authorizer gaps, unauthenticated kubelet, etcd and Docker API, provider metadata through an SSRF |
+| Supply chain | Dependency confusion and typosquatting from internal names left in bundles, maps, lockfiles and a leaked `.npmrc`; subdomain and dangling-resource takeover; component inventory as CycloneDX with a confidence per marker |
 | Known CVEs | Live triage of the fingerprinted stack against KEV, EPSS, NVD, GHSA, OSV and nuclei templates |
 
 This is what the methodology aims at, not a measured success rate. Each class has a
@@ -208,14 +210,23 @@ mythos -t https://target.example.com \
   --budget 7200 --workers 4
 ```
 
+Without a scope file, a target that is not loopback is confirmed once before anything is
+written — type the hostname, or pass `--yes`. That is the only prompt in the tool, and
+`--no-input` turns it into an error that names the flag instead.
+
 Quietly, for cron or CI:
 
 ```bash
-mythos -t https://target.example.com -s engagements/acme/scope.yaml -n
+mythos -t https://target.example.com -s engagements/acme/scope.yaml -n -q | tee run.log
+mythos -t https://target.example.com -s engagements/acme/scope.yaml --json > run.json
 ```
 
+`--json` writes one JSON document to stdout and moves every human line to stderr, so the
+pipe stays clean. It works on `run`, `doctor`, `providers`, `verdicts`, `login` and
+`logout`.
+
 While a run is up: `p` pauses, `h` sends the agents a hint ("the admin panel is on 8443"),
-`q` aborts. Nothing ever waits for you.
+`?` shows the keys, `q` aborts (twice to exit immediately). Nothing ever waits for you.
 
 ---
 
@@ -228,7 +239,9 @@ While a run is up: `p` pauses, `h` sends the agents a hint ("the admin panel is 
 | `mythos providers` | what is reachable, and how |
 | `mythos doctor` | check the machine before a run |
 | `mythos verdicts [dir]` | the endpoint ledger of an engagement |
+| `mythos web` | a local, read-only view of every engagement in a browser |
 | `mythos demo` | replay a scripted run through the view |
+| `mythos help [command]` | the full help, or one command's page with its examples and environment |
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -244,6 +257,26 @@ While a run is up: `p` pauses, `h` sends the agents a hint ("the admin panel is 
 | `--headed` | | show the browser instead of running it headless |
 | `-n, --no-tui` | | one line per event instead of the full-screen view |
 | `-v, --verbose` | | with `-n`, also log tool results and agent prose |
+| `-q, --quiet` | | only what a later reader must act on: findings, refusals, the verdict |
+| `--json` | | one JSON document on stdout, every human line on stderr |
+| `-y, --yes` | | answer the scope-file confirmation in advance |
+| `--no-input` | | never prompt; fail naming the flag that would have answered it |
+| `--no-color` | | never colour the output (so does `NO_COLOR=1`) |
+| `-h, --help` | | the full help; `mythos <command> --help` for one command |
+| `-V, --version` | | the version, then the licence and the node it runs on |
+
+Every command's own page lists the environment variables it reads: `mythos help run`.
+Colour is off when the stream is not a terminal, when `NO_COLOR` is set to anything
+non-empty, or with `--no-color`; `FORCE_COLOR=1` puts it back into a pipe.
+`MYTHOS_GLYPHS=ascii` drops to an ASCII glyph set.
+
+Exit codes: `0` finished and clean, `1` ran and did not (a phase `incomplete` or `failed`,
+a `doctor` check that failed), `2` usage or configuration and nothing ran, `130`
+interrupted. A CI step may retry a `1` and must never retry a `2`. Findings do not change
+the code — ask `mythos verdicts --json` for those.
+
+The conventions behind all of this, and the ones deliberately not adopted, are in
+[docs/cli-design.md](docs/cli-design.md).
 
 ---
 
@@ -310,8 +343,26 @@ engagements/<host>-<date>/
   findings.json         machine-readable, CVSS computed from each vector
   findings.sarif        SARIF 2.1.0, for a CI annotation
   traffic/              every request and response, replayable, HAR-exportable
+  evidence/<id>/        the bundle a human replays: request, response, control,
+                        oracle, screenshots, and a sha256 manifest
   run-events.jsonl      the whole run as an event stream
 ```
+
+### Reading it in a browser
+
+```bash
+mythos web
+```
+
+A local server on `127.0.0.1`, read-only: every engagement with its phases,
+findings, verdict ledger, recorded traffic, and the scope panel that answers
+"what did this thing touch". The URL it prints carries a per-run bearer token
+and that token is the only credential, so anyone with the URL has every
+engagement on the machine. Nothing in the view can start a run, send a request
+or edit a scope file, and a response body a target chose is rendered as text
+behind a strict Content-Security-Policy — a stored-XSS payload the framework
+captured must not execute in the tool that displays it. `docs/web-ui.md` has
+the security model.
 
 ---
 

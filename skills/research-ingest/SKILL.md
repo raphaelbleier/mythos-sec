@@ -8,6 +8,12 @@ description: Research a web security topic (a CVE, a technique, a new tool, a bu
 Turn a research question into a durable knowledge note the Mythos agents consult
 during engagements. Keep notes short, concrete and sourced.
 
+Triage never selects this skill: notes are written between engagements, not
+during one. It drives no script. Two indexes make a note or a skill reachable
+at runtime, and a file missing from them is never read: a note belongs in
+`knowledge/README.md`, and a skill belongs in `skills/registry.yaml` with the
+triggers that select it, the scripts it drives and one `why` line.
+
 ## Steps
 
 1. **Scope the question.** One topic per note: a bug class (e.g. "prototype

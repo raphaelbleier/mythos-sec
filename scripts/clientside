@@ -1,0 +1,1949 @@
+#!/usr/bin/env python3
+"""Mythos client-side surface — the artifacts that make the browser tool useful.
+
+The agent already drives a real Chromium (`browser`: goto, click, eval, console,
+requests, plus an init script, a CDP session, named contexts and WebSocket
+frames). What it did not have is anything to feed that browser: no recovered
+source, no gadget list, no policy analysis, no sender page. Asking a model to
+write each of those from scratch per engagement is both slow and inconsistent,
+and the measured lesson in this repository is that the tool layer decides the
+outcome, not the prose. So this script does the parts that are pure HTTP or pure
+text analysis, and for the parts that genuinely need a browser it **emits** the
+init script or the CDP call for the agent to run and then **judges** what comes
+back. It never drives a browser itself.
+
+  scripts/clientside sourcemaps   <url|@file>   [network]  recover .map + sourcesContent
+  scripts/clientside secrets      <dir|url>     [mixed]    credentials/endpoints in bundles
+  scripts/clientside protopollute               [offline]  emit PP probes, judge the read-back
+  scripts/clientside postmessage                [offline]  listener enumeration + sender page
+  scripts/clientside csp          <url>         [network]  what the policy is MISSING
+  scripts/clientside serviceworker <url>        [network]  registrations, importScripts, caches
+  scripts/clientside domclobber   <bundle-dir>  [offline]  window.X reads that feed a sink
+  scripts/clientside --selftest               runs the parser asserts, no network
+
+Which subcommands reach the network: `sourcemaps`, `csp`, `serviceworker`, and
+`secrets` only when its argument is a URL. `protopollute`, `postmessage`,
+`domclobber` and `secrets <dir>` send nothing at all.
+
+Every request goes through the same two gates the other scripts use: the active
+scope file (`hooks/scope-guard.py`) refuses a host it does not authorize, and the
+rate comes from `rules.rate_limit_rps` (`hooks/budget-guard.py`), so a canary is
+one request and stays one request. Requests inherit HTTP(S)_PROXY from the
+environment, which is how `scripts/traffic` records them; run under
+`eval "$(scripts/traffic env)"` or through the toolbox and the evidence is in
+the capture.
+
+Nothing here validates a credential, registers a domain or writes to the target.
+A found secret is reported and explicitly marked untested: whether to try it is a
+human decision, taken outside a run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+UA = "mythos-clientside/1.0 (authorized security testing)"
+
+
+class OutOfScope(Exception):
+    """A host the scope file does not authorize. Refused, never warned about.
+
+    The other scripts inherit the host plugin's warn-only behaviour, which tells
+    you about a slip after it left. Source-map recovery walks URLs printed by the
+    target, so it would happily follow a third-party CDN out of scope; here the
+    check has to come first and has to refuse.
+    """
+
+
+# --------------------------------------------------------------- guards, paced I/O
+
+_mods: dict = {}
+
+
+def mod(name):
+    """Load a hook by path, so its logic is called and not copied."""
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py", "budget-guard": "hooks/budget-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(f"mythos_{name}".replace("-", "_"),
+                                                      str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+_LAST = [0.0]
+_GAP = [0.0]
+
+
+def set_rate(explicit=None, default=5.0):
+    """The pace for this process, from the scope file unless told otherwise.
+
+    One process making dozens of requests never passes through the PreToolUse
+    budget guard, which paces tool calls and not the loop inside one. So the
+    rate is read here and held here.
+    """
+    rate = explicit
+    if rate is None:
+        try:
+            loaded = mod("budget-guard").load_rules()
+            rate = mod("budget-guard")._num(loaded[1], "rate_limit_rps") if loaded else None
+        except Exception:
+            rate = None
+    if rate is None:
+        rate = default
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    return rate
+
+
+def pace():
+    gap = _GAP[0]
+    if gap <= 0:
+        return
+    wait = _LAST[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+def in_scope(url):
+    try:
+        return not mod("scope-guard").check(url)["offenders"]
+    except Exception:
+        return True              # no scope machinery available: the caller's URL stands
+
+
+def http(url, headers=None, timeout=10.0, insecure=False, limit=2_000_000):
+    """One scope-checked, paced GET. (status, lowercased headers, text, final url).
+
+    Proxy variables are left to urllib's default opener on purpose: that is what
+    puts the request in the traffic recording without this script knowing the
+    recorder exists.
+    """
+    if not in_scope(url):
+        raise OutOfScope(url)
+    pace()
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    ctx = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            raw = r.read(limit)
+            hdrs = {k.lower(): v for k, v in dict(r.headers).items()}
+            # A header can legitimately appear twice (two CSP headers is a valid
+            # intersection). dict() keeps one, so collect the repeats too.
+            multi = {}
+            for k, v in r.headers.items():
+                multi.setdefault(k.lower(), []).append(v)
+            return r.status, hdrs, raw.decode("utf-8", "replace"), r.geturl(), multi
+    except urllib.error.HTTPError as e:
+        raw = e.read(limit) if e.fp else b""
+        hdrs = {k.lower(): v for k, v in dict(e.headers or {}).items()}
+        multi = {}
+        for k, v in (e.headers or {}).items():
+            multi.setdefault(k.lower(), []).append(v)
+        return e.code, hdrs, raw.decode("utf-8", "replace"), url, multi
+    except Exception as e:
+        return None, {}, f"{type(e).__name__}: {e}", url, {}
+
+
+def out_dir(a, leaf):
+    """Where recovered artifacts land: the engagement directory, never elsewhere."""
+    if getattr(a, "out", None):
+        d = Path(a.out)
+    else:
+        scope = os.environ.get("MYTHOS_SCOPE")
+        if not scope:
+            raise SystemExit("clientside: no engagement directory. Pass --out DIR or pin "
+                             "MYTHOS_SCOPE=<engagements/<dir>/scope.yaml>.")
+        d = Path(scope).resolve().parent / "clientside" / leaf
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# --------------------------------------------------------------- source maps
+
+SOURCEMAP_COMMENT = re.compile(
+    r"(?://|/\*)[#@]\s*sourceMappingURL\s*=\s*([^\s*'\")]+)")
+SCRIPT_SRC = re.compile(r"""<script[^>]+src\s*=\s*["']?([^"'>\s]+)""", re.I)
+INLINE_MAP = re.compile(r"^data:application/json(?:;charset=[-\w]+)?;base64,(.*)$", re.I | re.S)
+
+
+def map_candidates(js_url, body, headers):
+    """Every place a source map for this script could be, in the order to try.
+
+    Four mechanisms exist and sites use all of them: the `sourceMappingURL`
+    comment (which may be a `data:` URI with the map inline), the `SourceMap`
+    header, its legacy `X-SourceMap` spelling, and the bare `.map` suffix that
+    build tools emit even when nothing points at it. Trying only the comment is
+    why a black-box target looks mapless when it is not.
+    """
+    out, seen = [], set()
+
+    def add(kind, value):
+        if value and value not in seen:
+            seen.add(value)
+            out.append((kind, value))
+
+    for name in ("sourcemap", "x-sourcemap"):
+        if headers.get(name):
+            add(name, urllib.parse.urljoin(js_url, headers[name].strip()))
+    matches = SOURCEMAP_COMMENT.findall(body or "")
+    if matches:
+        # The last comment wins: bundlers append it, and a string earlier in the
+        # file may just be a library mentioning the directive.
+        ref = matches[-1].strip()
+        if INLINE_MAP.match(ref):
+            add("inline", ref)
+        else:
+            add("comment", urllib.parse.urljoin(js_url, ref))
+    bare = urllib.parse.urlsplit(js_url)
+    if bare.path.endswith((".js", ".mjs", ".cjs")):
+        add("suffix", urllib.parse.urlunsplit((bare.scheme, bare.netloc, bare.path + ".map", "", "")))
+    return out
+
+
+SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._@+-]")
+
+
+def source_path(raw, index):
+    """A `sources` entry turned into a path that cannot escape the output tree.
+
+    Entries look like `webpack:///./src/app.js`, `webpack://name/../x.js` or an
+    absolute build path. They are attacker-influenced strings: a `..` or a
+    leading `/` that survived would write outside the engagement directory.
+    """
+    text = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*:/{0,3}", "", (raw or "").strip())
+    text = text.split("?")[0].split("#")[0]
+    text = re.sub(r"^[A-Za-z]:[\\/]", "", text)                    # drive letter
+    parts = []
+    for seg in re.split(r"[\\/]+", text):
+        if seg in ("", ".", "..", "~"):
+            continue
+        parts.append(SAFE_SEGMENT.sub("_", seg)[:120])
+    if not parts:
+        return f"unnamed/source-{index}.js"
+    return "/".join(parts[-24:])
+
+
+def read_map(text):
+    """(sources, sourcesContent) from a map document, or None when it is not one."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or "sources" not in doc:
+        return None
+    sources = [s for s in (doc.get("sources") or []) if isinstance(s, str)]
+    contents = doc.get("sourcesContent") or []
+    if not isinstance(contents, list):
+        contents = []
+    return sources, contents
+
+
+def decode_inline(ref):
+    m = INLINE_MAP.match(ref or "")
+    if not m:
+        return None
+    try:
+        return base64.b64decode(m.group(1) + "==").decode("utf-8", "replace")
+    except (binascii.Error, ValueError):
+        return None
+
+
+class ScriptHrefs(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.scripts = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "script" and a.get("src"):
+            self.scripts.append(a["src"])
+
+
+def script_urls(page_url, html):
+    """Script URLs from a page, same-origin and cross-origin alike.
+
+    Cross-origin ones are kept in the list and then refused by the scope check
+    rather than silently dropped, because "a bundle exists on a CDN we may not
+    touch" is itself worth telling the agent.
+    """
+    p = ScriptHrefs()
+    try:
+        p.feed(html)
+    except Exception:
+        pass
+    urls, seen = [], set()
+    for src in p.scripts + SCRIPT_SRC.findall(html):
+        full = urllib.parse.urljoin(page_url, src).split("#")[0]
+        if full.startswith(("http://", "https://")) and full not in seen:
+            seen.add(full)
+            urls.append(full)
+    return urls
+
+
+def cmd_sourcemaps(a):
+    """Recover maps and write the source tree for scripts/sourcemap to read."""
+    targets = []
+    if a.target.startswith("@"):
+        targets = [l.strip() for l in Path(a.target[1:]).read_text().splitlines()
+                   if l.strip() and not l.startswith("#")]
+    else:
+        targets = [a.target]
+
+    headers = parse_headers(a.header)
+    scripts, pages, refused, notes = [], [], [], []
+    for t in targets:
+        if not in_scope(t):
+            refused.append(t)
+            continue
+        status, hdrs, body, final, _ = http(t, headers, a.timeout, a.insecure)
+        if status is None:
+            notes.append(f"{t}: unreachable ({body})")
+            continue
+        ctype = hdrs.get("content-type", "")
+        if "html" in ctype or (not ctype and "<script" in body.lower()):
+            found = script_urls(final, body)
+            pages.append({"url": t, "status": status, "scripts": len(found)})
+            scripts += [s for s in found if s not in scripts]
+        else:
+            scripts.append(final)
+            # a JS URL handed in directly: keep the body we already paid for
+            notes.append(f"{t}: treated as a script ({ctype or 'no content-type'})")
+
+    tree = out_dir(a, "sources")
+    recovered, per_script = [], []
+    for js in scripts[:a.max_scripts]:
+        if not in_scope(js):
+            refused.append(js)
+            continue
+        status, hdrs, body, final, _ = http(js, headers, a.timeout, a.insecure)
+        if status is None or status >= 400:
+            per_script.append({"script": js, "status": status, "map": None,
+                               "why": "script not retrievable"})
+            continue
+        row = {"script": js, "status": status, "map": None, "sources": 0, "with_content": 0,
+               "tried": []}
+        for kind, ref in map_candidates(final, body, hdrs):
+            row["tried"].append(kind)
+            if kind == "inline":
+                text = decode_inline(ref)
+                if text is None:
+                    continue
+                m_status, m_url = 200, "(inline data: URI)"
+            else:
+                if not in_scope(ref):
+                    refused.append(ref)
+                    continue
+                m_status, _mh, text, m_url, _mm = http(ref, headers, a.timeout, a.insecure)
+                if m_status is None or m_status >= 400:
+                    continue
+            parsed = read_map(text)
+            if not parsed:
+                continue
+            sources, contents = parsed
+            row.update(map=m_url, how=kind, sources=len(sources))
+            written = 0
+            for i, name in enumerate(sources):
+                content = contents[i] if i < len(contents) else None
+                if not isinstance(content, str):
+                    continue
+                dest = (tree / source_path(name, i)).resolve()
+                if tree.resolve() not in dest.parents:
+                    continue                       # a sources entry that tried to escape
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+                recovered.append(str(dest.relative_to(tree)))
+                written += 1
+            row["with_content"] = written
+            if written:
+                break                              # one working map per script is enough
+        per_script.append(row)
+
+    return {"command": "sourcemaps", "pages": pages, "scripts_seen": len(scripts),
+            "per_script": per_script, "tree": str(tree), "recovered_files": len(recovered),
+            "sample": sorted(recovered)[:25], "refused_out_of_scope": sorted(set(refused)),
+            "notes": notes,
+            "next": [f"scripts/sourcemap {tree} --json   # routes, missing guards, sinks",
+                     f"scripts/clientside secrets {tree}",
+                     f"scripts/clientside domclobber {tree}"]}
+
+
+# --------------------------------------------------------------- secrets
+
+# A pattern is a candidate, never a credential. Each row is (kind, regex, the
+# capture group that holds the value, confidence).
+SECRET_PATTERNS = [
+    ("aws-access-key-id", re.compile(r"\b(AKIA[0-9A-Z]{16})\b"), 1, "high"),
+    ("aws-secret-access-key",
+     re.compile(r"(?i)aws_?secret_?access_?key\W{0,4}([A-Za-z0-9/+=]{40})"), 1, "high"),
+    ("google-api-key", re.compile(r"\b(AIza[0-9A-Za-z_-]{35})\b"), 1, "high"),
+    ("slack-token", re.compile(r"\b(xox[baprs]-[0-9A-Za-z-]{10,})"), 1, "high"),
+    ("github-token", re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{36,})\b"), 1, "high"),
+    ("stripe-key", re.compile(r"\b(sk_(?:live|test)_[0-9A-Za-z]{16,})\b"), 1, "high"),
+    ("private-key", re.compile(r"(-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----)"), 1, "high"),
+    ("jwt", re.compile(r"\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,})"),
+     1, "medium"),
+    ("assigned-credential",
+     re.compile(r"""(?i)\b(api[_-]?key|apikey|secret|client[_-]?secret|password|passwd|pwd|
+                     auth[_-]?token|access[_-]?token|refresh[_-]?token|private[_-]?token|
+                     session[_-]?secret|signing[_-]?key)\b\s*[:=]\s*
+                     ["'`]([^"'`\n]{8,120})["'`]""", re.X), 2, "medium"),
+    ("basic-auth-url", re.compile(r"\b(https?://[^\s/:@\"']+:[^\s/@\"']+@[A-Za-z0-9.-]+)"),
+     1, "high"),
+]
+
+INTERNAL_HOST = re.compile(
+    r"""(?x)\b(
+      (?:[a-z0-9][a-z0-9-]*\.)+(?:internal|intranet|corp|local|lan|test|localdomain)
+      | [a-z0-9-]+\.svc\.cluster\.local
+      | 10\.\d{1,3}\.\d{1,3}\.\d{1,3}
+      | 192\.168\.\d{1,3}\.\d{1,3}
+      | 172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}
+      | 169\.254\.169\.254
+    )\b""", re.I)
+ENDPOINT = re.compile(r"""["'`](/(?:api|v\d{1,2}|internal|admin|graphql|rest|rpc|_next/|oauth|
+                           auth|account|users?|billing)[A-Za-z0-9_\-/.{}:$]*)["'`]""", re.X)
+
+PLACEHOLDER = re.compile(
+    r"""(?ix)^(
+      (?:your|my|the|some|test|demo|sample|example|dummy|fake|placeholder|changeme|insert|
+         replace|xxx+|todo|none|null|undefined|true|false|secret|password|apikey|api_key)
+      [\w-]* | \W* | \$\{.*\} | \{\{.*\}\} | %[A-Z_]+% | <.*> | process\.env.* | [\w]*(?:\*{3,}|x{6,})[\w]*
+    )$""")
+
+
+def looks_placeholder(value):
+    v = (value or "").strip()
+    if len(v) < 8 or PLACEHOLDER.match(v):
+        return True
+    return len(set(v)) <= 3                    # "aaaaaaaa", "--------"
+
+
+def scan_secrets_text(text, label=""):
+    """Credential candidates, internal hosts and endpoints, with line numbers."""
+    hits = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        # Minified bundles are one enormous line; cap what is read per line so a
+        # single-line 3 MB file does not turn every regex into a worst case.
+        line = line[:200_000]
+        for kind, pattern, group, confidence in SECRET_PATTERNS:
+            for m in pattern.finditer(line):
+                value = m.group(group)
+                if kind == "assigned-credential" and looks_placeholder(value):
+                    continue
+                hits.append({"kind": kind, "file": label, "line": lineno,
+                             "confidence": confidence,
+                             "match": value[:24] + ("..." if len(value) > 24 else ""),
+                             "context": line[max(0, m.start() - 40):m.start() + 80].strip()[:160]})
+        for m in INTERNAL_HOST.finditer(line):
+            hits.append({"kind": "internal-host", "file": label, "line": lineno,
+                         "confidence": "medium", "match": m.group(1), "context": ""})
+        for m in ENDPOINT.finditer(line):
+            hits.append({"kind": "endpoint", "file": label, "line": lineno,
+                         "confidence": "low", "match": m.group(1), "context": ""})
+    return hits
+
+
+SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf",
+            ".eot", ".mp4", ".webm", ".pdf", ".zip", ".gz", ".map"}
+
+
+def cmd_secrets(a):
+    """Offline over a recovered tree, or one network GET over a live page's scripts."""
+    hits, scanned, notes = [], 0, []
+    reached_network = False
+    target = a.target
+    if target.startswith(("http://", "https://")):
+        reached_network = True
+        headers = parse_headers(a.header)
+        status, hdrs, body, final, _ = http(target, headers, a.timeout, a.insecure)
+        if status is None:
+            raise SystemExit(f"clientside secrets: {target} unreachable ({body})")
+        hits += scan_secrets_text(body, final)
+        scanned += 1
+        for js in script_urls(final, body)[:a.max_scripts]:
+            if not in_scope(js):
+                notes.append(f"not fetched, out of scope: {js}")
+                continue
+            s, _h, b, f, _m = http(js, headers, a.timeout, a.insecure)
+            if s and s < 400:
+                hits += scan_secrets_text(b, f)
+                scanned += 1
+    else:
+        base = Path(target)
+        files = [base] if base.is_file() else sorted(
+            p for p in base.rglob("*") if p.is_file() and p.suffix.lower() not in SKIP_EXT)
+        for p in files[:a.max_files]:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if len(text) > a.max_bytes:
+                notes.append(f"{p}: truncated at {a.max_bytes} bytes")
+                text = text[:a.max_bytes]
+            label = str(p.relative_to(base)) if base.is_dir() else str(p)
+            hits += scan_secrets_text(text, label)
+            scanned += 1
+
+    by_kind = {}
+    for h in hits:
+        by_kind.setdefault(h["kind"], []).append(h)
+    return {"command": "secrets", "target": target, "network": reached_network,
+            "files_scanned": scanned, "total": len(hits),
+            "credentials": [h for h in hits if h["kind"] not in ("endpoint", "internal-host")][:200],
+            "internal_hosts": sorted({h["match"] for h in hits if h["kind"] == "internal-host"}),
+            "endpoints": sorted({h["match"] for h in hits if h["kind"] == "endpoint"})[:300],
+            "counts": {k: len(v) for k, v in sorted(by_kind.items())}, "notes": notes,
+            "not_tested": "No credential here was used, replayed or validated against any "
+                          "service. A pattern match is a candidate. Deciding whether to try one "
+                          "is a human decision taken outside a run; report it and stop."}
+
+
+# --------------------------------------------------------------- prototype pollution
+
+PP_SOURCES = [
+    ("query-bracket", "?__proto__[{c}]={v}"),
+    ("query-dotted", "?__proto__.{c}={v}"),
+    ("query-constructor", "?constructor[prototype][{c}]={v}"),
+    ("hash-bracket", "#__proto__[{c}]={v}"),
+    ("hash-dotted", "#__proto__.{c}={v}"),
+    ("hash-constructor", "#constructor.prototype.{c}={v}"),
+]
+
+READBACK = ("JSON.stringify({canary: ({})[%(c)r], polluted: Object.getOwnPropertyNames"
+            "(Object.prototype).filter(n=>!%(base)s.includes(n))})")
+
+# Property names every page reads on plain objects. They are noise in the
+# read-recorder output, not gadget candidates.
+GADGET_NOISE = {"then", "toJSON", "length", "nodeType", "nodeName", "inspect", "constructor",
+                "hasOwnProperty", "toString", "valueOf", "Symbol(Symbol.toPrimitive)",
+                "Symbol(Symbol.toStringTag)", "Symbol(Symbol.iterator)", "Symbol(nodejs.util.inspect.custom)",
+                "default", "__esModule", "props", "$$typeof", "_owner", "ref", "key"}
+
+
+def pp_readback(canary):
+    """The expression the agent evaluates after loading a polluted URL."""
+    base = json.dumps(["constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty",
+                       "__lookupGetter__", "__lookupSetter__", "isPrototypeOf",
+                       "propertyIsEnumerable", "toString", "valueOf", "__proto__",
+                       "toLocaleString"])
+    return READBACK % {"c": canary, "base": base}
+
+
+# Browser-API and config property names that have been gadgets before: the
+# `fetch` options bag, `Object.defineProperty` descriptors with no `value` or
+# `configurable`, storage reads, template and script-source names (Heyes,
+# 2022-06-22, updated 2022-10-28; the XSS examples came from Google Analytics,
+# GTM and Adobe scripts). The point of the recorder is to find the names this
+# application reads, so this list is only the seed.
+GADGET_SEED = [
+    "src", "srcdoc", "href", "innerHTML", "outerHTML", "template", "templateUrl", "url",
+    "baseUrl", "apiUrl", "endpoint", "callback", "jsonp", "body", "method", "headers",
+    "mode", "credentials", "integrity", "transport_url", "allowScriptAccess", "sanitize",
+    "sanitizer",
+    "ALLOWED_TAGS", "ALLOWED_ATTR", "RETURN_DOM", "hooks", "onload", "onerror", "script",
+    "scriptUrl", "chunkPath", "publicPath", "proxy", "target", "redirect", "next",
+    "locale", "theme", "debug", "env", "config", "settings", "options", "params", "query",
+]
+# These six are the `Object.defineProperty` descriptor fields. They are real
+# gadgets — a descriptor with a polluted `get` or `value` is one of the Heyes
+# browser-API gadgets — but watching them is destructive: once Object.prototype
+# answers `value` *and* `get`, every `Object.defineProperty` call in the page
+# throws "Cannot both specify accessors and a value or writable attribute". A
+# node smoke test of the emitted script died on exactly that before the page's
+# own code ran. So they are a separate, deliberate pass.
+DESCRIPTOR_SEED = ["value", "writable", "enumerable", "configurable", "get", "set"]
+JS_WORDS = {"length", "name", "prototype", "constructor", "call", "apply", "bind", "toString",
+            "valueOf", "push", "pop", "slice", "splice", "concat", "join", "map", "filter",
+            "reduce", "forEach", "indexOf", "includes", "keys", "values", "entries", "then",
+            "catch", "finally", "charAt", "charCodeAt", "replace", "split", "trim", "match",
+            "test", "exec", "substring", "substr", "toLowerCase", "toUpperCase", "padStart",
+            "padEnd", "startsWith", "endsWith", "repeat", "stringify", "parse", "assign",
+            "create", "defineProperty", "freeze", "hasOwnProperty", "getOwnPropertyNames",
+            "addEventListener", "removeEventListener", "appendChild", "removeChild",
+            "createElement", "querySelector", "querySelectorAll", "getElementById",
+            "setAttribute", "getAttribute", "style", "classList", "className", "children",
+            "parentNode", "nextSibling", "textContent", "data", "type", "id", "key", "default"}
+# `(?<![\d.])` keeps `1.5` and `a..b` out; the `=` lookahead keeps assignments
+# out, since a gadget is a property the page *reads*.
+PROP_READ = re.compile(r"""(?<![\d.])\.([A-Za-z_$][\w$]{2,30})\b(?!\s*=(?!=))""")
+BRACKET_READ = re.compile(r"""\[\s*["']([A-Za-z_$][\w$]{2,30})["']\s*\]""")
+
+
+def gadget_names(text, limit=400):
+    """Property names this application reads, most-read first.
+
+    The recorder needs names to watch. Taking them from the code is the whole
+    improvement over a wordlist: a gadget is a property *this* page reads, and
+    its name is usually application-specific.
+    """
+    counts = {}
+    for pattern in (PROP_READ, BRACKET_READ):
+        for m in pattern.finditer(text or ""):
+            name = m.group(1)
+            if name in JS_WORDS or name in WINDOW_BUILTINS:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+    return [n for n, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+
+
+def pp_recorder(names):
+    """Init script that records which of these absent properties the page reads.
+
+    The textbook idea is to put a recording Proxy on `Object.prototype`'s own
+    prototype, so that every missing-property read walks into it. That does not
+    work: `Object.prototype` is an immutable prototype exotic object, so
+    `Object.setPrototypeOf` on it throws a TypeError in every engine. What does
+    work is a recording getter per candidate name, which is why the names matter
+    and why `--names-from` exists.
+
+    Run this as a pass of its own, not alongside a proof. Defining a property on
+    `Object.prototype` makes `'name' in obj` true for every object, and a page
+    that branches on `in` then takes a path it normally would not.
+    """
+    return ("(()=>{const N=%s,seen=[];for(const n of N){try{"
+            "if(Object.prototype.hasOwnProperty(n))continue;"
+            "Object.defineProperty(Object.prototype,n,{configurable:true,"
+            "get(){seen.push(n);return undefined}})}catch(e){}}"
+            "window.__mythos_pp_reads=()=>Array.from(new Set(seen));"
+            "addEventListener('load',()=>setTimeout(()=>console.log('MYTHOS-PP:reads:'+"
+            "JSON.stringify(Array.from(new Set(seen)))),1500))})()" % json.dumps(names))
+
+
+def pp_message(canary, value):
+    """A JSON web message carrying the same pollution, for a postMessage source."""
+    return json.dumps({"__proto__": {canary: value}})
+
+
+def judge_pollution(doc, canary):
+    """Turn a read-back into a verdict, with the fingerprint/finding line drawn.
+
+    ppfuzz, ppmap and PPScan fingerprint; they do not prove. A fingerprint with
+    no read-back is a candidate. A read-back without a control is a candidate
+    too: the property could have been there all along.
+    """
+    polluted = doc.get("test") or doc.get("polluted_run") or doc
+    control = doc.get("control") or {}
+    test_value = polluted.get("canary")
+    control_value = control.get("canary") if control else "<no control>"
+    reads = [r for r in (doc.get("reads") or polluted.get("reads") or [])
+             if r not in GADGET_NOISE and not r.startswith("Symbol(")]
+    new_props = polluted.get("polluted") or []
+
+    if test_value in (None, "", "undefined"):
+        state, why = "not-polluted", (f"({{}}).{canary} is undefined after the probe: this "
+                                      "source does not reach a merge.")
+    elif not control:
+        state, why = "candidate", (f"({{}}).{canary} is set, but no control run was supplied. "
+                                   "Load the same URL without the probe parameter and read it "
+                                   "back again; only a control that returns undefined rules out "
+                                   "a property that was always there.")
+    elif control_value not in (None, "", "undefined"):
+        state, why = "not-a-finding", (f"({{}}).{canary} is set in the control run too, so the "
+                                       "page sets that property itself.")
+    else:
+        state, why = "confirmed-pollution", (f"({{}}).{canary} carries the probe value and the "
+                                             "control returns undefined: an attacker-controlled "
+                                             "source writes Object.prototype.")
+    return {"state": state, "why": why, "new_prototype_properties": new_props,
+            "gadget_candidates": sorted(set(reads))[:60],
+            "still_needed": ("A pollution write is not yet impact. Find a gadget: a property "
+                             "the page reads into a sink (script src, innerHTML, fetch options, "
+                             "a defineProperty descriptor, a storage read). Set only that "
+                             "property, only to a token payload, and prove execution through "
+                             "skills/stored-xss-oast. Reload the tab to discard the pollution; "
+                             "nothing is written server-side.")
+            if state == "confirmed-pollution" else None}
+
+
+def cmd_protopollute(a):
+    names = list(GADGET_SEED)
+    if a.names_from:
+        base = Path(a.names_from)
+        files = [base] if base.is_file() else [
+            f for f in base.rglob("*")
+            if f.is_file() and f.suffix.lower() in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")]
+        blob = "\n".join(f.read_text(encoding="utf-8", errors="replace")[:4 << 20]
+                          for f in files[:2000])
+        names += [n for n in gadget_names(blob)
+                  if n not in names and n not in DESCRIPTOR_SEED]
+    canary = a.canary
+    value = a.value
+    urls = []
+    if a.url:
+        split = urllib.parse.urlsplit(a.url)
+        for name, template in PP_SOURCES:
+            frag = template.format(c=canary, v=value)
+            if frag.startswith("#"):
+                urls.append({"source": name, "url": urllib.parse.urlunsplit(
+                    (split.scheme, split.netloc, split.path, split.query, frag[1:]))})
+            else:
+                query = (split.query + "&" if split.query else "") + frag[1:]
+                urls.append({"source": name, "url": urllib.parse.urlunsplit(
+                    (split.scheme, split.netloc, split.path, query, split.fragment))})
+        if not in_scope(a.url):
+            raise SystemExit(f"clientside protopollute: {a.url} is not in the active scope. "
+                             "Scope is the authorization boundary; it is widened in an editor, "
+                             "not here.")
+
+    result = {"command": "protopollute", "canary": canary, "value": value,
+              "network": False, "probe_urls": urls,
+              "message_source": pp_message(canary, value),
+              "readback_expression": pp_readback(canary),
+              "recorder_watches": names,
+              "recorder_init_script": pp_recorder(names),
+              "descriptor_recorder_init_script": pp_recorder(DESCRIPTOR_SEED),
+              "descriptor_warning": (
+                  "The descriptor recorder watches the Object.defineProperty descriptor fields. "
+                  "It makes every defineProperty call in the page throw, so most of the page "
+                  "will not run. Use it on its own, read the reads it logged before the page "
+                  "broke, and do not read anything else from that load."),
+              "how": [
+                  "1. For each probe_url: browser context(name='victim') -> init_script("
+                  "recorder_init_script) -> goto(url) -> eval(readback_expression).",
+                  "2. Run the control: the same URL with the probe fragment removed, same "
+                  "read-back. Without it a set property proves nothing.",
+                  "3. The recorder is its own pass: it defines properties on "
+                  "Object.prototype, which makes `in` checks true and can send the page down a "
+                  "path it normally would not take. Do not run it in the same load as a proof.",
+                  "4. For the message source, open the page and postMessage the "
+                  "message_source JSON from a foreign-origin context, then read back.",
+                  "5. Only if the first pass found nothing: run "
+                  "descriptor_recorder_init_script on its own load. Read descriptor_warning "
+                  "first; it breaks the page by design.",
+                  "6. Collect {'test': <readback>, 'control': <readback>, 'reads': "
+                  "<window.__mythos_pp_reads()>} into a file and run: "
+                  f"scripts/clientside protopollute --judge FILE --canary {canary}",
+              ],
+              "pre_filters": ("ppfuzz, ppmap and PPScan are heuristic fingerprinters. Use them "
+                              "to rank URLs cheaply and never as the oracle: their output is a "
+                              "candidate until the read-back and the control agree.")}
+    if a.judge:
+        text = sys.stdin.read() if a.judge == "-" else Path(a.judge).read_text()
+        try:
+            doc = json.loads(text)
+        except ValueError as e:
+            raise SystemExit(f"clientside protopollute: --judge input is not JSON: {e}")
+        # A browser `eval` usually hands back the JSON *string* the read-back built.
+        for key in ("test", "control"):
+            if isinstance(doc.get(key), str):
+                try:
+                    doc[key] = json.loads(doc[key])
+                except ValueError:
+                    pass
+        result["verdict"] = judge_pollution(doc, canary)
+    return result
+
+
+# --------------------------------------------------------------- postMessage
+
+def pm_listener_hook():
+    """Init script that records every `message` listener and its source text."""
+    return (
+        "(()=>{const log=[];const real=EventTarget.prototype.addEventListener;"
+        "EventTarget.prototype.addEventListener=function(type,fn,opts){"
+        "if(type==='message'){try{log.push({src:String(fn&&(fn.toString?fn.toString():fn))"
+        ".slice(0,4000),stack:(new Error()).stack})}catch(e){}}"
+        "return real.call(this,type,fn,opts)};"
+        "Object.defineProperty(window,'onmessage',{configurable:true,set(fn){"
+        "try{log.push({src:String(fn).slice(0,4000),via:'window.onmessage'})}catch(e){}"
+        "real.call(window,'message',fn)},get(){return undefined}});"
+        "window.__mythos_pm=()=>log})()")
+
+
+PM_CDP = [
+    {"step": 1, "method": "Runtime.evaluate",
+     "params": {"expression": "window", "returnByValue": False},
+     "take": "result.objectId"},
+    {"step": 2, "method": "DOMDebugger.getEventListeners",
+     "params": {"objectId": "<result.objectId from step 1>", "depth": -1, "pierce": True},
+     "take": "listeners[] where type=='message' -> scriptId, lineNumber, handler"},
+    {"step": 3, "method": "Debugger.getScriptSource",
+     "params": {"scriptId": "<scriptId from step 2>"},
+     "take": "the handler body, to read its origin check"},
+]
+
+ORIGIN_REF = re.compile(r"\b(?:e|ev|evt|event|m|msg)\s*(?:\.|\[\s*[\"'])origin")
+STRICT_CMP = re.compile(r"origin\s*(?:===|!==|==|!=)\s*[\"'`]|[\"'`]\s*(?:===|!==)\s*\w*\.?origin"
+                        r"|\.origin\s*(?:===|!==)\s*\w+\.origin")
+LOOSE_CMP = re.compile(r"origin\b[^;{}\n]{0,40}\.(?:indexOf|includes|startsWith|endsWith|match|"
+                       r"search|test)\s*\(|\.(?:test|match)\s*\(\s*\w*\.?origin")
+SOURCE_CHECK = re.compile(r"\.source\s*(?:===|!==)")
+HANDLER_SINKS = re.compile(
+    r"\b(innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval|Function\s*\(|"
+    r"setTimeout\s*\(\s*[\"'`]|location\s*=|location\.(?:href|replace|assign)|"
+    r"\.src\s*=|dangerouslySetInnerHTML|v-html|localStorage\.setItem|\$\s*\(|\.html\s*\()")
+
+
+def origin_check_report(src):
+    """Read one handler's source: does it check the origin, and how badly.
+
+    A substring check is the common real-world failure: `origin.indexOf('target.com')`
+    accepts `https://target.com.evil.net`, and `startsWith` accepts
+    `https://target.com.evil.net` too when the prefix is the scheme+host without a
+    terminator. That distinction decides whether a replay is worth building.
+    """
+    text = src or ""
+    sinks = sorted({m.group(1) for m in HANDLER_SINKS.finditer(text)})
+    if not ORIGIN_REF.search(text) and "origin" not in text:
+        state = "no-origin-check"
+        why = ("the handler never reads event.origin, so any page that can get a reference to "
+               "this window can drive it")
+    elif LOOSE_CMP.search(text) and not STRICT_CMP.search(text):
+        state = "weak-origin-check"
+        why = ("origin is compared by substring, prefix or regex. Try a host that contains the "
+               "expected one (expected.example.com.attacker.test) and an unanchored regex bypass")
+    elif STRICT_CMP.search(text):
+        state = "strict-origin-check"
+        why = ("origin is compared for equality against a literal. A replay from a foreign "
+               "origin should fail; that failure is the negative control, not the finding")
+    else:
+        state = "unclear-origin-check"
+        why = "origin is mentioned but no comparison was recognised: read the handler by hand"
+    return {"state": state, "why": why, "sinks_in_handler": sinks,
+            "checks_source": bool(SOURCE_CHECK.search(text)),
+            "worth_replaying": state in ("no-origin-check", "weak-origin-check",
+                                         "unclear-origin-check") and bool(sinks)}
+
+
+SENDER_HTML = """<!doctype html>
+<meta charset="utf-8">
+<title>mythos postMessage replay</title>
+<!-- Foreign-origin sender. Serve it from an origin that is NOT the target
+     (`python3 -m http.server %(port)d` in the toolbox) and open it by hand. It
+     sends the payload, then a control message of the wrong shape, then reports.
+     Nothing here writes to the target: both messages are read by the target's
+     own handler, which is the thing under test. -->
+<body>
+<pre id=log>opening %(target)s ...</pre>
+<script>
+const TARGET = %(target_json)s, ORIGIN = %(origin_json)s;
+const PAYLOAD = %(payload_json)s;
+const CONTROL = {mythos_control: %(token_json)s};
+const out = [], log = document.getElementById('log');
+const say = t => { out.push(t); log.textContent = out.join('\\n'); };
+addEventListener('message', e => say('REPLY from ' + e.origin + ': ' +
+  JSON.stringify(e.data).slice(0, 300)));
+const w = open(TARGET, 'mythos_victim');
+setTimeout(() => {
+  if (!w) return say('popup blocked: open the target in a tab first, then reload this page');
+  // 1. the real payload, wildcard target so a missing origin check is visible
+  w.postMessage(PAYLOAD, '*');
+  say('sent payload with targetOrigin "*"');
+  // 2. negative control: same channel, shape the handler should ignore. If the
+  //    target reacts to this too, the reaction is not the payload's doing.
+  setTimeout(() => { w.postMessage(CONTROL, '*'); say('sent control (wrong shape)'); }, 1200);
+  // 3. same payload addressed to the target origin only: separates "no origin
+  //    check" from "the browser refused to deliver".
+  setTimeout(() => { w.postMessage(PAYLOAD, ORIGIN); say('sent payload with targetOrigin ' + ORIGIN); }, 2400);
+}, %(delay)d);
+</script>
+"""
+
+
+def cmd_postmessage(a):
+    result = {"command": "postmessage", "network": False,
+              "listener_init_script": pm_listener_hook(),
+              "cdp_sequence": PM_CDP,
+              "how": [
+                  "1. browser context(name='victim') -> init_script(listener_init_script) -> "
+                  "goto(target) -> eval('window.__mythos_pm()'). That catches listeners "
+                  "registered during load, which an eval after load misses.",
+                  "2. Run cdp_sequence as a cross-check: it also finds listeners added by "
+                  "code the hook could not wrap (a different realm, an iframe).",
+                  "3. Feed the handler sources back: scripts/clientside postmessage "
+                  "--handlers FILE (a JSON list of strings, or the __mythos_pm() output).",
+                  "4. For each handler worth_replaying, serve the sender page from a foreign "
+                  "origin and watch the victim's console/sink hook.",
+              ]}
+    if a.handlers:
+        text = sys.stdin.read() if a.handlers == "-" else Path(a.handlers).read_text()
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            doc = [text]                      # a single pasted handler body
+        items = doc if isinstance(doc, list) else [doc]
+        report = []
+        for i, item in enumerate(items):
+            src = item.get("src") if isinstance(item, dict) else str(item)
+            row = {"index": i, "source_preview": (src or "")[:200]}
+            row.update(origin_check_report(src))
+            report.append(row)
+        result["handlers"] = report
+        result["replay_worth_it"] = [r["index"] for r in report if r["worth_replaying"]]
+    if a.target:
+        if not in_scope(a.target):
+            raise SystemExit(f"clientside postmessage: {a.target} is not in the active scope.")
+        origin = urllib.parse.urlsplit(a.target)
+        page = SENDER_HTML % {
+            "target": a.target, "target_json": json.dumps(a.target),
+            "origin_json": json.dumps(f"{origin.scheme}://{origin.netloc}"),
+            "payload_json": json.dumps(a.payload), "token_json": json.dumps(a.canary),
+            "port": a.port, "delay": a.delay}
+        dest = out_dir(a, "postmessage") / "sender.html"
+        dest.write_text(page, encoding="utf-8")
+        result["sender_page"] = str(dest)
+        result["serve"] = (f"cd {dest.parent} && python3 -m http.server {a.port}   "
+                           "# a different origin from the target, which is the whole point")
+    return result
+
+
+# --------------------------------------------------------------- CSP
+
+# The `content` attribute of a CSP meta tag is full of single quotes ('self',
+# 'nonce-...'), so the quote character has to be captured and matched back.
+# Reading it with a ["'] class on both ends truncated every policy at 'self'.
+CSP_META = re.compile(
+    r"""<meta[^>]+http-equiv\s*=\s*["']?content-security-policy(-report-only)?["']?[^>]*?"""
+    r"""content\s*=\s*(["'])(.*?)\2""", re.I | re.S)
+
+# A sample of the known-gadget hosts: JSONP endpoints with a controllable
+# callback, CDN paths that serve arbitrary user content, and hosts that have
+# shipped an old AngularJS. cspbypass.com tracks 350+; this list is a starting
+# point the agent should extend from that dataset, not a complete one.
+GADGET_HOSTS = {
+    "ajax.googleapis.com": "serves old AngularJS builds; a CSP that allows it allows an "
+                           "AngularJS sandbox escape",
+    "www.google-analytics.com": "known prototype-pollution and JSONP gadgets (Heyes 2022)",
+    "www.googletagmanager.com": "a tag-manager container is arbitrary JS chosen by whoever can "
+                                "publish in it",
+    "accounts.google.com": "JSONP endpoints with a callback parameter",
+    "apis.google.com": "JSONP endpoints with a callback parameter",
+    "cdn.jsdelivr.net": "arbitrary npm/GitHub package paths unless the allowlist pins a path",
+    "unpkg.com": "arbitrary npm package paths unless the allowlist pins a path",
+    "cdnjs.cloudflare.com": "ships old AngularJS, jQuery and prototype-pollution-prone libraries",
+    "cdn.polyfill.io": "the domain changed hands and served malicious script (2024-06)",
+    "raw.githubusercontent.com": "anyone can host a file there",
+    "s3.amazonaws.com": "bucket contents are writable by whoever owns the bucket, and often by more",
+    "storage.googleapis.com": "same: arbitrary object paths",
+    "translate.googleapis.com": "JSONP",
+    "www.youtube.com": "has hosted JSONP-style callback endpoints",
+}
+
+FETCH_DIRECTIVES = {"script-src", "script-src-elem", "script-src-attr", "style-src",
+                    "style-src-elem", "style-src-attr", "img-src", "connect-src", "font-src",
+                    "frame-src", "media-src", "object-src", "worker-src", "manifest-src",
+                    "child-src"}
+# These three do NOT fall back to default-src. That is the whole point of the
+# form-action check below and it is the part policies get wrong.
+NO_FALLBACK = {"form-action": "an injected form may post anywhere, which is credential theft",
+               "base-uri": "an injected <base> repoints every relative script URL",
+               "frame-ancestors": "the page may be framed, so clickjacking and "
+                                  "DoubleClickjacking are open"}
+
+
+def parse_csp(text):
+    """One policy string -> {directive: [values]}, lowercased directive names.
+
+    A policy's values keep their case: a nonce and a host are case-sensitive.
+    """
+    out = {}
+    for part in (text or "").split(";"):
+        tokens = part.split()
+        if not tokens:
+            continue
+        out.setdefault(tokens[0].lower(), []).extend(tokens[1:])
+    return out
+
+
+def split_policies(header_value):
+    """A CSP header may carry several comma-separated policies, each enforced.
+
+    Splitting on the comma is right for policies and wrong for the rare value
+    that contains one (a `report-uri` with a comma-bearing path). The failure
+    mode is an extra policy with a nonsense directive, which the report shows
+    rather than hides.
+    """
+    return [p.strip() for p in (header_value or "").split(",") if p.strip()]
+
+
+def csp_findings(policies, report_only=False, source="header"):
+    """What the policy is missing, which is the part a "present/absent" check loses."""
+    merged = {}
+    for pol in policies:
+        for k, v in pol.items():
+            merged.setdefault(k, []).extend(v)
+    findings = []
+
+    def add(severity, directive, state, note):
+        findings.append({"severity": severity, "directive": directive, "state": state,
+                         "note": note})
+
+    if report_only:
+        add("info", "(report-only)", "not enforced",
+            "Content-Security-Policy-Report-Only blocks nothing. Any bypass claim against it "
+            "is not a finding; find the enforced policy, or say there is none.")
+
+    for directive, consequence in NO_FALLBACK.items():
+        if source == "meta tag" and directive == "frame-ancestors":
+            # frame-ancestors, sandbox and report-uri are ignored in a meta tag by
+            # specification, so reporting them absent there would send the agent
+            # after a directive the page could not have set. The header is where
+            # that question is answered.
+            continue
+        if directive not in merged:
+            why = (f"`{directive}` is absent and does NOT inherit from default-src, so even "
+                   f"under an otherwise strict policy: {consequence}.")
+            if directive == "form-action":
+                why += (" Gareth Heyes, 2026-11-11: with HTML injection and no form-action, an "
+                        "injected self-posting form plus `<meta name=referrer "
+                        "content=unsafe-url>` and a meta refresh leaks the submitted "
+                        "credentials through the Referer to an attacker host with no script "
+                        "running at all. Record HTML injection under a strict CSP as a "
+                        "credential-theft candidate, not as 'CSP blocks it'.")
+            add("medium" if directive != "form-action" else "high", directive, "absent", why)
+
+    script = merged.get("script-src") or merged.get("script-src-elem") or merged.get("default-src") or []
+    lowered = [v.lower() for v in script]
+    nonces = sorted({v for v in script if v.lower().startswith("'nonce-")})
+    has_nonce = bool(nonces)
+    has_hash = any(v.lower().startswith(("'sha256-", "'sha384-", "'sha512-")) for v in script)
+
+    if not script:
+        add("high", "script-src", "absent",
+            "no script-src and no default-src: inline script and any host are allowed.")
+    if "'unsafe-inline'" in lowered and not (has_nonce or has_hash):
+        add("high", "script-src", "unsafe-inline",
+            "inline script is allowed outright. This is not itself an XSS finding; it removes "
+            "CSP as a mitigating factor for one.")
+    if "'unsafe-inline'" in lowered and (has_nonce or has_hash):
+        add("info", "script-src", "unsafe-inline with a nonce",
+            "browsers that understand the nonce ignore 'unsafe-inline'; it is a fallback for "
+            "old ones, not a hole here.")
+    if "'unsafe-eval'" in lowered:
+        add("low", "script-src", "unsafe-eval",
+            "eval and new Function are allowed, so a prototype-pollution or template gadget "
+            "that reaches them is not blocked.")
+    if "'strict-dynamic'" in lowered:
+        add("info", "script-src", "strict-dynamic",
+            "host allowlist entries are ignored by supporting browsers, but any script the "
+            "trusted script creates is trusted: a clobbered or polluted script.src is the "
+            "known path in (PortSwigger, 2023-06-05).")
+    for value in script:
+        host = value.strip("'").lower()
+        if host in ("*", "http:", "https:", "data:", "blob:"):
+            add("high", "script-src", f"wildcard {host}",
+                "any origin may serve script; the allowlist is decorative.")
+        bare = re.sub(r"^[a-z][a-z0-9+.-]*://", "", host).split("/")[0].lstrip("*.")
+        for gadget, why in GADGET_HOSTS.items():
+            if bare == gadget or bare.endswith("." + gadget):
+                add("medium", "script-src", f"gadget host {host}",
+                    f"{why}. Check the host against the cspbypass.com gadget dataset before "
+                    "claiming a bypass, and prove it with a canary that executes.")
+        if host.startswith("*."):
+            add("low", "script-src", f"wildcard subdomain {value}",
+                "any subdomain may serve script, including one that is takeover-able "
+                "(see subdomain-takeover.md).")
+
+    if "object-src" not in merged and "default-src" not in merged:
+        add("low", "object-src", "absent",
+            "plugin content is unrestricted; an <object data=...> path is still a sink on some "
+            "engines.")
+
+    tt = merged.get("require-trusted-types-for") or []
+    allow = merged.get("trusted-types") or []
+    if tt:
+        note = ("Trusted Types is required for script sinks, so a raw innerHTML write throws a "
+                "TypeError instead of executing. A DOM XSS proof here must go through a policy: "
+                "look for a default policy that passes strings through, a permissive entry in "
+                "the trusted-types allowlist, or 'allow-duplicates'. Read window.trustedTypes."
+                "defaultPolicy in the browser before calling a sink exploitable.")
+        if "'allow-duplicates'" in [v.lower() for v in allow]:
+            note += " 'allow-duplicates' is set: a second policy with the same name can be "\
+                    "registered, which is a known weakening."
+        if "*" in allow:
+            note += " The trusted-types allowlist is `*`: any policy name may be created."
+        add("info", "require-trusted-types-for", " ".join(tt), note)
+    else:
+        add("info", "require-trusted-types-for", "absent",
+            "no Trusted Types requirement. Note the other direction too: Trusted Types is on by "
+            "default in Firefox 148 (2026-02-24), so a payload that fires in the toolbox "
+            "Chromium may not fire in a victim's Firefox. Record the browser name and version "
+            "with the proof.")
+
+    return {"directives": {k: v for k, v in sorted(merged.items())}, "nonces": nonces,
+            "findings": findings, "source": source}
+
+
+def cmd_csp(a):
+    headers = parse_headers(a.header)
+    if a.policy:
+        report = csp_findings([parse_csp(a.policy)], report_only=False, source="--policy")
+        return {"command": "csp", "network": False, "target": None, "policies": [report],
+                "nonce_reuse": None}
+
+    status, hdrs, body, final, multi = http(a.target, headers, a.timeout, a.insecure)
+    if status is None:
+        raise SystemExit(f"clientside csp: {a.target} unreachable ({body})")
+
+    reports = []
+    for name, report_only in (("content-security-policy", False),
+                              ("content-security-policy-report-only", True)):
+        for value in multi.get(name, []):
+            pols = [parse_csp(p) for p in split_policies(value)]
+            reports.append(csp_findings(pols, report_only, source=name))
+    for ro, _q, content in CSP_META.findall(body):
+        reports.append(csp_findings([parse_csp(content)], bool(ro), source="meta tag"))
+    if not reports:
+        reports.append({"directives": {}, "nonces": [], "source": "none",
+                        "findings": [{"severity": "info", "directive": "(none)", "state": "absent",
+                                      "note": "no CSP in a header or a meta tag. Absence of CSP "
+                                              "is a hardening note, not a finding on its own."}]})
+
+    # Nonce reuse: 598 of 2,271 nonce policies reused one across responses
+    # (arXiv 2309.07782). Two fetches is the whole test, and two is all it takes.
+    reuse = None
+    first = [n for r in reports for n in r["nonces"]]
+    if first and not a.no_nonce_check:
+        s2, _h2, body2, _f2, multi2 = http(final, headers, a.timeout, a.insecure)
+        second = []
+        for name in ("content-security-policy", "content-security-policy-report-only"):
+            for value in multi2.get(name, []):
+                for p in split_policies(value):
+                    second += [v for v in parse_csp(p).get("script-src", [])
+                               if v.lower().startswith("'nonce-")]
+        for _ro, _q2, content in CSP_META.findall(body2):
+            second += [v for v in parse_csp(content).get("script-src", [])
+                       if v.lower().startswith("'nonce-")]
+        shared = sorted(set(first) & set(second))
+        reuse = {"first": first, "second": second, "shared": shared,
+                 "state": "reused" if shared else "fresh",
+                 "note": ("the same nonce came back on a second, independent fetch: it is not "
+                          "per-response, so an injected script tag carrying it executes. This "
+                          "is a real nonce bypass, and it still needs a canary that runs under "
+                          "the enforced policy to be a finding."
+                          if shared else
+                          "the nonce changed between fetches. Caching is the remaining angle: a "
+                          "bfcache/disk-cache restore can serve an old nonce (Woltjer, 2025); "
+                          "that needs a cached navigation, not a second fetch.")}
+    return {"command": "csp", "network": True, "target": a.target, "status": status,
+            "final_url": final, "policies": reports, "nonce_reuse": reuse}
+
+
+# --------------------------------------------------------------- service workers
+
+SW_REGISTER = re.compile(
+    r"""(?:navigator|\w+)\.serviceWorker\s*\.\s*register\s*\(\s*([^),]+)""")
+IMPORT_SCRIPTS = re.compile(r"""importScripts\s*\(([^)]*)\)""")
+SW_EVENTS = re.compile(r"""(?:self|addEventListener)\s*(?:\.\s*addEventListener\s*)?\(\s*["'](fetch|push|message|install|activate|notificationclick|sync)["']""")
+CACHE_OPEN = re.compile(r"""caches\s*\.\s*(?:open|match|has|delete)\s*\(\s*([^),]*)""")
+LITERAL = re.compile(r"""^\s*["'`]([^"'`]*)["'`]\s*$""")
+
+
+def registration_calls(text):
+    """Every serviceWorker.register() call, with whether its URL is a literal.
+
+    A registration whose URL is built from a variable, a template or anything
+    off `location` is the SW-XSS primitive from the WWXSS measurement (EuroS&P
+    2025: confirmed XSS in at least 89,945 workers across 31,619 sites). A
+    literal is just a path to go and read.
+    """
+    out = []
+    for m in SW_REGISTER.finditer(text or ""):
+        arg = m.group(1).strip()
+        lit = LITERAL.match(arg)
+        row = {"argument": arg[:160], "literal": bool(lit), "url": lit.group(1) if lit else None}
+        if not lit:
+            row["why"] = ("the worker URL is computed, not a literal. If any part of it comes "
+                          "from a source (location.search/hash, a message, a fetched JSON "
+                          "field) the attacker chooses which script becomes a service worker "
+                          "for this scope, which outlives the page.")
+        out.append(row)
+    return out
+
+
+def scan_worker(text):
+    """What a worker script does: imports, events, caches."""
+    imports = []
+    for m in IMPORT_SCRIPTS.finditer(text or ""):
+        for raw in m.group(1).split(","):
+            lit = LITERAL.match(raw)
+            imports.append({"argument": raw.strip()[:120], "literal": bool(lit),
+                            "url": lit.group(1) if lit else None})
+    return {"import_scripts": imports,
+            "events": sorted({m.group(1) for m in SW_EVENTS.finditer(text or "")}),
+            "caches": sorted({(LITERAL.match(m.group(1)).group(1) if LITERAL.match(m.group(1))
+                               else m.group(1).strip())[:80]
+                              for m in CACHE_OPEN.finditer(text or "") if m.group(1).strip()}),
+            "computed_imports": [i for i in imports if not i["literal"]]}
+
+
+SW_ENUM_JS = (
+    "(async()=>{const regs=await navigator.serviceWorker.getRegistrations();"
+    "const keys=await caches.keys();const out=[];"
+    "for(const r of regs){const w=r.active||r.installing||r.waiting;"
+    "out.push({scope:r.scope,script:w&&w.scriptURL,state:w&&w.state,"
+    "updateViaCache:r.updateViaCache})}"
+    "const cached={};for(const k of keys){const c=await caches.open(k);"
+    "cached[k]=(await c.keys()).slice(0,50).map(q=>q.url)}"
+    "return JSON.stringify({registrations:out,cache_names:keys,cached,"
+    "controller:navigator.serviceWorker.controller&&"
+    "navigator.serviceWorker.controller.scriptURL})})()")
+
+
+def cmd_serviceworker(a):
+    headers = parse_headers(a.header)
+    status, hdrs, body, final, _ = http(a.target, headers, a.timeout, a.insecure)
+    if status is None:
+        raise SystemExit(f"clientside serviceworker: {a.target} unreachable ({body})")
+
+    calls = registration_calls(body)
+    scanned_scripts = []
+    for js in script_urls(final, body)[:a.max_scripts]:
+        if not in_scope(js):
+            continue
+        s, _h, b, f, _m = http(js, headers, a.timeout, a.insecure)
+        if s and s < 400:
+            found = registration_calls(b)
+            if found:
+                scanned_scripts.append({"script": f, "registrations": found})
+                calls += found
+
+    workers = []
+    candidates = [c["url"] for c in calls if c["url"]]
+    # Build tools put the worker at a handful of conventional paths, and a site
+    # that registers it from a chunk this script never read still has one there.
+    candidates += ["/sw.js", "/service-worker.js", "/serviceworker.js", "/firebase-messaging-sw.js",
+                   "/workbox-sw.js", "/ngsw-worker.js"]
+    seen = set()
+    for ref in candidates:
+        url = urllib.parse.urljoin(final, ref).split("#")[0]
+        if url in seen or not in_scope(url):
+            continue
+        seen.add(url)
+        s, h, b, f, _m = http(url, headers, a.timeout, a.insecure)
+        if not s or s >= 400 or "script" not in h.get("content-type", "javascript"):
+            continue
+        row = {"url": f, "status": s, "bytes": len(b),
+               "service_worker_allowed": h.get("service-worker-allowed"),
+               "content_type": h.get("content-type", "")}
+        row.update(scan_worker(b))
+        if row["service_worker_allowed"]:
+            row["scope_note"] = (f"Service-Worker-Allowed: {row['service_worker_allowed']} widens "
+                                 "the scope this script may claim beyond its own directory.")
+        workers.append(row)
+
+    notes = []
+    if any(not c["literal"] for c in calls):
+        notes.append("A computed registration URL is the SW-XSS primitive (WWXSS, EuroS&P 2025). "
+                     "Trace where its parts come from before treating it as a finding.")
+    if any(w["computed_imports"] for w in workers):
+        notes.append("importScripts() with a computed URL: if a source reaches it, the attacker "
+                     "chooses code that runs in the worker for the whole scope.")
+    return {"command": "serviceworker", "network": True, "target": a.target,
+            "registrations_in_html": calls, "registrations_in_scripts": scanned_scripts,
+            "workers": workers, "notes": notes,
+            "enumerate_in_browser": SW_ENUM_JS,
+            "how": ["1. browser eval(enumerate_in_browser) on an authenticated page: that is the "
+                    "only way to see registrations, scopes and Cache API contents the HTML does "
+                    "not mention.",
+                    "2. A worker you registered during testing outlives the tab. Unregister it "
+                    "before you finish: "
+                    "(await navigator.serviceWorker.getRegistrations()).forEach(r=>r.unregister()).",
+                    "3. Cache API poisoning: a response the worker caches is served to later "
+                    "navigations, so a cached XSS persists. Prove it with your own canary and "
+                    "then clear the cache."]}
+
+
+# --------------------------------------------------------------- DOM clobbering
+
+# A read of `window.X` that then reaches a sink is the clobbering gadget. The
+# wordlist approach (try `config`, `settings`, ...) misses the names that matter
+# because they come from the application, so take them from the code.
+WINDOW_READ = re.compile(
+    r"""(?<![.\w$])(?:window|self|globalThis)\s*(?:\.\s*([A-Za-z_$][\w$]*)|"""
+    r"""\[\s*["']([A-Za-z_$][\w$]*)["']\s*\])""")
+WINDOW_WRITE = re.compile(r"""(?:window|self|globalThis)\s*(?:\.\s*[A-Za-z_$][\w$]*|"""
+                          r"""\[\s*["'][A-Za-z_$][\w$]*["']\s*\])\s*=(?!=)""")
+DOC_READ = re.compile(r"""(?<![.\w$])document\s*\.\s*([A-Za-z_$][\w$]*)""")
+SINKS = re.compile(
+    r"""\b(innerHTML|outerHTML|insertAdjacentHTML|document\.write|document\.writeln|eval|"""
+    r"""Function\s*\(|setTimeout|setInterval|\.src\s*=|\.href\s*=|location\s*=|"""
+    r"""location\.(?:href|replace|assign)|import\s*\(|fetch\s*\(|XMLHttpRequest|"""
+    r"""dangerouslySetInnerHTML|\.html\s*\(|appendChild|createElement\s*\(\s*["']script)""")
+# Properties of `window` that exist on every page: clobbering them is not a
+# gadget, it is a name collision the browser already resolved.
+WINDOW_BUILTINS = {
+    "location", "document", "navigator", "localStorage", "sessionStorage", "history", "screen",
+    "parent", "top", "self", "opener", "frames", "length", "name", "console", "performance",
+    "crypto", "fetch", "addEventListener", "removeEventListener", "postMessage", "setTimeout",
+    "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame", "innerWidth",
+    "innerHeight", "outerWidth", "outerHeight", "scrollX", "scrollY", "devicePixelRatio",
+    "JSON", "Math", "Object", "Array", "Promise", "Symbol", "Map", "Set", "Date", "RegExp",
+    "Error", "URL", "URLSearchParams", "TextEncoder", "TextDecoder", "atob", "btoa", "alert",
+    "confirm", "prompt", "open", "close", "focus", "blur", "matchMedia", "getComputedStyle",
+    "customElements", "indexedDB", "caches", "Intl", "WebAssembly", "Reflect", "Proxy",
+    "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI", "isNaN", "parseInt",
+    "parseFloat", "require", "module", "exports", "process", "global", "undefined", "NaN",
+    "Infinity", "onload", "onerror", "onmessage", "onpopstate", "onhashchange", "dispatchEvent",
+}
+# `document.X` is clobberable only for the form-feed names: an element with that
+# name or id shadows the document property.
+DOC_CLOBBERABLE = {"cookie", "domain", "referrer", "title", "URL", "documentURI", "forms",
+                   "images", "links", "scripts", "all", "body", "head", "currentScript",
+                   "lastModified", "baseURI", "activeElement", "defaultView"}
+
+
+def clobber_candidates(text, label="", window_chars=240):
+    """`window.X` reads near a sink, with the sink named.
+
+    Proximity, not data flow: a minified bundle is one line, so "the same line"
+    says nothing and a character window is the honest approximation. It over- and
+    under-reports, which is why each row carries the snippet to read. The flow
+    question is settled in the browser with the clobber probe, not here.
+
+    ponytail: character-window proximity. If this produces too much noise on a
+    real bundle, the upgrade is to parse the file and ask whether the read and
+    the sink share a scope, not to tighten the window.
+    """
+    rows = {}
+    written = {m.group(0).split("=")[0].strip() for m in WINDOW_WRITE.finditer(text or "")}
+    for m in WINDOW_READ.finditer(text or ""):
+        name = m.group(1) or m.group(2)
+        if not name or name in WINDOW_BUILTINS:
+            continue
+        lo, hi = max(0, m.start() - window_chars), m.end() + window_chars
+        near = sorted({s.group(1) for s in SINKS.finditer(text[lo:hi])})
+        if not near:
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        row = rows.setdefault(name, {"property": name, "object": "window", "file": label,
+                                     "line": line, "sinks": set(), "reads": 0,
+                                     "also_assigned": any(name in w for w in written),
+                                     "snippet": text[max(0, m.start() - 60):m.end() + 100]
+                                     .replace("\n", " ")[:200]})
+        row["sinks"].update(near)
+        row["reads"] += 1
+    for m in DOC_READ.finditer(text or ""):
+        name = m.group(1)
+        if name not in DOC_CLOBBERABLE:
+            continue
+        lo, hi = max(0, m.start() - window_chars), m.end() + window_chars
+        near = sorted({s.group(1) for s in SINKS.finditer(text[lo:hi])})
+        if not near:
+            continue
+        key = "document." + name
+        row = rows.setdefault(key, {"property": name, "object": "document", "file": label,
+                                    "line": text.count("\n", 0, m.start()) + 1,
+                                    "sinks": set(), "reads": 0, "also_assigned": False,
+                                    "snippet": text[max(0, m.start() - 60):m.end() + 100]
+                                    .replace("\n", " ")[:200]})
+        row["sinks"].update(near)
+        row["reads"] += 1
+    out = []
+    for row in rows.values():
+        row["sinks"] = sorted(row["sinks"])
+        out.append(row)
+    out.sort(key=lambda r: (-len(r["sinks"]), -r["reads"], r["property"]))
+    return out
+
+
+def clobber_probe(name, obj, token, oast):
+    """The HTML to inject and the expression that reads it back."""
+    if obj == "document":
+        return {"inject": f'<form name={name}><input name=value value="//{oast}/{token}"></form>',
+                "read_back": f"String(document.{name})",
+                "note": "an element whose name/id shadows the document property"}
+    return {"inject": f'<a id={name}></a><a id={name} name=mythos href="//{oast}/{token}"></a>',
+            "read_back": f"String(window.{name} && window.{name}.mythos)",
+            "note": "two same-id anchors give an HTMLCollection whose named member stringifies "
+                    "to the href, which is how a string lands in the gadget"}
+
+
+def cmd_domclobber(a):
+    base = Path(a.bundle_dir)
+    files = [base] if base.is_file() else sorted(
+        p for p in base.rglob("*")
+        if p.is_file() and p.suffix.lower() in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+                                                ".html", ".htm", ".vue", ".svelte"))
+    rows, scanned, notes = [], 0, []
+    for p in files[:a.max_files]:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > a.max_bytes:
+            notes.append(f"{p}: truncated at {a.max_bytes} bytes")
+            text = text[:a.max_bytes]
+        label = str(p.relative_to(base)) if base.is_dir() else str(p)
+        rows += clobber_candidates(text, label, a.window)
+        scanned += 1
+    rows.sort(key=lambda r: (-len(r["sinks"]), -r["reads"]))
+    top = rows[:a.max_candidates]
+    for row in top:
+        row["probe"] = clobber_probe(row["property"], row["object"], a.canary, a.oast)
+    return {"command": "domclobber", "network": False, "files_scanned": scanned,
+            "candidates": top, "total_candidates": len(rows), "notes": notes,
+            "method": ("Proximity of a `window.X` read to a sink within "
+                       f"{a.window} characters, not data flow. Each row is a candidate: it says "
+                       "which names are worth clobbering, which is what a wordlist cannot."),
+            "how": ["1. Clobbering needs HTML injection that keeps id/name attributes through "
+                    "the sanitizer; without that there is nothing to do here.",
+                    "2. Inject the row's probe.inject, then eval probe.read_back. A string back "
+                    "means the read is clobberable.",
+                    "3. The finding is the sink firing: an OAST fetch of the token URL, or "
+                    "execution proven through skills/stored-xss-oast. A read-back alone is not "
+                    "one, and neither is a `window.X` that the page also assigns itself "
+                    "(also_assigned: its own value wins)."]}
+
+
+# --------------------------------------------------------------- rendering
+
+def parse_headers(items):
+    headers = {}
+    for h in items or []:
+        name, sep, value = h.partition(":")
+        if not sep or not name.strip():
+            raise SystemExit(f"clientside: bad --header {h!r}: expected 'Name: value'")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def render(r):
+    """Compact prose for the agent; --json is the machine-readable form."""
+    cmd = r["command"]
+    out = [f"# clientside {cmd}"]
+
+    if cmd == "sourcemaps":
+        out.append(f"scripts seen: {r['scripts_seen']}   recovered files: {r['recovered_files']}"
+                   f"   tree: {r['tree']}")
+        for row in r["per_script"]:
+            got = f"map via {row.get('how')} -> {row['with_content']}/{row['sources']} sources" \
+                if row.get("map") else f"no map (tried: {', '.join(row.get('tried') or []) or '-'})"
+            out.append(f"  {row['script']}  {got}")
+        if r["sample"]:
+            out += ["", "## recovered (sample)"] + [f"  {s}" for s in r["sample"]]
+        if r["refused_out_of_scope"]:
+            out += ["", "## refused, out of scope (never requested)"] + \
+                   [f"  {u}" for u in r["refused_out_of_scope"]]
+        out += ["", "## next"] + [f"  {n}" for n in r["next"]]
+
+    elif cmd == "secrets":
+        out.append(f"{r['files_scanned']} file(s), {r['total']} candidate(s), "
+                   f"network: {r['network']}")
+        out.append("counts: " + (", ".join(f"{k}={v}" for k, v in r["counts"].items()) or "none"))
+        if r["credentials"]:
+            out += ["", "## credential candidates (NOT tested)"]
+            for h in r["credentials"]:
+                out.append(f"  {h['file']}:{h['line']}  {h['kind']} [{h['confidence']}]  "
+                           f"{h['match']}")
+                if h["context"]:
+                    out.append(f"      {h['context']}")
+        if r["internal_hosts"]:
+            out += ["", "## internal hostnames / private addresses"] + \
+                   [f"  {h}" for h in r["internal_hosts"][:60]]
+        if r["endpoints"]:
+            out += ["", f"## endpoints ({len(r['endpoints'])})"] + \
+                   [f"  {e}" for e in r["endpoints"][:80]]
+        out += ["", "! " + r["not_tested"]]
+
+    elif cmd == "protopollute":
+        out.append(f"canary: {r['canary']}   value: {r['value']}")
+        if r["probe_urls"]:
+            out += ["", "## probe URLs"] + [f"  [{u['source']}] {u['url']}" for u in r["probe_urls"]]
+        out += ["", "## web-message source", "  " + r["message_source"],
+                "", "## read-back expression", "  " + r["readback_expression"],
+                "", f"## Object.prototype read-recorder, {len(r['recorder_watches'])} names "
+                    f"watched (init script, runs before page JS)",
+                "  " + r["recorder_init_script"],
+                "", "## descriptor-field recorder (separate pass, breaks the page)",
+                "  " + r["descriptor_recorder_init_script"],
+                "  ! " + r["descriptor_warning"],
+                "", "## how"] + [f"  {s}" for s in r["how"]]
+        if r.get("verdict"):
+            v = r["verdict"]
+            out += ["", f"## verdict: {v['state']}", f"  {v['why']}"]
+            if v["new_prototype_properties"]:
+                out.append(f"  new Object.prototype properties: {v['new_prototype_properties']}")
+            if v["gadget_candidates"]:
+                out.append(f"  gadget candidates (absent properties the page read): "
+                           f"{', '.join(v['gadget_candidates'])}")
+            if v["still_needed"]:
+                out.append(f"  {v['still_needed']}")
+        out += ["", "! " + r["pre_filters"]]
+
+    elif cmd == "postmessage":
+        out += ["", "## listener init script (wrap addEventListener before page JS)",
+                "  " + r["listener_init_script"],
+                "", "## CDP cross-check"]
+        for s in r["cdp_sequence"]:
+            out.append(f"  {s['step']}. {s['method']} {json.dumps(s['params'])}")
+            out.append(f"     take: {s['take']}")
+        for row in r.get("handlers", []):
+            out += ["", f"## handler {row['index']}: {row['state']}", f"  {row['why']}",
+                    f"  sinks in handler: {', '.join(row['sinks_in_handler']) or 'none seen'}"
+                    f"   checks event.source: {row['checks_source']}"
+                    f"   worth replaying: {row['worth_replaying']}",
+                    f"  {row['source_preview']}"]
+        if r.get("sender_page"):
+            out += ["", f"## foreign-origin sender page: {r['sender_page']}", "  " + r["serve"]]
+        out += ["", "## how"] + [f"  {s}" for s in r["how"]]
+
+    elif cmd == "csp":
+        if r["target"]:
+            out.append(f"{r['status']} {r['final_url']}")
+        for pol in r["policies"]:
+            out += ["", f"## policy from {pol['source']}"]
+            for name, values in pol["directives"].items():
+                out.append(f"  {name} {' '.join(values)}"[:200])
+            for f in pol["findings"]:
+                out.append(f"  [{f['severity']}] {f['directive']}: {f['state']}")
+                out.append(f"      {f['note']}")
+        if r["nonce_reuse"]:
+            n = r["nonce_reuse"]
+            out += ["", f"## nonce across two fetches: {n['state']}", f"  {n['note']}"]
+            if n["shared"]:
+                out.append(f"  shared: {', '.join(n['shared'])}")
+
+    elif cmd == "serviceworker":
+        out.append(f"registrations found in HTML: {len(r['registrations_in_html'])}, "
+                   f"workers fetched: {len(r['workers'])}")
+        for c in r["registrations_in_html"]:
+            out.append(f"  register({c['argument']})" + ("" if c["literal"] else "   COMPUTED"))
+            if c.get("why"):
+                out.append(f"      {c['why']}")
+        for s in r["registrations_in_scripts"]:
+            out.append(f"  in {s['script']}: " +
+                       ", ".join(c["argument"] for c in s["registrations"]))
+        for w in r["workers"]:
+            out += ["", f"## {w['url']}  {w['status']} {w['bytes']}B"]
+            out.append(f"  events: {', '.join(w['events']) or 'none'}")
+            out.append(f"  importScripts: " +
+                       (", ".join(i["argument"] for i in w["import_scripts"]) or "none"))
+            if w["caches"]:
+                out.append(f"  caches: {', '.join(w['caches'])}")
+            if w.get("scope_note"):
+                out.append(f"  {w['scope_note']}")
+        if r["notes"]:
+            out += ["", "## notes"] + [f"  {n}" for n in r["notes"]]
+        out += ["", "## enumerate in the browser", "  " + r["enumerate_in_browser"],
+                "", "## how"] + [f"  {s}" for s in r["how"]]
+
+    elif cmd == "domclobber":
+        out.append(f"{r['files_scanned']} file(s), {r['total_candidates']} candidate(s)")
+        for row in r["candidates"]:
+            out += ["", f"## {row['object']}.{row['property']}  "
+                        f"({row['file']}:{row['line']}, {row['reads']} read(s))",
+                    f"  sinks near the read: {', '.join(row['sinks'])}"
+                    + ("   also assigned by the page" if row["also_assigned"] else ""),
+                    f"  {row['snippet']}",
+                    f"  inject:    {row['probe']['inject']}",
+                    f"  read back: {row['probe']['read_back']}"]
+        out += ["", "method: " + r["method"], "", "## how"] + [f"  {s}" for s in r["how"]]
+        if r["notes"]:
+            out += ["", "## notes"] + [f"  {n}" for n in r["notes"]]
+
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------- selftest
+
+def _selftest() -> int:
+    """Asserts over the parsing, which is where the bugs are and where they hide.
+
+    These are the readers whose mistakes are silent: a missed `sourceMappingURL`
+    makes a grey-box target look black-box, a CSP check that only reports what is
+    present loses the whole form-action class, and a secret pattern that fires on
+    `apiKey: "YOUR_API_KEY"` buries the real one.
+    """
+    fails = []
+
+    def want(got, expect, label):
+        if got != expect:
+            fails.append(f"{label}: got {got!r}, want {expect!r}")
+
+    def want_true(got, label):
+        if not got:
+            fails.append(f"{label}: expected truthy, got {got!r}")
+
+    # ---- source-map discovery: all four mechanisms, and the comment wins last
+    cands = map_candidates("https://t.test/a/app.js",
+                           "var x=1;\n//# sourceMappingURL=bundle.map\n", {})
+    want([k for k, _ in cands], ["comment", "suffix"], "comment and bare suffix both tried")
+    want(cands[0][1], "https://t.test/a/bundle.map", "comment resolved relative to the script")
+    want(len(map_candidates("https://t.test/a/app.js", "//# sourceMappingURL=app.js.map", {})), 1,
+         "a comment that points at the bare .map is not fetched twice")
+    cands = map_candidates("https://t.test/a/app.js", "x",
+                           {"sourcemap": "/maps/app.map", "x-sourcemap": "/legacy.map"})
+    want([k for k, _ in cands], ["sourcemap", "x-sourcemap", "suffix"],
+         "both header spellings are tried, and before the bare suffix")
+    want(cands[0][1], "https://t.test/maps/app.map", "SourceMap header resolved")
+    cands = map_candidates("https://t.test/app.js?v=9",
+                           "/*# sourceMappingURL=real.map */\n//# sourceMappingURL=last.map", {})
+    want(cands[0][1], "https://t.test/last.map", "the last sourceMappingURL wins")
+    want(cands[-1][1], "https://t.test/app.js.map", "the query is dropped from the bare suffix")
+    inline = ("//# sourceMappingURL=data:application/json;base64,"
+              + base64.b64encode(b'{"sources":["a.js"],"sourcesContent":["let a=1"]}').decode())
+    cands = map_candidates("https://t.test/app.js", inline, {})
+    want(cands[0][0], "inline", "an inline data: map is recognised, not fetched")
+    want_true(read_map(decode_inline(cands[0][1])), "the inline map decodes and parses")
+    want(map_candidates("https://t.test/style.css", "x", {}), [],
+         "a non-script URL gets no bare .map guess")
+
+    # ---- a `sources` entry is attacker-influenced: it must not escape the tree
+    want(source_path("webpack:///./src/app.js", 0), "src/app.js", "webpack prefix stripped")
+    want(source_path("webpack://app/./node_modules/x/y.js", 1), "app/node_modules/x/y.js",
+         "namespace kept, ./ dropped")
+    want(source_path("../../../../etc/passwd", 2), "etc/passwd", "traversal segments dropped")
+    want(source_path("/absolute/build/x.ts", 3), "absolute/build/x.ts", "leading slash dropped")
+    want(source_path("C:\\work\\src\\a.ts", 4), "work/src/a.ts", "drive letter and backslashes")
+    want(source_path("", 5), "unnamed/source-5.js", "an empty source still gets a file")
+    want(source_path("a/../../b", 6), "a/b", "a .. in the middle is dropped, not resolved")
+    want(read_map('{"version":3}'), None, "a JSON document with no sources is not a map")
+    want(read_map("not json"), None, "a non-JSON body is not a map")
+    want(read_map('{"sources":["a"],"sourcesContent":["x"]}'), (["a"], ["x"]), "a real map parses")
+
+    # ---- CSP: the missing directives are the point
+    pol = parse_csp("default-src 'self'; script-src 'self' 'nonce-abc' https://cdn.jsdelivr.net")
+    want(pol["script-src"], ["'self'", "'nonce-abc'", "https://cdn.jsdelivr.net"],
+         "directive values keep their case and order")
+    want(parse_csp("")["script-src"] if "script-src" in parse_csp("") else None, None,
+         "an empty policy has no directives")
+    want(split_policies("default-src 'none', script-src 'self'"),
+         ["default-src 'none'", "script-src 'self'"], "two policies in one header")
+    meta = CSP_META.findall(
+        """<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://c.test">""")
+    want([m[2] for m in meta], ["script-src 'self' https://c.test"],
+         "a meta policy survives the single quotes inside its double-quoted attribute")
+    want(CSP_META.findall("<meta http-equiv='content-security-policy-report-only' "
+                          "content='script-src *'")[0][0], "-report-only",
+         "the report-only spelling of a meta tag is recognised")
+    want([f["directive"] for f in csp_findings([parse_csp("script-src 'self'")],
+                                               source="meta tag")["findings"]
+          if f["directive"] == "frame-ancestors"], [],
+         "frame-ancestors is ignored in a meta tag, so its absence there is not reported")
+
+    rep = csp_findings([pol])
+    states = {(f["directive"], f["state"]) for f in rep["findings"]}
+    want_true(("form-action", "absent") in states, "absent form-action is reported")
+    want_true(("base-uri", "absent") in states, "absent base-uri is reported")
+    want_true(("frame-ancestors", "absent") in states, "absent frame-ancestors is reported")
+    want_true(any("does NOT inherit from default-src" in f["note"] for f in rep["findings"]),
+              "the report says why default-src does not cover them")
+    want_true(any("Heyes" in f["note"] for f in rep["findings"]),
+              "the form-action note carries the Referer credential-theft mechanism")
+    want_true(any(f["state"].startswith("gadget host") for f in rep["findings"]),
+              "an allowlisted CDN gadget host is flagged")
+    want(rep["nonces"], ["'nonce-abc'"], "the nonce is extracted for the reuse test")
+
+    full = csp_findings([parse_csp(
+        "script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; "
+        "object-src 'none'; require-trusted-types-for 'script'; trusted-types app")])
+    want([f["state"] for f in full["findings"] if f["directive"] in NO_FALLBACK], [],
+         "a policy that sets all three is not nagged about them")
+    want_true(any(f["directive"] == "require-trusted-types-for" and f["state"] == "'script'"
+                  for f in full["findings"]), "Trusted Types is read and reported")
+    want_true(any("Firefox 148" in f["note"] for f in
+                  csp_findings([parse_csp("script-src 'self'")])["findings"]),
+              "absent Trusted Types still warns that the victim's browser may enforce it")
+    loose = csp_findings([parse_csp("script-src * 'unsafe-inline' 'unsafe-eval'")])
+    want_true(any(f["state"] == "unsafe-inline" and f["severity"] == "high"
+                  for f in loose["findings"]), "unsafe-inline without a nonce is high")
+    want_true(any("wildcard *" in f["state"] for f in loose["findings"]), "a * host is flagged")
+    nonced = csp_findings([parse_csp("script-src 'nonce-x' 'unsafe-inline'")])
+    want_true(any(f["state"] == "unsafe-inline with a nonce" for f in nonced["findings"]),
+              "unsafe-inline next to a nonce is info, not high")
+    ro = csp_findings([parse_csp("script-src 'self'")], report_only=True)
+    want_true(any("blocks nothing" in f["note"] for f in ro["findings"]),
+              "a report-only policy is called out as unenforced")
+
+    # ---- bundle secret patterns, and the placeholders that must not fire
+    #
+    # The two fixtures that look like real keys are assembled from pieces rather
+    # than written out. They are the vendors' own published examples and carry
+    # nothing, but a literal `sk_live_...` in a tracked file is what a secret
+    # scanner is built to find, and it is not this repository's place to teach
+    # anyone's push protection to ignore that prefix. Assembled, the scanner
+    # under test still sees exactly the string it has to match.
+    aws_example = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    stripe_example = "sk_" + "live_" + "4eC39HqLyjWDarjtT1zdp7dc"
+    hits = scan_secrets_text(
+        f'const k="{aws_example}";\n'
+        f'var cfg={{apiKey:"{stripe_example}",url:"http://db.internal/x"}};\n'
+        'const demo={apiKey:"YOUR_API_KEY",secret:"changeme123",token:"${ENV_TOKEN}"};\n'
+        'fetch("/api/v2/users/me");\n', "bundle.js")
+    kinds = {h["kind"] for h in hits}
+    want_true("aws-access-key-id" in kinds, "an AWS key id is found")
+    want_true("stripe-key" in kinds, "a Stripe live key is found")
+    want_true("internal-host" in kinds, "an internal hostname is found")
+    want_true("endpoint" in kinds, "an /api endpoint string is found")
+    want([h["line"] for h in hits if h["kind"] == "aws-access-key-id"], [1],
+         "the line number is the line the match is on")
+    want([h["file"] for h in hits if h["kind"] == "stripe-key"], ["bundle.js"],
+         "the file label travels with the hit")
+    assigned = [h["match"] for h in hits if h["kind"] == "assigned-credential"]
+    want_true(all("YOUR" not in m and "changeme" not in m and "ENV_TOKEN" not in m
+                  for m in assigned),
+              "YOUR_API_KEY, changeme123 and ${ENV_TOKEN} are placeholders, not credentials")
+    want_true(any(m.startswith("sk_live_") for m in assigned),
+              "the one real assigned value on the same line is still reported")
+    real = scan_secrets_text('client_secret: "Gf7xQ2pLm9vTz4Rb8Nc1Kd3"', "x.js")
+    want([h["kind"] for h in real if h["kind"] == "assigned-credential"],
+         ["assigned-credential"], "a real-looking assigned secret does fire")
+    want_true(looks_placeholder("your_token_here"), "a 'your_' value is a placeholder")
+    want_true(looks_placeholder("aaaaaaaaaa"), "a single repeated character is a placeholder")
+    want(looks_placeholder("Gf7xQ2pLm9vTz4Rb8Nc1Kd3"), False, "a random-looking value is not")
+    want_true(any(h["kind"] == "private-key" for h in
+                  scan_secrets_text("-----BEGIN RSA PRIVATE KEY-----", "k")),
+              "a PEM private key header is found")
+    want_true(any(h["kind"] == "basic-auth-url" for h in
+                  scan_secrets_text('fetch("https://svc:p4ssw0rd@api.test/x")', "k")),
+              "credentials in a URL are found")
+
+    # ---- prototype pollution: the fingerprint/finding line
+    v = judge_pollution({"test": {"canary": "mythos"}, "control": {"canary": None}}, "mythosPP")
+    want(v["state"], "confirmed-pollution", "set in the test, undefined in the control")
+    v = judge_pollution({"test": {"canary": "mythos"}}, "mythosPP")
+    want(v["state"], "candidate", "no control run means candidate, never finding")
+    want_true("control" in v["why"], "and the verdict says a control is what is missing")
+    v = judge_pollution({"test": {"canary": "mythos"}, "control": {"canary": "mythos"}}, "mythosPP")
+    want(v["state"], "not-a-finding", "set in the control too: the page's own property")
+    v = judge_pollution({"test": {"canary": None}, "control": {"canary": None}}, "mythosPP")
+    want(v["state"], "not-polluted", "undefined read-back is not pollution")
+    v = judge_pollution({"test": {"canary": "m"}, "control": {"canary": None},
+                         "reads": ["then", "srcdoc", "Symbol(Symbol.iterator)", "template"]},
+                        "mythosPP")
+    want(v["gadget_candidates"], ["srcdoc", "template"],
+         "recorder noise (then, Symbols) is dropped from the gadget candidates")
+    want_true("mythosPP" in pp_readback("mythosPP"), "the read-back reads the right canary")
+    want(json.loads(pp_message("c", "v")), {"__proto__": {"c": "v"}},
+         "the web-message source is valid JSON")
+    rec = pp_recorder(["srcdoc", "tpl"])
+    want_true("setPrototypeOf" not in rec,
+              "the recorder does not try to reprototype Object.prototype: that throws, because "
+              "it is an immutable prototype exotic object")
+    want_true('"srcdoc"' in rec and "defineProperty(Object.prototype" in rec,
+              "the recorder installs a recording getter per watched name")
+    want([n for n in GADGET_SEED if n in DESCRIPTOR_SEED], [],
+         "the default recorder does not watch the defineProperty descriptor fields: watching "
+         "them makes every defineProperty call in the page throw")
+    want(gadget_names("a.srcdoc=1;b.tplName;c.tplName;d['chunkMap'];e.length;f.map(x=>x)"),
+         ["tplName", "chunkMap"],
+         "read property names are ranked by frequency; assignments and JS builtins are dropped")
+
+    # ---- postMessage handler origin checks
+    strict = origin_check_report(
+        "function(e){if(e.origin!=='https://app.test')return;el.innerHTML=e.data.html}")
+    want(strict["state"], "strict-origin-check", "an equality check against a literal is strict")
+    want(strict["sinks_in_handler"], ["innerHTML"], "the sink in the handler is named")
+    want(strict["worth_replaying"], False, "a strict check is the negative control, not a target")
+    weak = origin_check_report(
+        "e=>{if(e.origin.indexOf('app.test')>-1){document.write(e.data)}}")
+    want(weak["state"], "weak-origin-check", "a substring check is weak")
+    want_true(weak["worth_replaying"], "and worth replaying from a lookalike host")
+    want_true("attacker.test" in weak["why"], "the note shows the lookalike host shape")
+    none = origin_check_report("function(e){eval(e.data.cmd)}")
+    want(none["state"], "no-origin-check", "a handler that never reads origin says so")
+    want_true(none["worth_replaying"], "no origin check plus a sink is the case to replay")
+    want(origin_check_report("function(e){console.log(e.data)}")["worth_replaying"], False,
+         "no sink in the handler: nothing to prove even without an origin check")
+    want(origin_check_report("e=>{if(e.source!==frames[0])return;el.innerHTML=e.data}")
+         ["checks_source"], True, "an event.source check is recorded separately")
+    want_true("addEventListener" in pm_listener_hook(),
+              "the init script wraps addEventListener, so load-time listeners are caught")
+
+    # ---- service workers
+    calls = registration_calls(
+        "navigator.serviceWorker.register('/sw.js');\n"
+        "navigator.serviceWorker.register(base + params.get('w'));")
+    want(len(calls), 2, "both registrations found")
+    want(calls[0]["url"], "/sw.js", "a literal registration gives its URL")
+    want(calls[1]["literal"], False, "a computed registration is marked")
+    want_true("outlives the page" in calls[1]["why"], "and says why that matters")
+    sw = scan_worker("importScripts('https://cdn.test/a.js', cfg.extra);\n"
+                     "self.addEventListener('fetch', e=>{});\n"
+                     "self.addEventListener('push', e=>{});\n"
+                     "caches.open('v1');")
+    want([i["url"] for i in sw["import_scripts"]], ["https://cdn.test/a.js", None],
+         "a literal and a computed import are both listed")
+    want(len(sw["computed_imports"]), 1, "the computed import is singled out")
+    want(sw["events"], ["fetch", "push"], "the worker's event handlers are listed")
+    want(sw["caches"], ["v1"], "the cache name is read")
+
+    # ---- DOM clobbering candidates come from the code, not a wordlist
+    rows = clobber_candidates(
+        "var cfg=window.appConfig||{};el.innerHTML=cfg.tpl;"
+        "var s=document.createElement('script');s.src=window.cdnBase+'/x.js';"
+        "console.log(window.location.href);var t=window.unusedThing;", "app.js")
+    names = {r["property"] for r in rows}
+    want_true("appConfig" in names, "a window read that feeds innerHTML is a candidate")
+    want_true("cdnBase" in names, "a window read that feeds script.src is a candidate")
+    want("location" in names, False, "window.location is a builtin, not a gadget")
+    want(clobber_candidates("var t=window.unusedThing;console.log(t);", "a.js"), [],
+         "a window read with no sink nearby is not a candidate")
+    probe = clobber_probe("appConfig", "window", "tok1", "oast.test")
+    want_true("id=appConfig" in probe["inject"], "the probe injects the discovered name")
+    want_true("tok1" in probe["inject"], "and carries the token for the OAST oracle")
+    doc_rows = clobber_candidates("el.innerHTML=document.referrer;", "a.js")
+    want([r["property"] for r in doc_rows], ["referrer"],
+         "document.referrer feeding a sink is clobberable and reported")
+    want(clobber_candidates("var x=window.foo;", "a.js"), [],
+         "no sink anywhere means no candidates at all")
+    want_true(clobber_candidates("window.foo=1;var y=window.foo;el.innerHTML=y;", "a.js")[0]
+              ["also_assigned"], "a window property the page assigns itself is marked")
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"clientside selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
+# --------------------------------------------------------------- cli
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        return _selftest()
+
+    ap = argparse.ArgumentParser(
+        prog="scripts/clientside", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true", help="run the parser asserts, no network")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="SUBCOMMAND")
+
+    def net(p, out_default=False):
+        p.add_argument("--header", action="append", default=[],
+                       help="'Name: value', repeatable (a session cookie belongs here)")
+        p.add_argument("--timeout", type=float, default=10.0)
+        p.add_argument("--insecure", action="store_true", help="skip TLS verification")
+        p.add_argument("--rate", type=float, default=None,
+                       help="requests per second; default is rules.rate_limit_rps from the "
+                            "scope file, else 5")
+
+    sm = sub.add_parser("sourcemaps", help="[NETWORK] recover source maps and bundle sources",
+                        description="[NETWORK] Follow sourceMappingURL comments, the SourceMap "
+                        "and X-SourceMap headers, inline data: maps and the bare .map suffix; "
+                        "extract sourcesContent into the engagement directory. That turns a "
+                        "black-box target grey: point scripts/sourcemap at the tree afterwards.")
+    sm.add_argument("target", help="a page URL, a .js URL, or @file with one URL per line")
+    sm.add_argument("--out", help="output directory (default: <engagement>/clientside/sources)")
+    sm.add_argument("--max-scripts", type=int, default=60, dest="max_scripts")
+    net(sm)
+    sm.set_defaults(fn=cmd_sourcemaps)
+
+    se = sub.add_parser("secrets", help="[OFFLINE for a dir, NETWORK for a URL] credentials, "
+                                        "endpoints and internal hosts in bundles",
+                        description="Scan a recovered source tree (offline) or a live page and "
+                        "its scripts (one GET each) for credential candidates, API endpoints and "
+                        "internal hostnames, with file and line. Nothing found here is ever "
+                        "validated by using it.")
+    se.add_argument("target", help="a directory, a file, or a URL")
+    se.add_argument("--max-files", type=int, default=4000, dest="max_files")
+    se.add_argument("--max-bytes", type=int, default=4 << 20, dest="max_bytes")
+    se.add_argument("--max-scripts", type=int, default=40, dest="max_scripts")
+    net(se)
+    se.set_defaults(fn=cmd_secrets)
+
+    pp = sub.add_parser("protopollute", help="[OFFLINE] emit prototype-pollution probes and "
+                                             "judge the read-back",
+                        description="[OFFLINE] Emit the probe URLs, the web-message source, the "
+                        "({}).canary read-back and an Object.prototype read-recorder init "
+                        "script, then judge what the browser returned. Covers client-side and "
+                        "the client half of server-side PP; the server-side merge itself stays "
+                        "in the server playbook.")
+    pp.add_argument("--url", help="target URL to build probe URLs from (must be in scope)")
+    pp.add_argument("--canary", default="mythosPP1", help="property name to set and read back")
+    pp.add_argument("--value", default="mythos-polluted")
+    pp.add_argument("--names-from", metavar="DIR", dest="names_from",
+                    help="a recovered bundle tree: the recorder then watches the property "
+                         "names this application actually reads, not a wordlist")
+    pp.add_argument("--judge", metavar="FILE",
+                    help="JSON from the browser: {'test':<read-back>,'control':<read-back>,"
+                         "'reads':[...]}; '-' for stdin")
+    pp.set_defaults(fn=cmd_protopollute)
+
+    pm = sub.add_parser("postmessage", help="[OFFLINE] listener enumeration, origin-check "
+                                            "reading, foreign-origin sender page",
+                        description="[OFFLINE] Emit the addEventListener wrap and the CDP "
+                        "DOMDebugger.getEventListeners sequence, read the origin check in each "
+                        "handler you feed back, and write a foreign-origin sender page with a "
+                        "negative control. Writes a file; sends nothing.")
+    pm.add_argument("--target", help="target URL the sender page will open (must be in scope)")
+    pm.add_argument("--handlers", metavar="FILE",
+                    help="JSON list of handler sources (or window.__mythos_pm() output); "
+                         "'-' for stdin")
+    pm.add_argument("--payload", default="mythosPMcanary",
+                    help="the message body the sender posts")
+    pm.add_argument("--canary", default="mythosPMctl", help="token for the negative control")
+    pm.add_argument("--port", type=int, default=9001, help="port you will serve the page on")
+    pm.add_argument("--delay", type=int, default=3000, help="ms to wait after open() before posting")
+    pm.add_argument("--out", help="output directory (default: <engagement>/clientside/postmessage)")
+    pm.set_defaults(fn=cmd_postmessage)
+
+    cs = sub.add_parser("csp", help="[NETWORK] what the policy is missing, plus a nonce-reuse test",
+                        description="[NETWORK] Parse every policy (both header spellings, "
+                        "repeated headers, comma-separated policies, meta tags) and report the "
+                        "absences that matter: form-action, base-uri and frame-ancestors do not "
+                        "inherit from default-src. Also allowlisted JSONP/CDN gadget hosts, "
+                        "require-trusted-types-for, and whether the nonce survives a second "
+                        "fetch (two requests total). --policy parses a pasted policy offline.")
+    cs.add_argument("target", nargs="?", help="page URL")
+    cs.add_argument("--policy", help="parse this policy string instead, offline")
+    cs.add_argument("--no-nonce-check", action="store_true",
+                    help="do not send the second request")
+    net(cs)
+    cs.set_defaults(fn=cmd_csp)
+
+    sw = sub.add_parser("serviceworker", help="[NETWORK] registrations, scope, importScripts, caches",
+                        description="[NETWORK] Find serviceWorker.register() calls in the page "
+                        "and its scripts, mark the ones whose URL is computed rather than a "
+                        "literal, fetch the worker scripts (declared paths plus the "
+                        "conventional ones), and read their importScripts sources, event "
+                        "handlers, cache names and Service-Worker-Allowed header. Emits the "
+                        "in-page enumeration JS for registrations and Cache API contents, which "
+                        "only the browser can see.")
+    sw.add_argument("target", help="page URL")
+    sw.add_argument("--max-scripts", type=int, default=30, dest="max_scripts")
+    net(sw)
+    sw.set_defaults(fn=cmd_serviceworker)
+
+    dc = sub.add_parser("domclobber", help="[OFFLINE] window.X reads in bundles that feed a sink",
+                        description="[OFFLINE] Scan a recovered bundle tree for window/document "
+                        "property reads near a sink, so the clobbering candidates come from the "
+                        "application's own code instead of a wordlist, and emit the inject/"
+                        "read-back probe for each.")
+    dc.add_argument("bundle_dir", help="directory or file of recovered/minified JS")
+    dc.add_argument("--window", type=int, default=240,
+                    help="characters either side of a read to look for a sink")
+    dc.add_argument("--max-files", type=int, default=4000, dest="max_files")
+    dc.add_argument("--max-bytes", type=int, default=4 << 20, dest="max_bytes")
+    dc.add_argument("--max-candidates", type=int, default=40, dest="max_candidates")
+    dc.add_argument("--canary", default="mythosDC1", help="token for the OAST oracle")
+    dc.add_argument("--oast", default="oast.invalid", help="your OAST host")
+    dc.set_defaults(fn=cmd_domclobber)
+
+    for p in (sm, se, pp, pm, cs, sw, dc):
+        p.add_argument("--json", action="store_true")
+
+    a = ap.parse_args()
+    if a.cmd == "csp" and not a.target and not a.policy:
+        raise SystemExit("clientside csp: pass a URL, or --policy '<policy text>' to parse offline")
+    set_rate(getattr(a, "rate", None))
+    try:
+        result = a.fn(a)
+    except OutOfScope as e:
+        raise SystemExit(f"clientside: refused {e}: not in the active scope. The scope file is "
+                         "the authorization boundary and is widened in an editor, outside a run.")
+    print(json.dumps(result, indent=1, default=str) if a.json else render(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
