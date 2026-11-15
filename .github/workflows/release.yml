@@ -34,9 +34,16 @@ jobs:
       # flags it as cache poisoning. A cold `npm ci` costs a release a few
       # extra seconds. check.yml keeps its cache, because nothing it produces
       # leaves the run.
+      #
+      # It takes `package-manager-cache: false` to actually turn it off.
+      # setup-node v7 caches on its own when `cache` is unset, so dropping that
+      # input changed nothing. `cache: false` would be worse than useless: the
+      # action reads the input as a string, finds "false" truthy, and hands it
+      # to the cache restorer as a package manager name.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'   # cli/package.json: engines.node >= 22
+          package-manager-cache: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
