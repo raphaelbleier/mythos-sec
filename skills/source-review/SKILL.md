@@ -11,6 +11,14 @@ authorization matrix as the application actually writes it, and the sinks a
 value can reach. None of that is a finding. Every row stays a hypothesis until
 a live request proves it, under the proof standard in **exploit**.
 
+Triage selects this skill (`skills/registry.yaml`) when the surface shows a
+reachable `/.git/config` or a published `.js.map` — the two cases where the
+code can be had from the target itself. The normal case, where the program
+handed the source over or the product is open source, is not visible in
+`surface.json`, so the operator selects it instead. It drives `sourcemap`,
+`probe` and `verify`. Sources recovered from a JavaScript bundle come from
+**client-side** step 1, which hands the tree to `sourcemap` and arrives here.
+
 ## 0. Authorization — having the source does not widen the scope
 
 - `engagements/<dir>/scope.yaml` is still the only authorization boundary for
@@ -56,6 +64,23 @@ program allows source-assisted testing when its text says anything about it.
 scripts/sourcemap <source path> --json > engagements/<dir>/source/map.json
 scripts/sourcemap <source path>                      # the readable version
 ```
+
+`scripts/sourcemap`'s `config` section finds a credential written as
+`name = "value"`. That misses the shape that leaks most often: a high-entropy
+provider token assigned to an innocuous name, or one that is gone from the
+working tree and still in the history. So run the dedicated pass too — it is
+offline, it sends nothing, and the tree has to be inside the repository because
+that is all the toolbox can see:
+
+```
+scripts/tools secrets <source path under the repo> --json
+scripts/tools secrets <source path under the repo> --history   # git history too
+```
+
+Every hit is a `candidate` and a **finding about the repository**, never a
+credential to use: `rules.allow_secret_verification` stays false and the
+wrapper prints only the first four characters of the match. Do not
+authenticate with it; whether it is still live is the program's question.
 
 Then correlate with the live surface, which is the pass that pays:
 

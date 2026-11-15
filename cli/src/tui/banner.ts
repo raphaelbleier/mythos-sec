@@ -7,7 +7,7 @@
  * and then repainted over is a banner cut in half, and the terminal's
  * scrollback is not ours to rely on. The quiet mode gets the one-line form.
  */
-import { c, theme, type Theme } from "./theme.js";
+import { c, glyphs, theme, type Theme } from "./theme.js";
 
 /**
  * Five rows of full blocks and spaces, nothing else. Half-block glyphs made a
@@ -67,13 +67,18 @@ export function banner(t: Theme = theme()): string {
   );
 }
 
-/** One line for the quiet mode, where three rows of block letters are noise. */
+/**
+ * One line for the quiet mode, where three rows of block letters are noise.
+ *
+ * The dash comes from the glyph set: this line is the first thing in a log file
+ * and an em dash in a latin-1 terminal is a replacement box in the one place a
+ * reader looks to see whether the right tool ran.
+ */
 export function bannerLine(version: string, t: Theme = theme()): string {
-  if (t.mono) return `mythos ${version} — web red-team framework, authorized testing only`;
-  return (
-    `${ESC(t.accent)}mythos${RESET} ${ESC(t.muted)}${version} — web red-team framework, ` +
-    `authorized testing only${RESET}`
-  );
+  const d = glyphs().dash;
+  const tail = `web red-team framework, authorized testing only`;
+  if (t.mono) return `mythos ${version} ${d} ${tail}`;
+  return `${ESC(t.accent)}mythos${RESET} ${ESC(t.muted)}${version} ${d} ${tail}${RESET}`;
 }
 
 export const colour = (t: Theme, hex: string, s: string) =>

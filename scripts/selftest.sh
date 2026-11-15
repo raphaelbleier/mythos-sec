@@ -50,10 +50,63 @@ echo "== deterministic scripts =="
 # than as a failing build.
 for s in scripts/probe scripts/verify scripts/coverage scripts/findings scripts/cvefeed \
          scripts/sourcemap scripts/traffic scripts/watch scripts/lessons \
-         scripts/lessons-record scripts/models \
+         scripts/lessons-record scripts/models scripts/triage scripts/evidence \
+         scripts/clientside scripts/apiproto scripts/authflows scripts/ssrfprobe \
+         scripts/aiplatform scripts/supplychain scripts/takeover scripts/sbom \
+         scripts/race scripts/cache scripts/federation scripts/cloudexp scripts/tools \
          hooks/scope-guard.py hooks/budget-guard.py; do
   run "$s --selftest" python3 "$s" --selftest
 done
+
+# The readers that have a fallback, with the library hidden. `scripts/triage`
+# compares both of its registry readers against the registry that actually
+# ships, which is the check that would have caught the scope guard's port bug.
+NOYAML=$(mktemp -d)
+printf 'raise ImportError("blocked for this check")\n' > "$NOYAML/yaml.py"
+for s in hooks/scope-guard.py hooks/budget-guard.py scripts/traffic scripts/watch \
+         scripts/triage scripts/apiproto scripts/supplychain scripts/takeover \
+         scripts/sbom scripts/race scripts/cache scripts/federation scripts/cloudexp \
+         scripts/tools; do
+  run "$s --selftest (no PyYAML)" env PYTHONPATH="$NOYAML" python3 "$s" --selftest
+done
+rm -rf "$NOYAML"
+
+echo
+echo "== skills =="
+# CI validates every SKILL.md's frontmatter and this did not, so a description
+# containing a bare `word:` passed here and failed there. A check that only one
+# of the two runs is a check that finds things late.
+run "skill frontmatter is valid" python3 - <<'PY'
+import pathlib, re, sys
+try:
+    import yaml
+except ImportError:
+    print("PyYAML missing; the CI job covers this one")
+    sys.exit(0)
+errors = []
+skills = sorted(pathlib.Path("skills").glob("*/SKILL.md"))
+if not skills:
+    errors.append("skills/: no SKILL.md found")
+for p in skills:
+    m = re.match(r"---\r?\n(.*?)\r?\n---[ \t]*(\r?\n|$)", p.read_text(encoding="utf-8"), re.S)
+    if not m:
+        errors.append(f"{p}: no YAML frontmatter")
+        continue
+    try:
+        d = yaml.safe_load(m.group(1))
+    except Exception as e:
+        errors.append(f"{p}: {e}")
+        continue
+    if not isinstance(d, dict):
+        errors.append(f"{p}: frontmatter is not a mapping")
+        continue
+    if d.get("name") != p.parent.name:
+        errors.append(f"{p}: name {d.get('name')!r} != directory {p.parent.name!r}")
+    if not (isinstance(d.get("description"), str) and d["description"].strip()):
+        errors.append(f"{p}: missing description")
+print("\n".join(errors) or f"{len(skills)} skills valid")
+sys.exit(bool(errors))
+PY
 
 echo
 echo "== cli =="
@@ -69,6 +122,14 @@ if [ -f cli/dist/selftest.js ]; then
   run "cli/dist/selftest.js" node cli/dist/selftest.js
 else
   skip "cli selftest: no cli/dist (npm run build --prefix cli)"
+fi
+# The web interface serves engagement data and renders bytes a target chose, so
+# its checks are the token, the loopback bind, path traversal, the CSP and a
+# captured payload staying inert.
+if [ -f cli/dist/web/selftest.js ]; then
+  run "cli/dist/web/selftest.js" node cli/dist/web/selftest.js
+else
+  skip "web selftest: no cli/dist (npm run build --prefix cli)"
 fi
 
 echo

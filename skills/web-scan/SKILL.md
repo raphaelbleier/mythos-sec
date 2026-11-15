@@ -17,7 +17,7 @@ so do not run nuclei + sqlmap + a browser at once.
 
 If the target has a login, run **auth-session** first and repeat steps 1 to 5
 with the session (`nuclei -sf`, `dalfox --cookie/-H`, `sqlmap --cookie`, see the
-table there). Run `session_check.py` before each step.
+table there). Run `session-check` before each step.
 
 ## 0. Probe your hypotheses first
 
@@ -99,7 +99,22 @@ toolbox. Pick payloads by the stack recon found.
   `%2e%2e%2f`, null-byte/`?` truncation, `php://filter` for source read.
 - **Open redirect**: `?next=//evil.example`, `?url=https://evil.example`,
   `?redirect=/\evil.example`; follow with `-I` and read `Location`.
-- **CRLF**: `%0d%0aSet-Cookie:mythos=1` in a header-reflected param.
+- **CRLF**: `%0d%0aSet-Cookie:mythos=1` in a header-reflected param. For the
+  whole surface rather than one param, `crlfuzz` is wired:
+
+```
+scripts/tools crlf '<URL>' --json
+```
+
+  It checks the destination against `scope.yaml` before crlfuzz starts and
+  derives its concurrency from `rules.rate_limit_rps` (crlfuzz has no
+  requests-per-second flag). A hit is a `candidate`, never confirmed: crlfuzz
+  saw an injected CRLF become a header boundary, which is the right oracle for
+  the class but is not impact. Replay it by hand and read the raw response —
+  the finding is what the injected header achieves (a `Set-Cookie` the victim
+  keeps, a poisoned cache key, a split response), and
+  `knowledge/web/cache-poisoning.md` is why a reflected header alone is not a
+  report.
 
 ```
 scripts/mythos sh "curl -s -G '<URL>' --data-urlencode 'q={{7*7}}' | grep -o '49' && echo SSTI-LIKELY"
@@ -107,15 +122,32 @@ scripts/mythos sh "curl -s -G '<URL>' --data-urlencode 'q={{7*7}}' | grep -o '49
 
 ## 5. Auth / API / access-control
 
-- **JWT**: `scripts/mythos jwt_tool <token> -M at` (alg confusion, `alg:none`,
-  weak secret: `jwt_tool <token> -C -d /usr/share/wordlists/rockyou.txt`).
+- **JWT**: `scripts/tools jwt <token>` decodes it with no request at all and
+  names the live check per row (`alg:none`, a symmetric `alg`, a `kid`/`jku`
+  the server resolves, a missing `exp`). Add
+  `--target <URL> --canary '<string only an authenticated response contains>'`
+  to run jwt_tool's playbook against a scope-checked URL, paced from
+  `rules.rate_limit_rps`. The canary is required, and it is also the oracle:
+  if jwt_tool's anonymous control matches it too, the whole run comes back as
+  one `inconclusive` row instead of thirty false candidates. jwt_tool's own
+  "vulnerable" lines come back as candidates, because it compared one substring
+  in one response and not an authorization outcome.
+  The bare form is `scripts/mythos jwt_tool <token> -M at`, which is the same
+  playbook plus the claim fuzzers, unpaced and with the same `-cv`/`-rh`
+  requirement.
+  **Do not guess the signing secret.** `jwt_tool -C -d <wordlist>` is offline
+  credential brute force, `hooks/scope-guard.py` refuses brute force in every
+  mode and no scope rule overrides it, and this skill used to name it with
+  rockyou by path. A symmetric `alg` is a candidate because of `alg:none` and
+  RS→HS key confusion, both of which are single requests; it is not an
+  invitation to crack.
 - **CORS**: send `Origin: https://evil.example`; a reflected
   `Access-Control-Allow-Origin` + `-Allow-Credentials: true` is a finding.
 - **API excessive data exposure**: diff what the UI needs vs what the endpoint
   returns (extra PII, internal fields).
 - **BOLA / IDOR, BFLA, mass assignment, races, workflow abuse**: run the
-  **business-logic** skill (Subject x Object x Action matrix, `bola_diff.py`,
-  `mass_assign.py`, `race.py`) with the userA/userB sessions from
+  **business-logic** skill (Subject x Object x Action matrix, `bola-diff`,
+  `mass-assign`, `race`) with the userA/userB sessions from
   **auth-session**. Guard against token/auth params that just break the session
   (not a real finding).
 
@@ -163,10 +195,10 @@ and `n/a` (class does not apply to this endpoint):
 | class | endpoint (method path param) | role(s) | tool / check | state | evidence / reason |
 |---|---|---|---|---|---|
 | sqli | GET /search q | anon | sqlmap BT | rejected(no boolean diff) | scan/sqlmap-search.log |
-| xss-stored | POST /api/comments text | userA->userB | xss_verify | reproduced | scan/xss-mx1a2b3c4d.png |
-| bola | GET /api/orders/{id} | userA,userB,anon | bola_diff | candidate | scan/bola.jsonl line 4 |
-| mass-assign | PUT /api/users/{id} role | userA | mass_assign probe | untested | |
-| race | POST /api/redeem code | userA | race.py threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
+| xss-stored | POST /api/comments text | userA->userB | xss-verify | reproduced | scan/xss-mx1a2b3c4d.png |
+| bola | GET /api/orders/{id} | userA,userB,anon | bola-diff | candidate | scan/bola.jsonl line 4 |
+| mass-assign | PUT /api/users/{id} role | userA | mass-assign probe | untested | |
+| race | POST /api/redeem code | userA | race threads | validated(seq 1 / par 4, x2) | findings/F-03.md |
 | smuggling | * front proxy | anon | smuggler | n/a(single server, no proxy) | |
 ```
 
