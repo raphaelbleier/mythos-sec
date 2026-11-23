@@ -2,7 +2,7 @@
 #    uv pip compile --generate-hashes --python-version 3.14 --python-platform linux toolbox/requirements.in -o toolbox/requirements.txt
 arjun==2.2.7 \
     --hash=sha256:b193cdaf97bf7b0e8cd91a41da778639e01fd9738d5f666a8161377f475ce72e
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 brotlipy==0.7.0 \
     --hash=sha256:07194f4768eb62a4f4ea76b6d0df6ade185e24ebd85877c351daa0a069f1111a \
     --hash=sha256:08a16ebe2ffc52f645c076f96b138f185e74e5d59b4a65e84af17d5997d82890 \
@@ -393,7 +393,7 @@ cryptography==50.0.2 \
     --hash=sha256:f9f6143a8c75945eb960d9eb98905a441394abfa24afaae239d514ffb2586480 \
     --hash=sha256:fa8f5efb344d6908a1ce62f4a24e2e5780f825d6f53f5f50ec5ffacac72936cb \
     --hash=sha256:fdd28f912fccfec1846a94e2e1e8f9b0012f557f0c46fe4f3eb0d7a87afcf90b
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 dicttoxml==1.7.16 \
     --hash=sha256:6f36ce644881db5cd8940bee9b7cb3f3f6b7b327ba8a67d83d3e2caa0538bf9d \
     --hash=sha256:8677671496d0d38e66c7179f82a7e9059f94887777955dc71b0ac602ee637c26
@@ -482,22 +482,22 @@ greenlet==3.5.6 \
 h2spacex==1.2.2 \
     --hash=sha256:49c84d91feba0085692b94fe13b9570c424c5d97363b8fe9a6c49e3de791f120 \
     --hash=sha256:fc166843b67c124da59107b494a5d7f8b412efef3e6154b879dcb054999dbd60
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 idna==3.20 \
     --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
     --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
     # via requests
-playwright==1.65.1 \
-    --hash=sha256:0178cec62bfcc9c202f7d2c2c79c14ebac620c672f36ba31f0d7f0ee5ce87032 \
-    --hash=sha256:43541b89fa293819eb98383feea837368ee681e67cc105b19f3dd58f1409f1d6 \
-    --hash=sha256:4ffb9e62ee226130ec9333a062a3a30d6a12ee5e4d164a9076c2b54cd15cc14e \
-    --hash=sha256:5660e0b050a5bd5672bf8e366ed2580288a3d3640ff9444436ed2d890d3dc442 \
-    --hash=sha256:5f9542db4d3bff9943510297c1de4252bf8ee62c47fd5f5af3213645035ba6d7 \
-    --hash=sha256:a6c0db1447bcbe0493dcd23c84faf8e993fa7f8c1573b146a5c786df262f90b5 \
-    --hash=sha256:cd0eabebdadd45bd897a5465b358c26546cf0d7298492d66f609eec012a68de1 \
-    --hash=sha256:d50ad4dd217d4ee9e4672efd7ec4ab0523b5e73f64f6e0c5eae258961fa73a49 \
-    --hash=sha256:f9ea4f4b4f70ecc27ef0bd46a1b929798f1a8bf68b3e771261fc098bc98e1a0b
-    # via -r toolbox/requirements.in
+playwright==1.65.2 \
+    --hash=sha256:2e03da7fd7cd6ea92d22524be147e5803649ab0ae9b362b9a78efa869c2f57c7 \
+    --hash=sha256:33a224fba3fb72c5fa7eda49535b265c292f1fb87949c769754f9fcd0f5be2de \
+    --hash=sha256:3bb758e12b963bf32f7fba5c4b86994f060126feb32d47f236589f53fe09746f \
+    --hash=sha256:4476703bcdd1a2db06f5db5136af7c02552b1bb519d5fa4b94a8eead2a6a41ba \
+    --hash=sha256:58932d35f56767ab7ebcdd3d4a733bfb3e62a1a5bc43c08e28b9fa9b3e61cf33 \
+    --hash=sha256:8b031f81de9cdbe8550d8fe8b58dba47d96239e53177ee4cd47dab0fff07a87e \
+    --hash=sha256:99dd0de21173375cded45f4e26a9e19b862d748b06cbb11376313758cedc220e \
+    --hash=sha256:d0aec9e1c97b6f497f3d9f2ad6e1b7f299968e61239d71f100298b0690f3c776 \
+    --hash=sha256:dd3e54b6a926fc6510f272797eec0707dc34ae04d564e74a7056c4a813e53270
+    # via -r requirements.in
 pycparser==3.12 \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6
@@ -550,7 +550,7 @@ pycryptodomex==3.24.2 \
     --hash=sha256:fca1303bc8e9ad6a2e61e8e528161f1988776d12b7f523ec2b02e0e2e991424a \
     --hash=sha256:fe43b58a7d4a9c6aa33490f04eab4ffcd72320842dfddf1774357a54eebf09fc \
     --hash=sha256:feea36c026018e665503555d22c6d5ba32f4a4e4465cb553f56ede8b745a5e05
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 pysocks==1.7.1 \
     --hash=sha256:08e69f092cc6dbe92a0fdd16eeb9b9ffbc13cadfe5ca4c7bd92ffb078b293299 \
     --hash=sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5 \
@@ -561,11 +561,11 @@ pysocks==1.7.1 \
 ratelimit==2.2.1 \
     --hash=sha256:af8a9b64b821529aca09ebaf6d8d279100d766f19e90b5059ac6a718ca6dee42
     # via arjun
-requests==2.34.2 \
+requests[socks]==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
     # via
-    #   -r toolbox/requirements.in
+    #   -r requirements.in
     #   arjun
     #   wafw00f
 scapy==2.5.0 \
@@ -709,11 +709,11 @@ simplejson==4.3.0 \
     --hash=sha256:f99186392ea0e1adb663457d4bac5a6f01ad1f6950bf42bb5c266872e1c78ad3 \
     --hash=sha256:f9e38405339f79a70212495b9c080c19a2065ec38fa55840ebef99a5ee3988f1 \
     --hash=sha256:ffe34ab51a0d37e6d1c661a5672df00d2d5e18804e38eac07abffb83fa5ec3d7
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 termcolor==3.3.0 \
     --hash=sha256:348871ca648ec6a9a983a13ab626c0acce02f515b9e1983332b17af7979521c5 \
     --hash=sha256:cf642efadaf0a8ebbbf4bc7a31cec2f9b5f21a9f726f4ccbb08192c9c26f43a5
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
 urllib3==2.8.0 \
     --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
     --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
@@ -721,4 +721,4 @@ urllib3==2.8.0 \
 wafw00f==2.4.2 \
     --hash=sha256:05e4a49f6de433793ad506e37ae2c6f537c832959ee6e2bbdf573900f22194ae \
     --hash=sha256:c9a3df6e49b3ca913bd3a1a52dc7112ae0bc08c2bc0cfc0fd90e5982a202c05a
-    # via -r toolbox/requirements.in
+    # via -r requirements.in
