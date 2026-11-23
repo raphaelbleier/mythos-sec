@@ -22,7 +22,7 @@
 #   docker buildx imagetools inspect <image>:<tag> | grep Digest
 
 # ---------------------------------------------------------------- go builder
-FROM golang:1.26-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS gobuilder
+FROM golang:1.27-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS gobuilder
 # Versions: see toolbox/tools.txt.
 RUN set -eu; \
     for pkg in \
